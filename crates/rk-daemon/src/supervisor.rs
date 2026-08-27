@@ -5950,11 +5950,25 @@ impl Supervisor {
     /// Whether a ticket has ever produced a branch-bearing implementation
     /// candidate. This decides whether delivery evidence is applicable; it
     /// never decides whether delivery occurred.
-    fn ticket_has_delivery_candidate(&self, task: &str) -> bool {
-        self.lock_registry()
-            .list_all()
-            .iter()
-            .any(|record| record.task.as_deref() == Some(task) && record.branch.is_some())
+    ///
+    /// `record.task` is stored verbatim from `SpawnParams.task` and is never
+    /// canonicalized, so it carries whichever spelling the spawn's caller
+    /// used — a legacy ticket's `TKT-<ULID>` identity or its proquint alias.
+    /// `task` here is likewise whatever spelling the `done` caller typed.
+    /// Comparing the two raw would let a `done` addressed by one spelling
+    /// miss a candidate locked under the other and fail OPEN, which is the
+    /// TKT-18/46/147 dropped-land class this guard exists to prevent. Match
+    /// against every spelling of the ticket instead
+    /// ([`crate::tickets::Tickets::id_spellings`]).
+    fn ticket_has_delivery_candidate(&self, task: &str) -> rk_core::Result<bool> {
+        let spellings = self.tickets.id_spellings(task)?;
+        Ok(self.lock_registry().list_all().iter().any(|record| {
+            record
+                .task
+                .as_deref()
+                .is_some_and(|recorded| spellings.iter().any(|spelling| spelling == recorded))
+                && record.branch.is_some()
+        }))
     }
 
     /// Refuse an explicit `done` unless the landing finalizer has written the
@@ -5963,7 +5977,7 @@ impl Supervisor {
     pub(crate) async fn require_ticket_delivered(&self, task: &str) -> rk_core::Result<()> {
         match self.tickets.delivery(task)? {
             Some(_) => Ok(()),
-            None if !self.ticket_has_delivery_candidate(task) => Ok(()),
+            None if !self.ticket_has_delivery_candidate(task)? => Ok(()),
             None => Err(rk_core::Error::other(format!(
                 "ticket {task} cannot be marked done: no canonical delivery record; land its \
                  candidate through rk, or use the explicit non-delivery dismissal path"

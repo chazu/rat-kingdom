@@ -259,11 +259,20 @@ pub async fn show(layout: &Layout, id: String, as_json: bool) -> Result<()> {
         return Ok(());
     }
     let p = &t["payload"];
-    println!(
-        "{}: {}",
-        t["identity"].as_str().unwrap_or("?"),
-        p["title"].as_str().unwrap_or("")
-    );
+    match t["alias"].as_str() {
+        // A legacy TKT-<ULID> ticket: lead with its pronounceable alias and
+        // keep the durable identity available right below it, so an
+        // operator dictating the ticket gets the easy spelling first.
+        Some(alias) => {
+            println!("{alias}: {}", p["title"].as_str().unwrap_or(""));
+            println!("  id        {}", t["identity"].as_str().unwrap_or("?"));
+        }
+        None => println!(
+            "{}: {}",
+            t["identity"].as_str().unwrap_or("?"),
+            p["title"].as_str().unwrap_or("")
+        ),
+    }
     println!("  status    {}", p["status"].as_str().unwrap_or("?"));
     println!("  priority  {}", p["priority"].as_str().unwrap_or("normal"));
     println!("  scope     {}", t["scope"].as_str().unwrap_or("?"));
@@ -422,9 +431,15 @@ fn print_ticket_row(t: &Value, blocked: bool) {
     if blocked {
         title = format!("🔒 {title}");
     }
+    // Prefer the pronounceable alias for a legacy TKT-<ULID> ticket; the
+    // durable identity stays the sort/lookup key underneath it.
+    let id = match t["alias"].as_str() {
+        Some(alias) => alias.to_string(),
+        None => t["identity"].as_str().unwrap_or("?").to_string(),
+    };
     println!(
         "{:<9} {:<12} {:<9} {:<12} {}",
-        t["identity"].as_str().unwrap_or("?"),
+        id,
         p["status"].as_str().unwrap_or("?"),
         p["priority"].as_str().unwrap_or("normal"),
         t["scope"].as_str().unwrap_or("?"),

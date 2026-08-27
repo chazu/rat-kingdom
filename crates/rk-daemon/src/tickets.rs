@@ -34,6 +34,93 @@ pub const STATUSES: &[&str] = &[
 
 pub(crate) const ID_PREFIX: &str = "TKT-";
 
+/// Number of proquint syllables in a ticket's canonical or alias spelling —
+/// 3 words * 16 bits = 48 bits of identity.
+///
+/// # Entropy and collision policy
+///
+/// A ticket minted before this module existed carries a `TKT-<ULID>`
+/// identity — 26 Crockford-base32 characters (128 bits), globally unique
+/// but unpronounceable. A ticket minted after carries `TKT-<proquint>`
+/// instead: three dash-joined five-letter syllables (e.g.
+/// `TKT-babad-bisub-lodob`), drawn from 48 bits of OS randomness
+/// ([`Tickets::next_id`]).
+///
+/// 48 bits gives a birthday-bound 50% collision probability at roughly 2^24
+/// (~16.8 million) tickets minted *fleet-wide, across every castle, over
+/// the identifier's whole lifetime* — several orders of magnitude past any
+/// realistic ticket volume. Because the representation is intentionally
+/// narrower than the durable ULID space it could have drawn from,
+/// `next_id` does not lean on the birthday bound alone: it checks each
+/// freshly drawn candidate against every existing ticket identity *and*
+/// legacy alias (via [`Tickets::resolve`]) and retries on an actual
+/// collision, up to [`ID_COLLISION_RETRIES`] times, before failing the
+/// create outright rather than silently reusing or shadowing an existing
+/// ticket.
+///
+/// # Legacy aliasing
+///
+/// A ULID-identity ticket is never renamed — every workflow binding, agent
+/// task assignment, and delivery record already carries that identity, and
+/// it must keep resolving. Instead it gains a *deterministic* proquint
+/// alias ([`legacy_alias`]): a stable 48-bit hash of its ULID identity,
+/// encoded the same way as a native proquint id. The alias is never
+/// stored — it is recomputed on demand — so it costs nothing to keep
+/// correct as new tickets are minted, and it exists purely so an operator
+/// can dictate or type a pronounceable spelling for an old ticket and have
+/// it resolve to the same tuple.
+///
+/// [`Tickets::resolve`] is the one place both spellings (and, for a legacy
+/// ticket, both its ULID identity and its alias) are accepted; every
+/// mutating entrypoint funnels through it, directly or via
+/// [`Tickets::take_ticket`], so a caller can address a ticket by whichever
+/// spelling it has. Resolution is exact-match only — no prefix and no
+/// fuzzy matching — and every payload cross-reference (`parent`,
+/// `depends_on`) is canonicalized to the resolved tuple's real identity at
+/// write time, so downstream graph algorithms (`blockers`, `ready`, cycle
+/// detection) never need to re-resolve a spelling themselves.
+///
+/// Because the alias is a hash rather than a checked draw, two legacy
+/// tickets could in principle alias to the same spelling. At 48 bits this
+/// is astronomically unlikely for any real ticket volume, but `resolve`
+/// still checks: an alias matching more than one ticket is refused as
+/// ambiguous rather than picking one, so a hash collision fails closed
+/// instead of silently misrouting a mutation to the wrong ticket.
+const PROQUINT_WORDS: usize = 3;
+
+/// How many fresh candidates [`Tickets::next_id`] will draw before giving up
+/// a ticket create as unable to mint a unique id. Never expected to be hit
+/// in practice (see the entropy note on [`PROQUINT_WORDS`]) — it exists so a
+/// pathological run fails loudly instead of looping forever.
+const ID_COLLISION_RETRIES: usize = 8;
+
+/// A deterministic, hash-derived proquint alias for a legacy (ULID-identity)
+/// ticket. Pure function of the identity string — never stored, always
+/// recomputed — so it stays correct with zero migration cost. Uses FNV-1a
+/// rather than `std`'s `SipHash` because the alias must be identical on
+/// every run and every process, not merely stable within one.
+fn legacy_alias(identity: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let hash = identity
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET, |h, &b| (h ^ b as u64).wrapping_mul(FNV_PRIME));
+    format!(
+        "{ID_PREFIX}{}",
+        rk_core::proquint::encode(hash, PROQUINT_WORDS)
+    )
+}
+
+/// True if `identity` is itself a native proquint-form ticket id (as opposed
+/// to a legacy `TKT-<ULID>` identity, which only ever has an *alias* of this
+/// shape).
+fn is_proquint_identity(identity: &str) -> bool {
+    identity
+        .strip_prefix(ID_PREFIX)
+        .is_some_and(|rest| rk_core::proquint::looks_like(rest, PROQUINT_WORDS))
+}
+
 /// Payload key holding a ticket's durable delivery record — the answer to
 /// "did this ticket ship", written once by the landing pipeline at land time
 /// (P1b). Before this existed, delivery was inferred from live branch refs,
@@ -175,11 +262,25 @@ impl Tickets {
         }
     }
 
-    /// Mint a globally unique ticket id. RecordId is a ULID, so the identity
-    /// remains sortable while avoiding the local-maximum collision that used
-    /// to make two castles both create `TKT-1`.
+    /// Mint a pronounceable, globally-unique-in-practice ticket id: 48
+    /// random bits encoded as three proquint syllables (see the entropy and
+    /// collision policy on [`PROQUINT_WORDS`]). Each candidate is checked
+    /// against every existing ticket identity and legacy alias before it is
+    /// accepted, and redrawn on an actual collision, so the narrower
+    /// representation can never shadow or reuse an existing ticket's id.
     fn next_id(&self) -> rk_core::Result<String> {
-        Ok(format!("{ID_PREFIX}{}", RecordId::new()))
+        for _ in 0..ID_COLLISION_RETRIES {
+            let candidate = format!(
+                "{ID_PREFIX}{}",
+                rk_core::proquint::encode(rand::random::<u64>(), PROQUINT_WORDS)
+            );
+            if self.resolve(&candidate)?.is_none() {
+                return Ok(candidate);
+            }
+        }
+        Err(rk_core::Error::other(
+            "could not mint a unique ticket id after retrying",
+        ))
     }
 
     pub async fn create(&self, t: NewTicket) -> rk_core::Result<Tuple> {
@@ -207,16 +308,29 @@ impl Tickets {
         _guard: &TicketMutationGuard<'_>,
         t: NewTicket,
     ) -> rk_core::Result<(Tuple, bool)> {
+        // Resolved once and reused for both the scope-inheritance lookup and
+        // the payload write below, so a parent given by its legacy alias (or
+        // its ULID identity) is stored as its one true canonical identity —
+        // the spelling `all_by_id`'s graph algorithms key on.
+        let parent_tuple = t
+            .parent
+            .as_deref()
+            .map(|p| self.get(p))
+            .transpose()?
+            .flatten();
+        let parent_field = t.parent.as_ref().map(|p| {
+            parent_tuple
+                .as_ref()
+                .map(|pt| pt.identity.clone())
+                .unwrap_or_else(|| p.clone())
+        });
         // Explicit scope wins. Otherwise a sub-ticket inherits its parent's
         // scope, so decomposing a repo-scoped ticket doesn't silently drop the
         // sub-tickets into "system" (which breaks `rk spawn --ticket` and the
         // steward-on-completion trigger match).
         let scope = match &t.scope {
             Some(s) => s.clone(),
-            None => match t.parent.as_deref().map(|p| self.get(p)).transpose()? {
-                Some(Some(parent)) => parent.scope,
-                _ => system_scope(),
-            },
+            None => parent_tuple.map(|p| p.scope).unwrap_or_else(system_scope),
         };
         if let Some(key) = t.coalesce_key.as_deref() {
             if let Some(existing) = self
@@ -237,11 +351,17 @@ impl Tickets {
         rk_core::freeze::validate_labels(&t.labels).map_err(rk_core::Error::other)?;
         // Dependencies must reference tickets that already exist. (A brand-new
         // ticket has no dependents, so it can never close a cycle here.)
+        // Canonicalized to the resolved tuple's real identity, same reasoning
+        // as `parent_field` above.
+        let mut depends_on_canonical = Vec::with_capacity(t.depends_on.len());
         for dep in &t.depends_on {
-            if self.get(dep)?.is_none() {
-                return Err(rk_core::Error::other(format!(
-                    "cannot depend on missing ticket: {dep}"
-                )));
+            match self.get(dep)? {
+                Some(existing) => depends_on_canonical.push(existing.identity),
+                None => {
+                    return Err(rk_core::Error::other(format!(
+                        "cannot depend on missing ticket: {dep}"
+                    )))
+                }
             }
         }
         let id = self.next_id()?;
@@ -250,10 +370,10 @@ impl Tickets {
             "title": t.title,
             "body": t.body.unwrap_or_default(),
             "status": "open",
-            "parent": t.parent,
+            "parent": parent_field,
             "priority": t.priority,
             "labels": t.labels,
-            "depends_on": t.depends_on,
+            "depends_on": depends_on_canonical,
             "assignee": Value::Null,
             "created_by": t.created_by.unwrap_or_else(|| self.castle.clone()),
             "created_at": now,
@@ -312,9 +432,97 @@ impl Tickets {
     }
 
     pub fn get(&self, id: &str) -> rk_core::Result<Option<Tuple>> {
+        self.resolve(id)
+    }
+
+    /// Resolve a caller-supplied ticket id — a ticket's durable identity
+    /// (`TKT-<ULID>` for one minted before proquint ids, `TKT-<proquint>`
+    /// for one minted after) or a legacy ticket's deterministic proquint
+    /// alias — to its one true tuple. Exact match only: never a prefix and
+    /// never a fuzzy match. See the collision/aliasing policy documented on
+    /// [`PROQUINT_WORDS`].
+    pub fn resolve(&self, id: &str) -> rk_core::Result<Option<Tuple>> {
         let mut pattern = Pattern::category(Category::Task);
         pattern.identity = Some(id.to_string());
-        Ok(self.space.scan(&pattern)?.into_iter().next())
+        if let Some(t) = self.space.scan(&pattern)?.into_iter().next() {
+            return Ok(Some(t));
+        }
+        let Some(rest) = id.strip_prefix(ID_PREFIX) else {
+            return Ok(None);
+        };
+        if !rk_core::proquint::looks_like(rest, PROQUINT_WORDS) {
+            return Ok(None);
+        }
+        let normalized = rk_core::proquint::normalize(rest);
+        let mut candidates = self
+            .space
+            .scan(&Pattern::category(Category::Task))?
+            .into_iter()
+            .filter(|t| t.identity.starts_with(ID_PREFIX) && !is_proquint_identity(&t.identity))
+            .filter(|t| {
+                legacy_alias(&t.identity)
+                    .strip_prefix(ID_PREFIX)
+                    .is_some_and(|alias| alias == normalized)
+            });
+        let first = candidates.next();
+        match (first, candidates.next()) {
+            (None, _) => Ok(None),
+            (Some(t), None) => Ok(Some(t)),
+            (Some(_), Some(_)) => Err(rk_core::Error::other(format!(
+                "ambiguous ticket alias '{id}': matches more than one legacy ticket"
+            ))),
+        }
+    }
+
+    /// The exact durable identity string `id` resolves to, if any — the
+    /// canonical spelling every payload cross-reference (`parent`,
+    /// `depends_on`) is written in.
+    fn canonical_id(&self, id: &str) -> rk_core::Result<Option<String>> {
+        Ok(self.resolve(id)?.map(|t| t.identity))
+    }
+
+    /// The deterministic proquint alias for `ticket`, if it has one —
+    /// `None` for a ticket whose durable identity is already a proquint
+    /// spelling (nothing to alias to), `Some` for a legacy ULID-identity
+    /// ticket.
+    pub fn alias_of(&self, ticket: &Tuple) -> Option<String> {
+        if is_proquint_identity(&ticket.identity) {
+            None
+        } else {
+            Some(legacy_alias(&ticket.identity))
+        }
+    }
+
+    /// Every spelling that names the same ticket as `id`: `id` itself, the
+    /// durable identity it resolves to, and — for a legacy ULID ticket —
+    /// its deterministic proquint alias.
+    ///
+    /// [`Self::resolve`] canonicalizes a caller-supplied spelling for
+    /// everything that reads or writes the ticket *tuple*. This is the
+    /// mirror image, for the places that cannot go through `resolve`: a
+    /// ticket id captured verbatim at some earlier moment and stored
+    /// outside the ticket store — an agent record's `task`, a landing queue
+    /// entry's `task` — and later compared by string equality. That stored
+    /// value is whatever spelling its caller happened to use, so comparing
+    /// it against one spelling of the same ticket silently misses. Match
+    /// against this set instead.
+    ///
+    /// Errors propagate rather than degrading to "no match": `resolve`'s
+    /// only error is an ambiguous alias, and a guard reading that as "no
+    /// record found" would fail open on exactly the input that should fail
+    /// closed. An id that simply does not resolve is not an error — the set
+    /// is then just `[id]`, which is the correct answer for a task string
+    /// that never was a ticket.
+    pub fn id_spellings(&self, id: &str) -> rk_core::Result<Vec<String>> {
+        let mut spellings = vec![id.to_string()];
+        if let Some(ticket) = self.resolve(id)? {
+            for spelling in std::iter::once(ticket.identity.clone()).chain(self.alias_of(&ticket)) {
+                if !spellings.contains(&spelling) {
+                    spellings.push(spelling);
+                }
+            }
+        }
+        Ok(spellings)
     }
 
     pub fn list(
@@ -374,6 +582,13 @@ impl Tickets {
                 )));
             }
         }
+        // Canonicalized before the edit closure so a re-parent given by
+        // legacy alias (or ULID identity) is stored as the resolved tuple's
+        // one true identity, same reasoning as ticket creation's parent.
+        let parent_canonical = match &changes.parent {
+            Some(p) => Some(self.canonical_id(p)?.unwrap_or_else(|| p.clone())),
+            None => None,
+        };
         self.edit(id, |obj| {
             if let Some(v) = changes.status {
                 obj.insert("status".into(), json!(v));
@@ -390,7 +605,7 @@ impl Tickets {
             if let Some(v) = changes.assignee {
                 obj.insert("assignee".into(), json!(v));
             }
-            if let Some(v) = changes.parent {
+            if let Some(v) = parent_canonical {
                 obj.insert("parent".into(), json!(v));
             }
             if !changes.add_labels.is_empty() || !changes.remove_labels.is_empty() {
@@ -616,27 +831,34 @@ impl Tickets {
         id: &str,
         dep: &str,
     ) -> rk_core::Result<Tuple> {
-        if id == dep {
+        // Resolved to canonical identities up front: `by_id` (and the array
+        // this writes into) is keyed on real identities, so a self-loop or
+        // cycle given via a legacy alias must compare canonical-to-canonical,
+        // not raw spelling-to-spelling.
+        let Some(id_canonical) = self.canonical_id(id)? else {
+            return Err(rk_core::Error::other(format!("no such ticket: {id}")));
+        };
+        let Some(dep_canonical) = self.canonical_id(dep)? else {
+            return Err(rk_core::Error::other(format!("no such ticket: {dep}")));
+        };
+        if id_canonical == dep_canonical {
             return Err(rk_core::Error::other("a ticket cannot depend on itself"));
         }
         let by_id = self.all_by_id()?;
-        if !by_id.contains_key(id) {
-            return Err(rk_core::Error::other(format!("no such ticket: {id}")));
-        }
-        if !by_id.contains_key(dep) {
-            return Err(rk_core::Error::other(format!("no such ticket: {dep}")));
-        }
         // Adding id -> dep closes a cycle iff id is already reachable from dep.
-        if reaches(dep, id, &by_id) {
+        if reaches(&dep_canonical, &id_canonical, &by_id) {
             return Err(rk_core::Error::other(format!(
-                "{id} depends-on {dep} would create a dependency cycle"
+                "{id_canonical} depends-on {dep_canonical} would create a dependency cycle"
             )));
         }
-        self.edit(id, |obj| {
+        self.edit(&id_canonical, |obj| {
             let deps = obj.entry("depends_on").or_insert_with(|| json!([]));
             if let Some(arr) = deps.as_array_mut() {
-                if !arr.iter().any(|d| d.as_str() == Some(dep)) {
-                    arr.push(json!(dep));
+                if !arr
+                    .iter()
+                    .any(|d| d.as_str() == Some(dep_canonical.as_str()))
+                {
+                    arr.push(json!(dep_canonical));
                 }
             }
         })
@@ -648,9 +870,14 @@ impl Tickets {
         if self.get(id)?.is_none() {
             return Err(rk_core::Error::other(format!("no such ticket: {id}")));
         }
+        // `depends_on` entries are stored canonicalized (see `add_dep_locked`
+        // / creation), so the value to remove must be canonicalized the same
+        // way to match — otherwise removing by a legacy ticket's alias would
+        // silently no-op.
+        let dep_canonical = self.canonical_id(dep)?.unwrap_or_else(|| dep.to_string());
         self.edit(id, |obj| {
             if let Some(arr) = obj.get_mut("depends_on").and_then(Value::as_array_mut) {
-                arr.retain(|d| d.as_str() != Some(dep));
+                arr.retain(|d| d.as_str() != Some(dep_canonical.as_str()));
             }
         })
         .await
@@ -675,7 +902,12 @@ impl Tickets {
     /// `None` if the ticket does not exist.
     pub fn blockers(&self, id: &str) -> rk_core::Result<Option<Vec<String>>> {
         let by_id = self.all_by_id()?;
-        let Some(ticket) = by_id.get(id) else {
+        // `by_id` is keyed by canonical identity; `id` may be a legacy
+        // alias, so resolve it to the identity actually stored as the key.
+        let Some(canonical) = self.canonical_id(id)? else {
+            return Ok(None);
+        };
+        let Some(ticket) = by_id.get(&canonical) else {
             return Ok(None);
         };
         Ok(Some(
@@ -711,11 +943,11 @@ impl Tickets {
     /// block a `take` that would wait out its whole timeout. Assumes
     /// `self.lock` is already held by the caller.
     async fn take_ticket(&self, id: &str) -> rk_core::Result<Option<Tuple>> {
-        if self.get(id)?.is_none() {
+        let Some(canonical) = self.canonical_id(id)? else {
             return Ok(None);
-        }
+        };
         let mut pattern = Pattern::category(Category::Task);
-        pattern.identity = Some(id.to_string());
+        pattern.identity = Some(canonical);
         self.space.take(&pattern, Duration::from_secs(2)).await
     }
 
@@ -1158,6 +1390,210 @@ mod tests {
         assert!(a.identity.starts_with(ID_PREFIX));
         assert!(b.identity.starts_with(ID_PREFIX));
         assert_ne!(a.identity, b.identity);
+    }
+
+    #[tokio::test]
+    async fn new_ticket_ids_are_pronounceable_proquint_spellings() {
+        let t = tickets();
+        let a = t.create(new("first", "system", None)).await.unwrap();
+        let rest = a.identity.strip_prefix(ID_PREFIX).unwrap();
+        assert!(
+            rk_core::proquint::looks_like(rest, PROQUINT_WORDS),
+            "expected a {PROQUINT_WORDS}-word proquint id, got {}",
+            a.identity
+        );
+        // Round-trips through decode without error — not just shape-matched.
+        assert!(rk_core::proquint::decode(rest, PROQUINT_WORDS).is_ok());
+    }
+
+    /// Writes a raw ticket tuple with a ULID-shaped identity directly to the
+    /// space, bypassing `Tickets::create` (which only ever mints proquint
+    /// ids now) — the only way to get a "legacy" ticket into a test.
+    fn seed_legacy(space: &Space, identity: &str, title: &str) -> Tuple {
+        let payload = json!({
+            "title": title,
+            "status": "open",
+            "parent": Value::Null,
+            "priority": "normal",
+            "labels": Vec::<String>::new(),
+            "depends_on": Vec::<String>::new(),
+            "assignee": Value::Null,
+            "created_by": "castle",
+            "created_at": "2026-08-19T00:00:00Z",
+            "updated_at": "2026-08-19T00:00:00Z",
+        });
+        let tuple = Tuple::new(Category::Task, "system", identity, "castle", payload)
+            .with_lifecycle(Lifecycle::Session);
+        space.out(tuple.clone()).unwrap();
+        tuple
+    }
+
+    #[tokio::test]
+    async fn alias_of_is_none_for_a_native_proquint_ticket() {
+        let t = tickets();
+        let a = t.create(new("first", "system", None)).await.unwrap();
+        assert_eq!(t.alias_of(&a), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_ticket_resolves_by_its_deterministic_alias() {
+        let (t, space) = tickets_with_space();
+        let legacy = seed_legacy(&space, "TKT-01J000000000000000000000", "old one");
+        let alias = t
+            .alias_of(&legacy)
+            .expect("legacy ticket should have an alias");
+        assert_ne!(
+            alias, legacy.identity,
+            "alias must differ from the ULID identity"
+        );
+
+        // The alias resolves to the exact same tuple as the durable identity.
+        let by_alias = t.get(&alias).unwrap().expect("alias should resolve");
+        assert_eq!(by_alias.identity, legacy.identity);
+        assert_eq!(by_alias.payload["title"], "old one");
+
+        // Recomputing the alias is deterministic — same identity, same
+        // spelling, every time.
+        assert_eq!(t.alias_of(&by_alias).unwrap(), alias);
+    }
+
+    #[tokio::test]
+    async fn resolve_fails_closed_on_unknown_or_malformed_spellings() {
+        let t = tickets();
+        // Well-shaped proquint, but no ticket has ever aliased to it.
+        assert_eq!(t.get("TKT-babad-bisub-lodob").unwrap(), None);
+        // Not proquint-shaped and not a real identity either.
+        assert_eq!(t.get("TKT-not-a-real-id").unwrap(), None);
+        assert_eq!(t.get("garbage").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_an_ambiguous_alias_collision() {
+        let (t, space) = tickets_with_space();
+        // A verified FNV-1a-64 (low 48 bits) collision: these two distinct
+        // ULID-shaped identities alias to the exact same proquint spelling.
+        // Found by brute-force search over `TKT-<hex counter>` identities —
+        // see the entropy note on `PROQUINT_WORDS` for why this is only
+        // findable by search, not by chance, at realistic ticket volumes.
+        let one = seed_legacy(&space, "TKT-0000000000000000000172232D", "one");
+        let two = seed_legacy(&space, "TKT-000000000000000000060BC260", "two");
+        let alias_one = t.alias_of(&one).unwrap();
+        let alias_two = t.alias_of(&two).unwrap();
+        assert_eq!(
+            alias_one, alias_two,
+            "test fixture assumption broken: these identities no longer collide"
+        );
+
+        let err = t.get(&alias_one).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+        // Each ticket still resolves fine by its own durable identity — only
+        // the shared alias is refused.
+        assert_eq!(
+            t.get(&one.identity).unwrap().unwrap().identity,
+            one.identity
+        );
+        assert_eq!(
+            t.get(&two.identity).unwrap().unwrap().identity,
+            two.identity
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_and_depends_on_canonicalize_a_legacy_alias_to_the_real_identity() {
+        let (t, space) = tickets_with_space();
+        let legacy = seed_legacy(&space, "TKT-01J000000000000000000001", "blocker");
+        let alias = t.alias_of(&legacy).unwrap();
+
+        // Depending on the legacy ticket by its alias stores the canonical
+        // ULID identity in `depends_on`, not the alias spelling — so graph
+        // algorithms keyed on identity (blockers/ready/cycle-detection) see
+        // it without having to re-resolve.
+        let mut child = new("dependent", "system", None);
+        child.depends_on = vec![alias.clone()];
+        let child = t.create(child).await.unwrap();
+        assert_eq!(
+            child.payload["depends_on"][0].as_str().unwrap(),
+            legacy.identity
+        );
+
+        // Re-parenting by alias stores the canonical identity too.
+        let mut grandchild = new("grandchild", "system", None);
+        grandchild.parent = Some(alias.clone());
+        let grandchild = t.create(grandchild).await.unwrap();
+        assert_eq!(
+            grandchild.payload["parent"].as_str().unwrap(),
+            legacy.identity
+        );
+
+        // And `add_dep`/`remove_dep` by alias round-trip through the same
+        // canonicalization.
+        let other = t.create(new("other", "system", None)).await.unwrap();
+        t.add_dep(&other.identity, &alias).await.unwrap();
+        let blockers = t.blockers(&other.identity).unwrap().unwrap();
+        assert_eq!(blockers, vec![legacy.identity.clone()]);
+        t.remove_dep(&other.identity, &alias).await.unwrap();
+        let after = t.get(&other.identity).unwrap().unwrap();
+        assert_eq!(after.payload["depends_on"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn id_spellings_covers_both_spellings_of_a_legacy_ticket() {
+        let (t, space) = tickets_with_space();
+        let legacy = seed_legacy(&space, "TKT-01J000000000000000000003", "old");
+        let alias = t.alias_of(&legacy).unwrap();
+
+        // Symmetric: naming the ticket either way yields the same set, so a
+        // caller comparing a stored spelling against it matches regardless
+        // of which spelling was captured and which was typed.
+        for named_by in [&legacy.identity, &alias] {
+            let spellings = t.id_spellings(named_by).unwrap();
+            assert!(
+                spellings.contains(&legacy.identity) && spellings.contains(&alias),
+                "id_spellings({named_by}) must cover both spellings, got {spellings:?}"
+            );
+        }
+
+        // A native proquint ticket has no alias: exactly one spelling, not a
+        // duplicated entry.
+        let native = t.create(new("native", "system", None)).await.unwrap();
+        assert_eq!(
+            t.id_spellings(&native.identity).unwrap(),
+            vec![native.identity.clone()]
+        );
+
+        // A task string that is not a ticket at all is not an error — the
+        // landing pipeline enqueues `task: ""` for a spec-less review.
+        assert_eq!(t.id_spellings("").unwrap(), vec![String::new()]);
+        assert_eq!(
+            t.id_spellings("TKT-01J000000000000000000404").unwrap(),
+            vec!["TKT-01J000000000000000000404".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn mutations_accept_a_legacy_tickets_alias_as_well_as_its_ulid() {
+        let (t, space) = tickets_with_space();
+        let legacy = seed_legacy(&space, "TKT-01J000000000000000000002", "old");
+        let alias = t.alias_of(&legacy).unwrap();
+
+        let updated = t
+            .update(
+                &alias,
+                TicketChanges {
+                    title: Some("renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // The mutation lands on the ticket's one true tuple — identity
+        // unchanged, payload updated — regardless of which spelling named it.
+        assert_eq!(updated.identity, legacy.identity);
+        assert_eq!(updated.payload["title"], "renamed");
+        assert_eq!(
+            t.get(&legacy.identity).unwrap().unwrap().payload["title"],
+            "renamed"
+        );
     }
 
     #[tokio::test]

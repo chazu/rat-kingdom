@@ -7642,6 +7642,7 @@ impl Daemon {
         {
             Ok(tickets) => {
                 let blocked = self.tickets.blocked_ids(&tickets).unwrap_or_default();
+                let tickets = self.tickets_with_alias(&tickets);
                 Response::ok(req.id, json!({"tickets": tickets, "blocked": blocked}))
             }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
@@ -7656,10 +7657,30 @@ impl Daemon {
         match self.tickets.get(&params.id) {
             Ok(ticket) => {
                 let blockers = self.tickets.blockers(&params.id).ok().flatten();
+                let ticket = ticket.map(|t| self.ticket_with_alias(&t));
                 Response::ok(req.id, json!({"ticket": ticket, "blockers": blockers}))
             }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
+    }
+
+    /// Merge a ticket tuple's deterministic proquint alias (see the entropy
+    /// and collision policy documented in `tickets::PROQUINT_WORDS`) into
+    /// its wire representation as a sibling `alias` field, so a legacy
+    /// `TKT-<ULID>` ticket carries enough
+    /// identity for a client to display or dictate the pronounceable form
+    /// without a second round trip. `None` (field omitted) for a ticket
+    /// whose durable identity is already a proquint spelling.
+    fn ticket_with_alias(&self, ticket: &Tuple) -> Value {
+        let mut v = serde_json::to_value(ticket).unwrap_or(Value::Null);
+        if let Some(alias) = self.tickets.alias_of(ticket) {
+            v["alias"] = json!(alias);
+        }
+        v
+    }
+
+    fn tickets_with_alias(&self, tickets: &[Tuple]) -> Vec<Value> {
+        tickets.iter().map(|t| self.ticket_with_alias(t)).collect()
     }
 
     async fn handle_ticket_update(&self, req: Request) -> Response {
