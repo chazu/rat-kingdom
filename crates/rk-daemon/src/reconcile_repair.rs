@@ -43,6 +43,7 @@ use crate::agents::AgentRecord;
 use crate::reconcile::{self, GitFacts};
 use crate::tickets::{CasOutcome, Tickets};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
+use rk_git::Ancestry;
 use rk_space::Space;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -241,15 +242,15 @@ fn plan_delivered_but_open(
     };
     let ancestry_key = (record.merge_commit.clone(), record.target.clone());
     match facts.git.is_ancestor.get(&ancestry_key) {
-        None => base.held(
+        None | Some(Ancestry::Unknown) => base.held(
             HoldReason::MissingEvidence,
             "git ancestry for the delivery record was not freshly checked",
         ),
-        Some(false) => base.held(
+        Some(Ancestry::Absent) => base.held(
             HoldReason::AmbiguousDelivery,
             "git does not confirm the recorded merge commit reached its target",
         ),
-        Some(true) => match facts.protected_touch.get(&record.merge_commit) {
+        Some(Ancestry::Present) => match facts.protected_touch.get(&record.merge_commit) {
             None => base.held(
                 HoldReason::MissingEvidence,
                 "protected-path impact of the delivered commit was not checked",
@@ -629,7 +630,7 @@ mod tests {
 
     fn confirmed_facts(commit: &str, target: &str) -> RepairFacts {
         let mut is_ancestor = HashMap::new();
-        is_ancestor.insert((commit.to_string(), target.to_string()), true);
+        is_ancestor.insert((commit.to_string(), target.to_string()), Ancestry::Present);
         let mut protected_touch = HashMap::new();
         protected_touch.insert(commit.to_string(), false);
         RepairFacts {
@@ -750,6 +751,45 @@ mod tests {
     }
 
     #[test]
+    fn unknown_historical_ancestry_holds_as_missing_evidence() {
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            delivery_json("abc123", "deleted-target", "rat/x/tkt-1"),
+        );
+        let mut is_ancestor = HashMap::new();
+        is_ancestor.insert(
+            ("abc123".to_string(), "deleted-target".to_string()),
+            Ancestry::Unknown,
+        );
+        let facts = RepairFacts {
+            git: GitFacts {
+                is_ancestor,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let p = plan(
+            "myrepo",
+            &[t],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &facts,
+        );
+
+        assert!(matches!(
+            p.items[0].disposition,
+            Disposition::Held {
+                reason: HoldReason::MissingEvidence,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn git_disputing_the_delivery_record_holds_ambiguous() {
         let t = ticket(
             "TKT-1",
@@ -758,7 +798,7 @@ mod tests {
             delivery_json("abc123", "main", "rat/x/tkt-1"),
         );
         let mut is_ancestor = HashMap::new();
-        is_ancestor.insert(("abc123".to_string(), "main".to_string()), false);
+        is_ancestor.insert(("abc123".to_string(), "main".to_string()), Ancestry::Absent);
         let facts = RepairFacts {
             git: GitFacts {
                 is_ancestor,

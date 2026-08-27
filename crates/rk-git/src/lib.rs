@@ -45,6 +45,16 @@ pub struct Repo {
     root: PathBuf,
 }
 
+/// Git's three-valued answer to an ancestry question. `Unknown` is distinct
+/// from `Absent`: a deleted historical ref or missing object is not evidence
+/// that a previously recorded delivery never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ancestry {
+    Present,
+    Absent,
+    Unknown,
+}
+
 /// File list and total changed-line count for a diff range. See
 /// [`Repo::diff_stat`].
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -266,12 +276,24 @@ impl Repo {
     /// (branch name, tag, sha). Returns false when either revision is
     /// unresolvable, so the caller cannot mistake "couldn't tell" for merged.
     pub fn is_ancestor(&self, commit: &str, of: &str) -> bool {
-        // `merge-base --is-ancestor A B` exits 0 when A is an ancestor of B,
-        // 1 when it is not, and non-0/1 on a bad revision — `git()` maps every
-        // non-zero exit to Err, collapsing "not an ancestor" and "bad rev" into
-        // the same false. That is the safe direction: unknown ⇒ not merged.
-        self.git(&["merge-base", "--is-ancestor", commit, of])
-            .is_ok()
+        matches!(self.ancestry(commit, of), Ancestry::Present)
+    }
+
+    /// Tri-state ancestry for reconciliation and historical evidence checks.
+    /// Git documents exit 0 as ancestor, 1 as a clean negative, and every
+    /// other result as an inability to answer (bad/missing revision, corrupt
+    /// repository, or an unavailable git executable).
+    pub fn ancestry(&self, commit: &str, of: &str) -> Ancestry {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["merge-base", "--is-ancestor", commit, of])
+            .output();
+        match output.ok().and_then(|out| out.status.code()) {
+            Some(0) => Ancestry::Present,
+            Some(1) => Ancestry::Absent,
+            _ => Ancestry::Unknown,
+        }
     }
 
     /// Commit-count-aware delivery check: true iff `commit` was genuinely
@@ -2402,6 +2424,43 @@ mod tests {
         // A bad revision must read as "not an ancestor", never merged.
         assert!(!repo.is_ancestor("rat/does-not-exist/tkt", "main"));
         assert!(!repo.is_ancestor("main", "no-such-target"));
+        assert_eq!(
+            repo.ancestry("rat/does-not-exist/tkt", "main"),
+            Ancestry::Unknown
+        );
+        assert_eq!(repo.ancestry("main", "no-such-target"), Ancestry::Unknown);
+    }
+
+    #[test]
+    fn ancestry_distinguishes_a_clean_negative_from_an_unknown_revision() {
+        let (dir, repo) = scratch_repo();
+        let branch = commit_on_branch(dir.path(), &repo, "pip", "task-ancestry");
+
+        assert_eq!(repo.ancestry("main", &branch), Ancestry::Present);
+        assert_eq!(repo.ancestry(&branch, "main"), Ancestry::Absent);
+        assert_eq!(repo.ancestry("deleted-history", "main"), Ancestry::Unknown);
+    }
+
+    #[test]
+    fn deleted_intermediate_delivery_target_is_unknown_after_reaching_main() {
+        let (dir, repo) = scratch_repo();
+        let temporary_target = "temp/provolone";
+        run(repo.root(), &["branch", temporary_target, "main"]);
+        let work = commit_on_branch(dir.path(), &repo, "provolone", "task-history");
+
+        let temporary_delivery = repo.merge_branch(&work, temporary_target).unwrap();
+        assert!(temporary_delivery.merged, "{}", temporary_delivery.detail);
+        let temporary_commit = temporary_delivery.commit.unwrap();
+        let final_delivery = repo.merge_branch(temporary_target, "main").unwrap();
+        assert!(final_delivery.merged, "{}", final_delivery.detail);
+        assert_eq!(repo.ancestry(&temporary_commit, "main"), Ancestry::Present);
+
+        repo.delete_branch(temporary_target).unwrap();
+        assert_eq!(
+            repo.ancestry(&temporary_commit, temporary_target),
+            Ancestry::Unknown,
+            "deleting the historical target must not become a clean negative"
+        );
     }
 
     #[test]

@@ -63,6 +63,50 @@ const MAX_INBOX_ITEMS: usize = 2_048;
 /// whenever `RK_AGENT` is unset, and an empty caller means the same thing.
 const OPERATOR_ACTOR: &str = "operator";
 
+/// One independently configured deadline owned by the shared convergence
+/// scheduler. Scheduler memory is never an idempotency source: it only decides
+/// when to rescan durable facts, and every action remains replay-safe itself.
+#[derive(Debug, Clone, Copy)]
+struct ReconcileCadence {
+    enabled: bool,
+    interval: Duration,
+    next: Instant,
+}
+
+impl ReconcileCadence {
+    fn new(enabled: bool, interval: Duration, now: Instant) -> Self {
+        let interval = interval.max(Duration::from_secs(1));
+        Self {
+            enabled,
+            interval,
+            next: now + interval,
+        }
+    }
+
+    fn immediate(enabled: bool, interval: Duration, now: Instant) -> Self {
+        let mut cadence = Self::new(enabled, interval, now);
+        cadence.next = now;
+        cadence
+    }
+
+    fn next(self) -> Option<Instant> {
+        self.enabled.then_some(self.next)
+    }
+
+    /// Spend one or more elapsed deadlines as a single coalesced pass. Advancing
+    /// before the action runs prevents a slow pass from creating a tight retry
+    /// loop; durable action evidence, not this clock, governs replay.
+    fn take_due(&mut self, now: Instant) -> bool {
+        if !self.enabled || now < self.next {
+            return false;
+        }
+        while self.next <= now {
+            self.next += self.interval;
+        }
+        true
+    }
+}
+
 /// Bound every leaf in a King pull/checkpoint. Counts alone are insufficient:
 /// one operator-authored tuple field may itself approach the request frame
 /// ceiling. The full resource remains available through its native RPC.
@@ -94,6 +138,38 @@ fn king_snapshot_bound_truncates_nested_strings_and_arrays() {
     let mut value = json!({"items": [{"text": "abcdefgh"}, {"text": "ijklmnop"}]});
     bound_json(&mut value, 4, 1);
     assert_eq!(value, json!({"items": [{"text": "abcd"}]}));
+}
+
+#[cfg(test)]
+#[test]
+fn reconcile_cadence_preserves_grace_and_coalesces_elapsed_deadlines() {
+    let start = Instant::now();
+    let interval = Duration::from_secs(5);
+    let mut cadence = ReconcileCadence::new(true, interval, start);
+
+    assert_eq!(cadence.next(), Some(start + interval));
+    assert!(!cadence.take_due(start + Duration::from_secs(4)));
+    assert!(cadence.take_due(start + interval));
+    assert_eq!(cadence.next(), Some(start + Duration::from_secs(10)));
+
+    // Missing several deadlines produces one pass and advances beyond now.
+    assert!(cadence.take_due(start + Duration::from_secs(26)));
+    assert_eq!(cadence.next(), Some(start + Duration::from_secs(30)));
+    assert!(!cadence.take_due(start + Duration::from_secs(26)));
+}
+
+#[cfg(test)]
+#[test]
+fn reconcile_cadence_supports_immediate_and_disabled_jobs() {
+    let start = Instant::now();
+    let mut immediate = ReconcileCadence::immediate(true, Duration::ZERO, start);
+    assert_eq!(immediate.next(), Some(start));
+    assert!(immediate.take_due(start));
+    assert_eq!(immediate.next(), Some(start + Duration::from_secs(1)));
+
+    let mut disabled = ReconcileCadence::new(false, Duration::from_secs(1), start);
+    assert_eq!(disabled.next(), None);
+    assert!(!disabled.take_due(start + Duration::from_secs(60)));
 }
 
 type FactVoteKey = (String, String, String);
@@ -944,42 +1020,6 @@ impl Daemon {
             });
         }
 
-        // `task_done` vs budget/stuck/stop reconciliation
-        // (TKT-01M0J5KT4TCH03W48MR9T7EJ27, 2026-08-21 Cinder-11 incident):
-        // event-feed + interval loop, same shape as the late-review
-        // reconciler below and for the same reason — a harness's own
-        // `Completed` event can be lost to a concurrent hard stop, so
-        // something has to react to the durable `task_done` tuple
-        // independently. Unconditional (not gated on `sweep_config.enabled`):
-        // the race it closes is between `rk done` and `enforce_budget`, which
-        // runs on every `Usage` event regardless of whether the liveness/
-        // burn-rate sweep is turned on.
-        {
-            let task_done_supervisor = Arc::clone(&daemon.supervisor);
-            let mut task_done_feed = daemon.space.subscribe();
-            let mut task_done_shutdown = daemon.shutdown_tx.subscribe();
-            let task_done_interval = Duration::from_secs(daemon.sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(task_done_interval);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        recv = task_done_feed.recv() => match recv {
-                            Ok(_) => while task_done_feed.try_recv().is_ok() {},
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        },
-                        _ = task_done_shutdown.changed() => break,
-                    }
-                    match task_done_supervisor.reconcile_task_done().await {
-                        Ok(0) => {}
-                        Ok(n) => debug!(settled = n, "reconciled task_done vs terminal state"),
-                        Err(e) => warn!(error = %e, "task_done reconciliation failed"),
-                    }
-                }
-            });
-        }
-
         // Fetch-driven awaiting-review clear (TKT-70). Periodically fetch+prune
         // each repo with an open PR and check whether the forge merged/deleted
         // the branch upstream — clearing the inbox row for a merge the operator
@@ -1006,176 +1046,6 @@ impl Daemon {
                             }
                         }
                         _ = rs_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // Periodic worktree-leak sweep (`[worktree_sweep]`, TKT-01M04N6W4X47KMXDA6MH0WPH8H):
-        // the automated, unattended counterpart to `rk prune --reap-git`. A
-        // steward/workflow failure path that skips its own `dismiss` step
-        // leaves a terminal agent's worktree (and its multi-GB cargo
-        // `target/`) on disk indefinitely; this loop reclaims those on a
-        // timer instead of waiting for an operator to run `rk prune` by hand.
-        // Enabled by default (unlike the other sweeps here) because every
-        // removal it performs is already gated safe by `Supervisor::reap_git`
-        // (branch merged-or-gone AND worktree clean, or the worktree is left
-        // standing) — see the 2026-08-16 104-worktree/298GB incident this
-        // closes the gap on.
-        if daemon.worktree_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut ws_shutdown = daemon.shutdown_tx.subscribe();
-            let interval = Duration::from_secs(daemon.worktree_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                // Consume the immediate first tick: give a freshly-terminal
-                // agent a full `after_days` window before the first sweep.
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            let d = Arc::clone(&daemon_ref);
-                            match tokio::task::spawn_blocking(move || d.worktree_sweep_once()).await {
-                                Ok(0) => {}
-                                Ok(n) => info!(reclaimed = n, "worktree sweep reclaimed leaked worktrees"),
-                                Err(e) => warn!(error = %e, "worktree sweep task panicked"),
-                            }
-                        }
-                        _ = ws_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // Periodic gate-worktree retention sweep (`[gate_worktree_sweep]`):
-        // the persistent per-`(repo,target)` daemon-owned worktrees the
-        // landing pipeline gates against (`landing.rs` §2.2) have no
-        // dismiss-time cleanup the way an agent worktree does, so nothing
-        // else ever reclaims one — see
-        // docs/proposals/daemon-native-landing-pipeline.md §5 open question
-        // 4. Every reclaim this loop performs is gated the same way
-        // `worktree_sweep_once` gates agent reclaims: skipped outright while
-        // the `(repo, target)` key has any live `LandingQueue` entry.
-        if daemon.gate_worktree_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut gws_shutdown = daemon.shutdown_tx.subscribe();
-            let interval =
-                Duration::from_secs(daemon.gate_worktree_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            let d = Arc::clone(&daemon_ref);
-                            match tokio::task::spawn_blocking(move || d.gate_worktree_sweep_once()).await {
-                                Ok(0) => {}
-                                Ok(n) => info!(reclaimed = n, "gate worktree sweep reclaimed stale worktrees"),
-                                Err(e) => warn!(error = %e, "gate worktree sweep task panicked"),
-                            }
-                        }
-                        _ = gws_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // B2 re-notify sweep: an unacked `recovery-action` escalation
-        // re-pushes at `first_renotify_secs`, then every
-        // `repeat_renotify_secs`, up to `max_renotifies` times — after which
-        // it stands as a passive `rk inbox` row with no further pushes. `rk
-        // inbox ack <id>` is the only thing that stops it early.
-        //
-        // The repository-policy phase latency sweep (TKT-01M0P974MQK5XE1MR9KQCWT654,
-        // `Daemon::phase_latency_sweep_once`) shares this exact tick rather than
-        // getting its own config/timer: both are periodic housekeeping this
-        // daemon already runs by default, and a repo with no `phaseLatency`
-        // targets configured short-circuits immediately.
-        if daemon.recovery_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut rc_shutdown = daemon.shutdown_tx.subscribe();
-            let interval = Duration::from_secs(daemon.recovery_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            let d = Arc::clone(&daemon_ref);
-                            match tokio::task::spawn_blocking(move || {
-                                let recovery = d.recovery_renotify_sweep_once();
-                                let phase_latency = d.phase_latency_sweep_once();
-                                (recovery, phase_latency)
-                            }).await {
-                                Ok((0, 0)) => {}
-                                Ok((recovery, phase_latency)) => debug!(
-                                    pushed = recovery,
-                                    phase_latency_breaches = phase_latency,
-                                    "recovery re-notify sweep pushed escalations"
-                                ),
-                                Err(e) => warn!(error = %e, "recovery re-notify sweep task panicked"),
-                            }
-                        }
-                        _ = rc_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // B8 stale-`Running`-instance hard timeout sweep: a Running instance
-        // older than its effective timeout (workflow `staleTimeout:` override,
-        // else `default_timeout_secs`) is marked failed, finalized, and
-        // escalated through the B2 announce helper. Not spawn_blocking'd like
-        // the sweeps above — it awaits `WorkflowEngine::stale_timeout_sweep_once`
-        // directly (guaranteed-cleanup dismissal is already async), the same
-        // shape as the landing pipeline loop below.
-        if daemon.instance_timeout_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut it_shutdown = daemon.shutdown_tx.subscribe();
-            let interval =
-                Duration::from_secs(daemon.instance_timeout_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            match daemon_ref.stale_instance_timeout_sweep_once().await {
-                                0 => {}
-                                n => info!(timed_out = n, "stale-instance timeout sweep marked instances failed"),
-                            }
-                        }
-                        _ = it_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // B9 orphaned-ticket sweep (seam 5): an `in_progress` ticket whose
-        // assignee has had no live agent record for `stale_after_secs`
-        // reopens to `open` (drain-eligible again), announced through the B2
-        // helper. Drain only refills from `status = open`, so without this an
-        // errored rat's ticket is stuck `in_progress` forever. Runs directly
-        // on this async task rather than `spawn_blocking` — same as the drain
-        // loop below, which touches the same `Tickets`/`Space` methods this
-        // does — because they are lock-based, not blocking I/O.
-        if daemon.ticket_reopen_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut tr_shutdown = daemon.shutdown_tx.subscribe();
-            let interval =
-                Duration::from_secs(daemon.ticket_reopen_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            match daemon_ref.ticket_reopen_sweep_once().await {
-                                0 => {}
-                                n => debug!(reopened = n, "ticket reopen sweep reopened orphaned tickets"),
-                            }
-                        }
-                        _ = tr_shutdown.changed() => break,
                     }
                 }
             });
@@ -1224,6 +1094,162 @@ impl Daemon {
                 reclaimed_candidates,
                 "reclaimed orphaned landing candidate refs"
             );
+        }
+
+        // Durable convergence loop. These repairs used to be seven separate
+        // feed/timer/shutdown task shells. They retain independent policy
+        // switches and cadences here, but share one wake source because all of
+        // them converge durable RK facts through replay-safe actions. CUE
+        // remains the repository-owned policy authority; this scheduler only
+        // decides when Rust should rescan and execute those resolved policies.
+        {
+            let convergence_daemon = Arc::clone(&daemon);
+            let convergence_landing = Arc::clone(&daemon_landing);
+            let mut convergence_feed = daemon.space.subscribe();
+            let mut convergence_shutdown = daemon.shutdown_tx.subscribe();
+            let now = Instant::now();
+
+            // The two event reconcilers historically ran immediately and on
+            // every tuple-feed wake. Cleanup/recovery jobs retain a full first
+            // interval of grace.
+            let mut task_done = ReconcileCadence::immediate(
+                true,
+                Duration::from_secs(daemon.sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut late_review = ReconcileCadence::immediate(
+                daemon.reactor_config.enabled,
+                Duration::from_secs(daemon.reactor_config.interval_secs.max(1)),
+                now,
+            );
+            let mut worktree = ReconcileCadence::new(
+                daemon.worktree_sweep_config.enabled,
+                Duration::from_secs(daemon.worktree_sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut gate_worktree = ReconcileCadence::new(
+                daemon.gate_worktree_sweep_config.enabled,
+                Duration::from_secs(daemon.gate_worktree_sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut recovery = ReconcileCadence::new(
+                daemon.recovery_sweep_config.enabled,
+                Duration::from_secs(daemon.recovery_sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut stale_instance = ReconcileCadence::new(
+                daemon.instance_timeout_sweep_config.enabled,
+                Duration::from_secs(daemon.instance_timeout_sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut ticket_reopen = ReconcileCadence::new(
+                daemon.ticket_reopen_sweep_config.enabled,
+                Duration::from_secs(daemon.ticket_reopen_sweep_config.interval_secs.max(1)),
+                now,
+            );
+
+            background_tasks.spawn(async move {
+                loop {
+                    let next_deadline = [
+                        task_done.next(),
+                        late_review.next(),
+                        worktree.next(),
+                        gate_worktree.next(),
+                        recovery.next(),
+                        stale_instance.next(),
+                        ticket_reopen.next(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .expect("task_done convergence cadence is always enabled");
+
+                    let feed_wake = tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => false,
+                        recv = convergence_feed.recv() => match recv {
+                            Ok(_) => {
+                                while convergence_feed.try_recv().is_ok() {}
+                                true
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = convergence_shutdown.changed() => break,
+                    };
+
+                    let now = Instant::now();
+                    let run_task_done = task_done.take_due(now) || feed_wake;
+                    let run_late_review = late_review.take_due(now) || (late_review.enabled && feed_wake);
+                    let run_worktree = worktree.take_due(now);
+                    let run_gate_worktree = gate_worktree.take_due(now);
+                    let run_recovery = recovery.take_due(now);
+                    let run_stale_instance = stale_instance.take_due(now);
+                    let run_ticket_reopen = ticket_reopen.take_due(now);
+
+                    // Event-driven convergence runs first so infrequent cleanup
+                    // shell-outs cannot delay evidence already in the feed.
+                    if run_task_done {
+                        match convergence_daemon.supervisor.reconcile_task_done().await {
+                            Ok(0) => {}
+                            Ok(n) => debug!(settled = n, "reconciled task_done vs terminal state"),
+                            Err(e) => warn!(error = %e, "task_done reconciliation failed"),
+                        }
+                    }
+                    if run_late_review {
+                        match convergence_landing.reconcile_late_review_evidence() {
+                            Ok(0) => {}
+                            Ok(n) => debug!(retained = n, "retained late review evidence"),
+                            Err(e) => warn!(error = %e, "late review evidence reconciliation failed"),
+                        }
+                    }
+                    if run_stale_instance {
+                        match convergence_daemon.stale_instance_timeout_sweep_once().await {
+                            0 => {}
+                            n => info!(timed_out = n, "stale-instance timeout sweep marked instances failed"),
+                        }
+                    }
+                    if run_ticket_reopen {
+                        match convergence_daemon.ticket_reopen_sweep_once().await {
+                            0 => {}
+                            n => debug!(reopened = n, "ticket reopen sweep reopened orphaned tickets"),
+                        }
+                    }
+
+                    // Each blocking action gets its own task boundary so one
+                    // panic cannot suppress the other due convergence passes.
+                    if run_worktree {
+                        let d = Arc::clone(&convergence_daemon);
+                        match tokio::task::spawn_blocking(move || d.worktree_sweep_once()).await {
+                            Ok(0) => {}
+                            Ok(n) => info!(reclaimed = n, "worktree sweep reclaimed leaked worktrees"),
+                            Err(e) => warn!(error = %e, "worktree sweep task panicked"),
+                        }
+                    }
+                    if run_gate_worktree {
+                        let d = Arc::clone(&convergence_daemon);
+                        match tokio::task::spawn_blocking(move || d.gate_worktree_sweep_once()).await {
+                            Ok(0) => {}
+                            Ok(n) => info!(reclaimed = n, "gate worktree sweep reclaimed stale worktrees"),
+                            Err(e) => warn!(error = %e, "gate worktree sweep task panicked"),
+                        }
+                    }
+                    if run_recovery {
+                        let d = Arc::clone(&convergence_daemon);
+                        match tokio::task::spawn_blocking(move || d.recovery_renotify_sweep_once()).await {
+                            Ok(0) => {}
+                            Ok(n) => debug!(pushed = n, "recovery re-notify sweep pushed escalations"),
+                            Err(e) => warn!(error = %e, "recovery re-notify sweep task panicked"),
+                        }
+
+                        let d = Arc::clone(&convergence_daemon);
+                        match tokio::task::spawn_blocking(move || d.phase_latency_sweep_once()).await {
+                            Ok(0) => {}
+                            Ok(n) => debug!(breaches = n, "phase latency sweep found policy breaches"),
+                            Err(e) => warn!(error = %e, "phase latency sweep task panicked"),
+                        }
+                    }
+                }
+            });
         }
 
         // Reactor loop: fire registered #Trigger workflows on matching tuples.
@@ -1327,36 +1353,6 @@ impl Daemon {
                             debug!(processed = outcomes.len(), "landing pipeline cycle")
                         }
                         Err(e) => warn!(error = %e, "landing pipeline cycle failed"),
-                    }
-                }
-            });
-
-            // Late-review reconciliation must not share the drain task above.
-            // `run_cycle()` may legitimately spend the whole review ceiling in
-            // `await_primary_verdict`; putting reconciliation after that await
-            // starves late evidence for every other settled attempt (and for a
-            // restarted copy of the same awaiting entry). Keep its feed/timer
-            // independent so a verdict arriving from a fenced generation is
-            // retained promptly even while another review wait is live.
-            let landing_reconciler = Arc::clone(&daemon_landing);
-            let mut late_review_feed = daemon.space.subscribe();
-            let mut late_review_shutdown = daemon.shutdown_tx.subscribe();
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(landing_interval);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        recv = late_review_feed.recv() => match recv {
-                            Ok(_) => while late_review_feed.try_recv().is_ok() {},
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        },
-                        _ = late_review_shutdown.changed() => break,
-                    }
-                    match landing_reconciler.reconcile_late_review_evidence() {
-                        Ok(0) => {}
-                        Ok(n) => debug!(retained = n, "retained late review evidence"),
-                        Err(e) => warn!(error = %e, "late review evidence reconciliation failed"),
                     }
                 }
             });
@@ -3648,7 +3644,7 @@ impl Daemon {
         .map_err(|e| rk_core::Error::other(format!("repair git facts panicked: {e}")))
     }
 
-    /// `(merge_commit, target) -> is merge_commit an ancestor of target?` for
+    /// `(merge_commit, target) -> present | absent | unknown ancestry` for
     /// every pair in `pairs`, resolved against the repo registered as `repo`.
     /// An unregistered or unopenable repo returns an empty map — "cannot
     /// check", which `reconcile::build` reads as no evidence rather than a
@@ -3658,7 +3654,7 @@ impl Daemon {
         &self,
         repo: &str,
         pairs: Vec<(String, String)>,
-    ) -> rk_core::Result<HashMap<(String, String), bool>> {
+    ) -> rk_core::Result<HashMap<(String, String), rk_git::Ancestry>> {
         if pairs.is_empty() {
             return Ok(HashMap::new());
         }
@@ -3678,7 +3674,7 @@ impl Daemon {
                 return result;
             };
             for (commit, target) in pairs {
-                let verdict = git_repo.is_ancestor(&commit, &target);
+                let verdict = git_repo.ancestry(&commit, &target);
                 result.insert((commit, target), verdict);
             }
             result
