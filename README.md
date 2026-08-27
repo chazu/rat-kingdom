@@ -274,9 +274,10 @@ valid `.rk/checks.cue`, the daemon adds its named checks to the spawned and
 resumed worker's prompt as **Repository verification checks**. The section
 shows each check's name, command, working directory, expected exit, timeout,
 environment policy, and declared toolchain; the command is repository-owned
-guidance, not extra prompt instructions. A
-worker should prefer the `verify` check when present, otherwise choose the
-relevant declared check for its task. Workflow `run` steps remain the
+guidance, not extra prompt instructions. A worker should prefer
+`verify-changed` for ordinary development when present; the protected-final
+landing pipeline still runs the full `verify` check. Other repositories without
+a focused check continue to use `verify`. Workflow `run` steps remain the
 authoritative, fail-closed gate. Missing or malformed check registries do not
 prevent priming; the worker receives the generic instruction to report a
 missing gate instead of inventing a project-specific command.
@@ -1144,9 +1145,18 @@ the local daemon. A blocked `rk rd` wakes when a peer's tuple arrives.
 ## Development
 
 ```bash
-mise run verify            # build + test + clippy, the full pre-`rk done` check
+mise run verify            # changed crates + workspace reverse-dependents
+mise run verify-full       # full suite; CI and protected-final landing run this
 mise run lint              # clippy alone, warnings as errors
 ```
+
+The fast gate diffs from `origin/main` (falling back to the branch upstream),
+includes dirty and untracked files, widens changed crates through Cargo's reverse-dependency
+graph, and runs that package set with cargo-nextest. A shared-library change
+therefore tests every workspace crate that depends on it. Changes to
+workspace-wide inputs such as `Cargo.toml`, `Cargo.lock`, `mise.toml`, scripts,
+or CI/check configuration automatically fall back to `verify-full`. Override
+the comparison point with `RK_VERIFY_BASE=<ref>` when needed.
 
 The toolchain is pinned to Rust 1.95.0 in `mise.toml`, so run cargo through
 mise — a bare `cargo` picks up whatever is on `PATH` and an older one fails the

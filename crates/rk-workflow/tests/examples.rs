@@ -48,11 +48,24 @@ fn repository_verify_check_trusts_only_its_current_worktree() {
         .expect("repository must declare a verify check");
 
     assert_eq!(
-        verify.command, "MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" mise run verify",
-        "the named check runs in transient agent worktrees, so trust must be process-local"
+        verify.command, "MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" mise run verify-full",
+        "protected-final landing must retain the full workspace gate"
     );
     assert_eq!(
         verify.environment_policy,
+        rk_workflow::CheckEnvironmentPolicy::StripRkSpawn
+    );
+
+    let changed = checks
+        .iter()
+        .find(|check| check.name == "verify-changed")
+        .expect("repository must declare a focused development check");
+    assert_eq!(
+        changed.command, "MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" mise run verify",
+        "ordinary development should use the affected-package gate"
+    );
+    assert_eq!(
+        changed.environment_policy,
         rk_workflow::CheckEnvironmentPolicy::StripRkSpawn
     );
 }

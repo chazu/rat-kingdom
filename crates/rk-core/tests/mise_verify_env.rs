@@ -1,9 +1,9 @@
-//! `mise.toml`'s `[tasks.test]`/`[tasks.verify]` `env -u ...` prefix is the
-//! command a reviewer's own shell actually runs (as opposed to a
+//! The full and changed-test entrypoints' `env -u ...` prefixes are commands a
+//! reviewer's own shell actually runs (as opposed to a
 //! daemon-executed `strip_rk_spawn` check, which already derives from
 //! `rk_core::review::STRIPPED_RK_SPAWN_ENV`). It must strip exactly that
 //! canonical set — not a hand-typed subset — or a reviewer invoking
-//! `mise run verify` directly leaks its own `RK_REVIEW_*` binding into any
+//! verification command directly leaks its own `RK_REVIEW_*` binding into any
 //! nested process that exercises reviewer-role writes (e.g.
 //! `reviewer_drives_rework.rs`'s synthetic reviewer subprocess).
 
@@ -66,9 +66,16 @@ fn mise_test_task_strips_the_full_strip_rk_spawn_environment() {
 }
 
 #[test]
-fn mise_verify_task_strips_the_full_strip_rk_spawn_environment() {
+fn mise_verify_full_task_strips_the_full_strip_rk_spawn_environment() {
     let source =
         std::fs::read_to_string(workspace_root().join("mise.toml")).expect("read mise.toml");
     let parsed: toml::Table = source.parse().expect("parse mise.toml");
-    assert_strips_canonical_env("verify", &task_run_command(&parsed, "verify"));
+    assert_strips_canonical_env("verify-full", &task_run_command(&parsed, "verify-full"));
+}
+
+#[test]
+fn changed_test_runner_strips_the_full_strip_rk_spawn_environment() {
+    let script = std::fs::read_to_string(workspace_root().join("scripts/verify-changed.sh"))
+        .expect("read changed-test runner");
+    assert_strips_canonical_env("verify", &script);
 }

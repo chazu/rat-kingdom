@@ -1,5 +1,6 @@
 [tools]
 rust = "1.95.0"
+"cargo:cargo-nextest" = "0.9.143"
 
 [env]
 # Reinforce the Cargo profile setting for every repository task and any nested
@@ -50,10 +51,14 @@ description = "Run the workspace test suite"
 run = "env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE -u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT cargo test --workspace --no-fail-fast"
 
 [tasks.verify]
-description = "Build, test, and lint — the checks a rat must pass before `rk done`"
+description = "Fast verification of changed Rust packages and their reverse dependencies"
+run = "./scripts/verify-changed.sh"
+
+[tasks.verify-full]
+description = "Full workspace build, test, and lint — reserved for CI and protected-final landing"
 # Mirrors .github/workflows/ci.yml step-for-step (fmt, clippy --all-targets,
-# test) so one profile means one thing: a local `mise run verify` pass implies
-# a CI pass, not just a build+test pass. Previously verify ran neither
+# test) so the protected-final landing gate and CI keep the same full profile.
+# Previously verify ran neither
 # `cargo fmt --check` nor clippy against test/bench targets, so CI and
 # reviewers caught fmt/clippy issues verify had already reported clean.
 # See [tasks.test] above for why the `env -u` list must stay the full
