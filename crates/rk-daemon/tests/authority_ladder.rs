@@ -265,8 +265,29 @@ fn allow(kinds: &[&str]) -> PolicyConfig {
 #[tokio::test]
 async fn mechanical_fixture_repairs_without_an_llm_and_replay_cannot_repeat_it() {
     let home = tempfile::tempdir().unwrap();
+    // `execute_mechanical` now routes `delivered-but-open` through
+    // `reconcile_repair::plan`, which needs the SAME durable git evidence
+    // `reconcile.repair` does (ancestry, protected-path touch) — an
+    // unregistered repo reads as `HoldReason::MissingEvidence`, never a
+    // clean bill. A real repo, a real registration, and a real landed
+    // commit keep this fixture's fail-closed evidence model honest instead
+    // of special-casing a no-git path around it.
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    std::fs::write(repo_dir.path().join("mech.txt"), "x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "mech work"]);
+    let merge_commit = git(repo_dir.path(), &["rev-parse", "HEAD"]);
+
     let mut client = daemon_with_policy(home.path(), PolicyConfig::default()).await;
     let repo = "mech-repo";
+    client
+        .call(
+            "repo.add",
+            json!({"name": repo, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
 
     write_ticket(
         &mut client,
@@ -274,7 +295,7 @@ async fn mechanical_fixture_repairs_without_an_llm_and_replay_cannot_repeat_it()
         "TKT-MECH-1",
         ticket_payload(
             "in_progress",
-            delivery("abc123", "rat/x/tkt-mech-1", "main"),
+            delivery(&merge_commit, "rat/x/tkt-mech-1", "main"),
         ),
     )
     .await;
@@ -348,6 +369,105 @@ async fn mechanical_fixture_repairs_without_an_llm_and_replay_cannot_repeat_it()
         events_after_replay.len(),
         2,
         "a replay must not write another decision-journal event"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Mechanical: resolving one ticket's violation must never repair a sibling
+// ticket that is independently eligible for the same repair kind.
+// `execute_mechanical` builds its repair plan over the WHOLE repo (the same
+// scan `reconcile.repair` uses) and must narrow it to exactly the one
+// violation named by the decided item before applying.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn mechanical_repair_does_not_touch_a_sibling_ticket_with_the_same_kind() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+
+    // Two independent commits landed on `main`, each the sole delivery
+    // evidence for a DIFFERENT ticket — both eligible for the mechanical
+    // `delivered-but-open` repair at the same time.
+    std::fs::write(repo_dir.path().join("sib-a.txt"), "a\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "sib a"]);
+    let commit_a = git(repo_dir.path(), &["rev-parse", "HEAD"]);
+
+    std::fs::write(repo_dir.path().join("sib-b.txt"), "b\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "sib b"]);
+    let commit_b = git(repo_dir.path(), &["rev-parse", "HEAD"]);
+
+    let mut client = daemon_with_policy(home.path(), PolicyConfig::default()).await;
+    let repo = "mech-siblings";
+    client
+        .call(
+            "repo.add",
+            json!({"name": repo, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    write_ticket(
+        &mut client,
+        repo,
+        "TKT-SIB-A",
+        ticket_payload("in_progress", delivery(&commit_a, "rat/x/tkt-sib-a", "main")),
+    )
+    .await;
+    write_ticket(
+        &mut client,
+        repo,
+        "TKT-SIB-B",
+        ticket_payload("in_progress", delivery(&commit_b, "rat/x/tkt-sib-b", "main")),
+    )
+    .await;
+
+    // `attention.next`'s shared cursor would only ever surface one of these
+    // at a time; read A's violation directly so B is untouched by the query
+    // itself, not just by the decision under test.
+    let violation_a = reconcile_violation(&mut client, repo, "delivered-but-open", "TKT-SIB-A").await;
+    let result = decide(
+        &mut client,
+        repo,
+        violation_a["id"].as_str().unwrap(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["resolved"], true);
+
+    let ticket_a = get_ticket(&mut client, "TKT-SIB-A").await;
+    assert_eq!(ticket_a["payload"]["status"], "closed");
+
+    // The sibling — independently eligible for the exact same repair kind —
+    // must be completely untouched by resolving A's own violation.
+    let ticket_b = get_ticket(&mut client, "TKT-SIB-B").await;
+    assert_eq!(
+        ticket_b["payload"]["status"], "in_progress",
+        "resolving one ticket's delivered-but-open violation must not repair a sibling"
+    );
+
+    // No repair-applied journal entry exists for B's own violation id: the
+    // plan `execute_mechanical` applied must have contained only A's item.
+    let applied = client
+        .call(
+            "space.scan",
+            json!({"category": "event", "scope": repo, "identity": "reconcile_repair_applied"}),
+        )
+        .await
+        .unwrap();
+    let violation_b_id = "delivered-but-open:TKT-SIB-B";
+    let touched_b = applied["tuples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["payload"]["violation_id"] == violation_b_id);
+    assert!(
+        !touched_b,
+        "sibling ticket's own violation must never be marked repaired: {applied}"
     );
 }
 

@@ -3472,23 +3472,19 @@ impl Daemon {
     }
 
     /// Assemble a repair plan for the two mechanically-repairable
-    /// convergence violations (`crate::reconcile_repair`) and either preview
-    /// it (`apply = false`) or execute it (`apply = true`). Reuses the same
+    /// convergence violations (`crate::reconcile_repair`) — the same
     /// ticket/agent/carve-out scans `reconcile_value` performs, plus one
     /// extra round of durable-evidence git checks a read-only report never
     /// needs to answer: whether a delivered commit touches a protected path,
     /// and whether its landed branch has since diverged from what was
     /// recorded — both gathered fresh on every call, never cached, so a
-    /// repair can never act on stale evidence.
-    async fn reconcile_repair_value(
-        &self,
-        requested_repo: String,
-        apply: bool,
-    ) -> rk_core::Result<Value> {
-        let repo = self
-            .resolve_inbox_repo(Some(requested_repo))?
-            .ok_or_else(|| rk_core::Error::other("repo is required"))?;
-
+    /// repair can never act on stale evidence. Shared by `reconcile_repair_value`
+    /// (the `reconcile.repair` RPC, which may act on every eligible item in
+    /// `repo`) and `execute_mechanical` (which must narrow the resulting
+    /// plan down to one violation's own subject before applying, so that
+    /// resolving one attention item can never repair a sibling ticket as a
+    /// side effect).
+    async fn build_repair_plan(&self, repo: &str) -> rk_core::Result<crate::reconcile_repair::RepairPlan> {
         let agents: Vec<crate::agents::AgentRecord> = self
             .supervisor
             .list_all()
@@ -3496,7 +3492,7 @@ impl Daemon {
             .filter(|a| a.repo_name == repo)
             .collect();
 
-        let tickets = self.tickets.list(Some(repo.clone()), None, None)?;
+        let tickets = self.tickets.list(Some(repo.to_string()), None, None)?;
 
         // The same hand-off carve-outs `reconcile_value`/`Server::ticket_reopen_sweep_at`
         // use — see `reconcile_value` for the full rationale.
@@ -3526,9 +3522,9 @@ impl Daemon {
             .map(|d| (d.merge_commit, d.target))
             .collect();
         let is_ancestor = self
-            .merge_commit_ancestry(&repo, delivered_pairs.into_iter().collect())
+            .merge_commit_ancestry(repo, delivered_pairs.into_iter().collect())
             .await?;
-        let (protected_touch, diverged) = self.repair_git_facts(&repo, &tickets).await?;
+        let (protected_touch, diverged) = self.repair_git_facts(repo, &tickets).await?;
 
         let facts = crate::reconcile_repair::RepairFacts {
             git: crate::reconcile::GitFacts {
@@ -3539,14 +3535,26 @@ impl Daemon {
             diverged,
         };
 
-        let plan = crate::reconcile_repair::plan(
-            &repo,
+        Ok(crate::reconcile_repair::plan(
+            repo,
             &tickets,
             &agents,
             &landed_tickets,
             &queued_tickets,
             &facts,
-        );
+        ))
+    }
+
+    async fn reconcile_repair_value(
+        &self,
+        requested_repo: String,
+        apply: bool,
+    ) -> rk_core::Result<Value> {
+        let repo = self
+            .resolve_inbox_repo(Some(requested_repo))?
+            .ok_or_else(|| rk_core::Error::other("repo is required"))?;
+
+        let plan = self.build_repair_plan(&repo).await?;
         let report = if apply {
             // Re-fetch agents right here, immediately before the write: the
             // slice `plan` was built from can be seconds old by the time we
@@ -5150,11 +5158,52 @@ impl Daemon {
     /// The one registered mechanical repair this tracer bullet wires up:
     /// `delivered-but-open`'s own doc comment names the fix — the delivery
     /// record is the durable proof, so the ticket's status is what is wrong.
+    /// Routed through `crate::reconcile_repair` — the same CAS-guarded,
+    /// evidence-checked, replay-marked writer `reconcile.repair` uses —
+    /// rather than calling `Tickets::set_status` directly, so this arm gets
+    /// the same fail-closed ancestry/protected-path checks and idempotent
+    /// replay marker instead of being a third, independent writer. The plan
+    /// is built for the whole repo but then narrowed to `v`'s own subject
+    /// before applying: this call is authorizing a repair for exactly ONE
+    /// violation, and must never widen into repairing a sibling ticket that
+    /// happens to also be eligible.
     async fn execute_mechanical(&self, v: &crate::reconcile::Violation) -> rk_core::Result<String> {
         match v.kind.as_str() {
             crate::reconcile::kind::DELIVERED_BUT_OPEN => {
-                self.tickets.set_status(&v.subject, "closed").await?;
-                Ok(format!("{} set to closed", v.subject))
+                let mut plan = self.build_repair_plan(&v.scope).await?;
+                retain_matching_violation(&mut plan, v);
+                let agents: Vec<crate::agents::AgentRecord> = self
+                    .supervisor
+                    .list_all()
+                    .into_iter()
+                    .filter(|a| a.repo_name == v.scope)
+                    .collect();
+                let report = crate::reconcile_repair::apply(
+                    plan,
+                    &crate::reconcile_repair::ApplyContext {
+                        tickets: &self.tickets,
+                        space: &self.space,
+                        castle: &self.castle,
+                        agents: &agents,
+                    },
+                )
+                .await?;
+                let Some(result) = report.results.into_iter().next() else {
+                    return Err(rk_core::Error::other(format!(
+                        "{} no longer trips delivered-but-open — nothing to repair",
+                        v.subject
+                    )));
+                };
+                match result.outcome {
+                    crate::reconcile_repair::Outcome::Applied { detail, .. }
+                    | crate::reconcile_repair::Outcome::AlreadyApplied { detail } => Ok(detail),
+                    crate::reconcile_repair::Outcome::WouldApply { .. } => {
+                        unreachable!("apply() never returns WouldApply")
+                    }
+                    crate::reconcile_repair::Outcome::Held { reason, detail } => Err(
+                        rk_core::Error::other(format!("held ({reason:?}): {detail}")),
+                    ),
+                }
             }
             other => Err(rk_core::Error::other(format!(
                 "no mechanical repair implemented for kind {other}"
@@ -10391,6 +10440,92 @@ struct TicketReopenParams {
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, String> {
     serde_json::from_value(params.clone()).map_err(|e| e.to_string())
+}
+
+/// Narrow a freshly built repair plan down to exactly the one violation `v`
+/// names, in place — `execute_mechanical`'s subject-scoping guard. Matches
+/// the full violation identity (`violation_id`, `kind`, AND `subject`), not
+/// `subject` alone: a ticket can trip more than one repairable kind at once
+/// (e.g. a delivered-but-open ticket whose stale assignee also trips
+/// terminal-assignee-active-work), and those two kinds carry different
+/// authorities (`Mechanical` vs. `Orchestrator` — see
+/// `reconcile_repair`'s module doc). A subject-only filter would let this
+/// call, authorized for exactly one Mechanical violation, also execute a
+/// same-subject Orchestrator-authority repair as an unrequested side effect
+/// of the same `apply()` call.
+fn retain_matching_violation(plan: &mut crate::reconcile_repair::RepairPlan, v: &crate::reconcile::Violation) {
+    plan.items
+        .retain(|item| item.violation_id == v.id && item.kind == v.kind && item.subject == v.subject);
+}
+
+#[cfg(test)]
+mod retain_matching_violation_tests {
+    use super::*;
+    use crate::reconcile::{kind as vkind, Authority, Violation};
+    use crate::reconcile_repair::{Disposition, RepairAction, RepairItem, RepairPlan};
+
+    fn item(kind: &str, subject: &str) -> RepairItem {
+        RepairItem {
+            violation_id: format!("{kind}:{subject}"),
+            kind: kind.to_string(),
+            scope: "myrepo".to_string(),
+            subject: subject.to_string(),
+            detail: "test".to_string(),
+            evidence: vec![],
+            disposition: Disposition::Planned(RepairAction::CloseDelivered {
+                merge_commit: "abc123".to_string(),
+            }),
+        }
+    }
+
+    fn violation(kind: &str, subject: &str) -> Violation {
+        Violation {
+            id: format!("{kind}:{subject}"),
+            kind: kind.to_string(),
+            scope: "myrepo".to_string(),
+            subject: subject.to_string(),
+            detail: "test".to_string(),
+            evidence: vec![],
+            authority: Authority::Mechanical,
+        }
+    }
+
+    /// The bug this guards against: a ticket that trips BOTH
+    /// `delivered-but-open` and `terminal-assignee-active-work` at once
+    /// produces two plan items sharing one `subject`. A subject-only filter
+    /// (the version this replaces) would retain both, letting a call
+    /// authorized for only the `delivered-but-open` violation also execute
+    /// the OTHER kind's repair as a side effect.
+    #[test]
+    fn keeps_only_the_exact_kind_for_a_shared_subject() {
+        let mut plan = RepairPlan {
+            scope: "myrepo".into(),
+            items: vec![
+                item(vkind::DELIVERED_BUT_OPEN, "TKT-1"),
+                item(vkind::TERMINAL_ASSIGNEE_ACTIVE_WORK, "TKT-1"),
+            ],
+        };
+        let v = violation(vkind::DELIVERED_BUT_OPEN, "TKT-1");
+        retain_matching_violation(&mut plan, &v);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].kind, vkind::DELIVERED_BUT_OPEN);
+        assert_eq!(plan.items[0].subject, "TKT-1");
+    }
+
+    #[test]
+    fn drops_a_sibling_ticket_with_the_same_kind() {
+        let mut plan = RepairPlan {
+            scope: "myrepo".into(),
+            items: vec![
+                item(vkind::DELIVERED_BUT_OPEN, "TKT-1"),
+                item(vkind::DELIVERED_BUT_OPEN, "TKT-2"),
+            ],
+        };
+        let v = violation(vkind::DELIVERED_BUT_OPEN, "TKT-1");
+        retain_matching_violation(&mut plan, &v);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].subject, "TKT-1");
+    }
 }
 
 /// Does `commit`'s own diff (against its first parent) touch a path matched
