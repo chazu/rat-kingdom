@@ -100,7 +100,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Identity of a durably-queued landing candidate (`Furniture`, scoped to the
 /// repo it belongs to) — the T2 counterpart to the reactor's
@@ -520,6 +520,10 @@ pub(crate) struct LandingQueueEntry {
     pub(crate) head_sha: String,
     pub(crate) diff_class: String,
     pub(crate) task: String,
+    /// Exact source generation off the triggering `harness_result`. `None`
+    /// is the compatibility fallback for pre-migration/manual entries.
+    #[serde(default)]
+    pub(crate) source_spawn: Option<rk_core::id::SpawnId>,
     /// Exact merge object built before gates run. Persisted so a daemon
     /// rollover can retest and land the same parked object.
     #[serde(default)]
@@ -4179,9 +4183,6 @@ impl LandingPipeline {
     /// the branch and target it landed on. No build tooling is consulted and
     /// no language convention is assumed.
     async fn record_delivery(&self, entry: &LandingQueueEntry, result: &Value) {
-        if !entry.task.starts_with(crate::tickets::ID_PREFIX) {
-            return;
-        }
         if result.get("content_free").and_then(Value::as_bool) == Some(true) {
             info!(
                 task = %entry.task,
@@ -4197,6 +4198,10 @@ impl LandingPipeline {
         else {
             return;
         };
+        // A non-ticket candidate (a bare named-branch land the reactor picked
+        // up with no `--task`) still owns an agent generation whose merge
+        // pointer must be derived — only the ticket-side write is skipped.
+        let is_ticket = entry.task.starts_with(crate::tickets::ID_PREFIX);
         let landed_at = Utc::now();
         let record = crate::tickets::DeliveryRecord {
             merge_commit: merge_commit.to_string(),
@@ -4204,44 +4209,41 @@ impl LandingPipeline {
             target: entry.target.clone(),
             landed_at: landed_at.to_rfc3339(),
         };
-        let _ = crate::span::record_phase_span(
-            &self.space,
-            &entry.repo_name,
-            "daemon",
-            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Merge)
-                .repo(&entry.repo_name)
-                .target(&entry.target)
-                .candidate(merge_commit)
-                .ended_at(landed_at),
-        );
-        // Routes through the shared `finalize_delivery` seam
-        // (TKT-01M0P96ZSQAJGRE7WTGDBWAXJ9, see `crate::lifecycle`) so this
-        // automatic/reactor-triggered path derives the agent's merge pointer
-        // from the same commit as the ticket's delivery record, instead of
-        // leaving the agent side unset the way it did before this seam
-        // existed (`rk revert` silently failed for anything landed here).
+        if is_ticket {
+            let _ = crate::span::record_phase_span(
+                &self.space,
+                &entry.repo_name,
+                "daemon",
+                &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Merge)
+                    .repo(&entry.repo_name)
+                    .target(&entry.target)
+                    .candidate(merge_commit)
+                    .ended_at(landed_at),
+            );
+        }
+        if entry.source_spawn.is_none() {
+            debug!(task = %entry.task, "record_delivery: no source generation on entry (legacy fallback)");
+        }
         match self
             .supervisor
             .finalize_delivery(
                 std::path::Path::new(&entry.repo_path),
                 &entry.repo_name,
-                Some(&entry.task),
+                is_ticket.then_some(entry.task.as_str()),
                 &record,
+                entry.source_spawn,
             )
             .await
         {
-            Ok(_) => info!(
-                task = %entry.task,
-                merge_commit,
-                target = %entry.target,
-                "recorded delivery and closed ticket"
-            ),
-            Err(e) => warn!(
-                task = %entry.task,
-                merge_commit,
-                error = %e,
-                "landed but failed to record delivery on the ticket"
-            ),
+            Ok(_) => {
+                info!(task = %entry.task, merge_commit, target = %entry.target, "recorded delivery")
+            }
+            Err(e) => {
+                warn!(task = %entry.task, merge_commit, error = %e, "landed but failed to finalize delivery")
+            }
+        }
+        if !is_ticket {
+            return;
         }
         if let Err(error) = self.resubmit_reworked_parent(entry) {
             // The merge is durable; surface bookkeeping failure without denying it.

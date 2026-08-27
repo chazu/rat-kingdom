@@ -5983,53 +5983,32 @@ impl Supervisor {
         Ok(Some(task))
     }
 
-    /// The canonical delivery-finalization seam (TKT-01M0P96ZSQAJGRE7WTGDBWAXJ9,
-    /// see `crate::lifecycle` for the full before/after ownership map). Writes
-    /// the ticket's durable [`crate::tickets::DeliveryRecord`] (when `task` names
-    /// a real ticket) FIRST, then derives the matching agent generation's
-    /// `merge_commit` from the identical commit via
-    /// [`crate::lifecycle::resolve_merge_pointer`] — replacing the old
-    /// `record_merge_for_branch`, which only the two manual land paths ever
-    /// called, leaving the automatic/reactor-triggered pipeline path (the
-    /// common case) with no agent-side record at all and `rk revert` broken
-    /// for anything it landed.
-    ///
-    /// Order matters: the ticket record is the canonical fact and the agent
-    /// pointer is explicitly a *derived* cache of it, never an independent
-    /// authority — so if the daemon crashes between the two writes, the only
-    /// state a restart can observe is "canonical fact written, derived cache
-    /// not yet caught up," never the reverse (a derived pointer pointing at a
-    /// commit the canonical record never confirmed). When `task` is `None`
-    /// (a bare named-branch land with no ticket bound) there is no canonical
-    /// fact to order against, so only the derivation runs.
-    ///
-    /// A failed derivation is never silently swallowed: `Registry::update`
-    /// errors propagate, and a resolved generation that already carries a
-    /// DIFFERENT commit ([`crate::lifecycle::MergePointerDecision::Conflict`])
-    /// fails closed — returned as an error *and* emitted as a durable
-    /// `delivery_merge_pointer_conflict` event, so the drift is reconcilable
-    /// from `rk scan`/an inbox extension rather than only a log line that
-    /// vanishes with the process.
-    ///
-    /// Called from both the manual land paths (`land`, `land_force`) and
-    /// `LandingPipeline::record_delivery`, so a delivery is finalized exactly
-    /// once per landing regardless of which path triggered it.
+    /// Canonical delivery-finalization seam (TKT-01M0P96ZSQAJGRE7WTGDBWAXJ9):
+    /// writes the ticket's [`crate::tickets::DeliveryRecord`] (if `task` names
+    /// one), then derives the matching generation's `merge_commit` via
+    /// [`crate::lifecycle::resolve_merge_pointer`] under one held registry
+    /// lock, so concurrent deliveries against the same generation cannot both
+    /// observe "unset" and both win. `exact_spawn` generation-fences
+    /// resolution when known (the automatic path always has one); `None`
+    /// falls back to newest-matching, for manual land paths and pre-migration
+    /// queue entries. A resolved generation carrying a DIFFERENT commit fails
+    /// closed: an error plus a durable `delivery_merge_pointer_conflict`
+    /// event, so a caller past irreversible git effects can still surface the
+    /// drift without claiming the merge itself failed.
     pub(crate) async fn finalize_delivery(
         &self,
         repo_root: &std::path::Path,
         repo_name: &str,
         task: Option<&str>,
         record: &crate::tickets::DeliveryRecord,
+        exact_spawn: Option<rk_core::id::SpawnId>,
     ) -> rk_core::Result<()> {
         if let Some(task) = task {
-            // Canonical fact first: if this fails, the derivation below never
-            // runs, so no half-written state (agent pointer set, ticket
-            // record missing) can ever exist — exactly the "independent
-            // delivery authority" this seam exists to eliminate.
             self.tickets.record_delivery(task, record).await?;
         }
+        use crate::lifecycle::MergePointerDecision;
+        let mut registry = self.lock_registry();
         let decision = {
-            let registry = self.lock_registry();
             let agents = registry.list_all();
             crate::lifecycle::resolve_merge_pointer(
                 agents.into_iter(),
@@ -6037,28 +6016,17 @@ impl Supervisor {
                 &record.branch,
                 &record.target,
                 &record.merge_commit,
+                exact_spawn,
             )
         };
         match decision {
-            crate::lifecycle::MergePointerDecision::Set { agent } => {
+            MergePointerDecision::Set { agent } => {
                 let commit = record.merge_commit.clone();
-                let updated = self
-                    .lock_registry()
-                    .update(&agent, move |r| r.merge_commit = Some(commit))?;
-                if updated.is_none() {
-                    // The generation vanished (archived/removed) between
-                    // resolution and write — a lost race, not a conflict;
-                    // never fatal to a delivery that already landed for real.
-                    warn!(
-                        agent,
-                        "finalize_delivery: resolved agent generation vanished before its \
-                         merge pointer could be written"
-                    );
-                }
+                registry.update(&agent, move |r| r.merge_commit = Some(commit))?;
             }
-            crate::lifecycle::MergePointerDecision::AlreadyRecorded
-            | crate::lifecycle::MergePointerDecision::NoTarget => {}
-            crate::lifecycle::MergePointerDecision::Conflict { agent, recorded } => {
+            MergePointerDecision::AlreadyRecorded | MergePointerDecision::NoTarget => {}
+            MergePointerDecision::Conflict { agent, recorded } => {
+                drop(registry);
                 self.emit_event(
                     repo_name,
                     "delivery_merge_pointer_conflict",
@@ -6921,12 +6889,7 @@ impl Supervisor {
         ) {
             if let Some(pipeline) = self.landing_pipeline() {
                 let task = self.resolve_land_task(&repo_name, repo.root(), branch, task)?;
-                // `submit_manual` drives the same `process_entry` ->
-                // `LandingPipeline::record_delivery` -> `finalize_delivery`
-                // chain the automatic pipeline uses, synchronously, before
-                // returning — so both the ticket's delivery record and this
-                // agent's derived merge pointer are already written by the
-                // time control returns here. Nothing left to record.
+                // `submit_manual` drives `finalize_delivery` internally; nothing left to record.
                 let result = pipeline
                     .submit_manual(repo.root(), branch, target, keep_branch, task)
                     .await?;
@@ -7018,9 +6981,9 @@ impl Supervisor {
         let delivery = self
             .deliver_branch(&repo, &repo_name, branch, target, keep_branch)
             .await?;
-        // `land_force` binds no ticket (it takes no `--task`), so only the
-        // agent-side merge pointer is derived here; `task: None` skips the
-        // ticket write in `finalize_delivery` exactly as this path always has.
+        // Best-effort: the merge above already happened, so a derivation
+        // failure is logged, never propagated — it must not make this RPC
+        // claim the completed merge failed or skip the evidence emitted below.
         if let Some(commit) = delivery
             .merge_commit
             .as_deref()
@@ -7032,8 +6995,12 @@ impl Supervisor {
                 target: delivery.target.clone(),
                 landed_at: chrono::Utc::now().to_rfc3339(),
             };
-            self.finalize_delivery(repo.root(), &repo_name, None, &record)
-                .await?;
+            if let Err(error) = self
+                .finalize_delivery(repo.root(), &repo_name, None, &record, None)
+                .await
+            {
+                warn!(repo = %repo_name, branch, %error, "forced landing merged but failed to derive its agent merge pointer");
+            }
         }
         let result = json!({
             "branch": branch,
@@ -8728,6 +8695,105 @@ mod respawn_tests {
             recovery: None,
             recovery_receipt: None,
         }
+    }
+
+    /// TKT-01M10FQRYBS73BXY3NVYYSDRWW must_fix #2: the resolve-then-write must
+    /// not split across two lock acquisitions. N concurrent deliveries racing
+    /// the same generation with distinct candidate commits must yield exactly
+    /// one winner, never two — the old two-lock version could let two callers
+    /// both observe "unset" and both succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finalize_delivery_serializes_concurrent_writers_to_one_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let sup = supervisor(home.path());
+        let mut rec = record(repo_dir.path(), Some("feature"));
+        rec.name = "gen1".into();
+        sup.lock_registry().insert(rec).unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let sup = Arc::clone(&sup);
+            let repo_root = repo_dir.path().to_path_buf();
+            tasks.push(tokio::spawn(async move {
+                let delivery = crate::tickets::DeliveryRecord {
+                    merge_commit: format!("sha-{i}"),
+                    branch: "feature".into(),
+                    target: "main".into(),
+                    landed_at: chrono::Utc::now().to_rfc3339(),
+                };
+                sup.finalize_delivery(&repo_root, "repo", None, &delivery, None)
+                    .await
+            }));
+        }
+        let mut oks = 0;
+        for t in tasks {
+            if t.await.unwrap().is_ok() {
+                oks += 1;
+            }
+        }
+        assert_eq!(
+            oks, 1,
+            "exactly one concurrent delivery may win the merge pointer"
+        );
+        assert!(sup
+            .lock_registry()
+            .get("gen1")
+            .unwrap()
+            .merge_commit
+            .is_some());
+    }
+
+    /// TKT-01M10FQRYBS73BXY3NVYYSDRWW must_fix #1: a merge-pointer conflict
+    /// discovered AFTER `land_force`'s git merge already ran must never make
+    /// the RPC claim that merge failed, and must never suppress its evidence.
+    #[tokio::test]
+    async fn land_force_reports_the_real_merge_even_when_its_pointer_conflicts() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let p = repo_dir.path();
+        git(p, &["checkout", "-b", "feature"]);
+        std::fs::write(p.join("f"), "1\n").unwrap();
+        git(p, &["commit", "-am", "c1"]);
+        let sup = supervisor(home.path());
+        let canonical_root = Repo::discover(p).unwrap().root().to_path_buf();
+        let mut rec = record(&canonical_root, Some("feature"));
+        rec.name = "worker1".into();
+        sup.lock_registry().insert(rec).unwrap();
+
+        let first = sup
+            .land_force(p, "feature", "main", true, "test")
+            .await
+            .unwrap();
+        assert_eq!(first["merged"], true);
+        let first_commit = sup
+            .lock_registry()
+            .get("worker1")
+            .unwrap()
+            .merge_commit
+            .clone();
+        assert!(first_commit.is_some());
+
+        // A second, independent change on the same branch/generation lands a
+        // DIFFERENT commit — the pointer resolution must conflict, but the
+        // git merge itself still genuinely succeeds and must be reported so.
+        std::fs::write(p.join("f"), "2\n").unwrap();
+        git(p, &["commit", "-am", "c2"]);
+        let second = sup
+            .land_force(p, "feature", "main", true, "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            second["merged"], true,
+            "the real git merge must still be reported"
+        );
+        assert_eq!(
+            sup.lock_registry().get("worker1").unwrap().merge_commit,
+            first_commit,
+            "a conflicting pointer must fail closed, not overwrite the first delivery"
+        );
     }
 
     /// The merged-branch guardrail is precise: a branch whose work landed (and
