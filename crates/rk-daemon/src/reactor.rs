@@ -1232,6 +1232,16 @@ impl Reactor {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // Exact generation, straight off `harness_result` — generation-fences
+        // automatic finalization (`crate::lifecycle::resolve_merge_pointer`).
+        let source_agent = payload
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let source_spawn = payload
+            .get("spawn")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse().ok());
 
         let entry = LandingQueueEntry {
             repo_name: repo_name.to_string(),
@@ -1241,6 +1251,8 @@ impl Reactor {
             head_sha,
             diff_class,
             task,
+            source_agent,
+            source_spawn,
             ..Default::default()
         };
         match landing.enqueue(entry) {

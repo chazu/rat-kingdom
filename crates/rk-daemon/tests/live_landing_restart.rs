@@ -274,6 +274,20 @@ async fn two_daemon_restart_mid_gate_resumes_and_lands_through_the_reactor() {
         "the rat's doc-only work must be on main"
     );
 
+    // This candidate carries no `--task` (a bare named-branch land) and
+    // survived a daemon restart mid-flight — proving both that automatic
+    // finalization derives the agent's merge pointer for a non-ticket
+    // delivery, and that the derivation itself is restart/replay-safe.
+    let status = client
+        .call("agent.status", json!({"name": &agent_name}))
+        .await
+        .unwrap();
+    assert_eq!(
+        status["agent"]["merge_commit"].as_str(),
+        Some(main_after.as_str()),
+        "the rat's own generation must carry the merge pointer it landed"
+    );
+
     handle_b.abort();
     let _ = handle_b.await;
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
