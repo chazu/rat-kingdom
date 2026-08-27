@@ -39,6 +39,7 @@
 use crate::agents::AgentRecord;
 use crate::workflow_exec::{Instance, InstanceStatus};
 use rk_core::tuple::Tuple;
+use rk_git::Ancestry;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -150,12 +151,12 @@ pub struct ConvergenceReport {
 /// repository.
 #[derive(Debug, Default, Clone)]
 pub struct GitFacts {
-    /// `(merge_commit, target) -> is merge_commit an ancestor of target?`
+    /// `(merge_commit, target) -> present | absent | unknown ancestry`
     /// Answers [`kind::TRACKER_CONTRADICTS_GIT`] for each ticket's delivery
     /// record. A pair absent from this map means the caller could not check
     /// it (unregistered or unopenable repo) — treated as "no evidence
     /// either way", never as a violation.
-    pub is_ancestor: HashMap<(String, String), bool>,
+    pub is_ancestor: HashMap<(String, String), Ancestry>,
     /// `(scope, branch)` pairs a dropped land has since actually reached its
     /// target by any route (merged, or the branch is gone) — the same
     /// self-clearing check `rk inbox`'s `unlanded-branch` row uses.
@@ -428,10 +429,11 @@ fn tracker_contradicts_git(tickets: &[Tuple], git: &GitFacts) -> Vec<Violation> 
                 return None;
             }
             let key = (record.merge_commit.clone(), record.target.clone());
-            // `None` means the caller could not check (unregistered or
-            // unopenable repo) — absence of evidence, not evidence of a
-            // contradiction, so no violation is raised.
-            if git.is_ancestor.get(&key).copied().unwrap_or(true) {
+            // Only a clean negative is contradictory. `None` and `Unknown`
+            // mean the caller could not check (unregistered/unopenable repo,
+            // or deleted historical revision) — absence of evidence, not
+            // evidence of absence.
+            if git.is_ancestor.get(&key) != Some(&Ancestry::Absent) {
                 return None;
             }
             Some(Violation {
@@ -1081,7 +1083,7 @@ mod tests {
     fn git_disagreeing_with_a_delivery_record_is_flagged() {
         let t = ticket("TKT-1", "myrepo", "closed", delivery_json("abc123", "main"));
         let mut is_ancestor = HashMap::new();
-        is_ancestor.insert(("abc123".to_string(), "main".to_string()), false);
+        is_ancestor.insert(("abc123".to_string(), "main".to_string()), Ancestry::Absent);
         let git = GitFacts {
             is_ancestor,
             ..Default::default()
@@ -1121,10 +1123,49 @@ mod tests {
     }
 
     #[test]
+    fn deleted_historical_intermediate_target_is_unknown_not_a_contradiction() {
+        // Regression: work landed as 01011fec on a temporary Provolone
+        // target, main later advanced to 7a6a4e8, and the intermediate ref was
+        // deleted. Git can no longer resolve the historical target; that is
+        // not a clean negative ancestry verdict and must not page a human.
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "closed",
+            delivery_json("01011fec", "temp/provolone"),
+        );
+        let mut is_ancestor = HashMap::new();
+        is_ancestor.insert(
+            ("01011fec".to_string(), "temp/provolone".to_string()),
+            Ancestry::Unknown,
+        );
+        let git = GitFacts {
+            is_ancestor,
+            ..Default::default()
+        };
+
+        let report = build(
+            "myrepo",
+            &[t],
+            &[],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &git,
+        );
+
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
     fn git_confirming_the_delivery_record_is_not_flagged() {
         let t = ticket("TKT-1", "myrepo", "closed", delivery_json("abc123", "main"));
         let mut is_ancestor = HashMap::new();
-        is_ancestor.insert(("abc123".to_string(), "main".to_string()), true);
+        is_ancestor.insert(
+            ("abc123".to_string(), "main".to_string()),
+            Ancestry::Present,
+        );
         let git = GitFacts {
             is_ancestor,
             ..Default::default()
@@ -1441,7 +1482,7 @@ mod tests {
         let agent_rec = agent("Whisker", Some("TKT-1"), AgentState::Dismissed);
         let land = branch_landed("myrepo", "rat/x/tkt-1", "main", false, false);
         let mut is_ancestor = HashMap::new();
-        is_ancestor.insert(("def456".to_string(), "main".to_string()), false);
+        is_ancestor.insert(("def456".to_string(), "main".to_string()), Ancestry::Absent);
         let human_ticket = ticket("TKT-2", "myrepo", "closed", delivery_json("def456", "main"));
         let git = GitFacts {
             is_ancestor,
