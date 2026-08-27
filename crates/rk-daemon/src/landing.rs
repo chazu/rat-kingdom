@@ -1135,9 +1135,26 @@ impl Default for RetrySchedule {
     }
 }
 
-/// One resolved named check plus the env pairs and wall-clock bound it runs
-/// with, in the order [`LandingPipeline::gate_plan`] wants them run.
-type GatePlan = Vec<(rk_workflow::Check, Vec<(String, String)>, Duration)>;
+/// The complete, repo-owned gate decision for one exact candidate and target.
+/// Built once from `.rk/repo.cue`, `.rk/checks.cue`, and the candidate's
+/// changed paths, then consumed without reading either policy file again.
+type ResolvedGateCheck = (rk_workflow::Check, Vec<(String, String)>, Duration);
+
+struct ResolvedGatePlan {
+    checks: Vec<ResolvedGateCheck>,
+    edge_class: LandingEdgeClass,
+    full_check_required: bool,
+    reason: String,
+}
+
+/// Classification of the one prepared-target advance implementation. Callers
+/// still own mode-specific reporting, but none may call `land_prepared`
+/// directly or reinterpret its stale/blocked flags independently.
+enum TargetAdvance {
+    Landed(Value),
+    Stale(Value),
+    Blocked(Value),
+}
 
 /// Which of the two landing-edge classes `GateConfig::protected_targets`
 /// (`LandingPolicy::protected_targets`, `.rk/repo.cue`) puts a candidate's
@@ -2044,6 +2061,43 @@ impl LandingPipeline {
         result.map(Some)
     }
 
+    /// Terminal fail-closed transition for a candidate whose repo-owned CUE
+    /// policy cannot produce a complete gate plan. Policy errors are verdicts
+    /// on admissibility, not transient daemon faults, so retrying the queue
+    /// forever would only hide the required human action.
+    fn hold_no_gate(
+        &self,
+        entry: &LandingQueueEntry,
+        error: String,
+    ) -> rk_core::Result<LandingOutcome> {
+        let need = self.escalate(
+            entry,
+            format!(
+                "steward: NO GATE for {} on {} — branch held unmerged: {error}",
+                entry.task, entry.branch
+            ),
+        )?;
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                "landing_no_gate",
+                "daemon",
+                json!({
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "task": entry.task,
+                    "error": error,
+                    "state": "no-gate",
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        )?;
+        let outcome = LandingOutcome::NoGate(need);
+        self.mark_processed(entry, &outcome)?;
+        Ok(outcome)
+    }
+
     async fn process_entry(&self, entry: &LandingQueueEntry) -> rk_core::Result<LandingOutcome> {
         // Crash-window reconciliation (review round 2): a crash between
         // `mark_processed` and the caller's queue removal leaves both the
@@ -2099,35 +2153,6 @@ impl LandingPipeline {
             return Ok(outcome);
         }
         let gates = self.gate_config(&git_repo);
-        let checks_file = repo_path.join(".rk").join("checks.cue");
-        if let Err(error) = self.gate_plan(&checks_file, &entry.target, &gates, &[]) {
-            let need = self.escalate(
-                &entry,
-                format!(
-                    "steward: NO GATE for {} on {} — branch held unmerged: {error}",
-                    entry.task, entry.branch
-                ),
-            )?;
-            self.space.out(
-                Tuple::new(
-                    Category::Event,
-                    entry.repo_name.clone(),
-                    "landing_no_gate",
-                    "daemon",
-                    json!({
-                        "branch": entry.branch,
-                        "target": entry.target,
-                        "task": entry.task,
-                        "error": error.to_string(),
-                        "state": "no-gate",
-                    }),
-                )
-                .with_lifecycle(Lifecycle::Furniture),
-            )?;
-            let outcome = LandingOutcome::NoGate(need);
-            self.mark_processed(&entry, &outcome)?;
-            return Ok(outcome);
-        }
         let candidate = if let (Some(commit), Some(base), Some(candidate_ref)) = (
             entry.candidate_sha.clone(),
             entry.candidate_base.clone(),
@@ -2158,8 +2183,18 @@ impl LandingPipeline {
                 }
             }
         };
+        let gate_plan = match self
+            .resolve_gate_plan_at(&entry, &git_repo, &gates, &candidate.commit)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                git_repo.discard_candidate(&candidate.candidate_ref)?;
+                return self.hold_no_gate(&entry, error.to_string());
+            }
+        };
         let gate_outcome = self
-            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .execute_gate_plan_at(&mut entry, &git_repo, gate_plan, &candidate.commit)
             .await?;
         if gate_outcome != GateRunOutcome::Pass {
             git_repo.discard_candidate(&candidate.candidate_ref)?;
@@ -2190,29 +2225,19 @@ impl LandingPipeline {
             return Ok(outcome);
         }
         if matches!(entry.diff_class.as_str(), "doc-only" | "trivial") {
-            self.note_non_main_land_target(&entry);
             self.queue.set_status(&entry, LandingEntryStatus::Landing)?;
-            let result = self
-                .supervisor
-                .land_prepared(
-                    Path::new(&entry.repo_path),
-                    &entry.branch,
-                    &entry.target,
-                    entry.keep_branch,
-                    &candidate,
-                )
-                .await?;
-            if result.get("stale").and_then(Value::as_bool) == Some(true) {
-                return self.requeue_stale(&entry, &git_repo, &candidate, &result);
-            }
-            if result.get("blocked").and_then(Value::as_bool) == Some(true) {
-                let outcome =
-                    LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
-                self.mark_processed(&entry, &outcome)?;
-                return Ok(outcome);
-            }
-            self.record_delivery(&entry, &result).await;
-            let outcome = LandingOutcome::Landed(result);
+            let outcome = match self
+                .advance_target(&entry, entry.keep_branch, &candidate)
+                .await?
+            {
+                TargetAdvance::Landed(result) => self.finalize_landed(&entry, result).await,
+                TargetAdvance::Stale(result) => {
+                    return self.requeue_stale(&entry, &git_repo, &candidate, &result);
+                }
+                TargetAdvance::Blocked(result) => {
+                    LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?)
+                }
+            };
             self.mark_processed(&entry, &outcome)?;
             return Ok(outcome);
         }
@@ -2295,19 +2320,6 @@ impl LandingPipeline {
 
         let repo = rk_git::Repo::discover(Path::new(&entries[0].repo_path))?;
         let gates = self.gate_config(&repo);
-        let checks_file = Path::new(&entries[0].repo_path)
-            .join(".rk")
-            .join("checks.cue");
-        if self
-            .gate_plan(&checks_file, &entries[0].target, &gates, &[])
-            .is_err()
-        {
-            let mut outcomes = Vec::with_capacity(entries.len());
-            for entry in entries {
-                outcomes.push((entry.clone(), self.process_entry(&entry).await?));
-            }
-            return Ok(outcomes);
-        }
 
         let branch_names: Vec<String> = entries.iter().map(|e| e.branch.clone()).collect();
         let recovered = entries.iter().find_map(|entry| {
@@ -2350,6 +2362,23 @@ impl LandingPipeline {
                 .persist(entry, LandingEntryStatus::RunningGates)?;
         }
 
+        let gate_plan = match self
+            .resolve_gate_plan_at(&entries[0], &repo, &gates, &candidate.commit)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                repo.discard_candidate(&candidate.candidate_ref)?;
+                let error = error.to_string();
+                let mut outcomes = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let outcome = self.hold_no_gate(&entry, error.clone())?;
+                    outcomes.push((entry, outcome));
+                }
+                return Ok(outcomes);
+            }
+        };
+
         // The gate run mutates and durably persists `entries[0]`'s own
         // infra-retry-budget fields (and, on the infra-retry path, re-persists
         // its candidate identity too — see `run_gates_at`). It must run
@@ -2365,7 +2394,7 @@ impl LandingPipeline {
         // later `bisect_batch`/`mark_processed` pass over `entries` grant a
         // second retry the durable store had already spent.
         if !self
-            .run_gates_at(&mut entries[0], &repo, &gates, &candidate.commit)
+            .execute_gate_plan_at(&mut entries[0], &repo, gate_plan, &candidate.commit)
             .await?
             .passed()
         {
@@ -2373,35 +2402,30 @@ impl LandingPipeline {
         }
 
         let first = entries[0].clone();
-        self.note_non_main_land_target(&first);
-        let mut result = self
-            .supervisor
-            .land_prepared(
-                Path::new(&first.repo_path),
-                &first.branch,
-                &first.target,
-                true,
-                &candidate,
-            )
-            .await?;
-        if result.get("stale").and_then(Value::as_bool) == Some(true) {
-            let mut outcomes = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let outcome = self.requeue_stale(&entry, &repo, &candidate, &result)?;
-                outcomes.push((entry, outcome));
-            }
-            return Ok(outcomes);
+        for entry in &entries {
+            self.queue.set_status(entry, LandingEntryStatus::Landing)?;
         }
-        if result.get("blocked").and_then(Value::as_bool) == Some(true) {
-            let mut outcomes = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let outcome =
-                    LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
-                self.mark_processed(&entry, &outcome)?;
-                outcomes.push((entry, outcome));
+        let mut result = match self.advance_target(&first, true, &candidate).await? {
+            TargetAdvance::Landed(result) => result,
+            TargetAdvance::Stale(result) => {
+                let mut outcomes = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let outcome = self.requeue_stale(&entry, &repo, &candidate, &result)?;
+                    outcomes.push((entry, outcome));
+                }
+                return Ok(outcomes);
             }
-            return Ok(outcomes);
-        }
+            TargetAdvance::Blocked(result) => {
+                let mut outcomes = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let outcome =
+                        LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
+                    self.mark_processed(&entry, &outcome)?;
+                    outcomes.push((entry, outcome));
+                }
+                return Ok(outcomes);
+            }
+        };
 
         let policy = self.supervisor.repository_policy(&repo);
         let mut all_deleted = true;
@@ -2424,8 +2448,7 @@ impl LandingPipeline {
 
         let mut outcomes = Vec::with_capacity(entries.len());
         for entry in entries {
-            self.record_delivery(&entry, &result).await;
-            let outcome = LandingOutcome::Landed(result.clone());
+            let outcome = self.finalize_landed(&entry, result.clone()).await;
             self.mark_processed(&entry, &outcome)?;
             outcomes.push((entry, outcome));
         }
@@ -3217,7 +3240,6 @@ impl LandingPipeline {
         };
         match verdict.as_str() {
             "APPROVE" => {
-                self.note_non_main_land_target(entry);
                 // Capture the review phase's own clock BEFORE the status
                 // transition below moves the durable candidate into `Landing`
                 // (`Phase::Merge`) — that transition resets
@@ -3241,26 +3263,18 @@ impl LandingPipeline {
                     ),
                 );
                 self.queue.set_status(entry, LandingEntryStatus::Landing)?;
-                let result = self
-                    .supervisor
-                    .land_prepared(
-                        Path::new(&entry.repo_path),
-                        &entry.branch,
-                        &entry.target,
-                        entry.keep_branch,
-                        candidate,
-                    )
-                    .await?;
-                if result.get("stale").and_then(Value::as_bool) == Some(true) {
-                    return self.requeue_stale(entry, git_repo, candidate, &result);
-                }
-                if result.get("blocked").and_then(Value::as_bool) == Some(true) {
-                    return Ok(LandingOutcome::Escalated(
+                match self
+                    .advance_target(entry, entry.keep_branch, candidate)
+                    .await?
+                {
+                    TargetAdvance::Landed(result) => Ok(self.finalize_landed(entry, result).await),
+                    TargetAdvance::Stale(result) => {
+                        self.requeue_stale(entry, git_repo, candidate, &result)
+                    }
+                    TargetAdvance::Blocked(result) => Ok(LandingOutcome::Escalated(
                         self.worktree_blocked_gate(entry, &result)?,
-                    ));
+                    )),
                 }
-                self.record_delivery(entry, &result).await;
-                Ok(LandingOutcome::Landed(result))
             }
             "REWORK" => self.route_rework(entry, git_repo).await,
             "STOP" => Ok(LandingOutcome::Escalated(self.review_human_gate(
@@ -4165,6 +4179,44 @@ impl LandingPipeline {
             .await
     }
 
+    /// The sole prepared target-advance implementation. Every ordinary,
+    /// workflow, automatic, and batch merge reaches this method after its
+    /// CUE plan passes; mode-specific callers only decide how to report or
+    /// requeue the classified result.
+    async fn advance_target(
+        &self,
+        entry: &LandingQueueEntry,
+        keep_branch: bool,
+        candidate: &rk_git::PreparedMerge,
+    ) -> rk_core::Result<TargetAdvance> {
+        self.note_non_main_land_target(entry);
+        let result = self
+            .supervisor
+            .land_prepared(
+                Path::new(&entry.repo_path),
+                &entry.branch,
+                &entry.target,
+                keep_branch,
+                candidate,
+            )
+            .await?;
+        if result.get("stale").and_then(Value::as_bool) == Some(true) {
+            Ok(TargetAdvance::Stale(result))
+        } else if result.get("blocked").and_then(Value::as_bool) == Some(true) {
+            Ok(TargetAdvance::Blocked(result))
+        } else {
+            Ok(TargetAdvance::Landed(result))
+        }
+    }
+
+    /// The sole successful-land finalization transition. Delivery facts,
+    /// generation-fenced ticket closure, and the terminal landing outcome
+    /// cannot drift apart because all successful paths pass through here.
+    async fn finalize_landed(&self, entry: &LandingQueueEntry, result: Value) -> LandingOutcome {
+        self.record_delivery(entry, &result).await;
+        LandingOutcome::Landed(result)
+    }
+
     /// Write the durable delivery record onto `entry`'s ticket and close it
     /// (P1b). Called from every successful-land path in this module, which is
     /// the whole fix: nothing used to close a ticket after a land, so
@@ -4307,8 +4359,7 @@ impl LandingPipeline {
             "merged": true, "merge_commit": commit, "content_free": commit == base,
             "recovered": true,
         });
-        self.record_delivery(entry, &result).await;
-        let outcome = LandingOutcome::Landed(result);
+        let outcome = self.finalize_landed(entry, result).await;
         self.mark_processed(entry, &outcome)?;
         Ok(Some(outcome))
     }
@@ -6139,17 +6190,45 @@ impl LandingPipeline {
             .join(sanitize_path_component(target))
     }
 
+    /// Resolve the repo-owned CUE policy once for this exact prepared
+    /// candidate. The returned value is data-only and can be executed later
+    /// without rereading either policy file.
+    async fn resolve_gate_plan_at(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+        gates: &GateConfig,
+        tested_sha: &str,
+    ) -> rk_core::Result<ResolvedGatePlan> {
+        let changed_paths = {
+            let git_repo = git_repo.clone();
+            let target = entry.target.clone();
+            let sha = tested_sha.to_string();
+            blocking(move || {
+                Ok(git_repo
+                    .diff_stat(&target, &sha)
+                    .map(|stat| stat.files)
+                    .unwrap_or_default())
+            })
+            .await?
+        };
+        let checks_file = PathBuf::from(&entry.repo_path)
+            .join(".rk")
+            .join("checks.cue");
+        self.gate_plan(&checks_file, &entry.target, gates, &changed_paths)
+    }
+
     /// Run the same three gates `steward.cue`'s `_gates` block runs today
     /// (POLICY, DIFF-SCOPE, the repo's named `verify` check) against a
     /// persistent daemon-owned worktree reset to the candidate's tip.
     /// Returns [`GateRunOutcome::Pass`] only if every gate reported
     /// `verdict: "pass"`; a caller that needs a plain pass/fail bool can
     /// use [`GateRunOutcome::passed`].
-    async fn run_gates_at(
+    async fn execute_gate_plan_at(
         &self,
         entry: &mut LandingQueueEntry,
         git_repo: &rk_git::Repo,
-        gates: &GateConfig,
+        gate_plan: ResolvedGatePlan,
         tested_sha: &str,
     ) -> rk_core::Result<GateRunOutcome> {
         let started = Instant::now();
@@ -6169,7 +6248,6 @@ impl LandingPipeline {
         // name, which said nothing about whether the command/toolchain/
         // environment that actually ran still matches a later caller's.
         let mut check_proof_keys: Vec<(String, Option<String>)> = Vec::new();
-        let repo_path = PathBuf::from(&entry.repo_path);
         let gate_dir = self.gate_worktree_path(&entry.repo_name, &entry.target);
         {
             let git_repo = git_repo.clone();
@@ -6187,40 +6265,21 @@ impl LandingPipeline {
         // worktree "just used" that was not actually touched.
         self.touch_gate_worktree_marker(&entry.repo_name, &entry.target);
 
-        let checks_file = repo_path.join(".rk").join("checks.cue");
-        // Best-effort: only feeds INNER-edge focused-check selection
-        // (`gate_plan`'s `select_focused_checks`), never a PROTECTED-FINAL
-        // edge's full-check decision, which does not look at changed paths
-        // at all. A target that fails to resolve as a revision (synthetic
-        // test target names, an exotic history shape) falls back to no
-        // known changed paths — the same fail-closed-toward-fewer-checks
-        // direction `ere_matches_any` already takes, never toward silently
-        // promoting to the full suite.
-        let changed_paths = {
-            let git_repo = git_repo.clone();
-            let target = entry.target.clone();
-            let sha = tested_sha.to_string();
-            blocking(move || {
-                Ok(git_repo
-                    .diff_stat(&target, &sha)
-                    .map(|stat| stat.files)
-                    .unwrap_or_default())
-            })
-            .await?
-        };
-        let (plan, edge_class, full_check_required, reason) =
-            self.gate_plan(&checks_file, &entry.target, gates, &changed_paths)?;
+        let ResolvedGatePlan {
+            checks,
+            edge_class,
+            full_check_required,
+            reason,
+        } = gate_plan;
 
-        let selected_checks: Vec<String> = plan
+        let selected_checks: Vec<String> = checks
             .iter()
             .map(|(check, _, _)| check.name.clone())
             .collect();
         let proof_key = if full_check_required {
-            plan.iter()
-                .find(|(check, _, _)| check.name == gates.check_name)
-                .and_then(|(check, _, _)| {
-                    verification_proof_key(&entry.repo_name, tested_sha, check)
-                })
+            checks.last().and_then(|(check, _, _)| {
+                verification_proof_key(&entry.repo_name, tested_sha, check)
+            })
         } else {
             None
         };
@@ -6260,7 +6319,7 @@ impl LandingPipeline {
         );
 
         let id = format!("landing:{}", entry.branch);
-        for (check_index, (check, env, timeout)) in plan.into_iter().enumerate() {
+        for (check_index, (check, env, timeout)) in checks.into_iter().enumerate() {
             // This check's position in the plan, not a rework-round counter:
             // stable across a crash-resume re-run of this same plan (so a
             // repeated earlier check dedupes against the span it already
@@ -6958,10 +7017,31 @@ impl LandingPipeline {
         gates: &GateConfig,
     ) -> rk_core::Result<bool> {
         let head_sha = entry.head_sha.clone();
+        let gate_plan = self
+            .resolve_gate_plan_at(entry, git_repo, gates, &head_sha)
+            .await?;
         Ok(self
-            .run_gates_at(entry, git_repo, gates, &head_sha)
+            .execute_gate_plan_at(entry, git_repo, gate_plan, &head_sha)
             .await?
             .passed())
+    }
+
+    /// Test convenience for cases that exercise an exact prepared candidate.
+    /// Production resolves the CUE plan in `process_entry`/`process_batch`
+    /// and passes the immutable plan directly to `execute_gate_plan_at`.
+    #[cfg(test)]
+    async fn run_gates_at(
+        &self,
+        entry: &mut LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+        gates: &GateConfig,
+        tested_sha: &str,
+    ) -> rk_core::Result<GateRunOutcome> {
+        let gate_plan = self
+            .resolve_gate_plan_at(entry, git_repo, gates, tested_sha)
+            .await?;
+        self.execute_gate_plan_at(entry, git_repo, gate_plan, tested_sha)
+            .await
     }
 
     /// Resolve the protected-paths/diff-scope policy gates plus this edge's
@@ -6988,7 +7068,7 @@ impl LandingPipeline {
         target: &str,
         gates: &GateConfig,
         changed_paths: &[String],
-    ) -> rk_core::Result<(GatePlan, LandingEdgeClass, bool, String)> {
+    ) -> rk_core::Result<ResolvedGatePlan> {
         if !checks_file.exists() {
             return Err(rk_core::Error::other(format!(
                 "landing pipeline: no check registry at {}",
@@ -7012,7 +7092,7 @@ impl LandingPipeline {
         let protected_paths = find(PROTECTED_PATHS_CHECK)?;
         let diff_scope = find(DIFF_SCOPE_CHECK)?;
 
-        let mut plan: GatePlan = vec![
+        let mut checks = vec![
             (
                 protected_paths,
                 vec![
@@ -7044,7 +7124,7 @@ impl LandingPipeline {
         let is_protected_final = gates.protected_targets.iter().any(|t| t == target);
         let (edge_class, full_check_required, reason) = if is_protected_final {
             let verify = find(&gates.check_name)?;
-            plan.push((verify, Vec::new(), gates.gate_timeout));
+            checks.push((verify, Vec::new(), gates.gate_timeout));
             (
                 LandingEdgeClass::ProtectedFinal,
                 true,
@@ -7068,7 +7148,7 @@ impl LandingPipeline {
             } else {
                 for check_name in &selected {
                     let check = find(check_name)?;
-                    plan.push((
+                    checks.push((
                         check,
                         vec![("RK_CHECK_TARGET".to_string(), target.to_string())],
                         gates.gate_timeout,
@@ -7086,7 +7166,12 @@ impl LandingPipeline {
             }
         };
 
-        Ok((plan, edge_class, full_check_required, reason))
+        Ok(ResolvedGatePlan {
+            checks,
+            edge_class,
+            full_check_required,
+            reason,
+        })
     }
 
     /// Sibling marker file recording when `gate_worktree_path(repo, target)`
@@ -16577,6 +16662,79 @@ checks: [
             .scan(&Pattern::category(Category::Event).identity(GATE_PASS_IDENTITY))
             .unwrap();
         assert_eq!(pass_events.len(), 2, "pass events: {pass_events:?}");
+    }
+
+    /// Resolution and execution are one admission decision: once the exact
+    /// candidate's CUE plan has been built, a concurrent edit to the live
+    /// registry cannot swap the command underneath that in-flight run. A
+    /// later candidate resolves the new registry normally.
+    #[tokio::test]
+    async fn landing_gate_executes_the_single_resolved_cue_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let resolved_log = home.path().join("resolved.log");
+        let late_log = home.path().join("late.log");
+        write_checks(
+            repo_dir.path(),
+            &checks_cue_with_verify(
+                &format!("echo resolved >> '{}'", resolved_log.display()),
+                "rust-stable",
+                "inherit",
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space);
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        let mut entry = LandingQueueEntry {
+            repo_name: "single-resolution-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "single-resolution-task".into(),
+            ..Default::default()
+        };
+
+        let plan = pipeline
+            .resolve_gate_plan_at(&entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        write_checks_uncommitted(
+            repo_dir.path(),
+            &checks_cue_with_verify(
+                &format!("echo late >> '{}'", late_log.display()),
+                "rust-stable",
+                "inherit",
+            ),
+        );
+
+        let outcome = pipeline
+            .execute_gate_plan_at(&mut entry, &git_repo, plan, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert!(resolved_log.exists(), "the resolved command must run");
+        assert!(
+            !late_log.exists(),
+            "execution must not reread and substitute the later CUE command"
+        );
     }
 
     /// Builds a `checks.cue` registry identical to the replay test's own,
