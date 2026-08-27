@@ -377,14 +377,30 @@ it from process logs.
    policy gate, a within-budget diff, a green suite, and (when review wasn't
    skipped) an explicit `APPROVE`.
 
-**Operator-facing landing authority is repository policy.** `LandingPipeline`
-calls `Supervisor::land` directly: for a repo whose activated CUE triggers
-include an `action: "land"` entry, that trigger's existence and match predicate
-is the unattended-landing authorization. Its activated landing limits and
-named checks are evaluated mechanically. The old workflow-name exception has
-been removed. Workflow `land`/`open_pr` steps instead obey
-`policy.require_approval_for_landing` uniformly and may target only the branch
-authorized by the activated repository policy.
+**Operator-facing landing authority has moved.** `LandingPipeline` calls
+`Supervisor::land` directly and never passes through the workflow executor, so
+for a repo whose activated CUE triggers include an `action: "land"` entry, that
+trigger's existence and match predicate *is* the unattended-landing
+authorization; its activated landing limits and named checks are evaluated
+mechanically. Neither of the two daemon config knobs that gate a workflow
+`land` step — `policy.automated_landing_workflows` (only a workflow named in
+this list may `land` unattended) and `policy.require_approval_for_landing` —
+governs the daemon-native pipeline.
+
+That is the intended end state (steward remediation Phase 4, item 4: "landing
+authority becomes the daemon pipeline's own, not a string match on a workflow
+filename"), and the shipped `steward` mega-workflow that relied on the
+workflow-name exception is now gone from the tree — but **the exception itself
+has not been removed from the code.** `policy.automated_landing_workflows` is
+still `["steward"]` by default in `rk-core`'s `PolicyConfig`
+(`crates/rk-core/src/config.rs`) and is still enforced by
+`WorkflowEngine::is_automated_landing_definition`
+(`crates/rk-daemon/src/workflow_exec.rs`), which also requires the definition
+to resolve out of the operator-owned global workflow directory so a repo-local
+shadow cannot inherit it. In a stock installation nothing exercises it; it
+remains load-bearing for an operator-authored custom workflow that still uses
+an explicit `land` step (a bespoke `curator`, say). Narrowing or removing the
+two fields is tracked separately: TKT-01M048ASY8MDB5DVV5VG3WRM47.
 
 ### Land target inheritance
 
