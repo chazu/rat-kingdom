@@ -3484,7 +3484,10 @@ impl Daemon {
     /// plan down to one violation's own subject before applying, so that
     /// resolving one attention item can never repair a sibling ticket as a
     /// side effect).
-    async fn build_repair_plan(&self, repo: &str) -> rk_core::Result<crate::reconcile_repair::RepairPlan> {
+    async fn build_repair_plan(
+        &self,
+        repo: &str,
+    ) -> rk_core::Result<crate::reconcile_repair::RepairPlan> {
         let agents: Vec<crate::agents::AgentRecord> = self
             .supervisor
             .list_all()
@@ -10453,9 +10456,13 @@ fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, Str
 /// call, authorized for exactly one Mechanical violation, also execute a
 /// same-subject Orchestrator-authority repair as an unrequested side effect
 /// of the same `apply()` call.
-fn retain_matching_violation(plan: &mut crate::reconcile_repair::RepairPlan, v: &crate::reconcile::Violation) {
-    plan.items
-        .retain(|item| item.violation_id == v.id && item.kind == v.kind && item.subject == v.subject);
+fn retain_matching_violation(
+    plan: &mut crate::reconcile_repair::RepairPlan,
+    v: &crate::reconcile::Violation,
+) {
+    plan.items.retain(|item| {
+        item.violation_id == v.id && item.kind == v.kind && item.subject == v.subject
+    });
 }
 
 #[cfg(test)]

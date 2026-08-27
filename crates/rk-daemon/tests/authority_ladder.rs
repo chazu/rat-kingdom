@@ -413,21 +413,28 @@ async fn mechanical_repair_does_not_touch_a_sibling_ticket_with_the_same_kind() 
         &mut client,
         repo,
         "TKT-SIB-A",
-        ticket_payload("in_progress", delivery(&commit_a, "rat/x/tkt-sib-a", "main")),
+        ticket_payload(
+            "in_progress",
+            delivery(&commit_a, "rat/x/tkt-sib-a", "main"),
+        ),
     )
     .await;
     write_ticket(
         &mut client,
         repo,
         "TKT-SIB-B",
-        ticket_payload("in_progress", delivery(&commit_b, "rat/x/tkt-sib-b", "main")),
+        ticket_payload(
+            "in_progress",
+            delivery(&commit_b, "rat/x/tkt-sib-b", "main"),
+        ),
     )
     .await;
 
     // `attention.next`'s shared cursor would only ever surface one of these
     // at a time; read A's violation directly so B is untouched by the query
     // itself, not just by the decision under test.
-    let violation_a = reconcile_violation(&mut client, repo, "delivered-but-open", "TKT-SIB-A").await;
+    let violation_a =
+        reconcile_violation(&mut client, repo, "delivered-but-open", "TKT-SIB-A").await;
     let result = decide(
         &mut client,
         repo,
