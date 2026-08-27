@@ -77,6 +77,7 @@ async fn concurrent_gated_landings_all_merge_into_main() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Spawn N rats, all forked off main.
     let mut agents = Vec::with_capacity(N);

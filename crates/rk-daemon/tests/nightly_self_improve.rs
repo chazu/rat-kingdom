@@ -101,6 +101,7 @@ async fn nightly_self_improve_runs_all_three_phases() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Two ready tickets → two fanned-out drain rats → two drain branches.
     for title in ["add caching", "fix pagination"] {

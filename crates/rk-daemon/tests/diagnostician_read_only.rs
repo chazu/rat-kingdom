@@ -48,6 +48,7 @@ async fn diagnostician_is_confined_to_reading() {
     std::fs::write(repo_dir.path().join("f"), "x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", IDLE_FAKE);
     let layout = Layout::at(home.path());
@@ -61,6 +62,7 @@ async fn diagnostician_is_confined_to_reading() {
     .unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut operator = connect(&layout).await;
+    support::register_repo(&mut operator, repo_dir.path()).await;
 
     let spawned = operator
         .call(

@@ -41,6 +41,7 @@ fn init_repo(dir: &Path) -> String {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     dir.file_name().unwrap().to_string_lossy().to_string()
 }
 
@@ -86,6 +87,7 @@ async fn spawn(
     });
     tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir).await;
 
     let spawned = client
         .call(

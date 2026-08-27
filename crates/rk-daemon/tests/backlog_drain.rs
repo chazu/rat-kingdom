@@ -93,6 +93,7 @@ async fn backlog_drain_fans_out_and_joins() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Two ready tickets in this repo, plus one in another scope that must NOT
     // be drained (proves the query is repo-scoped).

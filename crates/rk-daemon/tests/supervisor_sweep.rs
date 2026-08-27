@@ -42,6 +42,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("f"), "x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 /// One fake, behaviour selected by the task carried in the prompt (the fake
@@ -118,6 +119,7 @@ async fn silent_rat_is_flagged_stuck_then_killed_after_grace() {
         },
     )
     .await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -175,6 +177,7 @@ async fn busy_runaway_rat_is_flagged_runaway_by_burn_rate() {
         },
     )
     .await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Model set so pricing applies (haiku: each burst ≈ $0.40, ~$1+/sec).
     client

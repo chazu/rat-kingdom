@@ -77,6 +77,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("f"), "x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 async fn spawn_daemon(home: &Path) -> (Layout, Client) {
@@ -137,6 +138,7 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", spender_fake());
     let (_layout, mut client) = spawn_daemon(home.path()).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let repo = repo_dir.path().to_string_lossy().to_string();
 
     // First spawn is allowed and burns ≈$0.40 (usage-based), STAYS Running, and
@@ -204,6 +206,7 @@ async fn dismissed_agent_drops_off_fleet_tally() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", spender_fake());
     let (_layout, mut client) = spawn_daemon(home.path()).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let repo = repo_dir.path().to_string_lossy().to_string();
 
     // First spawn burns ≈$0.40 and STAYS Running, putting the live fleet over
@@ -276,6 +279,7 @@ async fn completed_agent_drops_off_fleet_tally() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", spender_fake());
     let (_layout, mut client) = spawn_daemon(home.path()).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let repo = repo_dir.path().to_string_lossy().to_string();
 
     // The `*oneshot*` branch self-reports $0.50 and EXITS → the agent flips to

@@ -153,6 +153,7 @@ async fn gated_merge_approval_merges_the_branch() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let id = run_to_gate(&mut client, repo_dir.path(), "approve-me").await;
 
@@ -195,6 +196,7 @@ async fn gated_merge_rejection_ends_cleanly_unmerged() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let id = run_to_gate(&mut client, repo_dir.path(), "reject-me").await;
 

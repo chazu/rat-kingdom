@@ -85,6 +85,7 @@ async fn setup_with_space() -> (
     std::fs::write(wf_dir.join("factory-test.cue"), WORKFLOW).unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let space = Space::open_in_memory().unwrap();

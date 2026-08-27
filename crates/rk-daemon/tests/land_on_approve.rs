@@ -163,6 +163,7 @@ async fn land_on_approve_merges_chained_branch_to_main() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let (id, held_branch) = run_to_gate(&mut client, repo_dir.path(), "land-me").await;
     // The held branch is the reviewer's, chained off the work branch — its base
@@ -215,6 +216,7 @@ async fn land_on_approve_rejection_lands_nothing() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let (id, _held) = run_to_gate(&mut client, repo_dir.path(), "reject-me").await;
 

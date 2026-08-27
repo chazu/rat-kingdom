@@ -51,6 +51,8 @@ async fn spawn_ticket_resolves_repo_through_system_scoped_parent_chain() {
     git(repo_dir.path(), &["config", "user.email", "r@x"]);
     git(repo_dir.path(), &["config", "user.name", "R"]);
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    std::fs::create_dir_all(repo_dir.path().join(".rk")).unwrap();
+    std::fs::write(repo_dir.path().join(".rk/repo.cue"), "repo: {}\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
 

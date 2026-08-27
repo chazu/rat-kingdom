@@ -96,6 +96,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 
     let rk_dir = dir.join(".rk");
     std::fs::create_dir_all(&rk_dir).unwrap();
