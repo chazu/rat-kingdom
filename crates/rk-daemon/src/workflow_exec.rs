@@ -1924,7 +1924,7 @@ impl WorkflowEngine {
             }
             self.lock_archived().insert(instance.id.clone(), instance);
         }
-        let blocked = self.fail_legacy_unlinked_subworkflows();
+        self.fail_children_owned_by_terminal_parents();
         // Only top-level (depth 0) instances resume standalone. A linked nested
         // child is re-driven by its parent's resumed `sub_workflow` step, which
         // rejoins the same durable child id. Resuming it here as well would
@@ -1932,11 +1932,7 @@ impl WorkflowEngine {
         let resumable: Vec<Instance> = self
             .lock()
             .values()
-            .filter(|instance| {
-                instance.status == InstanceStatus::Running
-                    && instance.depth == 0
-                    && !blocked.contains(&instance.id)
-            })
+            .filter(|instance| instance.status == InstanceStatus::Running && instance.depth == 0)
             .cloned()
             .collect();
         if !resumable.is_empty() {
@@ -1948,88 +1944,48 @@ impl WorkflowEngine {
         resumable
     }
 
-    /// Snapshots written before `active_subworkflow` cannot prove which parent
-    /// owns a running nested child. Continuing the parent would repeat the step
-    /// and duplicate the child's side effects, while resuming both independently
-    /// would race them. Fail the orphan and every exact current-step parent match
-    /// closed so an operator can inspect and retry deliberately.
-    fn fail_legacy_unlinked_subworkflows(&self) -> HashSet<String> {
-        let snapshots = self.list();
-        let linked: HashSet<&str> = snapshots
-            .iter()
-            .filter(|instance| instance.status == InstanceStatus::Running)
-            .filter_map(|instance| instance.context.active_subworkflow.as_deref())
+    /// Exact persisted parent-to-child links remain authoritative across a
+    /// restart. A terminal parent can no longer rejoin its still-running child,
+    /// so fail that child instead of leaving an unresumable workflow alive.
+    /// This deliberately does not infer ownership for unlinked snapshots.
+    fn fail_children_owned_by_terminal_parents(&self) {
+        let links: Vec<(String, String)> = self
+            .list()
+            .into_iter()
+            .filter(|parent| parent.status.is_terminal())
+            .filter_map(|parent| {
+                parent
+                    .context
+                    .active_subworkflow
+                    .map(|child| (parent.id, child))
+            })
             .collect();
-        let orphans: Vec<Instance> = snapshots
-            .iter()
-            .filter(|instance| instance.depth > 0 && !linked.contains(instance.id.as_str()))
-            .cloned()
-            .collect();
-        let mut blocked = HashSet::new();
 
-        for child in orphans {
-            let parents: Vec<String> = snapshots
-                .iter()
-                .filter(|parent| {
-                    parent.status == InstanceStatus::Running
-                        && parent.depth + 1 == child.depth
-                        && parent.repo == child.repo
-                        && parent.started_at <= child.started_at
-                        && self.current_step_contains_subworkflow(parent, &child.definition)
-                })
-                .map(|parent| parent.id.clone())
-                .collect();
-            let child_id = child.id.clone();
-            for parent_id in parents {
-                blocked.insert(parent_id.clone());
-                if let Err(error) = self.try_update_with_reason(
-                    &parent_id,
-                    "legacy_sub_workflow_ambiguous",
-                    |instance| {
-                        instance.status = InstanceStatus::Failed;
-                        instance.error = Some(format!(
-                            "restart refused to repeat sub_workflow child {child_id} without durable parent linkage"
-                        ));
-                        instance.completed_at = Some(Utc::now());
-                    },
-                ) {
-                    warn!(parent = %parent_id, child = %child_id, %error, "could not persist legacy sub-workflow parent failure; suppressing resume in this process");
-                    self.fail_recovery_in_memory(
-                        &parent_id,
-                        format!("legacy parent failure persistence failed: {error}"),
-                    );
-                }
+        for (parent_id, child_id) in links {
+            if !self
+                .status(&child_id)
+                .is_some_and(|child| child.status == InstanceStatus::Running)
+            {
+                continue;
             }
-            if child.status == InstanceStatus::Running {
-                if let Err(error) = self.try_update_with_reason(
+            if let Err(error) = self.try_update_with_reason(
+                &child_id,
+                "sub_workflow_parent_terminal",
+                |child| {
+                    child.status = InstanceStatus::Failed;
+                    child.error = Some(format!(
+                        "sub_workflow parent {parent_id} became terminal before rejoining this child"
+                    ));
+                    child.completed_at = Some(Utc::now());
+                },
+            ) {
+                warn!(parent = %parent_id, child = %child_id, %error, "could not persist linked sub-workflow child failure");
+                self.fail_recovery_in_memory(
                     &child_id,
-                    "legacy_sub_workflow_orphaned",
-                    |instance| {
-                        instance.status = InstanceStatus::Failed;
-                        instance.error = Some(
-                            "restart refused an unlinked legacy sub_workflow child; retry its parent deliberately"
-                                .into(),
-                        );
-                        instance.completed_at = Some(Utc::now());
-                    },
-                ) {
-                    warn!(child = %child_id, %error, "could not persist legacy sub-workflow child failure");
-                    self.fail_recovery_in_memory(
-                        &child_id,
-                        format!("legacy child failure persistence failed: {error}"),
-                    );
-                }
+                    format!("linked child failure persistence failed: {error}"),
+                );
             }
         }
-        blocked
-    }
-
-    fn current_step_contains_subworkflow(&self, instance: &Instance, child: &str) -> bool {
-        self.find_definition(&instance.definition, &instance.repo)
-            .and_then(|file| rk_workflow::load(&file, &instance.params))
-            .ok()
-            .and_then(|workflow| workflow.steps.get(instance.current_step).cloned())
-            .is_some_and(|step| step_contains_subworkflow(&step, child))
     }
 
     /// Resume the top-level running snapshots returned by [`rehydrate`](Self::rehydrate).
@@ -5843,23 +5799,6 @@ fn flatten_step(rows: &mut Vec<TimelineRow>, index: usize, depth: usize, step: &
             }
         }
         _ => {}
-    }
-}
-
-fn step_contains_subworkflow(step: &Step, child: &str) -> bool {
-    match step {
-        Step::SubWorkflow(sub) => sub.workflow == child,
-        Step::When(when) => when
-            .cases
-            .values()
-            .flat_map(|steps| steps.iter())
-            .chain(when.default.iter())
-            .any(|step| step_contains_subworkflow(step, child)),
-        Step::Repeat(repeat) => repeat
-            .steps
-            .iter()
-            .any(|step| step_contains_subworkflow(step, child)),
-        _ => false,
     }
 }
 
