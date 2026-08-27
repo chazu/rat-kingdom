@@ -56,6 +56,27 @@ pub struct ReopenArgs {
 }
 
 #[derive(Args)]
+pub struct DeliverArgs {
+    /// Ticket id whose work is already present on the target branch.
+    pub id: String,
+    /// Registered repository name or path.
+    #[arg(long)]
+    pub repo: String,
+    /// Commit to bind as the durable delivery fact.
+    #[arg(long)]
+    pub commit: String,
+    /// Local target branch which must contain the commit.
+    #[arg(long)]
+    pub target: String,
+    /// Human-readable evidence for the validation already performed.
+    #[arg(long)]
+    pub verification: String,
+    /// Optional source branch retained for provenance.
+    #[arg(long)]
+    pub source_branch: Option<String>,
+}
+
+#[derive(Args)]
 pub struct UpdateArgs {
     /// Ticket id (for example, TKT-01J...).
     pub id: String,
@@ -359,6 +380,33 @@ pub async fn reopen(layout: &Layout, args: ReopenArgs, as_json: bool) -> Result<
             "reopened {} — status {}",
             ticket["identity"].as_str().unwrap_or("?"),
             ticket["payload"]["status"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+pub async fn deliver(layout: &Layout, args: DeliverArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let mut params = json!({
+        "id": args.id,
+        "repo": args.repo,
+        "commit": args.commit,
+        "target": args.target,
+        "verification": args.verification,
+    });
+    if let Some(source_branch) = args.source_branch {
+        params["source_branch"] = json!(source_branch);
+    }
+    let result = client.call("ticket.deliver", params).await?;
+    if as_json {
+        println!("{result}");
+    } else if result["already_recorded"].as_bool() == Some(true) {
+        println!("delivery already recorded for {}", args.id);
+    } else {
+        println!(
+            "recorded manual delivery for {} at {}",
+            args.id,
+            result["delivery"]["merge_commit"].as_str().unwrap_or("?")
         );
     }
     Ok(())

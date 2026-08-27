@@ -545,6 +545,8 @@ enum TicketCommand {
     /// ticket update --status ...` can never do this: the state machine
     /// refuses `done -> in_progress` and any backwards move out of `closed`.
     Reopen(ticket_cmds::ReopenArgs),
+    /// Record externally landed work with content-bound git evidence.
+    Deliver(ticket_cmds::DeliverArgs),
 }
 
 #[derive(Subcommand)]
@@ -1697,6 +1699,7 @@ async fn main() -> Result<()> {
                 ticket_cmds::dep(&layout, id, dep, true, cli.json).await?
             }
             TicketCommand::Reopen(args) => ticket_cmds::reopen(&layout, args, cli.json).await?,
+            TicketCommand::Deliver(args) => ticket_cmds::deliver(&layout, args, cli.json).await?,
         },
     }
 
