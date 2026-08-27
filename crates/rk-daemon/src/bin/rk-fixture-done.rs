@@ -6,9 +6,9 @@
 //! declare done the way a real primed rat does: write the tuple, then let the
 //! harness report the turn.
 //!
-//! A fixture cannot do this from the test process. `Pattern::for_agent_since`
-//! bounds the lookup to a generation whose agent name does not exist until
-//! after the spawn, and a workflow `for_each` fan-out names its rats itself, so
+//! A fixture cannot do this from the test process. Exact tuple attribution
+//! requires the spawn id that does not exist until after dispatch, and a
+//! workflow `for_each` fan-out names its rats itself, so
 //! there is no point at which the test knows who to write it for. It has to
 //! come from inside the fake — which means a process on the far side of the
 //! daemon socket, which means a binary. `env!("CARGO_BIN_EXE_rk-fixture-done")`
@@ -65,15 +65,11 @@ async fn main() {
                 "identity": "task_done",
                 "payload": {
                     "task": env("RK_TASK"),
-                    // The field `Pattern::for_agent_since` searches for.
-                    // Everything else here is dressing.
+                    // Display identity; exact attribution uses `spawn` below.
                     "agent": env("RK_AGENT"),
-                    // `Pattern::for_spawn`'s join key (C1/S3a, docs/2026-08-17-
-                    // tkt-c1-generation-identity.md). Optional: only set once
-                    // the daemon mints RK_SPAWN (C6), so a fixture run against
-                    // an unmigrated daemon still falls back to the name+floor
-                    // predicate above instead of writing a null field.
-                    "spawn": std::env::var("RK_SPAWN").ok(),
+                    // Exact generation join key. Missing RK_SPAWN is a broken
+                    // fixture environment, never a name/time fallback.
+                    "spawn": env("RK_SPAWN"),
                     "branch": std::env::var("RK_BRANCH").ok(),
                     "summary": std::env::args().nth(1).unwrap_or_else(|| "done".into()),
                 },

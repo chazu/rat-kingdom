@@ -755,7 +755,7 @@ mod tests {
     ) -> AgentRecord {
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: harness.into(),
@@ -1246,22 +1246,15 @@ mod tests {
     }
 
     #[test]
-    fn run_id_stays_distinct_for_legacy_agents_sharing_a_creation_instant() {
-        // docs/2026-08-17-tkt-c1-generation-identity.md consumer F4: a
-        // pre-migration record (`spawn: None`) falls back to
-        // `SpawnId::synthetic_for(created_at)`, which has zero random bits —
-        // two such records minted in the same millisecond produce the SAME
-        // synthetic id. `inputs()` builds exactly that: "rat-1" and "rat-2"
-        // both carry `created_at: Utc.timestamp_opt(1_000, 0)`. The run id
-        // must still tell them apart, or this fixture (and any real fleet
-        // burst that lands two legacy rats in one millisecond) silently
-        // merges two distinct runs into one source.
+    fn run_id_stays_distinct_for_agents_sharing_a_creation_instant() {
+        // Exact spawn ids, not creation timestamps, distinguish simultaneous
+        // runs. `inputs()` gives rat-1 and rat-2 the same `created_at`.
         let at = Utc.timestamp_opt(2_000, 0).unwrap();
         let response = scorecards_response(&inputs(), &FactoryAnalyticsRequest::default(), at);
         assert_eq!(
             source_count(&response, "AgentRecord")["active_source_count"],
             json!(2),
-            "two same-instant legacy agents must not collapse into one run"
+            "two same-instant agents must not collapse into one run"
         );
     }
 

@@ -661,7 +661,7 @@ mod tests {
     fn agent(name: &str, task: Option<&str>, state: AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "worker".into(),
             coordination: None,
             harness: "claude".into(),

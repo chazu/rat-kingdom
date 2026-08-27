@@ -64,8 +64,8 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did the wo
 /// Stand up a fresh repo with an `origin` bare remote (the PR push target) and
 /// pr-on-approve.cue (harness rewired to fake) shipped into its repo-local
 /// workflows dir. Returns (working repo, bare origin). The working repo is
-/// intentionally NOT registered with the daemon, so its merge mode resolves to
-/// the default Direct — proving `open_pr` opens a PR regardless of policy.
+/// explicitly owns and activates a direct-delivery policy — proving `open_pr`
+/// opens a PR because the workflow requests it, not because of delivery mode.
 fn init_repo() -> (tempfile::TempDir, tempfile::TempDir) {
     let origin = tempfile::tempdir().unwrap();
     git(origin.path(), &["init", "--bare", "-b", "main"]);
@@ -79,6 +79,12 @@ fn init_repo() -> (tempfile::TempDir, tempfile::TempDir) {
         &["remote", "add", "origin", &origin.path().to_string_lossy()],
     );
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    std::fs::create_dir_all(repo_dir.path().join(".rk")).unwrap();
+    std::fs::write(
+        repo_dir.path().join(".rk/repo.cue"),
+        r#"repo: {delivery: {target: "main", mode: "merge", remote: "origin", remoteBranch: "{{branch}}", deleteSource: true}}"#,
+    )
+    .unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
     git(repo_dir.path(), &["push", "-u", "origin", "main"]);
@@ -176,6 +182,7 @@ async fn pr_on_approve_opens_pr_and_keeps_branch() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let (id, held_branch) = run_to_gate(&mut client, repo_dir.path(), "pr-me").await;
     assert!(
@@ -243,6 +250,7 @@ async fn pr_on_approve_rejection_opens_no_pr() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let (id, held_branch) = run_to_gate(&mut client, repo_dir.path(), "reject-me").await;
 

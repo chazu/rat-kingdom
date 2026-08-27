@@ -47,6 +47,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     support::install_passing_landing_checks(dir);
 }
 
@@ -127,6 +128,7 @@ async fn sub_workflow_runs_child_and_joins_its_result() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -204,6 +206,7 @@ async fn nested_sub_workflow_clears_its_link_only_with_the_top_level_cursor() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let started = client
         .call(
             "workflow.run",
@@ -262,6 +265,7 @@ async fn sub_workflow_cycle_fails_closed_at_depth_cap() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -343,6 +347,7 @@ async fn interrupted_sub_workflow_rejoins_the_same_durable_child_after_restart()
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     client
         .call(
             "workflow.run",
@@ -373,6 +378,7 @@ async fn interrupted_sub_workflow_rejoins_the_same_durable_child_after_restart()
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let children: Vec<_> = list["instances"]
@@ -404,6 +410,7 @@ async fn legacy_unlinked_running_child_fails_closed_instead_of_duplicating() {
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let started = client
         .call(
             "workflow.run",
@@ -446,6 +453,7 @@ async fn legacy_unlinked_running_child_fails_closed_instead_of_duplicating() {
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let instances = list["instances"].as_array().unwrap();
@@ -478,6 +486,7 @@ async fn legacy_unlinked_completed_child_fails_parent_closed_without_relaunch() 
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let started = client
         .call(
             "workflow.run",
@@ -517,6 +526,7 @@ async fn legacy_unlinked_completed_child_fails_parent_closed_without_relaunch() 
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let instances = list["instances"].as_array().unwrap();
@@ -548,6 +558,7 @@ async fn terminal_parent_does_not_shield_a_running_linked_child_from_recovery() 
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     client
         .call(
             "workflow.run",
@@ -581,6 +592,7 @@ async fn terminal_parent_does_not_shield_a_running_linked_child_from_recovery() 
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let child = list["instances"]
@@ -609,6 +621,7 @@ async fn mismatched_linked_child_is_failed_with_its_parent_instead_of_becoming_a
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     client
         .call(
             "workflow.run",
@@ -640,6 +653,7 @@ async fn mismatched_linked_child_is_failed_with_its_parent_instead_of_becoming_a
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let instances = list["instances"].as_array().unwrap();

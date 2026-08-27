@@ -82,6 +82,7 @@ fn init_repo(dir: &Path) -> String {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     support::install_passing_landing_checks(dir);
     let wf_dir = dir.join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
@@ -149,6 +150,7 @@ async fn wait_ignores_a_predecessors_harness_result() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // The registry is empty, so this is exactly the name the workflow's rat
     // will be given — the same collision archiving used to manufacture.
@@ -212,14 +214,9 @@ async fn wait_ignores_a_predecessors_harness_result() {
     );
 }
 
-/// Spawn-keyed twin of `wait_ignores_a_predecessors_harness_result`
-/// (docs/2026-08-17-tkt-c1-generation-identity.md §3G, G2). The test above
-/// proves the name+floor fallback (`Pattern::for_agent_since`) still works
-/// unchanged — that is the dual-key compat proof. This proves the stronger
-/// claim `Pattern::for_spawn` makes: even a namesake tuple planted AFTER the
-/// live rat's own floor (so the TKT-146 floor alone would NOT exclude it)
-/// cannot satisfy `wait` once the rat carries a minted `SpawnId`, because the
-/// planted tuple names a different generation's id.
+/// Exact-generation twin of `wait_ignores_a_predecessors_harness_result`.
+/// Even a namesake tuple planted after dispatch cannot satisfy `wait`: the
+/// planted tuple names a different spawn id.
 #[tokio::test]
 async fn wait_ignores_a_namesake_tuple_with_a_different_spawn_planted_after_the_floor() {
     let home = tempfile::tempdir().unwrap();
@@ -231,6 +228,7 @@ async fn wait_ignores_a_namesake_tuple_with_a_different_spawn_planted_after_the_
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let id = run_workflow(&mut client, repo_dir.path()).await;
 
@@ -314,6 +312,7 @@ async fn archiving_does_not_hand_a_name_to_the_next_workflow_rat() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // First generation: runs, completes, is dismissed by the workflow.
     let first_id = run_workflow(&mut client, repo_dir.path()).await;

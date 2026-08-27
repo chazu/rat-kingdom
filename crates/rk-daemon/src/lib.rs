@@ -539,7 +539,7 @@ mod tests {
             let now = chrono::Utc::now();
             AgentRecord {
                 name: name.into(),
-                spawn: None,
+                spawn: Some(rk_core::id::SpawnId::new()),
                 role: "rat".into(),
                 coordination: None,
                 harness: "fake".into(),
