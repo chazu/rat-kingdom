@@ -135,6 +135,7 @@ fn init_repo(repo: &Path) {
     std::fs::write(repo.join("README.md"), "# x\n").unwrap();
     let rk_dir = repo.join(".rk");
     std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(rk_dir.join("repo.cue"), "repo: {}\n").unwrap();
     // The stack-neutral landing checks must be COMMITTED: the dismiss-time
     // merge resolves them from the repository's own tree, not from the
     // uncommitted registry the test overwrites below.
@@ -201,6 +202,13 @@ async fn strip_rk_spawn_lets_a_nested_reviewer_write_its_own_verdict_artifact() 
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    client
+        .call(
+            "repo.add",
+            json!({"name": "review-binding-artifact", "path": repo_dir.path()}),
+        )
+        .await
+        .unwrap();
 
     // The "repo's own test suite" daemon: its own home, its own empty agent
     // registry. Both checks write here.

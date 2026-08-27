@@ -54,6 +54,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     install_passing_landing_checks(dir);
 }
 
@@ -80,6 +81,7 @@ async fn explicit_task_binds_a_recovery_branch_with_no_agent_record() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let ticket = client
         .call(
@@ -139,6 +141,7 @@ async fn explicit_task_must_name_an_existing_ticket() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let branch = recovery_branch(&repo, "rat/recovery-retry/tkt-y", "recovered.txt");
 
@@ -174,6 +177,7 @@ async fn explicit_task_must_match_the_repo_being_landed_into() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     // A real ticket, but scoped to a different repo entirely.
     let ticket = client
@@ -229,6 +233,7 @@ async fn explicit_task_disagreeing_with_a_real_agent_record_fails_closed() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let real_ticket = client
         .call(
@@ -324,6 +329,7 @@ async fn duplicate_submission_with_explicit_task_is_idempotent() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let ticket = client
         .call(
@@ -403,6 +409,7 @@ async fn resubmission_to_a_different_target_is_a_distinct_candidate() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let ticket = client
         .call(
@@ -491,6 +498,7 @@ async fn unbound_recovery_branch_without_task_fails_closed() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let branch = recovery_branch(&repo, "rat/recovery-retry/tkt-unbound", "recovered.txt");
 
@@ -532,6 +540,7 @@ async fn resubmission_with_a_different_task_fails_closed() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let first_ticket = client
         .call(
@@ -632,6 +641,7 @@ async fn force_landing_rejects_explicit_task() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let ticket = client
         .call(

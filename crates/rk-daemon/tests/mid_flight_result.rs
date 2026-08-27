@@ -11,7 +11,7 @@
 //! a workflow `wait` unblocked on "the full cargo test pass is still running",
 //! the `evaluate` behind it judged that text, and three steward reviewers whose
 //! APPROVE/REWORK landed in a later turn were read as having no verdict at all.
-//! The TKT-146 generation floor does not help — these are turns WITHIN one
+//! Exact spawn identity does not help — these are turns WITHIN one
 //! generation, milliseconds apart.
 //!
 //! The gate is in the supervisor rather than in the workflow `wait`, because
@@ -96,6 +96,7 @@ fn init_repo(dir: &Path) -> String {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     dir.file_name().unwrap().to_string_lossy().to_string()
 }
 
@@ -109,6 +110,7 @@ async fn start(task: &str) -> (tempfile::TempDir, tempfile::TempDir, Client, Str
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(

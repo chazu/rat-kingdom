@@ -116,20 +116,13 @@ rk repo show svc
 See [Repository work and delivery policy](repository-policy.md) for the full
 schema and other modes.
 
-### Fleet-wide default
+### Activation requirement
 
-A legacy repo registered **without** an activated `.rk/repo.cue` falls back to the daemon's
-`[policy] default_merge_mode` in `~/.rat-kingdom/config.toml`:
-
-```toml
-[policy]
-default_merge_mode = "direct"    # or "pr" — fleet-wide fallback for repos
-                                 # registered without a versioned policy.
-```
-
-Default is `direct`, so old registry files behave exactly as before. The legacy
-`rk repo add --merge-mode/--remote` flags remain available only when the repo
-has no `.rk/repo.cue`.
+Delivery mode and remote come only from the activated `.rk/repo.cue`. A
+registered repository without an activated policy is visible in `rk repo
+list`, but dispatch and delivery fail closed with an onboarding instruction.
+There is no fleet-wide merge-mode fallback and `rk repo add` has no
+merge-mode/remote compatibility flags.
 
 ---
 
@@ -254,13 +247,10 @@ fetch_timeout_secs = 30 # hard timeout so a stuck fetch cannot pin the sweep
 ## 6. Quick reference
 
 ```bash
-# switch a repo to PR mode (push + open PR instead of merging)
-rk repo add <path> --merge-mode pr [--remote <name>]
-rk repo show <name>            # merge / remote / host as recorded
-
-# fleet-wide default (config.toml)
-[policy]
-default_merge_mode = "pr"      # or "direct" (the default)
+# Set repo.delivery.mode: "pr" and repo.delivery.remote in .rk/repo.cue,
+# commit it, then validate and activate that exact digest:
+rk repo onboard start <path>
+rk repo show <name>
 ```
 
 | | Direct mode | PR mode |

@@ -285,8 +285,8 @@ fn daemon_home(workflow_cue: &str, supervisor_interval_secs: Option<u64>) -> tem
 /// past its trivial threshold, so a smaller diff would land straight through
 /// on a gate pass and never reach the review phase this test is about.
 ///
-/// `repo_policy_cue`, when `Some`, is committed as `.rk/repo.cue` alongside
-/// the checks — e.g. [`NO_REVIEW_DEATH_RETRY_POLICY`] to fence a dead
+/// `repo_policy_cue` overrides the minimal activated `.rk/repo.cue` committed
+/// alongside the checks — e.g. [`NO_REVIEW_DEATH_RETRY_POLICY`] fences a dead
 /// reviewer with one bounded escalation instead of a retry chain.
 fn candidate_repo(repo_policy_cue: Option<&str>) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -305,11 +305,12 @@ fn candidate_repo(repo_policy_cue: Option<&str>) -> (tempfile::TempDir, String) 
          {name: \"verify\", command: \"true\", timeout: \"30s\"},\n]\n",
     )
     .unwrap();
-    git(dir.path(), &["add", ".rk/checks.cue"]);
-    if let Some(policy) = repo_policy_cue {
-        std::fs::write(dir.path().join(".rk/repo.cue"), policy).unwrap();
-        git(dir.path(), &["add", ".rk/repo.cue"]);
-    }
+    std::fs::write(
+        dir.path().join(".rk/repo.cue"),
+        repo_policy_cue.unwrap_or("repo: {}\n"),
+    )
+    .unwrap();
+    git(dir.path(), &["add", ".rk/checks.cue", ".rk/repo.cue"]);
     git(
         dir.path(),
         &["commit", "-m", "test: register landing checks"],

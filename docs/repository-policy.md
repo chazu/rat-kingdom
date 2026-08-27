@@ -95,51 +95,25 @@ for forge review.
 
 ## Steward and trust
 
-Every completed rat's branch is triaged by a daemon-managed landing algorithm,
-the **steward**: a reviewer verdict (or, for a doc-only/trivial diff or a
-cache hit, no review at all) flows directly into delivery without a separate
-human gate, gated by the `landing` policy above plus the repo's real `verify`
-check. As of the steward remediation's Phase 3/4 cutover
-(`docs/reactor.md`, "Shipped reaction: the steward and the landing pipeline"),
-this triage runs two ways, and they are authorized differently:
+Every completed rat's branch may be triaged by the daemon-native landing
+pipeline when the repository's activated CUE triggers include an
+`action: "land"` match. That activated trigger is the unattended-landing
+authorization. The same activated policy supplies protected paths, diff
+budgets, timeouts, delivery mode, target, and the repository's named `verify`
+check. These checks are evaluated mechanically; they do not require an agent.
+A protected-path hit, an over-budget diff, or a failed/timed-out check holds
+the branch and surfaces attention instead of weakening the policy.
 
-- **Daemon-native landing pipeline (`action: "land"` trigger, live).**
-  `LandingPipeline` (`crates/rk-daemon/src/landing.rs`) calls
-  `Supervisor::land` directly — never through the workflow engine — so the
-  automated-landing exception described below (`automated_landing_workflows`,
-  `require_approval_for_landing`) **does not apply to it at all**. For a repo
-  whose installed triggers include an `action: "land"` entry, that trigger's
-  own existence and match predicate is the sole unattended-landing
-  authorization; the activated `landing` policy (protected paths, diff
-  budget, timeouts) is the only per-repo tuning available. This is the
-  intended end state, but narrowing/removing the two config fields below
-  (steward remediation Phase 4, item 4) is not yet done
-  (TKT-01M048ASY8MDB5DVV5VG3WRM47) — until then the fields keep working, but
-  only for the workflow-driven path.
-- **Workflow-driven mega-workflow (`run: "steward"` trigger, pre-cutover
-  reference).** The `land` workflow step this trigger's spawned instance
-  reaches is subject to the exception below, unchanged. This is the original
-  design; nothing installs it by default anymore, but it remains valid to run
-  instead of the daemon-native path (never both at once — see
-  `docs/reactor.md`).
+Workflow `land` and `open_pr` steps are a separate path. When
+`policy.require_approval_for_landing` is true they require a prior approved
+human gate, regardless of workflow name, and their target must match the
+activated repository policy. There is no workflow-name exception.
 
-### The `automated_landing_workflows` / `require_approval_for_landing` exception (workflow-driven path only)
+## Activation is mandatory
 
-Only the installed global workflow receives the configured automated-landing
-exception (`policy.automated_landing_workflows`, default `["steward"]`). A
-repository-local workflow with the same name cannot inherit that authority. A
-`land` step also checks `policy.require_approval_for_landing`, unless the
-workflow is in the exception list. `agent-base` authorizes the daemon-authored
-base for a managed steward run; a fixed target authorizes only that exact
-target. Manual workflows and explicit `open_pr` steps retain the normal
-approval and target-allowlist checks. Both fields are read only in
-`crates/rk-daemon/src/workflow_exec.rs`, so they have no effect on the
-daemon-native landing pipeline (see above).
-
-## Legacy registrations
-
-Repositories without `.rk/repo.cue` keep the previous registry behavior:
-`--merge-mode direct|pr`, `--remote`, and the daemon's
-`default_merge_mode`. Those flags are rejected when `.rk/repo.cue` exists so
-there cannot be two competing per-repository policies. Add the file through
-onboarding to migrate a legacy registration.
+A registered repository without an activated `.rk/repo.cue` remains visible
+to the operator but cannot dispatch or deliver work. Run `rk repo onboard
+start <path-or-name>` (or `rk repo add <path>` once the file is committed) to
+validate and activate the repository policy. Rat Kingdom does not translate
+legacy registry flags into live policy and does not fall back to a fleet-wide
+merge mode.
