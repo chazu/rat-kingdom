@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 rk-core.workspace = true
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+rusqlite = { workspace = true, features = ["functions"] }
 serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true
@@ -18,7 +18,7 @@ tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 rand = "0.8"
 

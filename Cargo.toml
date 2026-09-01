@@ -64,6 +64,8 @@ rand = "0.8"
 hex = "0.4"
 sha2 = "0.10"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

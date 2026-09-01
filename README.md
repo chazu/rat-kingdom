@@ -1169,6 +1169,12 @@ baseline. A toolchain bump may add lints over code that was clean when written
 — sweep those deliberately in one commit rather than folding them into an
 unrelated change.
 
+`Cargo.lock` is committed and CI builds with `--locked`, so every checkout
+resolves the same dependency graph. Adding or bumping a dependency means
+committing the lockfile change alongside the manifest edit (a plain `cargo
+build` rewrites it for you); a manifest that disagrees with the lockfile fails
+CI rather than quietly re-resolving on the runner.
+
 Crate map: `rk-core` (tuple model, config, priming), `rk-space` (tuplespace),
 `rk-git` (worktrees/merges), `rk-harness` (claude/codex/jcode/fake adapters),
 `rk-ledger` (pricing/budgets), `rk-workflow` (CUE definitions), `rk-sync`

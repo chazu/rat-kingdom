@@ -12,15 +12,15 @@ env:
 jobs:
   check:
     strategy:
-      # macOS is rk's actual runtime (single-operator laptop castle); it is
-      # the blocking signal. The ubuntu leg has never been green — it keeps
-      # surfacing platform assumptions (cue, tool probes) one layer at a
-      # time — so it runs advisory-only until the portability backlog is
-      # peeled (ticketed), and must not cancel the macOS leg.
+      # macOS is rk's actual runtime (single-operator laptop castle). The
+      # ubuntu leg ran advisory-only while it peeled platform assumptions
+      # (cue, tool probes) one layer at a time; by 2026-08 its only failures
+      # were the same test races the macOS leg hit, so both legs now block.
+      # `fail-fast: false` keeps one platform's failure from cancelling the
+      # other's run, which is the signal that tells the two kinds apart.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +36,12 @@ jobs:
           version: v0.12.0
       - name: fmt
         run: cargo fmt --all --check
+      # Cargo.lock is committed so every build — a contributor's, a rat's, a
+      # CI runner's — resolves the identical dependency graph. `--locked`
+      # turns a stale lockfile (a manifest edit without the matching
+      # `cargo update`) into a build error here rather than a silent re-resolve
+      # that only this runner sees.
       - name: clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
       - name: test
-        run: cargo test --workspace --no-fail-fast
+        run: cargo test --workspace --no-fail-fast --locked

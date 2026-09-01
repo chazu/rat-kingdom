@@ -17,7 +17,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 rk-daemon = { path = "../rk-daemon", features = ["test-fixtures"] }
-tempfile = "3"
+tempfile.workspace = true
 
 [lints]
 workspace = true

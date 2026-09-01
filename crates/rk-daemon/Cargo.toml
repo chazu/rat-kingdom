@@ -42,8 +42,8 @@ required-features = ["test-fixtures"]
 
 [dev-dependencies]
 rk-daemon = { path = ".", features = ["test-fixtures"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-tempfile = "3"
+rusqlite.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
