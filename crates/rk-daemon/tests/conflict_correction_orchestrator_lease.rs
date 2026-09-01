@@ -502,9 +502,16 @@ async fn conflict_correction_decision_and_lease_survive_a_genuine_daemon_restart
     let head_sha = branch_off_main(repo_dir.path());
     let layout = Layout::at(home.path());
     layout.ensure().unwrap();
-    let config = Config {
-        policy: allow(&["conflict-held-landing"]),
-        ..Config::default()
+    // `Daemon::new` honours the configured default harness, and
+    // `Config::default()` names `claude` — a binary a CI runner does not
+    // have, which turned the correction dispatch below into an ENOENT
+    // refusal. Every other daemon in this file comes from
+    // `Daemon::new_in_memory`, whose default harness is already `fake`.
+    let config = {
+        let mut c = Config::default();
+        c.harness.default = "fake".into();
+        c.policy = allow(&["conflict-held-landing"]);
+        c
     };
     let repo = repo_name_of(repo_dir.path());
     let repo = repo.as_str();

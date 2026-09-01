@@ -119,6 +119,23 @@ async fn harness_result_events(client: &mut Client, repo: &str, agent: &str) -> 
         .collect()
 }
 
+/// `reconcile_task_done` flips the registry to `Completed` (what
+/// `wait_for_state` observes) BEFORE `route_completion` publishes the
+/// `harness_result`, so a one-shot scan right after the state flip can see
+/// zero events. Poll until at least one is visible, then let a short grace
+/// window pass so a duplicate would also have had time to appear, and return
+/// everything visible for the caller's exact-count assertion.
+async fn settled_harness_result_events(client: &mut Client, repo: &str, agent: &str) -> Vec<Value> {
+    for _ in 0..200 {
+        if !harness_result_events(client, repo, agent).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            return harness_result_events(client, repo, agent).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Vec::new()
+}
+
 async fn late_evidence_artifacts(client: &mut Client, repo: &str, agent: &str) -> Vec<Value> {
     let res = client
         .call(
@@ -245,7 +262,7 @@ async fn task_done_wins_and_a_later_budget_check_cannot_overwrite_it() {
         "a durably-accepted task_done must complete the generation on its own"
     );
 
-    let events = harness_result_events(&mut client, &repo_name, &name).await;
+    let events = settled_harness_result_events(&mut client, &repo_name, &name).await;
     assert_eq!(
         events.len(),
         1,
@@ -543,7 +560,7 @@ async fn restart_mid_reconcile_barrier_still_completes_the_generation() {
         state, "completed",
         "the generation must converge to Completed on the successor daemon"
     );
-    let events = harness_result_events(&mut client, &repo_name, &name).await;
+    let events = settled_harness_result_events(&mut client, &repo_name, &name).await;
     assert_eq!(
         events.len(),
         1,

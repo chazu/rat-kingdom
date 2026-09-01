@@ -10395,6 +10395,22 @@ mod respawn_tests {
         );
     }
 
+    /// Occupy `repo`'s implementation lane with a durable live record instead
+    /// of a spawned fake. The default fake script exits almost at once, and
+    /// on a loaded runner its completion (which frees the lane) can land
+    /// before the next `spawn_async`'s admission check — so a test that
+    /// expects that spawn to be REFUSED sees it admitted instead. A record
+    /// inserted directly stays `Running` until the test itself settles it,
+    /// exactly as `implementation_lane_occupancy_survives_a_restart` does.
+    fn occupy_lane(sup: &Supervisor, repo: &Path, repo_name: &str, name: &str) -> AgentRecord {
+        let mut live = record(repo, Some("main"));
+        live.name = name.into();
+        live.repo_name = repo_name.into();
+        live.state = AgentState::Running;
+        sup.lock_registry().insert(live.clone()).unwrap();
+        live
+    }
+
     /// A saturated implementation lane must never starve the review lane for
     /// the SAME repository — they are independent counters
     /// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2's core "implementation admission
@@ -10407,13 +10423,9 @@ mod respawn_tests {
         let repo_name = Repo::discover(repo.path()).unwrap().name();
         let sup = supervisor(home.path());
         sup.set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
-        sup.set_review_admission_limits(0, HashMap::from([(repo_name, 1)]));
+        sup.set_review_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
 
-        let occupying = sup
-            .spawn_async(spawn_params(repo.path(), "impl-occupying"), 0)
-            .await
-            .unwrap();
-        assert!(occupying.state.is_live());
+        let _occupying = occupy_lane(&sup, repo.path(), &repo_name, "impl-occupying");
         let overflow = sup
             .spawn_async(spawn_params(repo.path(), "impl-overflow"), 0)
             .await;
@@ -10480,13 +10492,9 @@ mod respawn_tests {
         init_repo(repo.path());
         let repo_name = Repo::discover(repo.path()).unwrap().name();
         let sup = supervisor(home.path());
-        sup.set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
+        sup.set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
 
-        let occupying = sup
-            .spawn_async(spawn_params(repo.path(), "occupying"), 0)
-            .await
-            .unwrap();
-        assert!(occupying.state.is_live());
+        let occupying = occupy_lane(&sup, repo.path(), &repo_name, "occupying");
 
         // Two DISTINCT logical requests, both refused while the lane is full —
         // "first-in-line" strictly before "second-in-line" is queued.
@@ -10525,9 +10533,12 @@ mod respawn_tests {
             "the longest-waiting request must be admitted once a slot frees: {first_retry:?}"
         );
 
-        // With the first now occupying the lane's only slot again, the second
-        // waiter is STILL refused — proving the first retry didn't leave the
-        // second's queue position stale/skipped.
+        // With the lane full again, the second waiter is STILL refused —
+        // proving the first retry didn't leave the second's queue position
+        // stale/skipped. The admitted first's fake exits almost at once and
+        // would free the slot underneath this check, so hold the lane full
+        // with a durable occupant rather than relying on the first's liveness.
+        let _held = occupy_lane(&sup, repo.path(), &repo_name, "occupying-again");
         let second_again = sup.spawn_async(second_params, 0).await;
         assert!(matches!(
             &second_again,
@@ -10550,10 +10561,7 @@ mod respawn_tests {
         let before_restart = supervisor(home.path());
         before_restart
             .set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
-        let occupying = before_restart
-            .spawn_async(spawn_params(repo.path(), "occupying"), 0)
-            .await
-            .unwrap();
+        let occupying = occupy_lane(&before_restart, repo.path(), &repo_name, "occupying");
         let queued_params = spawn_params(repo.path(), "queued-before-restart");
         let refusal = before_restart.spawn_async(queued_params.clone(), 0).await;
         assert!(matches!(
@@ -10601,17 +10609,23 @@ mod respawn_tests {
     async fn implementation_lane_refuses_admission_rather_than_silently_lose_durable_queue_order() {
         use std::os::unix::fs::PermissionsExt;
 
+        // The forced failure below is a directory-permission denial, which
+        // root is exempt from: inside a root container the persist succeeds
+        // and the "fail closed" half of the test cannot be exercised at all.
+        // SAFETY: `geteuid` reads a process attribute and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, directory permissions do not deny writes");
+            return;
+        }
+
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
         let repo_name = Repo::discover(repo.path()).unwrap().name();
         let sup = supervisor(home.path());
-        sup.set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
+        sup.set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
 
-        let occupying = sup
-            .spawn_async(spawn_params(repo.path(), "occupying"), 0)
-            .await
-            .unwrap();
+        let occupying = occupy_lane(&sup, repo.path(), &repo_name, "occupying");
         let waiter_params = spawn_params(repo.path(), "waiter");
         let refusal = sup.spawn_async(waiter_params.clone(), 0).await;
         assert!(matches!(

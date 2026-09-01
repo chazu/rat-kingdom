@@ -402,8 +402,7 @@ async fn reap_git_leaves_a_dirty_worktree_standing() {
     let name = spawn(&mut client, repo_dir.path(), "dirty-1", json!({})).await;
     wait_for_state(&mut client, &name, "completed").await;
 
-    let agents = list(&mut client, json!({})).await;
-    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let rec = wait_for_list_record(&mut client, &name).await;
     let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
     assert!(worktree.exists());
     assert!(
@@ -645,8 +644,7 @@ async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
     .await;
     wait_for_state(&mut client, &name, "completed").await;
 
-    let agents = list(&mut client, json!({})).await;
-    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let rec = wait_for_list_record(&mut client, &name).await;
     let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
 
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
@@ -707,8 +705,7 @@ async fn periodic_sweep_reaps_nothing_for_a_repo_with_no_declared_artifact_paths
     .await;
     wait_for_state(&mut client, &name, "completed").await;
 
-    let agents = list(&mut client, json!({})).await;
-    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let rec = wait_for_list_record(&mut client, &name).await;
     let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
 
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
