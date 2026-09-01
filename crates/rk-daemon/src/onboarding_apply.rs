@@ -13,11 +13,11 @@ use crate::onboarding_proposals::{
 };
 use crate::onboarding_sessions::OnboardingSession;
 use chrono::Utc;
+use rk_git::plumbing::{git_ok, git_output, git_text, git_with_stdin};
 use rk_workflow::{Check, CheckEnvironmentPolicy};
 use sha2::{Digest, Sha256};
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 const CHECKS_TARGET: &str = ".rk/checks.cue";
@@ -501,69 +501,6 @@ fn require_only_target(paths: &[String], target: &str) -> rk_core::Result<()> {
                 paths.join(", ")
             }
         )))
-    }
-}
-
-fn git_output(worktree: &Path, args: &[&str]) -> rk_core::Result<Output> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(rk_core::Error::other(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            output_detail(&output)
-        )))
-    }
-}
-
-fn git_ok(worktree: &Path, args: &[&str]) -> rk_core::Result<()> {
-    git_output(worktree, args).map(|_| ())
-}
-
-fn git_text(worktree: &Path, args: &[&str]) -> rk_core::Result<String> {
-    let output = git_output(worktree, args)?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn git_with_stdin(worktree: &Path, args: &[&str], input: &str) -> rk_core::Result<()> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| rk_core::Error::other("git apply stdin was not piped"))?
-        .write_all(input.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(rk_core::Error::other(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            output_detail(&output)
-        )))
-    }
-}
-
-fn output_detail(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    } else {
-        stderr
     }
 }
 

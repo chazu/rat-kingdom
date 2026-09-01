@@ -16,9 +16,9 @@ use crate::onboarding_sessions::{
     OnboardingSessionState,
 };
 use chrono::Utc;
+use rk_git::plumbing::{git_ok, git_output, git_succeeds, git_text};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::process::{Command, Output};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationContract {
@@ -272,50 +272,11 @@ fn require_clean(path: &Path) -> rk_core::Result<()> {
 }
 
 fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .env("LC_ALL", "C")
-        .status()
-        .is_ok_and(|status| status.success())
+    git_succeeds(path, &["merge-base", "--is-ancestor", ancestor, descendant])
 }
 
 fn file_digest(path: &Path) -> rk_core::Result<String> {
     let bytes = std::fs::read(path)
         .map_err(|error| rk_core::Error::other(format!("read {}: {error}", path.display())))?;
     Ok(hex::encode(Sha256::digest(bytes)))
-}
-
-fn git_ok(path: &Path, args: &[&str]) -> rk_core::Result<()> {
-    git_output(path, args).map(|_| ())
-}
-
-fn git_text(path: &Path, args: &[&str]) -> rk_core::Result<String> {
-    let output = git_output(path, args)?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn git_output(path: &Path, args: &[&str]) -> rk_core::Result<Output> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        } else {
-            stderr
-        };
-        Err(rk_core::Error::other(format!(
-            "git {} failed in {}: {detail}",
-            args.join(" "),
-            path.display()
-        )))
-    }
 }

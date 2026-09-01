@@ -16,6 +16,28 @@ daemon **reactor** as the keystone. Most of the work below was delivered by the
 fleet reviewing and merging *itself* through the steward loop (see _How this was
 built_).
 
+### Build, CI, and test hygiene (2026-09-01)
+
+- **Committed `Cargo.lock`; CI builds `--locked`** — the workspace ships three
+  binaries but never pinned its dependency graph, so every fresh checkout and
+  CI runner re-resolved transitive crates on its own. The lockfile is now
+  versioned, `tempfile`/`rusqlite` moved into `[workspace.dependencies]` so a
+  version lives in one place, and CI fails a manifest edit that arrives
+  without its lockfile change.
+- **`main` CI green again** — every push since 2026-08-19 had failed on four
+  tests: the conflict-correction restart test built a real `Daemon::new` with
+  `Config::default()`'s `claude` harness (ENOENT on any runner without it);
+  the implementation-lane tests occupied a lane with a fake spawn that exits
+  almost immediately, freeing the slot before the next admission check on a
+  loaded runner (now a durable synthetic occupant, matching the restart test);
+  and two restart/sweep tests one-shot-read `agent.list`/`harness_result`
+  right after `agent.status` flipped, ahead of the write that follows it (now
+  polled). The ubuntu leg, advisory since it was added, blocks like macOS.
+- **`rk_git::plumbing`** — one success-checked `git_output`/`git_text`/
+  `git_ok`/`git_succeeds`/`git_with_stdin` for callers that need a raw git
+  command in a directory, replacing the three private near-copies the
+  onboarding apply/activation modules carried with different error text.
+
 ### Removed
 
 - **`axe` harness adapter** — deleted (`rk-harness/src/axe.rs`, the `axe` arm of

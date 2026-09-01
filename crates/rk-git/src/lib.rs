@@ -2,6 +2,8 @@
 //! merge on dismiss. Shells out to system `git` — proven semantics, and the
 //! same binary humans use when they inspect what the rats did.
 
+pub mod plumbing;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
