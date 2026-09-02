@@ -44,8 +44,16 @@ registered generation and makes interrupted work replayable to a later spawn.
 6. The King acts through ordinary RK commands. Existing authority policy,
    allowlists, rate caps, approval gates, and lease generations remain the
    authority boundary.
-7. `rk king resolve` or `rk king defer` settles the envelope. An unchanged
-   settled digest is suppressed; a changed state creates a new wake.
+   A ready ticket's `ready-for-agent` label is the explicit unattended-dispatch
+   grant: after a current policy, dependency, budget, resource, and WIP re-read,
+   the King may pass that ticket to `rk spawn --ticket`. An unlabeled ready
+   ticket remains operator-visible but does not independently authorize the
+   King to spend or mutate its repository. Continuous drain remains the
+   separate opt-in for refilling from the whole eligible backlog.
+7. `rk king resolve` or `rk king defer` settles the envelope. The King must not
+   resolve while a labeled, authorized ready ticket can safely use available
+   WIP; it either dispatches the ticket or defers at a named concrete gate. An
+   unchanged settled digest is suppressed; a changed state creates a new wake.
 
 Wake delivery is at least once. Claiming is idempotent for the registered
 holder, and a terminal restarted in the same pane does not inherit the old
@@ -111,5 +119,7 @@ retention is an optimization rather than a correctness dependency.
   the relevant RK resource and pass its own current policy/lease checks.
 - `ready_frontier.truncated` and its `rk ticket ready` command make that
   re-read boundary explicit; the wake never becomes a second ticket store.
+- `ready-for-agent` is an unattended-dispatch grant, not a waiver: normal
+  admission, repository, budget, WIP, and delivery policy still applies.
 - The King is privileged local operator infrastructure. Registering its pane
   and enabling `[king]` are explicit human configuration actions.

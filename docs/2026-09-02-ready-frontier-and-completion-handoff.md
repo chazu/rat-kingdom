@@ -1,7 +1,7 @@
 # Ready frontier and completion handoff
 
-*Status: implemented from the Glossolalia foreign-tenant pilot; activation is
-pending a separately requested install and daemon rollover.*
+*Status: implemented and activated from the Glossolalia foreign-tenant pilot;
+the post-rollover canary added the explicit ready-for-agent dispatch contract.*
 
 ## Evidence
 
@@ -27,6 +27,15 @@ The King remains the LLM operator delegate. This change does **not** grant the
 daemon new dispatch authority. Continuous drain remains the existing explicit
 opt-in for automatic WIP-targeted dispatch; a King wake remains notification
 that causes the King to re-read and act through ordinary RK commands.
+
+The post-rollover canary made the authority boundary more precise. `open` plus
+dependency satisfaction means a ticket is technically ready, but does not by
+itself authorize unattended spend across every registered repository. The
+`ready-for-agent` label is the explicit King dispatch grant. A King must re-read
+that labeled ticket and the ordinary dependency, repository, budget, resource,
+and WIP gates, then dispatch it or defer at a named concrete gate. Unlabeled
+ready work remains visible for interactive operator selection. This preserves
+the distinction between a registered operator delegate and continuous drain.
 
 Replace the shallow global `tickets.ready(None)?.take(20)` projection with one
 ready-frontier module whose interface returns:
@@ -54,6 +63,8 @@ still tells the King to re-read the native ticket/work projection.
 5. The payload stays bounded; native ticket/work RPCs remain authoritative.
 6. No ready transition directly spawns a rat unless continuous drain is
    explicitly enabled.
+7. A King dispatch requires `ready-for-agent`; the label never bypasses an
+   ordinary admission or delivery gate.
 
 ### Rejected alternatives
 

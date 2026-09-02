@@ -136,6 +136,24 @@ conversation.
 - `rk spawn --task <id> --prompt \"...\" --repo <name>` — dispatch ad hoc work.
 - Options: `--role rat|reviewer`, `--harness`, `--model`, `--base <branch>`, `--attach`.
 
+## King wake dispatch contract
+- A ready ticket labeled `ready-for-agent` is authorized unattended work. On a
+  King wake, re-read it with `rk ticket show`, confirm its dependencies, repo
+  policy, budget, and current WIP still permit dispatch, then use `rk spawn
+  --ticket`. The label grants dispatch authority, not permission to waive any
+  ordinary admission or delivery gate.
+- Ready tickets without `ready-for-agent` are candidates for an interactive
+  operator, not implicit permission for the King to spend or mutate a repo.
+  Continuous drain remains the separate explicit opt-in that refills from the
+  whole eligible backlog.
+- The wake's ready frontier is bounded. Inspect its fair representatives first;
+  when it is truncated, use its `rk ticket ready` command and filter for
+  `ready-for-agent` rather than treating the first repository's backlog as the
+  whole queue.
+- Do not resolve a King wake while authorized ready work and safe WIP capacity
+  remain unaddressed. Dispatch it, or defer the wake only for a concrete human,
+  policy, budget, resource, or dependency gate and name that gate.
+
 ## Watching and steering
 - `rk list` — the fleet (state, tokens, cost) · `rk status <name>` — one rat.
 - `rk log <name>` — a rat's transcript (prose, tool calls, retries); `--follow` to stream.
@@ -1450,6 +1468,9 @@ mod tests {
         assert!(text.contains("operator of a rat kingdom"));
         assert!(text.contains("rk spawn --ticket"));
         assert!(text.contains("rk ticket ready"));
+        assert!(text.contains("ready ticket labeled `ready-for-agent` is authorized"));
+        assert!(text.contains("Do not resolve a King wake while authorized ready work"));
+        assert!(text.contains("not implicit permission for the King"));
         // The operator is not a single-task worker and never reports completion.
         assert!(!text.contains("only your task"));
         assert!(!text.contains("MANDATORY final step"));
