@@ -2233,7 +2233,7 @@ impl LandingPipeline {
                 .advance_target(&entry, entry.keep_branch, &candidate)
                 .await?
             {
-                TargetAdvance::Landed(result) => self.finalize_landed(&entry, result).await,
+                TargetAdvance::Landed(result) => self.finalize_landed(&entry, result).await?,
                 TargetAdvance::Stale(result) => {
                     return self.requeue_stale(&entry, &git_repo, &candidate, &result);
                 }
@@ -2322,6 +2322,9 @@ impl LandingPipeline {
         }
 
         let repo = rk_git::Repo::discover(Path::new(&entries[0].repo_path))?;
+        if let Some(recovered) = self.recover_completed_batch(&entries, &repo).await? {
+            return Ok(recovered);
+        }
         let gates = self.gate_config(&repo)?;
 
         let branch_names: Vec<String> = entries.iter().map(|e| e.branch.clone()).collect();
@@ -2451,11 +2454,90 @@ impl LandingPipeline {
 
         let mut outcomes = Vec::with_capacity(entries.len());
         for entry in entries {
-            let outcome = self.finalize_landed(&entry, result.clone()).await;
+            let outcome = self.finalize_landed(&entry, result.clone()).await?;
             self.mark_processed(&entry, &outcome)?;
             outcomes.push((entry, outcome));
         }
         Ok(outcomes)
+    }
+
+    /// Batch counterpart to [`Self::recover_completed_land`]. Batch landing
+    /// advances one shared prepared commit and only then finalizes each member;
+    /// after a crash or retry, running gates/CAS again would misclassify that
+    /// already-landed commit as stale. Recover straight from the durable
+    /// `Landing` rows whenever their exact shared candidate is contained in
+    /// the target.
+    async fn recover_completed_batch(
+        &self,
+        entries: &[LandingQueueEntry],
+        repo: &rk_git::Repo,
+    ) -> rk_core::Result<Option<Vec<(LandingQueueEntry, LandingOutcome)>>> {
+        if entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| entry.status != LandingEntryStatus::Landing)
+        {
+            return Ok(None);
+        }
+        let Some(commit) = entries[0].candidate_sha.as_deref() else {
+            return Ok(None);
+        };
+        let Some(base) = entries[0].candidate_base.as_deref() else {
+            return Ok(None);
+        };
+        if entries.iter().any(|entry| {
+            entry.candidate_sha.as_deref() != Some(commit)
+                || entry.candidate_base.as_deref() != Some(base)
+        }) || !repo.is_ancestor(commit, &entries[0].target)
+        {
+            return Ok(None);
+        }
+
+        let policy = self.supervisor.repository_policy(repo)?;
+        let mut all_deleted = true;
+        if policy.delivery.delete_source {
+            for entry in entries {
+                if entry.keep_branch {
+                    all_deleted = false;
+                    continue;
+                }
+                if repo.branch_exists(&entry.branch) && repo.delete_branch(&entry.branch).is_err() {
+                    all_deleted = false;
+                }
+            }
+        } else {
+            all_deleted = false;
+        }
+
+        let result = json!({
+            "branch": entries[0].branch,
+            "target": entries[0].target,
+            "delivered": true,
+            "merged": true,
+            "merge_commit": commit,
+            "content_free": commit == base,
+            "recovered": true,
+            "branch_deleted": all_deleted,
+            "batch_branches": entries.iter().map(|entry| entry.branch.clone()).collect::<Vec<_>>(),
+            "batch_size": entries.len(),
+        });
+        let mut outcomes = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(marker) = self.admission_marker(entry)? {
+                let prior = marker
+                    .payload
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                outcomes.push((entry.clone(), LandingOutcome::Reconciled(prior)));
+                continue;
+            }
+            let outcome = self.finalize_landed(entry, result.clone()).await?;
+            self.mark_processed(entry, &outcome)?;
+            outcomes.push((entry.clone(), outcome));
+        }
+        Ok(Some(outcomes))
     }
 
     async fn bisect_batch(
@@ -3270,7 +3352,7 @@ impl LandingPipeline {
                     .advance_target(entry, entry.keep_branch, candidate)
                     .await?
                 {
-                    TargetAdvance::Landed(result) => Ok(self.finalize_landed(entry, result).await),
+                    TargetAdvance::Landed(result) => self.finalize_landed(entry, result).await,
                     TargetAdvance::Stale(result) => {
                         self.requeue_stale(entry, git_repo, candidate, &result)
                     }
@@ -4215,9 +4297,13 @@ impl LandingPipeline {
     /// The sole successful-land finalization transition. Delivery facts,
     /// generation-fenced ticket closure, and the terminal landing outcome
     /// cannot drift apart because all successful paths pass through here.
-    async fn finalize_landed(&self, entry: &LandingQueueEntry, result: Value) -> LandingOutcome {
-        self.record_delivery(entry, &result).await;
-        LandingOutcome::Landed(result)
+    async fn finalize_landed(
+        &self,
+        entry: &LandingQueueEntry,
+        result: Value,
+    ) -> rk_core::Result<LandingOutcome> {
+        self.record_delivery(entry, &result).await?;
+        Ok(LandingOutcome::Landed(result))
     }
 
     /// Write the durable delivery record onto `entry`'s ticket and close it
@@ -4230,28 +4316,33 @@ impl LandingPipeline {
     /// Skipped — deliberately, not as an error — when the merge produced no
     /// merge commit (`merged: false`, a conflict the queue will surface) or
     /// when the branch was `content_free` (an empty branch is not a delivery).
-    /// Best-effort: the merge already happened and is durable in git, so a
-    /// failure to annotate the ticket is logged and never turned into a
-    /// landing failure that would strand the queue entry.
+    /// The merge already happened and is durable in git, so a failure here is
+    /// propagated specifically to KEEP the durable `Landing` queue entry. A
+    /// later pass recovers from that receipt and retries this idempotent
+    /// finalization instead of marking an incomplete delivery processed.
     ///
     /// Stack-neutral by construction: the record is a merge commit sha plus
     /// the branch and target it landed on. No build tooling is consulted and
     /// no language convention is assumed.
-    async fn record_delivery(&self, entry: &LandingQueueEntry, result: &Value) {
+    async fn record_delivery(
+        &self,
+        entry: &LandingQueueEntry,
+        result: &Value,
+    ) -> rk_core::Result<()> {
         if result.get("content_free").and_then(Value::as_bool) == Some(true) {
             info!(
                 task = %entry.task,
                 branch = %entry.branch,
                 "land added nothing over target; not recording a delivery"
             );
-            return;
+            return Ok(());
         }
         let Some(merge_commit) = result
             .get("merge_commit")
             .and_then(Value::as_str)
             .filter(|c| !c.is_empty())
         else {
-            return;
+            return Ok(());
         };
         // A non-ticket candidate (a bare named-branch land the reactor picked
         // up with no `--task`) still owns an agent generation whose merge
@@ -4276,7 +4367,7 @@ impl LandingPipeline {
                     .ended_at(landed_at),
             );
         }
-        match self
+        if let Err(error) = self
             .supervisor
             .finalize_delivery(
                 std::path::Path::new(&entry.repo_path),
@@ -4287,15 +4378,13 @@ impl LandingPipeline {
             )
             .await
         {
-            Ok(_) => {
-                info!(task = %entry.task, merge_commit, target = %entry.target, "recorded delivery")
-            }
-            Err(e) => {
-                warn!(task = %entry.task, merge_commit, error = %e, "landed but failed to finalize delivery")
-            }
+            self.note_finalization_failure(entry, merge_commit, &error);
+            warn!(task = %entry.task, merge_commit, error = %error, "landed but failed to finalize delivery; retaining landing receipt for replay");
+            return Err(error);
         }
+        info!(task = %entry.task, merge_commit, target = %entry.target, "recorded delivery");
         if !is_ticket {
-            return;
+            return Ok(());
         }
         if let Err(error) = self.resubmit_reworked_parent(entry) {
             // The merge is durable; surface bookkeeping failure without denying it.
@@ -4333,6 +4422,54 @@ impl LandingPipeline {
                 "conflict correction landed but parent resubmission failed"
             );
         }
+        Ok(())
+    }
+
+    /// Visibility for a retryable post-merge bookkeeping failure. The queue
+    /// entry remains the authority; this event is deduplicated evidence for
+    /// operators and `rk work`, not a second recovery ledger.
+    fn note_finalization_failure(
+        &self,
+        entry: &LandingQueueEntry,
+        merge_commit: &str,
+        error: &rk_core::Error,
+    ) {
+        const IDENTITY: &str = "landing_finalization_failed";
+        let prior = self
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .scope(&entry.repo_name)
+                    .identity(IDENTITY),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .any(|tuple| {
+                tuple.payload["task"] == entry.task && tuple.payload["merge_commit"] == merge_commit
+            });
+        if prior {
+            return;
+        }
+        let _ = self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                IDENTITY,
+                "daemon",
+                json!({
+                    "task": entry.task,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "merge_commit": merge_commit,
+                    "error": error.to_string(),
+                    "text": format!(
+                        "landing {} reached {} but delivery finalization failed: {error}",
+                        entry.branch, merge_commit
+                    ),
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        );
     }
 
     /// Recover after an APPROVE-authorized target advance but before delivery.
@@ -4352,7 +4489,7 @@ impl LandingPipeline {
         let (Some(commit), Some(base)) = (&entry.candidate_sha, &entry.candidate_base) else {
             return Ok(None);
         };
-        if repo.rev_parse(&entry.target)? != *commit {
+        if !repo.is_ancestor(commit, &entry.target) {
             return Ok(None);
         }
         let result = json!({
@@ -4360,7 +4497,7 @@ impl LandingPipeline {
             "merged": true, "merge_commit": commit, "content_free": commit == base,
             "recovered": true,
         });
-        let outcome = self.finalize_landed(entry, result).await;
+        let outcome = self.finalize_landed(entry, result).await?;
         self.mark_processed(entry, &outcome)?;
         Ok(Some(outcome))
     }
@@ -8663,6 +8800,170 @@ workflow: {
             events[0].payload["text"],
             "landing pipeline will land feature on non-main target base"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_finalization_retains_receipt_and_recovers_after_target_moves() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs/note.md"), "note\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: add note"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                // A missing ticket forces finalization to fail only after the
+                // prepared commit has durably advanced the target.
+                task: "TKT-missing-finalization-probe".into(),
+                keep_branch: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let error = pipeline.drain_key("docs-repo", "main").await.unwrap_err();
+        assert!(error.to_string().contains("no such ticket"), "{error}");
+        let retained = pipeline
+            .queue
+            .scan_current("docs-repo", Some("main"))
+            .unwrap();
+        assert_eq!(
+            retained.len(),
+            1,
+            "failed finalization must retain its receipt"
+        );
+        assert_eq!(retained[0].payload["status"], "landing");
+        assert!(pipeline
+            .processed_outcome(&LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                branch: "feature".into(),
+                head_sha: retained[0].payload["head_sha"].as_str().unwrap().into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_none());
+
+        // A later target commit must not erase the evidence that the exact
+        // prepared candidate already landed.
+        std::fs::write(repo_dir.path().join("later.txt"), "later\n").unwrap();
+        git(repo_dir.path(), &["add", "later.txt"]);
+        git(repo_dir.path(), &["commit", "-m", "chore: advance target"]);
+        let second = pipeline.drain_key("docs-repo", "main").await.unwrap_err();
+        assert!(second.to_string().contains("no such ticket"), "{second}");
+        assert_eq!(
+            pipeline
+                .queue
+                .scan_current("docs-repo", Some("main"))
+                .unwrap()
+                .len(),
+            1,
+            "ancestry recovery must keep retrying finalization, not mark the candidate empty"
+        );
+        assert_eq!(
+            space
+                .scan(
+                    &Pattern::category(Category::Event)
+                        .scope("docs-repo")
+                        .identity("landing_finalization_failed")
+                )
+                .unwrap()
+                .len(),
+            1,
+            "retries must deduplicate operator visibility"
+        );
+    }
+
+    #[tokio::test]
+    async fn landed_batch_recovers_without_gating_or_advancing_again() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        // If recovery accidentally returns to the gate path, this check fails.
+        write_checks(repo_dir.path(), VERIFY_FAILS_CHECKS);
+        for (branch, file) in [("feature-a", "a.md"), ("feature-b", "b.md")] {
+            git(repo_dir.path(), &["checkout", "main"]);
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::write(repo_dir.path().join(file), format!("{branch}\n")).unwrap();
+            git(repo_dir.path(), &["add", file]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+        }
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space);
+        for branch in ["feature-a", "feature-b"] {
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: "docs-repo".into(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: branch.into(),
+                    target: "main".into(),
+                    head_sha: rev_parse(repo_dir.path(), branch),
+                    diff_class: "doc-only".into(),
+                    task: format!("deliver-{branch}"),
+                    keep_branch: true,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let mut entries = pipeline.queue.claim_batch("docs-repo", "main", 8).unwrap();
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let branches = entries
+            .iter()
+            .map(|entry| entry.branch.clone())
+            .collect::<Vec<_>>();
+        let rk_git::PrepareOutcome::Prepared(candidate) =
+            repo.prepare_merge_batch(&branches, "main").unwrap()
+        else {
+            panic!("batch must prepare cleanly");
+        };
+        for entry in &mut entries {
+            entry.candidate_sha = Some(candidate.commit.clone());
+            entry.candidate_base = Some(candidate.base.clone());
+            entry.candidate_ref = Some(candidate.candidate_ref.clone());
+            entry.batch_branches = branches.clone();
+            pipeline
+                .queue
+                .persist(entry, LandingEntryStatus::Landing)
+                .unwrap();
+        }
+        let advanced = repo
+            .advance_target_to("main", &candidate.commit, &candidate.base)
+            .unwrap();
+        assert!(matches!(advanced, rk_git::AdvanceOutcome::Advanced { .. }));
+        std::fs::write(repo_dir.path().join("later.txt"), "later\n").unwrap();
+        git(repo_dir.path(), &["add", "later.txt"]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "chore: advance after batch"],
+        );
+
+        let outcomes = pipeline.drain_key("docs-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, LandingOutcome::Landed(_))));
+        assert!(pipeline
+            .queue
+            .scan_current("docs-repo", Some("main"))
+            .unwrap()
+            .is_empty());
     }
 
     /// TKT-01M0EHFDGZQDZM0CF4E04G6JKA: an approved candidate landing onto a

@@ -327,14 +327,17 @@ pub fn validate_role(role: &str) -> rk_core::Result<()> {
 /// Read-only roles are assessment-only. Their filesystem boundary is enforced
 /// by the harness rather than by prompt prose, and callers cannot override it.
 fn permission_mode(role: &str, harness: &str) -> rk_core::Result<String> {
-    if !forces_read_only_harness(role) {
-        return Ok(default_permission_mode(harness).into());
+    let profile = crate::capabilities::role_harness_profile(role, harness)?;
+    if let Some(mode) = profile.forced_permission_mode {
+        return Ok(mode.into());
     }
-    crate::read_only_roles::permission_mode(harness)
+    Ok(default_permission_mode(harness).into())
 }
 
 fn uses_harness_terminal_completion(role: &str, harness: &str) -> bool {
-    role == ONBOARDER_ROLE && harness == "jcode"
+    crate::capabilities::role_harness_profile(role, harness).is_ok_and(|profile| {
+        profile.completion == crate::capabilities::CompletionChannel::HarnessTerminal
+    })
 }
 
 fn is_reporting_boundary(record: &AgentRecord) -> bool {
@@ -1893,13 +1896,19 @@ impl Supervisor {
         // registry record to explain it, including a worktree or launch failure.
         let effective =
             effective_agent_config(&self.default_harness, &self.default_agent, &params)?;
+        let capability_profile =
+            crate::capabilities::role_harness_profile(&params.role, &effective.harness)?;
         let harness = make_harness(&effective.harness)?;
-        if params.attach && uses_harness_terminal_completion(&params.role, &effective.harness) {
-            return Err(rk_core::Error::other(
-                "jcode onboarding is headless-only: its restricted tool surface cannot run \
-                 `rk done`, so Rat Kingdom completes the assessment from jcode's one-shot \
-                 terminal event",
-            ));
+        if params.attach
+            && capability_profile.completion
+                == crate::capabilities::CompletionChannel::HarnessTerminal
+        {
+            return Err(rk_core::Error::other(format!(
+                "jcode {} is headless-only: its restricted tool surface cannot run `rk \
+                     done`, so Rat Kingdom completes the work from jcode's one-shot terminal \
+                     event",
+                params.role
+            )));
         }
 
         // Castle-wide circuit-breaker admission: a NEW launch for a provider
@@ -2389,10 +2398,16 @@ impl Supervisor {
             return Err(rk_core::Error::other(format!("{name} is still running")));
         }
         validate_role(&record.role)?;
-        if attach && uses_harness_terminal_completion(&record.role, &record.harness) {
-            return Err(rk_core::Error::other(
-                "jcode onboarding is headless-only: resume without `--attach`",
-            ));
+        let capability_profile =
+            crate::capabilities::role_harness_profile(&record.role, &record.harness)?;
+        if attach
+            && capability_profile.completion
+                == crate::capabilities::CompletionChannel::HarnessTerminal
+        {
+            return Err(rk_core::Error::other(format!(
+                "jcode {} is headless-only: resume without `--attach`",
+                record.role
+            )));
         }
         let (Some(worktree), Some(task)) = (record.worktree.clone(), record.task.clone()) else {
             return Err(rk_core::Error::other("record lacks worktree/task"));
@@ -2436,12 +2451,20 @@ impl Supervisor {
                 &record.harness,
             ),
         };
-        let resume_prompt = if uses_harness_terminal_completion(&record.role, &record.harness) {
+        let resume_prompt = if uses_harness_terminal_completion(&record.role, &record.harness)
+            && record.role == ONBOARDER_ROLE
+        {
             format!(
                 "Resume onboarding session {task}. Reassess the repository read-only, \
                  preserve the existing onboarding branch and session record, then return \
                  the final findings and stop. Do not edit or commit files and do not try \
                  to run `rk done`; the terminal response completes this assessment."
+            )
+        } else if uses_harness_terminal_completion(&record.role, &record.harness) {
+            format!(
+                "Resume diagnostic task {task}. Reassess the evidence read-only, return the \
+                 final diagnosis, then stop. Do not edit or commit files and do not try to run \
+                 `rk done`; the terminal response completes this diagnosis."
             )
         } else if record.role == ONBOARDER_ROLE {
             format!(
@@ -8309,11 +8332,16 @@ mod respawn_tests {
             "danger-full-access"
         );
         assert_eq!(permission_mode("groomer", "codex").unwrap(), "read-only");
+        let error = permission_mode("groomer", "jcode").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("evidence-bearing ticket closure"));
     }
 
     #[test]
-    fn only_jcode_onboarders_use_native_terminal_completion() {
+    fn restricted_jcode_reporters_use_native_terminal_completion() {
         assert!(uses_harness_terminal_completion("onboarder", "jcode"));
+        assert!(uses_harness_terminal_completion("diagnostician", "jcode"));
         assert!(!uses_harness_terminal_completion("rat", "jcode"));
         assert!(!uses_harness_terminal_completion("onboarder", "codex"));
 

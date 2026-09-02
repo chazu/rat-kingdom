@@ -63,26 +63,27 @@ pub fn forces_read_only_harness(role: &str) -> bool {
 /// harness we cannot prove confines to reading must not receive one of these
 /// agents at all.
 pub fn permission_mode(harness: &str) -> rk_core::Result<String> {
-    match harness {
-        "claude" => Ok("plan".into()),
-        "codex" | "fake" | "jcode" => Ok("read-only".into()),
-        other => Err(rk_core::Error::other(format!(
-            "harness {other:?} has no enforced read-only mode"
-        ))),
-    }
+    crate::capabilities::role_harness_profile(DIAGNOSTICIAN_ROLE, harness).map(|profile| {
+        profile
+            .forced_permission_mode
+            .expect("diagnostician always forces a permission mode")
+            .to_string()
+    })
 }
 
 /// Daemon-side allowlist. Everything not named here is refused, so a new
 /// mutating RPC is denied to read-only roles by default rather than by
 /// remembering to deny it.
 pub fn method_allowed(role: &str, req: &Request) -> bool {
-    match req.method.as_str() {
-        "ping" | "status" | "space.scan" | "space.rd" | "repo.list" | "repo.get"
-        | "agent.status" | "agent.log" | "agent.progress" => true,
+    let Some(policy) = crate::capabilities::method_policy(&req.method) else {
+        return false;
+    };
+    match policy.read_only {
+        crate::capabilities::ReadOnlyGrant::Always => true,
         // The one permitted write: declaring yourself finished. Narrowed to a
         // task_done event naming the caller, so it cannot carry a finding for
         // another instance or masquerade as another tuple category.
-        "space.out" => {
+        crate::capabilities::ReadOnlyGrant::SelfTaskDone => {
             req.params.get("category").and_then(Value::as_str) == Some("event")
                 && req.params.get("identity").and_then(Value::as_str) == Some("task_done")
                 && req
@@ -100,8 +101,8 @@ pub fn method_allowed(role: &str, req: &Request) -> bool {
         // Onboarding sessions own the assessment report the onboarder is
         // spawned to produce. Neither method mutates the repository: inspect
         // reads, and propose journals advice that still needs approval.
-        "repo.onboard.inspect" | "repo.onboard.propose" => role == ONBOARDER_ROLE,
-        _ => false,
+        crate::capabilities::ReadOnlyGrant::Onboarder => role == ONBOARDER_ROLE,
+        crate::capabilities::ReadOnlyGrant::None => false,
     }
 }
 

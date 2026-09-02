@@ -124,10 +124,25 @@ where
         .expect("convergence action task is present")
 }
 
-fn current_inbox_resolution(mut item: Value) -> Option<Value> {
-    let kind = item.get("kind")?.as_str()?;
-    let action = item.get("action")?.as_str()?;
-    let supported = match kind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentInboxClass {
+    Actionable,
+    DecisionRequired,
+    Stalled,
+}
+
+fn classify_current_inbox(mut item: Value) -> (CurrentInboxClass, Value) {
+    let kind = item
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let action = item
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let actionable = match kind.as_str() {
         "agent-failed" | "agent-orphaned" => action.starts_with("rk respawn "),
         // A transport outage still in automatic retry is diagnostic only;
         // the exhausted form's action changes to the bounded respawn command.
@@ -135,14 +150,34 @@ fn current_inbox_resolution(mut item: Value) -> Option<Value> {
         "recovery-action" => action.starts_with("rk inbox ack "),
         _ => false,
     };
-    if !supported {
-        return None;
+    let decision_required = kind == "workflow-gate" && action.contains('|');
+    if let Some(fields) = item.as_object_mut() {
+        fields.insert("source".into(), json!("inbox"));
+        if actionable {
+            if let Some(command) = fields.remove("action") {
+                fields.insert("command".into(), command);
+            }
+        } else if decision_required {
+            fields.insert(
+                "commands".into(),
+                json!(action
+                    .split('|')
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .collect::<Vec<_>>()),
+            );
+        }
     }
-    let fields = item.as_object_mut()?;
-    let command = fields.remove("action")?;
-    fields.insert("source".into(), json!("inbox"));
-    fields.insert("command".into(), command);
-    Some(item)
+    let class = if actionable {
+        CurrentInboxClass::Actionable
+    } else if decision_required {
+        CurrentInboxClass::DecisionRequired
+    } else {
+        // Exhaustive visibility is the point: a new or malformed inbox kind
+        // defaults to stalled instead of disappearing from `rk work`.
+        CurrentInboxClass::Stalled
+    };
+    (class, item)
 }
 
 /// Bound every leaf in a King pull/checkpoint. Counts alone are insufficient:
@@ -231,7 +266,7 @@ async fn convergence_action_panic_is_observed_without_panicking_the_scheduler() 
 
 #[cfg(test)]
 #[test]
-fn current_work_only_admits_single_supported_resolutions() {
+fn current_work_classifies_every_inbox_row_without_silent_drops() {
     let row = |kind: &str, action: &str| json!({"kind": kind, "action": action});
     for (kind, action) in [
         ("agent-failed", "rk respawn Tails"),
@@ -239,12 +274,13 @@ fn current_work_only_admits_single_supported_resolutions() {
         ("transport-outage", "rk respawn Tails"),
         ("recovery-action", "rk inbox ack 01M10ABC"),
     ] {
-        let current = current_inbox_resolution(row(kind, action)).unwrap();
+        let (class, current) = classify_current_inbox(row(kind, action));
+        assert_eq!(class, CurrentInboxClass::Actionable);
         assert_eq!(current["source"], "inbox");
         assert_eq!(current["command"], action);
         assert!(current.get("action").is_none());
     }
-    for (kind, action) in [
+    for (kind, action, expected) in [
         ("workflow-failed", "rk workflow status wf-1"),
         ("workflow-gate", "rk approve wf-1 | rk reject wf-1"),
         (
@@ -253,11 +289,19 @@ fn current_work_only_admits_single_supported_resolutions() {
         ),
         ("transport-outage", "rk status Tails"),
         ("landing-queue-stalled", "rk status --json"),
-    ] {
-        assert!(
-            current_inbox_resolution(row(kind, action)).is_none(),
-            "{kind} is diagnostic or unbounded, not one-command attention"
-        );
+    ]
+    .into_iter()
+    .map(|(kind, action)| {
+        let class = if kind == "workflow-gate" {
+            CurrentInboxClass::DecisionRequired
+        } else {
+            CurrentInboxClass::Stalled
+        };
+        (kind, action, class)
+    }) {
+        let (class, current) = classify_current_inbox(row(kind, action));
+        assert_eq!(class, expected, "{kind}");
+        assert_eq!(current["source"], "inbox");
     }
 }
 
@@ -272,9 +316,15 @@ async fn empty_current_work_has_exact_zero_counts_and_diagnostic_pointers() {
     assert_eq!(work["counts"]["live_agents"], 0);
     assert_eq!(work["counts"]["ready_tickets"], 0);
     assert_eq!(work["counts"]["attention"], 0);
+    assert_eq!(work["counts"]["actionable"], 0);
+    assert_eq!(work["counts"]["decision_required"], 0);
+    assert_eq!(work["counts"]["stalled"], 0);
     assert_eq!(work["live_agents"].as_array().unwrap().len(), 0);
     assert_eq!(work["ready_tickets"].as_array().unwrap().len(), 0);
     assert_eq!(work["attention"].as_array().unwrap().len(), 0);
+    assert_eq!(work["actionable"].as_array().unwrap().len(), 0);
+    assert_eq!(work["decision_required"].as_array().unwrap().len(), 0);
+    assert_eq!(work["stalled"].as_array().unwrap().len(), 0);
     assert_eq!(work["no_current_work"], true);
     assert_eq!(work["history_command"], "rk digest --since 1d");
     assert_eq!(work["diagnostics_command"], "rk top");
@@ -1978,97 +2028,24 @@ impl Daemon {
                 return (false, "invalid_role");
             }
         }
-        if !matches!(
-            req.method.as_str(),
-            "stop"
-                | "daemon.pause_dispatch"
-                | "daemon.resume_dispatch"
-                | "agent.spawn"
-                | "agent.respawn"
-                // Continuation of a parked post-commit recovery relaunches a
-                // harness against committed work, so it sits with spawn /
-                // respawn on the operator-only list. Deliberately NOT added to
-                // the foreman subset below: a foreman manages its own children's
-                // lifecycle, but deciding whether committed work is resumed,
-                // rerouted to another harness, or written off is an operator or
-                // policy call.
-                | "agent.continue_recovery"
-                | "agent.abandon_recovery"
-                | "agent.dismiss"
-                | "agent.interrupt"
-                | "agent.steer"
-                | "agent.archive"
-                | "agent.unarchive"
-                | "agent.revert"
-                | "repo.add"
-                | "repo.land"
-                | "repo.land.reenqueue"
-                | "repo.land.cancel_review"
-                | "repo.remove"
-                | "repo.onboard.start"
-                | "repo.onboard.propose"
-                | "repo.onboard.approve"
-                | "repo.onboard.decline"
-                | "repo.onboard.apply"
-                | "repo.onboard.activate"
-                | "repo.onboard.decline_activation"
-                | "repo.onboard.cleanup"
-                | "repo.onboard.resume"
-                | "repo.onboard.status"
-                | "repo.onboard.report"
-                | "workflow.run"
-                | "factory.propose_action"
-                | "factory.approve_action"
-                | "factory.execute_action"
-                | "workflow.approve"
-                | "workflow.archive"
-                | "workflow.unarchive"
-                | "coordinator.snapshot"
-                | "coordinator.watch"
-                | "coordinator.register"
-                | "coordinator.pending"
-                | "coordinator.ack"
-                | "sync.now"
-                | "sync.peers"
-                | "ticket.update"
-                | "ticket.dep"
-                | "ticket.reopen"
-                | "ticket.deliver"
-                | "reconcile.repair"
-                | "attention.invalidate"
-                | "king.spawn"
-                | "king.register"
-                | "king.dismiss"
-                | "king.restart"
-                | "king.status"
-                | "king.pull"
-                | "king.settle"
-                | "king.checkpoint"
-                | "king.restore"
-                | "king.tick"
-        ) {
+        let Some(policy) = crate::capabilities::method_policy(&req.method) else {
+            return (false, "operator_only_method");
+        };
+        if policy.ordinary {
             return (true, "");
         }
 
         // A foreman gets only the child-management subset. Each target is
         // checked again at dispatch time against the structural parent edge;
         // this broad authorization is only the first gate.
-        let foreman_allowed = self.supervisor.is_foreman(&req.caller)
-            && matches!(
-                req.method.as_str(),
-                "agent.spawn"
-                    | "agent.respawn"
-                    | "agent.dismiss"
-                    | "agent.interrupt"
-                    | "agent.steer"
-            );
+        let foreman_allowed = policy.foreman_child && self.supervisor.is_foreman(&req.caller);
         // A groomer gets exactly one grant from this operator-only list: a
         // ticket.update whose wire shape proves it is a closure carrying
         // recorded evidence. ticket.dep and every other method here (spawn,
         // repo.add, workflow.run, ...) stay refused. handle_ticket_update
         // re-checks the shape and writes the audit event; this is only the
         // wire-level gate.
-        let groomer_allowed = req.method == "ticket.update"
+        let groomer_allowed = policy.groomer_close
             && self.supervisor.is_groomer(&req.caller)
             && crate::read_only_roles::groomer_can_close_ticket(&req.params);
         let allowed = foreman_allowed || groomer_allowed;
@@ -3881,20 +3858,21 @@ impl Daemon {
             .collect::<Vec<_>>();
 
         let mut inbox = self.inbox_value(repo.clone()).await?;
-        let mut inbox_rows = inbox["items"]
+        let inbox_rows = inbox["items"]
             .as_array_mut()
             .map(std::mem::take)
             .unwrap_or_default();
-        // `rk inbox` intentionally remains the broad diagnostic surface. The
-        // daily view is narrower: only rows whose existing action is one
-        // supported, bounded, replay-safe resolution belong under
-        // "attention". Advice, external git/forge work, open-ended needs,
-        // and two-way approval choices remain visible in `rk inbox` without
-        // pretending they are one-command work.
-        inbox_rows = inbox_rows
-            .into_iter()
-            .filter_map(current_inbox_resolution)
-            .collect();
+        let mut actionable = Vec::new();
+        let mut decision_required = Vec::new();
+        let mut stalled = Vec::new();
+        for row in inbox_rows {
+            let (class, row) = classify_current_inbox(row);
+            match class {
+                CurrentInboxClass::Actionable => actionable.push(row),
+                CurrentInboxClass::DecisionRequired => decision_required.push(row),
+                CurrentInboxClass::Stalled => stalled.push(row),
+            }
+        }
 
         let registered_repos = self
             .repos
@@ -3942,15 +3920,21 @@ impl Daemon {
             }
         }
 
-        let mut attention = inbox_rows;
-        attention.extend(convergence_rows);
+        actionable.extend(convergence_rows);
+        let attention = actionable.clone();
         let counts = json!({
             "live_agents": live_agents.len(),
             "ready_tickets": ready_tickets.len(),
-            "attention": attention.len(),
+            "actionable": actionable.len(),
+            "attention": actionable.len(),
+            "decision_required": decision_required.len(),
+            "stalled": stalled.len(),
         });
-        let no_current_work =
-            live_agents.is_empty() && ready_tickets.is_empty() && attention.is_empty();
+        let no_current_work = live_agents.is_empty()
+            && ready_tickets.is_empty()
+            && actionable.is_empty()
+            && decision_required.is_empty()
+            && stalled.is_empty();
         Ok(json!({
             "generated_at": (self.request_clock)(),
             "repo": repo,
@@ -3958,7 +3942,10 @@ impl Daemon {
             "counts": counts,
             "live_agents": live_agents,
             "ready_tickets": ready_tickets,
+            "actionable": actionable,
             "attention": attention,
+            "decision_required": decision_required,
+            "stalled": stalled,
             "no_current_work": no_current_work,
             "history_command": "rk digest --since 1d",
             "diagnostics_command": "rk top",
@@ -12077,6 +12064,11 @@ mod authorize_reasoned_tests {
         let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
         assert!(allowed);
         assert_eq!(reason, "");
+
+        let unknown = req("some-rat", "future.dangerous", &token);
+        let (allowed, reason) = daemon.authorize_reasoned(&unknown, &origin);
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
     }
 
     fn groomer_origin() -> PeerOrigin {
@@ -12181,6 +12173,23 @@ mod authorize_reasoned_tests {
             caller: "invalid-rat".into(),
             client_version: None,
             params: json!({"repo": "repo", "item": "violation"}),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn an_ordinary_rat_cannot_impersonate_an_ingest_source() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "ingest.event".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"source": "ci", "event": {}}),
         };
         let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
         assert!(!allowed);

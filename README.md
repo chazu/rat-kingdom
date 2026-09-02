@@ -37,12 +37,11 @@ rk work rat-kingdom             # one repo
 rk --json work rat-kingdom      # same exact counts and rows for scripts
 ```
 
-It reports installed/daemon build parity, live rats, ready tickets, and only
-bounded human attention that has one supported, idempotent resolving command.
-Run the command printed under a row, then run `rk work` again; a successful
+It reports installed/daemon build parity, live rats, ready tickets, bounded
+actionable work, decisions, and stalled/diagnostic work. Run a printed command
+or make the displayed decision, then run `rk work` again; a successful
 resolution removes that row. `rk inbox`, `rk reconcile`, `rk attention`, and
-`rk top` remain the broad diagnostic surfaces for history, open-ended choices,
-and control-loop internals.
+`rk top` remain the detailed surfaces for history and control-loop internals.
 
 A ready ticket can reach landed-and-clean in four operator commands (often
 three when the landing workflow is automatic):

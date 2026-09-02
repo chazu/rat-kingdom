@@ -6,6 +6,7 @@ pub mod agent_log;
 pub mod agents;
 pub mod attention;
 pub mod authority;
+mod capabilities;
 pub mod client;
 pub mod coordinator;
 pub mod cron;
