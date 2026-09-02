@@ -17,13 +17,12 @@ use tracing::debug;
 pub struct HerdrMux;
 
 /// Stable identity of one detected agent generation. `terminal_id` anchors the
-/// pane while `session_id` fences a restarted agent in that same terminal.
+/// pane while `session_id` stores Herdr's required `revision` as
+/// `revision:<number>`. The name is retained for state-file compatibility.
 ///
-/// `agent_session` is nullable in the Herdr API schema: it is populated only
-/// when the harness itself reports a session (`herdr pane
-/// report-agent-session`), which Claude Code does not do. When it is absent we
-/// fence on the pane's `revision` counter instead — a required field that
-/// Herdr increments when a new agent generation takes over the pane.
+/// Do not use optional `agent_session` here. Some harnesses report it after
+/// interactive readiness, so switching from the revision to that late value
+/// makes a freshly registered agent appear to have replaced itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentIdentity {
     pub terminal_id: String,
@@ -74,20 +73,7 @@ impl HerdrMux {
             create.push("--env".into());
             create.push(format!("{key}={value}"));
         }
-        let created = match run_herdr_owned(&create) {
-            Ok(created) => created,
-            // Herdr <0.8 exposed `agent start NAME --cwd ... -- ARGV`
-            // directly. Keep that compatibility path after the current API
-            // fails so older installations and deterministic fake-Herdr test
-            // harnesses remain usable.
-            Err(current_api_error) => {
-                return Self::start_agent_legacy(name, cwd, env, argv).map_err(|legacy_error| {
-                    rk_core::Error::other(format!(
-                        "current Herdr start failed ({current_api_error}); legacy start failed ({legacy_error})"
-                    ))
-                });
-            }
-        };
+        let created = run_herdr_owned(&create)?;
         let value: Value = serde_json::from_str(&created)
             .map_err(|e| rk_core::Error::other(format!("invalid herdr workspace response: {e}")))?;
         let workspace = find_string_key(&value, "workspace_id").ok_or_else(|| {
@@ -114,22 +100,9 @@ impl HerdrMux {
     /// splitting those operations reintroduces the timing race this API exists
     /// to avoid.
     ///
-    /// Herdr 0.8 dropped `agent send`, so the split send-then-Enter path is
-    /// only reachable on older servers. Report the original `agent prompt`
-    /// failure when the fallback is unavailable too: the fallback's own usage
-    /// error says nothing about why the prompt did not land.
     pub fn send(target: &str, text: &str) -> rk_core::Result<()> {
         let target = &Self::agent_target(target);
-        let prompt_error = match run_herdr(&["agent", "prompt", target, text]) {
-            Ok(_) => return Ok(()),
-            Err(error) => error,
-        };
-        if run_herdr(&["agent", "send", target, text]).is_err() {
-            return Err(prompt_error);
-        }
-        let pane = Self::find_pane(target)
-            .ok_or_else(|| rk_core::Error::other(format!("no herdr pane for {target}")))?;
-        run_herdr(&["pane", "send-keys", &pane, "enter"])?;
+        run_herdr(&["agent", "prompt", target, text])?;
         Ok(())
     }
 
@@ -148,26 +121,6 @@ impl HerdrMux {
             Some(pane) => pane,
             None => target.to_string(),
         }
-    }
-
-    fn start_agent_legacy(
-        name: &str,
-        cwd: &Path,
-        env: &HashMap<String, String>,
-        argv: &[String],
-    ) -> rk_core::Result<String> {
-        let mut command = vec!["agent".into(), "start".into(), name.into()];
-        command.push("--cwd".into());
-        command.push(cwd.to_string_lossy().to_string());
-        for (key, value) in env {
-            command.push("--env".into());
-            command.push(format!("{key}={value}"));
-        }
-        command.push("--no-focus".into());
-        command.push("--".into());
-        command.extend(argv.iter().cloned());
-        run_herdr_owned(&command)?;
-        Ok(name.to_string())
     }
 
     /// Submit and wait for a settled semantic state. Used for lifecycle
@@ -352,21 +305,14 @@ fn identity_from_entry(entry: &Value) -> rk_core::Result<AgentIdentity> {
 
 /// Fence one agent generation within a pane.
 ///
-/// Prefer the harness-reported `agent_session.value`: it survives Herdr server
-/// restarts and identifies the harness session itself. Herdr leaves it null
-/// for harnesses that do not report one, so fall back to the pane's required
-/// `revision` counter, which Herdr increments when a new generation takes over
-/// the pane. Either way a replacement agent in the same pane fences out.
+/// Use the one generation field every Herdr agent has. Optional
+/// `agent_session` can appear after startup and is therefore not stable across
+/// two adjacent snapshots of the same generation.
 fn generation_fence(entry: &Value) -> rk_core::Result<String> {
-    if let Some(session) = entry["agent_session"]["value"].as_str() {
-        return Ok(session.to_string());
-    }
     entry["revision"]
         .as_u64()
         .map(|revision| format!("revision:{revision}"))
-        .ok_or_else(|| {
-            rk_core::Error::other("herdr agent omitted both agent_session.value and revision")
-        })
+        .ok_or_else(|| rk_core::Error::other("herdr agent omitted revision"))
 }
 
 fn find_string_key(value: &Value, key: &str) -> Option<String> {
@@ -545,18 +491,16 @@ mod tests {
         assert!(HerdrMux::agent_entry(&snapshot, "Nibbles").is_none());
     }
 
-    /// A harness-reported session is the preferred fence, but Herdr's schema
-    /// declares `agent_session` nullable and Claude Code never reports one.
-    /// Requiring it made `rk king spawn` fail outright against a healthy
-    /// agent, so an omitted session falls back to the pane `revision`.
+    /// Optional harness session reporting may lag interactive readiness. The
+    /// required pane revision is stable before and after that late report.
     #[test]
-    fn generation_fence_prefers_agent_session_then_falls_back_to_revision() {
+    fn generation_fence_is_stable_when_agent_session_appears_late() {
         let reported: Value = serde_json::from_str(
             r#"{"terminal_id":"term_1","pane_id":"w1:p1","revision":7,
                 "agent":"codex","cwd":"/repo","agent_session":{"value":"sess_abc"}}"#,
         )
         .unwrap();
-        assert_eq!(generation_fence(&reported).unwrap(), "sess_abc");
+        assert_eq!(generation_fence(&reported).unwrap(), "revision:7");
 
         // Verbatim shape of a live `claude` agent under herdr 0.8.2: healthy,
         // interactive, and carrying no `agent_session` key at all.

@@ -641,7 +641,6 @@ aging_secs = 3600               # seconds of waiting that buy one priority level
                                  # so low-priority tickets can't starve (0 = strict)
 
 [king]                          # dedicated LLM operator-delegate control loop
-enabled = false                 # requires this opt-in and a spawned/registered King
 poll_secs = 15                  # authoritative RK-state scan cadence
 wake_retry_secs = 60            # retry an injected-but-unclaimed durable wake
 compact_after_idle_secs = 300   # request `/compact` after five idle minutes
@@ -764,21 +763,21 @@ cd /path/to/rat-kingdom
 MISE_TRUSTED_CONFIG_PATHS="$PWD" mise run install
 ```
 
-Enable the loop in `~/.rat-kingdom/config.toml` (or `$RK_HOME/config.toml`):
+The defaults start Codex with full operator permissions. To override the
+harness, model, or lifecycle timings, edit `~/.rat-kingdom/config.toml` (or
+`$RK_HOME/config.toml`):
 
 ```toml
 [king]
-enabled = true
 harness = "codex"
 permission_mode = "danger-full-access"
 ```
 
-Configuration is loaded at daemon startup. Roll the daemon onto the installed
-binary, then start the configured harness in a dedicated, primed Herdr
-workspace:
+Configuration is loaded at daemon startup, so roll the daemon after changing
+it. Herdr must be running; launch it once in a terminal, then spawn the King:
 
 ```bash
-rk daemon rollover
+herdr                        # leave Herdr running
 rk king spawn
 rk king at                 # alias for: rk king attach
 rk king restart            # checkpoint, replace, and restore
@@ -794,8 +793,8 @@ checkpoint; `dismiss` deliberately ends the session and makes any interrupted
 wake replayable to the next spawn.
 
 For an existing manually-created King, recover the pane or terminal id with
-`herdr agent list` and pass that value to `rk king register`. Registration
-remains generation-fenced: replacing the agent in the pane requires
+`herdr api snapshot` and pass that value to `rk king register`. Registration
+is fenced by Herdr's required pane revision: replacing the agent in the pane requires
 registration of the replacement unless RK itself performed a checkpointed
 restart or hibernation.
 
@@ -815,9 +814,10 @@ enters the injected wake. The lease acquired by `king pull` is still fenced by
 by the authority allowlist and rate cap.
 
 Idle lifecycle state is durable in `~/.rat-kingdom/king-state.json`. Compaction
-runs only when Herdr reports the exact registered generation idle, unfocused,
-and with no unsettled wake. RK submits `/compact` atomically through `herdr
-agent prompt`; it never separately types text and Enter. A timeout or the hard
+runs only when Herdr reports the exact registered generation quiescent (`idle`
+or a completed `done` turn), unfocused, and with no unsettled wake. RK submits
+`/compact` atomically through `herdr agent prompt`; it never separately types
+text and Enter. A timeout or the hard
 idle threshold writes a bounded checkpoint, exits that exact generation, and
 starts a fresh harness in the same pane. The fresh session receives only a
 checkpoint id and restores via `rk king restore KCP-...`; it never resumes the
@@ -828,8 +828,8 @@ restarted session receives the checkpoint restore command and current RK state,
 but does not rerun the full `rk prime --role operator` text. Re-prime it
 manually after replacement when the complete operator reference is needed.
 
-`rk king tick` runs one cycle immediately for diagnostics. The feature stays
-inert by default, and a stale terminal or changed Herdr agent-session id fails
+`rk king tick` runs one cycle immediately for diagnostics. With no registered
+King the loop is a no-op; a stale terminal or changed Herdr pane revision fails
 closed until explicitly re-registered.
 
 ## Workflows

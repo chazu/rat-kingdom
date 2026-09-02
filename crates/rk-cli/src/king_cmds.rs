@@ -157,11 +157,6 @@ pub async fn run(layout: &Layout, command: KingCommand, as_json: bool) -> Result
                     .as_str()
                     .unwrap_or("Herdr"),
             );
-            if result["enabled"].as_bool() == Some(false) {
-                eprintln!(
-                    "warning: [king].enabled is false; enable it and roll the daemon to receive automatic wakes"
-                );
-            }
         } else if result["dismissed"].as_bool() == Some(true) {
             println!("dismissed King");
         } else if result["restarted"].as_bool() == Some(true) {

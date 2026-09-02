@@ -98,6 +98,17 @@ case "${1:-} ${2:-}" in
   "status server")
     exit 0
     ;;
+  "workspace create")
+    shift 2
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--cwd" ]; then
+        printf '%s' "$2" > "$RK_TEST_HERDR_STATE.cwd"
+        break
+      fi
+      shift
+    done
+    printf '%s\n' '{"workspace_id":"workspace-1"}'
+    ;;
   "agent start")
     printf '%s' "$3" > "$RK_TEST_HERDR_STATE"
     printf '%s\n' "$*" > "$RK_TEST_HERDR_ARGV"
@@ -105,9 +116,14 @@ case "${1:-} ${2:-}" in
     ;;
   "api snapshot")
     name="$(cat "$RK_TEST_HERDR_STATE" 2>/dev/null || true)"
-    printf '{"result":{"snapshot":{"agents":[{"name":"%s","agent_status":"working","pane_id":"pane-1"}]}}}\n' "$name"
+    cwd="$(cat "$RK_TEST_HERDR_STATE.cwd" 2>/dev/null || printf /tmp)"
+    if [ -n "$name" ]; then
+      printf '{"result":{"snapshot":{"panes":[{"workspace_id":"workspace-1","pane_id":"pane-1"}],"agents":[{"name":"%s","agent":"codex","agent_status":"working","cwd":"%s","terminal_id":"term-1","pane_id":"pane-1","revision":1}]}}}\n' "$name" "$cwd"
+    else
+      printf '%s\n' '{"result":{"snapshot":{"panes":[{"workspace_id":"workspace-1","pane_id":"pane-1"}],"agents":[]}}}'
+    fi
     ;;
-  "agent wait"|"agent send"|"pane send-keys"|"pane close"|"notification show")
+  "agent wait"|"agent prompt"|"pane close"|"notification show")
     exit 0
     ;;
   *)

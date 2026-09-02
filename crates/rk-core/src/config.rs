@@ -36,8 +36,8 @@ pub struct Config {
     pub evaporation: EvaporationConfig,
     pub ingest: IngestConfig,
     pub policy: PolicyConfig,
-    /// Dedicated operator-delegate control loop. Disabled until a King is
-    /// explicitly registered with `rk king register` and this switch is set.
+    /// Dedicated operator-delegate control loop. It is inert until a King is
+    /// explicitly spawned or registered.
     pub king: KingConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
     /// The "default" profile applies centrally to every ordinary spawn that
@@ -58,9 +58,6 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct KingConfig {
-    /// Run the daemon's wake/idle lifecycle loop. Registration alone never
-    /// turns automation on.
-    pub enabled: bool,
     /// Durable-state scan cadence.
     pub poll_secs: u64,
     /// Re-inject an unclaimed at-least-once wake after this interval.
@@ -83,7 +80,6 @@ pub struct KingConfig {
 impl Default for KingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             poll_secs: 15,
             wake_retry_secs: 60,
             compact_after_idle_secs: 5 * 60,
@@ -1379,7 +1375,6 @@ mod tests {
         let cfg = Config::load(Path::new("/nonexistent/config.toml")).unwrap();
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.harness.default, "claude");
-        assert!(!cfg.king.enabled);
         assert_eq!(cfg.king.compact_after_idle_secs, 300);
         assert_eq!(cfg.king.hibernate_after_idle_secs, 3600);
     }
@@ -1391,7 +1386,6 @@ mod tests {
         std::fs::write(
             &path,
             r#"[king]
-enabled = true
 poll_secs = 7
 wake_retry_secs = 20
 compact_after_idle_secs = 240
@@ -1405,7 +1399,6 @@ permission_mode = "workspace-write"
         )
         .unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert!(cfg.king.enabled);
         assert_eq!(cfg.king.poll_secs, 7);
         assert_eq!(cfg.king.compact_min_wake_batches, 4);
         assert_eq!(cfg.king.model.as_deref(), Some("gpt-5.6"));

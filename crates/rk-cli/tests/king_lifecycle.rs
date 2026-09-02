@@ -15,6 +15,11 @@ fn install_fake_herdr(root: &Path) -> (PathBuf, PathBuf) {
 set -eu
 printf '%s\n' "$*" >> "$RK_TEST_HERDR_LOG"
 
+if [ -n "${RK_TEST_HERDR_DOWN:-}" ]; then
+  printf '%s\n' '{"error":{"code":"server_not_running","message":"no herdr server is running"}}' >&2
+  exit 1
+fi
+
 case "$1 $2" in
   "status server") exit 0 ;;
   "workspace create")
@@ -36,7 +41,14 @@ case "$1 $2" in
       # Herdr populates `agent_session` only for harnesses that report one.
       # RK_TEST_HERDR_NO_SESSION reproduces the omitted-session shape a live
       # `claude` agent actually returns, where `revision` is the only fence.
-      if [ -n "${RK_TEST_HERDR_NO_SESSION:-}" ]; then
+      delayed=0
+      if [ -n "${RK_TEST_HERDR_DELAY_SESSION:-}" ]; then
+        delayed="$(cat "$RK_TEST_HERDR_DELAY_SESSION" 2>/dev/null || printf 0)"
+      fi
+      if [ -n "${RK_TEST_HERDR_NO_SESSION:-}" ] || { [ -n "${RK_TEST_HERDR_DELAY_SESSION:-}" ] && [ "$delayed" -lt 2 ]; }; then
+        if [ -n "${RK_TEST_HERDR_DELAY_SESSION:-}" ]; then
+          printf '%s' "$((delayed + 1))" > "$RK_TEST_HERDR_DELAY_SESSION"
+        fi
         printf '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[{"name":"king","label":"king","terminal_id":"term_king","pane_id":"pane_king","revision":%s,"agent":"claude","cwd":"%s","agent_status":"idle","interactive_ready":true,"focused":false}]}}}\n' "$session" "$cwd"
       else
         printf '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[{"name":"king","label":"king","terminal_id":"term_king","pane_id":"pane_king","revision":%s,"agent_session":{"value":"session_%s"},"agent":"codex","cwd":"%s","agent_status":"idle","focused":false}]}}}\n' "$session" "$session" "$cwd"
@@ -73,11 +85,6 @@ case "$1 $2" in
     esac
     exit 0
     ;;
-  "agent send")
-    # Removed in Herdr 0.8; the real CLI prints usage and fails.
-    printf 'herdr agent commands:\n' >&2
-    exit 64
-    ;;
   "pane close")
     rm -f "$RK_TEST_HERDR_AGENT" "$RK_TEST_HERDR_WORKSPACE"
     ;;
@@ -106,8 +113,8 @@ async fn connect(layout: &Layout) -> Client {
 }
 
 /// Drive the full lifecycle once and return the two generation fences the
-/// daemon registered. `report_session` selects which Herdr snapshot shape the
-/// fake serves: a harness that reports `agent_session`, or one that does not.
+/// daemon registered. `report_session` reproduces Codex's live startup race:
+/// the first ready snapshot has only `revision`, then `agent_session` appears.
 async fn run_lifecycle(report_session: bool) -> (String, String) {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -135,9 +142,26 @@ async fn run_lifecycle(report_session: bool) -> (String, String) {
     std::env::set_var("RK_TEST_HERDR_AGENT", root.path().join("herdr.agent"));
     if report_session {
         std::env::remove_var("RK_TEST_HERDR_NO_SESSION");
+        std::env::set_var(
+            "RK_TEST_HERDR_DELAY_SESSION",
+            root.path().join("herdr.delay-session"),
+        );
     } else {
         std::env::set_var("RK_TEST_HERDR_NO_SESSION", "1");
+        std::env::remove_var("RK_TEST_HERDR_DELAY_SESSION");
     }
+
+    std::env::set_var("RK_TEST_HERDR_DOWN", "1");
+    let error = client
+        .call("king.spawn", json!({"cwd": root.path(), "holder": "king"}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Herdr is not running; start it with `herdr`"),
+        "unexpected preflight error: {error}"
+    );
+    std::env::remove_var("RK_TEST_HERDR_DOWN");
 
     let spawned = client
         .call("king.spawn", json!({"cwd": root.path(), "holder": "king"}))
@@ -173,6 +197,8 @@ async fn run_lifecycle(report_session: bool) -> (String, String) {
     handle.await.unwrap().unwrap();
     std::env::set_var("PATH", original_path);
     std::env::remove_var("RK_TEST_HERDR_NO_SESSION");
+    std::env::remove_var("RK_TEST_HERDR_DELAY_SESSION");
+    std::env::remove_var("RK_TEST_HERDR_DOWN");
     (first, second)
 }
 
@@ -181,8 +207,8 @@ async fn run_lifecycle(report_session: bool) -> (String, String) {
 #[tokio::test]
 async fn spawn_restart_and_dismiss_manage_one_registered_king_generation() {
     let (first, second) = run_lifecycle(true).await;
-    assert_eq!(first, "session_1");
-    assert_eq!(second, "session_2");
+    assert_eq!(first, "revision:1");
+    assert_eq!(second, "revision:2");
 
     // Claude Code reports no `agent_session`, so Herdr omits the field
     // entirely. The King must still spawn, restart, and fence generations.

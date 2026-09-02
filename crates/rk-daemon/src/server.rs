@@ -1580,27 +1580,23 @@ impl Daemon {
             });
         }
 
-        // Dedicated King control loop. This is intentionally config-gated AND
-        // registration-gated: enabling it without `rk king register` has no
-        // terminal side effect. Every cycle rebuilds authoritative RK state;
-        // Herdr receives only an opaque durable wake/checkpoint id.
-        if daemon.king_config.enabled {
-            let king_daemon = Arc::clone(&daemon);
-            let mut king_shutdown = daemon.shutdown_tx.subscribe();
-            let interval = Duration::from_secs(daemon.king_config.poll_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        _ = king_shutdown.changed() => break,
-                    }
-                    if let Err(error) = king_daemon.king_cycle().await {
-                        warn!(%error, "King control-loop cycle failed");
-                    }
+        // Registration is the opt-in boundary. With no registered King the
+        // cycle is a cheap no-op and has no terminal side effect.
+        let king_daemon = Arc::clone(&daemon);
+        let mut king_shutdown = daemon.shutdown_tx.subscribe();
+        let interval = Duration::from_secs(daemon.king_config.poll_secs.max(1));
+        background_tasks.spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = king_shutdown.changed() => break,
                 }
-            });
-        }
+                if let Err(error) = king_daemon.king_cycle().await {
+                    warn!(%error, "King control-loop cycle failed");
+                }
+            }
+        });
 
         // The maps were rehydrated before dispatch loops started. Now that
         // reactor/scheduler consumers are listening, resume in-flight instances.
@@ -4114,10 +4110,7 @@ impl Daemon {
             self.king_config.compact_min_wake_batches,
             (self.request_clock)(),
         ) {
-            Ok(registration) => Response::ok(
-                req.id,
-                json!({"registration": registration, "enabled": self.king_config.enabled}),
-            ),
+            Ok(registration) => Response::ok(req.id, json!({"registration": registration})),
             Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
         }
     }
@@ -4128,6 +4121,16 @@ impl Daemon {
             Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
         };
         let _cycle = self.king_cycle_lock.lock().await;
+        let herdr_available = tokio::task::spawn_blocking(rk_mux::HerdrMux::available)
+            .await
+            .unwrap_or(false);
+        if !herdr_available {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                "Herdr is not running; start it with `herdr`, then rerun `rk king spawn`",
+            );
+        }
         let now = (self.request_clock)();
         let state = match self.king.snapshot() {
             Ok(state) => state,
@@ -4216,7 +4219,6 @@ impl Daemon {
                 req.id,
                 json!({
                     "spawned": true,
-                    "enabled": self.king_config.enabled,
                     "harness": self.king_config.harness,
                     "registration": registration,
                 }),
@@ -4369,10 +4371,7 @@ impl Daemon {
 
     fn handle_king_status(&self, req: Request) -> Response {
         match self.king.snapshot() {
-            Ok(state) => Response::ok(
-                req.id,
-                json!({"enabled": self.king_config.enabled, "state": state}),
-            ),
+            Ok(state) => Response::ok(req.id, json!({"state": state})),
             Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
         }
     }
@@ -4587,7 +4586,7 @@ impl Daemon {
         };
 
         let now = (self.request_clock)();
-        if herdr_state.status == "idle" {
+        if crate::king::is_quiescent(&herdr_state.status) {
             if let Some(checkpoint) = self
                 .king
                 .pending_restore_due(self.king_config.wake_retry_secs, now)?
@@ -4629,7 +4628,7 @@ impl Daemon {
             now,
         )?;
         if let Some(wake) = wake {
-            if herdr_state.status == "idle" {
+            if crate::king::is_quiescent(&herdr_state.status) {
                 let target = registration.identity.terminal_id.clone();
                 let text = format!(
                     "RK_WAKE {id}. Run `rk --json king pull {id} --holder {holder}`; after handling it run `rk king resolve {id} --holder {holder}`, or `rk king defer {id} --holder {holder}` only for an explicit human gate.",

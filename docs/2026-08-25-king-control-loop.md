@@ -1,6 +1,6 @@
 # King control loop and idle context lifecycle
 
-Status: implemented behind disabled-by-default `[king]` configuration.
+Status: implemented; explicit King registration is the opt-in boundary.
 
 ## Intent
 
@@ -26,8 +26,8 @@ registered generation and makes interrupted work replayable to a later spawn.
 
 1. `rk king register <herdr-target> --holder <stable-id>` (normally performed
    by `rk king spawn`) resolves a name, pane,
-   terminal, or agent-session id to `{terminal_id, pane_id, session_id}` and
-   persists that exact generation.
+   terminal, or agent-session id to a terminal, pane, and required Herdr pane
+   revision, then persists that exact generation.
 2. The daemon scans current reconciliation attention, operator inbox, ready
    tickets, and live agents. The generated timestamp is excluded from the
    state digest.
@@ -47,7 +47,7 @@ registered generation and makes interrupted work replayable to a later spawn.
 
 Wake delivery is at least once. Claiming is idempotent for the registered
 holder, and a terminal restarted in the same pane does not inherit the old
-generation because `agent_session.value` is part of the registration fence.
+generation because the required Herdr pane revision is the registration fence.
 
 ## Context lifecycle
 
@@ -62,7 +62,8 @@ token counter. Later eligibility is based on claimed wake batches.
 
 Compaction is allowed only when:
 
-- the exact registered Herdr generation reports `idle`;
+- the exact registered Herdr generation reports `idle` or a completed `done`
+  turn;
 - its pane is not focused (the conservative human-takeover signal);
 - there is no pending, injected, or claimed wake; and
 - idle time and work-batch thresholds are satisfied.
@@ -87,8 +88,7 @@ retention is an optimization rather than a correctness dependency.
 
 ## Failure behavior
 
-- No config opt-in: no background loop or terminal side effect.
-- Opted in but unregistered: no action.
+- No registered King: no action or terminal side effect.
 - Registered generation missing or replaced: fail closed and require explicit
   registration of the replacement.
 - Herdr injection failure: wake stays pending and is retried.

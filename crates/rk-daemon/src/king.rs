@@ -125,6 +125,12 @@ pub enum ContextAction {
     Hibernate,
 }
 
+/// Herdr uses `done` for a completed interactive turn and `idle` before the
+/// first turn. Both states are ready to accept the next atomic prompt.
+pub(crate) fn is_quiescent(status: &str) -> bool {
+    matches!(status, "idle" | "done")
+}
+
 pub struct KingStore {
     path: PathBuf,
     state: Mutex<KingState>,
@@ -387,7 +393,7 @@ impl KingStore {
             self.persist(&state)?;
             return Ok(None);
         }
-        if status != "idle" {
+        if !is_quiescent(status) {
             self.persist(&state)?;
             return Ok(None);
         }
@@ -704,6 +710,15 @@ mod tests {
                 .unwrap(),
             Some(ContextAction::Compact)
         );
+    }
+
+    #[test]
+    fn completed_herdr_turn_is_quiescent() {
+        assert!(is_quiescent("idle"));
+        assert!(is_quiescent("done"));
+        assert!(!is_quiescent("working"));
+        assert!(!is_quiescent("blocked"));
+        assert!(!is_quiescent("unknown"));
     }
 
     #[test]
