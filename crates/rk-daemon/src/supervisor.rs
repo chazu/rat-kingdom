@@ -6600,12 +6600,12 @@ impl Supervisor {
         .await?;
         let repo_name = repo.name();
         let policy = self.repository_policy(&repo)?;
-        let effective_target = policy.delivery_target(target);
-        if effective_target != target {
-            return Err(rk_core::Error::other(format!(
-                "prepared landing target mismatch: candidate was built for {target}, policy resolved {effective_target}"
-            )));
-        }
+        // `target` is no longer an agent base at this boundary: the caller's
+        // LandingQueueEntry already contains the exact destination resolved
+        // when the work was spawned or explicitly submitted. Resolving a
+        // fixed delivery target again here rewrites legitimate rework lands
+        // onto their parent branch (for example `--base <held-branch>`) and
+        // permanently retries an otherwise approved prepared merge.
         if !matches!(
             policy.delivery.mode,
             DeliveryMode::Merge | DeliveryMode::MergePush

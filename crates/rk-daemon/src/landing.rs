@@ -10411,23 +10411,19 @@ workflow: {
         }
     }
 
-    /// Activate `landing` as `repo_path`'s repository policy, the way an
-    /// operator's `rk repo policy activate` would — the only way a test can
-    /// exercise `route_review_death` under a policy other than
-    /// `LandingPolicy::default()`, since the pipeline reads it back through
-    /// `Supervisor::repository_policy` -> `repos.json` rather than from any
-    /// injectable field. Registered against `Repo::discover`'s resolved root
-    /// (not the raw temp path), because that is the key `repository_policy`
-    /// looks up.
-    fn activate_landing_policy(home: &Path, repo_path: &Path, landing: rk_workflow::LandingPolicy) {
+    /// Activate `policy` for `repo_path`, the way an operator's repository
+    /// policy activation would. Registered against `Repo::discover`'s
+    /// resolved root (not the raw temp path), because that is the key
+    /// `Supervisor::repository_policy` looks up.
+    fn activate_repository_policy(
+        home: &Path,
+        repo_path: &Path,
+        policy: rk_workflow::RepositoryPolicy,
+    ) {
         let root = rk_git::Repo::discover(repo_path)
             .unwrap()
             .root()
             .to_path_buf();
-        let policy = rk_workflow::RepositoryPolicy {
-            landing,
-            ..rk_workflow::RepositoryPolicy::default()
-        };
         let mut registry = crate::repos::RepoRegistry::load(&home.join("repos.json")).unwrap();
         registry
             .add(crate::repos::RepoRecord {
@@ -10441,6 +10437,20 @@ workflow: {
                 }),
             })
             .unwrap();
+    }
+
+    /// Activate `landing` as `repo_path`'s repository policy — the only way
+    /// a test can exercise `route_review_death` under a policy other than
+    /// `LandingPolicy::default()`.
+    fn activate_landing_policy(home: &Path, repo_path: &Path, landing: rk_workflow::LandingPolicy) {
+        activate_repository_policy(
+            home,
+            repo_path,
+            rk_workflow::RepositoryPolicy {
+                landing,
+                ..rk_workflow::RepositoryPolicy::default()
+            },
+        );
     }
 
     /// The review-death backoff knobs under test, with everything else left
@@ -11352,6 +11362,17 @@ workflow: {
         let repo_dir = tempfile::tempdir().unwrap();
         init_repo(repo_dir.path());
         write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        activate_repository_policy(
+            home.path(),
+            repo_dir.path(),
+            rk_workflow::RepositoryPolicy {
+                delivery: rk_workflow::DeliveryPolicy {
+                    target: "main".into(),
+                    ..rk_workflow::DeliveryPolicy::default()
+                },
+                ..rk_workflow::RepositoryPolicy::default()
+            },
+        );
         git(repo_dir.path(), &["checkout", "-b", "base"]);
         git(repo_dir.path(), &["checkout", "-b", "feature"]);
         std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
