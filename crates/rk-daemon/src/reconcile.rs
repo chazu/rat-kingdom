@@ -38,6 +38,7 @@
 
 use crate::agents::AgentRecord;
 use crate::workflow_exec::{Instance, InstanceStatus};
+use chrono::{DateTime, Utc};
 use rk_core::tuple::Tuple;
 use rk_git::Ancestry;
 use serde::Serialize;
@@ -142,7 +143,80 @@ pub struct Violation {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConvergenceReport {
     pub scope: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoffs: Vec<ActiveHandoff>,
     pub violations: Vec<Violation>,
+}
+
+/// A normal, non-contradictory transition between execution completion and
+/// durable delivery. Kept in the report so "no violation" does not erase why
+/// a terminal owner still legitimately appears on an active ticket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActiveHandoff {
+    pub task: String,
+    pub agent: String,
+    pub spawn: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub age_secs: i64,
+}
+
+/// Exact clean-completion receipt derived from one durable
+/// `Event/harness_result`.
+#[derive(Debug, Clone)]
+pub struct CompletionHandoff {
+    pub event_id: String,
+    pub task: String,
+    pub agent: String,
+    pub spawn: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl CompletionHandoff {
+    pub fn from_harness_result(tuple: &Tuple) -> Option<Self> {
+        let payload = &tuple.payload;
+        if tuple.category != rk_core::tuple::Category::Event
+            || tuple.identity != "harness_result"
+            || payload.get("role").and_then(Value::as_str) != Some("rat")
+            || payload.get("is_error").and_then(Value::as_bool) != Some(false)
+            || payload.get("declared_done").and_then(Value::as_bool) != Some(true)
+            || payload
+                .get("branch")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || payload
+                .get("head_sha")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return None;
+        }
+        Some(Self {
+            event_id: tuple.id.to_string(),
+            task: payload.get("task")?.as_str()?.to_string(),
+            agent: payload.get("agent")?.as_str()?.to_string(),
+            spawn: payload.get("spawn")?.as_str()?.to_string(),
+            recorded_at: tuple.created_at,
+        })
+    }
+}
+
+/// Exact in-flight landing receipt projected from the durable landing queue.
+#[derive(Debug, Clone)]
+pub struct LandingHandoff {
+    pub task: String,
+    pub source_spawn: Option<String>,
+    pub status: String,
+    pub age_secs: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandoffFacts {
+    pub now: DateTime<Utc>,
+    pub admission_grace_secs: i64,
+    pub completions: Vec<CompletionHandoff>,
+    pub landings: Vec<LandingHandoff>,
 }
 
 /// Git's own answer to the questions this module needs asked of it,
@@ -585,8 +659,170 @@ pub fn build(
     violations.sort_by(|a, b| a.id.cmp(&b.id));
     ConvergenceReport {
         scope: scope.to_string(),
+        handoffs: Vec::new(),
         violations,
     }
+}
+
+/// Handoff-aware form used by the live server. Kept separate from [`build`]
+/// so pure callers that do not own completion/landing evidence retain the
+/// conservative legacy interpretation.
+#[allow(clippy::too_many_arguments)]
+pub fn build_with_handoffs(
+    scope: &str,
+    tickets: &[Tuple],
+    agents: &[AgentRecord],
+    lands: &[Tuple],
+    landed_tickets: &HashSet<String>,
+    queued_tickets: &HashSet<String>,
+    instances: &[Instance],
+    git: &GitFacts,
+    handoff_facts: &HandoffFacts,
+) -> ConvergenceReport {
+    let mut report = build(
+        scope,
+        tickets,
+        agents,
+        lands,
+        landed_tickets,
+        queued_tickets,
+        instances,
+        git,
+    );
+    // Replace only this contradiction family. Every other family retains the
+    // exact legacy derivation above; handoff semantics cannot weaken an
+    // unrelated convergence check.
+    report
+        .violations
+        .retain(|violation| violation.kind != kind::TERMINAL_ASSIGNEE_ACTIVE_WORK);
+    let (handoffs, terminal_violations) =
+        terminal_assignee_with_handoffs(tickets, agents, landed_tickets, handoff_facts);
+    report.handoffs = handoffs;
+    report.violations.extend(terminal_violations);
+    report.violations.sort_by(|a, b| a.id.cmp(&b.id));
+    report
+}
+
+fn terminal_assignee_with_handoffs(
+    tickets: &[Tuple],
+    agents: &[AgentRecord],
+    landed_tickets: &HashSet<String>,
+    facts: &HandoffFacts,
+) -> (Vec<ActiveHandoff>, Vec<Violation>) {
+    let mut handoffs = Vec::new();
+    let mut violations = Vec::new();
+    for ticket in tickets.iter().filter(|ticket| {
+        matches!(
+            ticket.payload.get("status").and_then(Value::as_str),
+            Some("claimed") | Some("in_progress")
+        )
+    }) {
+        if landed_tickets.contains(&ticket.identity) {
+            continue;
+        }
+        let assignee = ticket.payload.get("assignee").and_then(Value::as_str);
+        let Some(agent) = resolve_owner(&ticket.identity, assignee, agents) else {
+            continue;
+        };
+        if !agent.state.is_archivable() {
+            continue;
+        }
+        let spawn = agent.spawn_id().to_string();
+
+        if let Some(landing) = facts.landings.iter().find(|landing| {
+            landing.task == ticket.identity
+                && landing.source_spawn.as_deref() == Some(spawn.as_str())
+        }) {
+            handoffs.push(ActiveHandoff {
+                task: ticket.identity.clone(),
+                agent: agent.name.clone(),
+                spawn: spawn.clone(),
+                phase: "landing".into(),
+                status: Some(landing.status.clone()),
+                age_secs: landing.age_secs.max(0),
+            });
+            continue;
+        }
+
+        let completion = facts.completions.iter().find(|completion| {
+            completion.task == ticket.identity
+                && completion.agent == agent.name
+                && completion.spawn == spawn
+        });
+        let completion_age = completion.map(|completion| {
+            facts
+                .now
+                .signed_duration_since(completion.recorded_at)
+                .num_seconds()
+                .max(0)
+        });
+        if completion_age.is_some_and(|age| age <= facts.admission_grace_secs.max(0)) {
+            handoffs.push(ActiveHandoff {
+                task: ticket.identity.clone(),
+                agent: agent.name.clone(),
+                spawn: spawn.clone(),
+                phase: "completion_pending_admission".into(),
+                status: None,
+                age_secs: completion_age.unwrap_or(0),
+            });
+            continue;
+        }
+
+        let mut evidence = vec![
+            format!("ticket:{}", ticket.identity),
+            format!("agent:{}", agent.name),
+            format!("agent.spawn:{spawn}"),
+            format!("agent.state:{:?}", agent.state),
+        ];
+        let detail = if let (Some(completion), Some(age)) = (completion, completion_age) {
+            evidence.push(format!("harness_result:{}", completion.event_id));
+            evidence.push(format!("handoff.age_secs:{age}"));
+            evidence.push(format!(
+                "handoff.grace_secs:{}",
+                facts.admission_grace_secs.max(0)
+            ));
+            format!(
+                "{} is still '{}' after owner {} completed; its clean delivery handoff has waited {age}s without entering the landing queue",
+                ticket.identity,
+                ticket
+                    .payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                agent.name,
+            )
+        } else {
+            format!(
+                "{} is still '{}' but its owner {} settled to {:?} with no hand-off recorded",
+                ticket.identity,
+                ticket
+                    .payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                agent.name,
+                agent.state,
+            )
+        };
+        if let Some(workflow) = &agent.workflow_instance {
+            evidence.push(format!("workflow_instance:{workflow}"));
+        }
+        violations.push(Violation {
+            id: format!(
+                "{}:{}",
+                kind::TERMINAL_ASSIGNEE_ACTIVE_WORK,
+                ticket.identity
+            ),
+            kind: kind::TERMINAL_ASSIGNEE_ACTIVE_WORK.into(),
+            scope: ticket.scope.clone(),
+            subject: ticket.identity.clone(),
+            detail,
+            evidence,
+            authority: Authority::Orchestrator,
+        });
+    }
+    handoffs.sort_by(|a, b| a.task.cmp(&b.task));
+    (handoffs, violations)
 }
 
 pub fn to_json(report: &ConvergenceReport) -> Value {
@@ -596,6 +832,13 @@ pub fn to_json(report: &ConvergenceReport) -> Value {
 /// A concise human-readable rendering, one line per violation.
 pub fn to_human(report: &ConvergenceReport) -> String {
     if report.violations.is_empty() {
+        if !report.handoffs.is_empty() {
+            return format!(
+                "{}: converged — {} delivery handoff(s) in flight\n",
+                report.scope,
+                report.handoffs.len()
+            );
+        }
         return format!("{}: converged — no contradictions detected\n", report.scope);
     }
     let mut out = format!(
@@ -853,6 +1096,220 @@ mod tests {
             kind::TERMINAL_ASSIGNEE_ACTIVE_WORK
         );
         assert_eq!(report.violations[0].authority, Authority::Orchestrator);
+    }
+
+    fn clean_completion(agent: &AgentRecord, task: &str, recorded_at: DateTime<Utc>) -> Tuple {
+        let mut tuple = Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "castle",
+            serde_json::json!({
+                "agent": agent.name,
+                "spawn": agent.spawn_id().to_string(),
+                "role": "rat",
+                "task": task,
+                "is_error": false,
+                "declared_done": true,
+                "branch": "rk/whisker/tkt-1",
+                "head_sha": "abc123",
+            }),
+        );
+        tuple.created_at = recorded_at;
+        tuple
+    }
+
+    #[test]
+    fn recent_clean_completion_is_an_admission_handoff_not_an_orphan() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            serde_json::json!({"assignee": "Whisker"}),
+        );
+        let mut a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        a.role = "rat".into();
+        let event = clean_completion(&a, "TKT-1", now - chrono::Duration::seconds(30));
+        let facts = HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
+            landings: Vec::new(),
+        };
+
+        let report = build_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &facts,
+        );
+
+        assert!(report.violations.is_empty());
+        assert_eq!(report.handoffs.len(), 1);
+        assert_eq!(report.handoffs[0].phase, "completion_pending_admission");
+    }
+
+    #[test]
+    fn completion_handoff_expires_into_a_visible_violation() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            serde_json::json!({"assignee": "Whisker"}),
+        );
+        let mut a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        a.role = "rat".into();
+        let event = clean_completion(&a, "TKT-1", now - chrono::Duration::seconds(301));
+        let facts = HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
+            landings: Vec::new(),
+        };
+
+        let report = build_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &facts,
+        );
+
+        assert!(report.handoffs.is_empty());
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0]
+            .evidence
+            .iter()
+            .any(|item| item == "handoff.age_secs:301"));
+    }
+
+    #[test]
+    fn completion_handoff_is_fenced_to_the_exact_generation() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            serde_json::json!({"assignee": "Whisker"}),
+        );
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let mut event = clean_completion(&a, "TKT-1", now);
+        event.payload["spawn"] = Value::String(rk_core::id::SpawnId::new().to_string());
+        let facts = HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
+            landings: Vec::new(),
+        };
+
+        let report = build_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &facts,
+        );
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.handoffs.is_empty());
+    }
+
+    #[test]
+    fn only_clean_declared_rat_results_form_completion_handoffs() {
+        let now = Utc::now();
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let valid = clean_completion(&a, "TKT-1", now);
+        for (field, value) in [
+            ("role", serde_json::json!("reviewer")),
+            ("is_error", serde_json::json!(true)),
+            ("declared_done", serde_json::json!(false)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.payload[field] = value;
+            assert!(CompletionHandoff::from_harness_result(&invalid).is_none());
+        }
+        for field in ["branch", "head_sha"] {
+            let mut invalid = valid.clone();
+            invalid.payload.as_object_mut().unwrap().remove(field);
+            assert!(CompletionHandoff::from_harness_result(&invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn landing_handoff_is_also_fenced_to_the_exact_generation() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            serde_json::json!({"assignee": "Whisker"}),
+        );
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let exact = LandingHandoff {
+            task: "TKT-1".into(),
+            source_spawn: Some(a.spawn_id().to_string()),
+            status: "awaiting_review".into(),
+            age_secs: 42,
+        };
+        let facts = HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: vec![exact.clone()],
+        };
+        let report = build_with_handoffs(
+            "myrepo",
+            std::slice::from_ref(&t),
+            std::slice::from_ref(&a),
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &facts,
+        );
+        assert!(report.violations.is_empty());
+        assert_eq!(report.handoffs[0].phase, "landing");
+        assert_eq!(
+            report.handoffs[0].status.as_deref(),
+            Some("awaiting_review")
+        );
+        assert_eq!(report.handoffs[0].age_secs, 42);
+
+        let wrong = HandoffFacts {
+            landings: vec![LandingHandoff {
+                source_spawn: Some(rk_core::id::SpawnId::new().to_string()),
+                ..exact
+            }],
+            ..facts
+        };
+        let report = build_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &wrong,
+        );
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.handoffs.is_empty());
     }
 
     #[test]

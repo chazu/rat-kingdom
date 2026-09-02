@@ -807,7 +807,10 @@ rk king defer KWK-... --holder king      # explicit human gate
 ```
 
 The pull payload is bounded to current attention items, the first 20 inbox
-rows, the first 20 ready tickets, and 50 live agents. Repo-authored text never
+rows, up to 20 ready-ticket representatives selected fairly across
+repositories, and 50 live agents. `ready_frontier` carries the exact ready
+total, a digest over every ready identity, per-repository counts, truncation,
+and the native `rk ticket ready` re-read command. Repo-authored text never
 enters the injected wake. The lease acquired by `king pull` is still fenced by
 `[policy] orchestrator_lease_ttl_secs`, and `attention.decide` remains bounded
 by the authority allowlist and rate cap.

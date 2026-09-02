@@ -29,8 +29,10 @@ registered generation and makes interrupted work replayable to a later spawn.
    terminal, or agent-session id to a terminal, pane, and required Herdr pane
    revision, then persists that exact generation.
 2. The daemon scans current reconciliation attention, operator inbox, ready
-   tickets, and live agents. The generated timestamp is excluded from the
-   state digest.
+   tickets, and live agents. Ready work is compressed into an exact total and
+   full identity digest plus a bounded round-robin representative set, so one
+   repository's deep backlog cannot hide another repository's ready work. The
+   generated timestamp is excluded from the state digest.
 3. A changed actionable digest creates one durable `KWK-...` record in
    `pending`. One active record coalesces later changes.
 4. Herdr receives only the opaque wake id and a fixed built-in RK pull
@@ -107,5 +109,7 @@ retention is an optimization rather than a correctness dependency.
   blocks compaction.
 - The initial wake snapshot is bounded and advisory. Every action must re-read
   the relevant RK resource and pass its own current policy/lease checks.
+- `ready_frontier.truncated` and its `rk ticket ready` command make that
+  re-read boundary explicit; the wake never becomes a second ticket store.
 - The King is privileged local operator infrastructure. Registering its pane
   and enabling `[king]` are explicit human configuration actions.

@@ -334,6 +334,57 @@ async fn empty_current_work_has_exact_zero_counts_and_diagnostic_pointers() {
         .contains("not the work itself"));
 }
 
+#[cfg(test)]
+#[tokio::test]
+async fn king_snapshot_exposes_a_ready_ticket_behind_another_repositories_backlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(Layout::at(dir.path()), &rk_core::config::Config::default()).unwrap();
+    for index in 0..25 {
+        daemon
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: format!("alpha {index}"),
+                body: None,
+                scope: Some("alpha".into()),
+                parent: None,
+                priority: "normal".into(),
+                labels: Vec::new(),
+                depends_on: Vec::new(),
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+    }
+    let glossolalia = daemon
+        .tickets
+        .create(crate::tickets::NewTicket {
+            title: "glossolalia successor".into(),
+            body: None,
+            scope: Some("glossolalia".into()),
+            parent: None,
+            priority: "normal".into(),
+            labels: Vec::new(),
+            depends_on: Vec::new(),
+            created_by: None,
+            coalesce_key: None,
+        })
+        .await
+        .unwrap();
+
+    let (snapshot, summary, has_work) = daemon.king_authoritative_snapshot().await.unwrap();
+
+    assert!(has_work);
+    assert!(summary.contains("26 ready"), "{summary}");
+    assert_eq!(snapshot["ready_frontier"]["total"], 26);
+    assert_eq!(snapshot["ready_frontier"]["truncated"], true);
+    assert!(snapshot["ready_tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|ticket| ticket["id"] == glossolalia.identity));
+}
+
 type FactVoteKey = (String, String, String);
 type FactVoteState = (DateTime<Utc>, RecordId, String);
 type RequestClock = fn() -> DateTime<Utc>;
@@ -3531,7 +3582,73 @@ impl Daemon {
             })
             .filter(|task| !task.is_empty())
             .collect();
-        let queued_tickets = crate::landing::tasks_in_landing_queue(&self.space);
+        let landing_queue = crate::landing::landing_queue_snapshot(&self.space);
+        let queued_tickets = landing_queue
+            .iter()
+            .map(|entry| entry.task.clone())
+            .collect::<HashSet<_>>();
+
+        // A clean completion is a bounded pre-admission handoff only when its
+        // task, agent, and generation all match the terminal owner. Query by
+        // spawn first, then retain the repository scope: names and timestamps
+        // are deliberately not identity joins.
+        let mut completions = Vec::new();
+        let mut scanned_spawns = HashSet::new();
+        for ticket in tickets.iter().filter(|ticket| {
+            matches!(
+                ticket.payload.get("status").and_then(Value::as_str),
+                Some("claimed") | Some("in_progress")
+            )
+        }) {
+            let Some(agent) = crate::reconcile::resolve_owner(
+                &ticket.identity,
+                ticket.payload.get("assignee").and_then(Value::as_str),
+                &agents,
+            ) else {
+                continue;
+            };
+            if agent.state != crate::agents::AgentState::Completed
+                || !scanned_spawns.insert(agent.spawn_id())
+            {
+                continue;
+            }
+            completions.extend(
+                self.space
+                    .scan(&Pattern::for_spawn(
+                        Category::Event,
+                        "harness_result",
+                        agent.spawn_id(),
+                    ))?
+                    .into_iter()
+                    .filter(|tuple| tuple.scope == repo)
+                    .filter_map(|tuple| {
+                        crate::reconcile::CompletionHandoff::from_harness_result(&tuple)
+                    }),
+            );
+        }
+        let landing_handoffs = landing_queue
+            .iter()
+            .filter(|entry| entry.repo == repo)
+            .map(|entry| crate::reconcile::LandingHandoff {
+                task: entry.task.clone(),
+                source_spawn: entry.source_spawn.map(|spawn| spawn.to_string()),
+                status: entry.status.as_str().to_string(),
+                age_secs: entry.age_secs,
+            })
+            .collect();
+        let admission_grace_secs = self
+            .reactor_config
+            .interval_secs
+            .saturating_mul(2)
+            .max(300)
+            .try_into()
+            .unwrap_or(i64::MAX);
+        let handoff_facts = crate::reconcile::HandoffFacts {
+            now: (self.request_clock)(),
+            admission_grace_secs,
+            completions,
+            landings: landing_handoffs,
+        };
 
         // Both branch-shaped self-clearing checks reuse the exact machinery
         // `rk inbox` uses: the dropped-land half of `cleared_branches`, and a
@@ -3560,7 +3677,7 @@ impl Daemon {
             .filter(|i| i.repo == repo)
             .collect();
 
-        Ok(crate::reconcile::build(
+        Ok(crate::reconcile::build_with_handoffs(
             &repo,
             &tickets,
             &agents,
@@ -3569,6 +3686,7 @@ impl Daemon {
             &queued_tickets,
             &instances,
             &git,
+            &handoff_facts,
         ))
     }
 
@@ -4490,11 +4608,13 @@ impl Daemon {
         if let Some(items) = inbox["items"].as_array_mut() {
             items.truncate(20);
         }
-        let ready = self
-            .tickets
-            .ready(None)?
-            .into_iter()
-            .take(20)
+        let ready_frontier = crate::operator_frontier::build(
+            self.tickets.ready(None)?,
+            crate::operator_frontier::MAX_READY_REPRESENTATIVES,
+        );
+        let ready = ready_frontier
+            .representatives
+            .iter()
             .map(|ticket| {
                 json!({
                     "id": ticket.identity,
@@ -4528,12 +4648,12 @@ impl Daemon {
             || inbox["items"]
                 .as_array()
                 .is_some_and(|items| !items.is_empty())
-            || !ready.is_empty();
+            || ready_frontier.total > 0;
         let summary = format!(
             "{} attention, {} inbox, {} ready, {} live",
             attention.len(),
             inbox["items"].as_array().map_or(0, Vec::len),
-            ready.len(),
+            ready_frontier.total,
             live_agents.len()
         );
         let mut snapshot = json!({
@@ -4541,6 +4661,13 @@ impl Daemon {
             "attention": attention,
             "inbox": inbox,
             "ready_tickets": ready,
+            "ready_frontier": {
+                "total": ready_frontier.total,
+                "digest": ready_frontier.digest,
+                "truncated": ready_frontier.truncated,
+                "repositories": ready_frontier.repositories,
+                "command": "rk ticket ready",
+            },
             "live_agents": live_agents,
             "drain": {
                 "enabled": self.drain_config.enabled,
@@ -12612,6 +12739,63 @@ mod ticket_reopen_sweep_tests {
             .await
             .unwrap();
         ticket.identity
+    }
+
+    #[tokio::test]
+    async fn live_reconcile_uses_the_exact_clean_completion_as_a_handoff() {
+        let (_dir, daemon) = daemon_with_agent("Done-1", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Done-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Done-1")
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/done-1/work",
+                    "head_sha": "abc123",
+                }),
+            ))
+            .unwrap();
+
+        let report = daemon.reconcile_report("repo".into()).await.unwrap();
+
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert_eq!(report.handoffs.len(), 1);
+        assert_eq!(report.handoffs[0].task, ticket.identity);
+        assert_eq!(report.handoffs[0].phase, "completion_pending_admission");
     }
 
     #[tokio::test]

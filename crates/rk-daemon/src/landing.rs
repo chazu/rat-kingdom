@@ -207,6 +207,9 @@ pub(crate) struct LandingQueueSnapshotEntry {
     pub(crate) target: String,
     pub(crate) branch: String,
     pub(crate) task: String,
+    /// Exact agent generation that produced this candidate. Operator-authored
+    /// submissions remain `None` and cannot stand in for an agent handoff.
+    pub(crate) source_spawn: Option<rk_core::id::SpawnId>,
     pub(crate) status: LandingEntryStatus,
     /// Seconds since [`LandingQueueEntry::enqueued_at`].
     pub(crate) age_secs: i64,
@@ -275,6 +278,7 @@ pub(crate) fn landing_queue_snapshot(space: &Space) -> Vec<LandingQueueSnapshotE
                 target: entry.target,
                 branch: entry.branch,
                 task: entry.task,
+                source_spawn: entry.source_spawn,
                 status: entry.status,
                 age_secs,
                 phase_age_secs,
@@ -672,6 +676,15 @@ pub(crate) enum LandingEntryStatus {
 }
 
 impl LandingEntryStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LandingEntryStatus::Queued => "queued",
+            LandingEntryStatus::RunningGates => "running_gates",
+            LandingEntryStatus::AwaitingReview => "awaiting_review",
+            LandingEntryStatus::Landing => "landing",
+        }
+    }
+
     /// The task-to-main [`crate::span::Phase`] a candidate in this status is
     /// living in. Deliberately the ONE definition of that mapping: the
     /// phase-latency sweep (`crate::server`) labels its live probes with it,
@@ -8036,6 +8049,7 @@ workflow: {
             head_sha: "sha-old".into(),
             diff_class: "trivial".into(),
             task: "TKT-1".into(),
+            source_spawn: Some(rk_core::id::SpawnId::new()),
             enqueued_at: Some(old_enqueued_at),
             ..Default::default()
         };
@@ -8073,6 +8087,7 @@ workflow: {
         queue.requeue_tail(&claimed).unwrap();
         let after = landing_queue_snapshot(&space);
         let requeued = after.iter().find(|e| e.branch == "b1").unwrap();
+        assert_eq!(requeued.source_spawn, base.source_spawn);
         assert!(
             requeued.age_secs >= 5 * 3600 - 5,
             "requeue must not reset age, got {}",

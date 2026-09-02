@@ -28,6 +28,7 @@ pub mod onboarding_activation;
 pub mod onboarding_apply;
 pub mod onboarding_proposals;
 pub mod onboarding_sessions;
+mod operator_frontier;
 pub mod orchestrator_lease;
 pub mod phase_latency;
 pub mod proto;
