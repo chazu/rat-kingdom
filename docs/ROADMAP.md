@@ -208,6 +208,13 @@ irreducible unattended week.
 - Every human interaction is a pre-classified human gate.
 - The outcome says proceed, repair and repeat, or stop.
 
+Capture these criteria with a repository-scoped external observation run
+([observation runbook](2026-09-02-observation-runs.md)). The manifest freezes
+thresholds before dispatch; append-only samples retain transient maxima and
+daemon outages; typed intervention records and the derived report provide the
+pilot evidence. The same mechanism is intentionally reusable for release
+soaks, benchmarks, and incident windows.
+
 ### Ticket rollup
 
 - `TKT-01M0FQ94FSY0VB4ZP60DK4Q8PJ` - post-slimming foreign-tenant pilot.

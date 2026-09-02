@@ -8,6 +8,7 @@ mod factory_dashboard;
 mod factory_skill;
 mod ingest_cmds;
 mod king_cmds;
+mod observation_cmds;
 mod observe;
 mod product_to_code_cmds;
 mod reconcile_cmds;
@@ -155,6 +156,12 @@ enum Command {
         /// (falls back to the raw digest if the binary is unavailable).
         #[arg(long)]
         llm: bool,
+    },
+    /// Run an external, repository-scoped observation window. Samples are
+    /// append-only and never auto-start or repair the daemon being observed.
+    Observe {
+        #[command(subcommand)]
+        command: observation_cmds::ObservationCommand,
     },
     /// Show one agent's status, or (given a TKT- id) a ticket's task-to-main
     /// critical path: queue wait, execution duration, attempts, terminal
@@ -1203,6 +1210,7 @@ async fn main() -> Result<()> {
         Command::King { command } => king_cmds::run(&layout, command, cli.json).await?,
         Command::Top { interval, all } => top::top(&layout, interval, all).await?,
         Command::Digest { since, llm } => observe::digest(&layout, &since, llm, cli.json).await?,
+        Command::Observe { command } => observation_cmds::run(&layout, command, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
         Command::Log(args) => agent_cmds::log(&layout, args, cli.json).await?,
         Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
