@@ -85,6 +85,19 @@ The report covers:
 - forced ungated landings;
 - intervention counts by class.
 
+Ready-queue age is observation-window time, not ticket lifetime. It starts when
+a selected ticket first appears ready in a sample, accumulates while the ticket
+remains continuously ready, and resets if the ticket leaves and later re-enters
+the ready queue. Its resolution is therefore the observer interval. This keeps
+pre-registered or dependency-blocked work from inheriting preflight wall time
+while still failing a run that leaves actionable work undispatched.
+
+A stale ticket is ownerless work already in `claimed`, `in_progress`, or
+`blocked` state whose ticket record has not changed within `--stale-after`.
+Open dependency-blocked tickets are not stale, and work with a live agent is
+covered by liveness and phase telemetry instead. Ready open work is measured by
+the ready-queue-age check rather than counted a second time as stale.
+
 Spend is derived from matching agent generations active or updated during the
 run, including archived records, as a run-window delta. It is not the live-fleet snapshot shown by
 `rk cost --fleet`. Agent results, transcripts, and historical King checkpoints

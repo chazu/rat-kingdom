@@ -478,7 +478,7 @@ async fn append_sample(layout: &Layout, run_dir: &Path) -> Result<Sample> {
             .events
             .sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     }
-    sample.metrics = derive_sample_metrics(&sample, &manifest);
+    sample.metrics = derive_sample_metrics(&sample, &manifest, &prior);
     append_json_line(&run_dir.join(SAMPLES), &sample)?;
     Ok(sample)
 }
@@ -498,7 +498,21 @@ async fn call(
     }
 }
 
-fn derive_sample_metrics(sample: &Sample, manifest: &Manifest) -> SampleMetrics {
+fn derive_sample_metrics(sample: &Sample, manifest: &Manifest, prior: &[Sample]) -> SampleMetrics {
+    let live_tasks: BTreeSet<String> = sample
+        .agents
+        .iter()
+        .filter(|agent| matches!(agent["state"].as_str(), Some("spawning" | "running")))
+        .filter_map(|agent| agent["task"].as_str().map(str::to_string))
+        .collect();
+    let ready = ready_ticket_ids(sample);
+    let selected_ready: BTreeSet<String> = sample
+        .tickets
+        .iter()
+        .filter_map(|ticket| ticket["identity"].as_str())
+        .filter(|identity| ready.contains(*identity))
+        .map(str::to_string)
+        .collect();
     let mut metrics = SampleMetrics {
         live_agents: sample
             .agents
@@ -516,17 +530,16 @@ fn derive_sample_metrics(sample: &Sample, manifest: &Manifest) -> SampleMetrics 
     for ticket in &sample.tickets {
         if ticket_is_nonterminal(ticket) {
             metrics.open_tickets += 1;
-            let age = DateTime::parse_from_rfc3339(ticket["created_at"].as_str().unwrap_or(""))
-                .ok()
-                .and_then(|at| {
-                    sample
-                        .observed_at
-                        .signed_duration_since(at.with_timezone(&Utc))
-                        .to_std()
-                        .ok()
-                })
+            let identity = ticket["identity"].as_str().unwrap_or("");
+            let status = ticket["payload"]["status"].as_str().unwrap_or("open");
+            let stale_candidate = matches!(status, "claimed" | "in_progress" | "blocked")
+                && !live_tasks.contains(identity)
+                && !ready.contains(identity);
+            let age = parse_time(&ticket["payload"]["updated_at"])
+                .or_else(|| parse_time(&ticket["created_at"]))
+                .and_then(|at| sample.observed_at.signed_duration_since(at).to_std().ok())
                 .map_or(0, |age| age.as_secs());
-            if age > manifest.thresholds.stale_after_secs {
+            if stale_candidate && age > manifest.thresholds.stale_after_secs {
                 metrics.stale_tickets += 1;
             }
         }
@@ -564,23 +577,9 @@ fn derive_sample_metrics(sample: &Sample, manifest: &Manifest) -> SampleMetrics 
             .flat_map(|field| work[field].as_array().into_iter().flatten())
             .filter(|row| row["kind"].as_str().is_none_or(str::is_empty))
             .count() as u64;
-        let ready: BTreeSet<&str> = work["ready_tickets"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|row| row["id"].as_str())
-            .collect();
-        metrics.oldest_ready_age_secs = sample
-            .tickets
+        metrics.oldest_ready_age_secs = selected_ready
             .iter()
-            .filter(|ticket| {
-                ticket["identity"]
-                    .as_str()
-                    .is_some_and(|id| ready.contains(id))
-            })
-            .filter_map(|ticket| parse_time(&ticket["created_at"]))
-            .filter_map(|at| sample.observed_at.signed_duration_since(at).to_std().ok())
-            .map(|age| age.as_secs())
+            .map(|ticket| continuous_ready_age_secs(sample, prior, ticket))
             .max()
             .unwrap_or(0);
     }
@@ -596,6 +595,33 @@ fn derive_sample_metrics(sample: &Sample, manifest: &Manifest) -> SampleMetrics 
     }
     metrics.duplicate_dispatches = live_by_task.values().filter(|&&count| count > 1).count() as u64;
     metrics
+}
+
+fn ready_ticket_ids(sample: &Sample) -> BTreeSet<String> {
+    sample
+        .work
+        .as_ref()
+        .and_then(|work| work["ready_tickets"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn continuous_ready_age_secs(sample: &Sample, prior: &[Sample], ticket: &str) -> u64 {
+    let mut ready_since = sample.observed_at;
+    for previous in prior.iter().rev() {
+        if ready_ticket_ids(previous).contains(ticket) {
+            ready_since = previous.observed_at;
+        } else {
+            break;
+        }
+    }
+    sample
+        .observed_at
+        .signed_duration_since(ready_since)
+        .to_std()
+        .map_or(0, |age| age.as_secs())
 }
 
 fn record(args: RecordArgs, as_json: bool) -> Result<()> {
@@ -1047,6 +1073,7 @@ fn compact_ticket(ticket: Value) -> Value {
         "created_at": ticket["created_at"],
         "payload": {
             "status": ticket["payload"]["status"],
+            "updated_at": ticket["payload"]["updated_at"],
             "title": ticket["payload"]["title"],
             "priority": ticket["payload"]["priority"],
             "delivery": ticket["payload"]["delivery"],
@@ -1311,6 +1338,146 @@ mod tests {
         let report = derive_report(dir.path()).unwrap();
         assert_eq!(report.max_landing_age_secs, 700);
         assert!(!report.checks["landing-queue-age-secs"].passed);
+    }
+
+    #[test]
+    fn newly_observed_ready_ticket_does_not_inherit_preflight_creation_age() {
+        let (_, manifest) = fixture();
+        let mut value = sample(1, "2026-09-02T00:00:30Z");
+        value.work = Some(json!({
+            "ready_tickets": [{"id": "TKT-1"}],
+            "actionable": [],
+            "decision_required": [],
+            "stalled": [],
+        }));
+        value.tickets = vec![json!({
+            "identity": "TKT-1",
+            "created_at": "2026-09-01T00:00:00Z",
+            "payload": {
+                "status": "open",
+                "updated_at": "2026-09-01T00:00:00Z",
+                "delivery": null,
+            },
+        })];
+
+        let metrics = derive_sample_metrics(&value, &manifest, &[]);
+        assert_eq!(metrics.oldest_ready_age_secs, 0);
+    }
+
+    #[test]
+    fn ready_age_tracks_only_the_current_observed_ready_streak() {
+        let (_, manifest) = fixture();
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        first.work = Some(json!({
+            "ready_tickets": [{"id": "TKT-1"}],
+            "actionable": [], "decision_required": [], "stalled": [],
+        }));
+        let mut second = sample(2, "2026-09-02T00:05:00Z");
+        second.work = Some(json!({
+            "ready_tickets": [{"id": "TKT-1"}],
+            "actionable": [], "decision_required": [], "stalled": [],
+        }));
+        let mut current = sample(3, "2026-09-02T00:10:00Z");
+        current.work = Some(json!({
+            "ready_tickets": [{"id": "TKT-1"}],
+            "actionable": [], "decision_required": [], "stalled": [],
+        }));
+        current.tickets = vec![json!({
+            "identity": "TKT-1",
+            "created_at": "2026-09-01T00:00:00Z",
+            "payload": {"status": "open", "delivery": null},
+        })];
+
+        let metrics = derive_sample_metrics(&current, &manifest, &[first, second]);
+        assert_eq!(metrics.oldest_ready_age_secs, 600);
+
+        let mut not_ready = sample(4, "2026-09-02T00:11:00Z");
+        not_ready.work = Some(json!({
+            "ready_tickets": [],
+            "actionable": [], "decision_required": [], "stalled": [],
+        }));
+        let mut ready_again = sample(5, "2026-09-02T00:12:00Z");
+        ready_again.work = current.work.clone();
+        ready_again.tickets = current.tickets.clone();
+        let metrics = derive_sample_metrics(&ready_again, &manifest, &[current, not_ready]);
+        assert_eq!(metrics.oldest_ready_age_secs, 0);
+    }
+
+    #[test]
+    fn ready_age_ignores_repo_work_outside_the_selected_ticket_set() {
+        let (_, manifest) = fixture();
+        let mut previous = sample(1, "2026-09-02T00:00:00Z");
+        previous.work = Some(json!({
+            "ready_tickets": [{"id": "TKT-OTHER"}],
+            "actionable": [], "decision_required": [], "stalled": [],
+        }));
+        let mut current = sample(2, "2026-09-02T01:00:00Z");
+        current.work = previous.work.clone();
+        current.tickets = vec![json!({
+            "identity": "TKT-1",
+            "created_at": "2026-09-01T00:00:00Z",
+            "payload": {"status": "open", "delivery": null},
+        })];
+
+        let metrics = derive_sample_metrics(&current, &manifest, &[previous]);
+        assert_eq!(metrics.oldest_ready_age_secs, 0);
+    }
+
+    #[test]
+    fn dependency_blocked_open_ticket_is_not_stale() {
+        let (_, manifest) = fixture();
+        let mut value = sample(1, "2026-09-02T01:00:00Z");
+        value.work = Some(json!({
+            "ready_tickets": [],
+            "actionable": [], "decision_required": [], "stalled": [],
+        }));
+        value.tickets = vec![json!({
+            "identity": "TKT-1",
+            "created_at": "2026-09-01T00:00:00Z",
+            "payload": {
+                "status": "open",
+                "updated_at": "2026-09-01T00:00:00Z",
+                "delivery": null,
+            },
+        })];
+
+        let metrics = derive_sample_metrics(&value, &manifest, &[]);
+        assert_eq!(metrics.stale_tickets, 0);
+    }
+
+    #[test]
+    fn ownerless_active_status_uses_last_ticket_update_for_staleness() {
+        let (_, manifest) = fixture();
+        let mut value = sample(1, "2026-09-02T01:00:00Z");
+        value.work = Some(json!({
+            "ready_tickets": [],
+            "actionable": [], "decision_required": [], "stalled": [],
+        }));
+        value.tickets = vec![json!({
+            "identity": "TKT-1",
+            "created_at": "2026-09-01T00:00:00Z",
+            "payload": {
+                "status": "in_progress",
+                "updated_at": "2026-09-02T00:50:01Z",
+                "delivery": null,
+            },
+        })];
+        assert_eq!(
+            derive_sample_metrics(&value, &manifest, &[]).stale_tickets,
+            0
+        );
+
+        value.tickets[0]["payload"]["updated_at"] = json!("2026-09-02T00:40:00Z");
+        assert_eq!(
+            derive_sample_metrics(&value, &manifest, &[]).stale_tickets,
+            1
+        );
+
+        value.agents = vec![json!({"task": "TKT-1", "state": "running"})];
+        assert_eq!(
+            derive_sample_metrics(&value, &manifest, &[]).stale_tickets,
+            0
+        );
     }
 
     #[test]
