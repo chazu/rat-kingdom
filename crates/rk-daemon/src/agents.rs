@@ -1278,6 +1278,68 @@ impl Registry {
         Ok(Some(snapshot))
     }
 
+    /// Clear only this generation's exact delivery pointer, including archived
+    /// copies. Restore memory on persistence failure so a retry still writes it.
+    pub(crate) fn settle_revert(
+        &mut self,
+        name: &str,
+        spawn: rk_core::id::SpawnId,
+        commit: &str,
+    ) -> rk_core::Result<()> {
+        let matches = |record: &&AgentRecord| record.name == name && record.spawn == Some(spawn);
+        let records: Vec<_> = self
+            .agents
+            .values()
+            .chain(self.archived.iter())
+            .filter(matches)
+            .collect();
+        if records.is_empty() {
+            return Err(rk_core::Error::other(
+                "reverted agent generation is no longer in the registry",
+            ));
+        }
+        if records.iter().any(|record| {
+            record
+                .merge_commit
+                .as_deref()
+                .is_some_and(|value| value != commit)
+        }) {
+            return Err(rk_core::Error::other(
+                "reverted agent generation has a different delivery pointer",
+            ));
+        }
+        let before_agents = self.agents.clone();
+        let before_archive = self.archived.clone();
+        let mut live_changed = false;
+        let mut archive_changed = false;
+        for record in self.agents.values_mut() {
+            if record.name == name && record.spawn == Some(spawn) && record.merge_commit.is_some() {
+                record.merge_commit = None;
+                live_changed = true;
+            }
+        }
+        for record in &mut self.archived {
+            if record.name == name && record.spawn == Some(spawn) && record.merge_commit.is_some() {
+                record.merge_commit = None;
+                archive_changed = true;
+            }
+        }
+        let persisted = (|| {
+            if live_changed {
+                self.persist()?;
+            }
+            if archive_changed {
+                self.persist_archive()?;
+            }
+            Ok(())
+        })();
+        if persisted.is_err() {
+            self.agents = before_agents;
+            self.archived = before_archive;
+        }
+        persisted
+    }
+
     /// Like [`update`](Self::update), but never touches `updated_at`, and
     /// only persists to disk when `mutate` reports it actually changed
     /// something (returns `true`).
@@ -1496,6 +1558,41 @@ mod tests {
 
     fn names(records: &[&AgentRecord]) -> Vec<String> {
         records.iter().map(|r| r.name.clone()).collect()
+    }
+
+    #[test]
+    fn revert_settlement_fences_archived_generation_and_newer_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let mut registry = Registry::load(&path).unwrap();
+        let mut old = aged("same-name", AgentState::Dismissed, 60);
+        old.merge_commit = Some("old-commit".into());
+        let spawn = old.spawn.unwrap();
+        registry.insert(old).unwrap();
+        registry.archive(Utc::now()).unwrap();
+        let mut current = record("same-name", AgentState::Completed);
+        current.merge_commit = Some("new-commit".into());
+        registry.insert(current).unwrap();
+        assert!(registry
+            .settle_revert("same-name", spawn, "wrong-commit")
+            .is_err());
+        registry
+            .settle_revert("same-name", spawn, "old-commit")
+            .unwrap();
+        registry
+            .settle_revert("same-name", spawn, "old-commit")
+            .unwrap();
+        let reloaded = Registry::load(&path).unwrap();
+        assert_eq!(
+            reloaded.get("same-name").unwrap().merge_commit.as_deref(),
+            Some("new-commit")
+        );
+        let old = reloaded
+            .records_of("same-name")
+            .into_iter()
+            .find(|r| r.spawn == Some(spawn))
+            .unwrap();
+        assert!(old.merge_commit.is_none());
     }
 
     /// A rat that ran: the harness gave it a session and it burned tokens.

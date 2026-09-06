@@ -152,7 +152,7 @@ pub struct DismissArgs {
 pub struct LandArgs {
     /// Local branch to submit to the landing queue.
     pub branch: String,
-    /// Repository checkout (defaults to the current directory).
+    /// Repository path or registered name (defaults to the current directory).
     #[arg(long, default_value = ".")]
     pub repo: String,
     /// Target branch.
@@ -180,7 +180,7 @@ pub struct LandArgs {
 pub struct ReenqueueReviewArgs {
     /// Branch whose review attempt was ceiling-settled.
     pub branch: String,
-    /// Repository checkout (defaults to the current directory).
+    /// Repository path or registered name (defaults to the current directory).
     #[arg(long, default_value = ".")]
     pub repo: String,
     /// Target branch.
@@ -199,7 +199,7 @@ pub struct ReenqueueReviewArgs {
 pub struct CancelReviewArgs {
     /// Branch whose review attempt is currently in progress.
     pub branch: String,
-    /// Repository checkout (defaults to the current directory).
+    /// Repository path or registered name (defaults to the current directory).
     #[arg(long, default_value = ".")]
     pub repo: String,
     /// Target branch.
@@ -218,6 +218,9 @@ pub struct RevertArgs {
     /// out of the auto-dispatch backlog until a human looks at it.
     #[arg(long)]
     pub block: bool,
+    /// Resume this exact operation, including after the agent name is reused.
+    #[arg(long)]
+    pub operation: Option<rk_core::id::RecordId>,
 }
 
 pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()> {
@@ -865,8 +868,8 @@ pub async fn dismiss(layout: &Layout, args: DismissArgs, as_json: bool) -> Resul
 }
 
 pub async fn land(layout: &Layout, args: LandArgs, as_json: bool) -> Result<()> {
-    let repo = std::fs::canonicalize(&args.repo)?;
     let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
     let result = client
         .call(
             "repo.land",
@@ -912,8 +915,8 @@ pub async fn reenqueue_review(
     args: ReenqueueReviewArgs,
     as_json: bool,
 ) -> Result<()> {
-    let repo = std::fs::canonicalize(&args.repo)?;
     let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
     let result = client
         .call(
             "repo.land.reenqueue",
@@ -946,8 +949,8 @@ pub async fn reenqueue_review(
 /// still arrives afterward is retained as evidence, never treated as the
 /// landing decision.
 pub async fn cancel_review(layout: &Layout, args: CancelReviewArgs, as_json: bool) -> Result<()> {
-    let repo = std::fs::canonicalize(&args.repo)?;
     let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
     let result = client
         .call(
             "repo.land.cancel_review",
@@ -979,7 +982,7 @@ pub async fn revert(layout: &Layout, args: RevertArgs, as_json: bool) -> Result<
     let result = client
         .call(
             "agent.revert",
-            json!({"name": args.name, "block": args.block}),
+            json!({"name": args.name, "block": args.block, "operation": args.operation}),
         )
         .await?;
     if as_json {

@@ -1187,8 +1187,7 @@ pub struct PolicyConfig {
     /// before a different holder may preempt it.
     pub orchestrator_lease_ttl_secs: i64,
     /// Fleet-wide default max concurrent daemon-managed verification runs
-    /// (`WorkflowEngine::run_check_in`, gated to checks that set
-    /// `sharedCargoTarget` — the CPU/wall-clock-heavy ones, e.g. `verify`) for
+    /// (all commands, including non-Cargo checks) for
     /// one repository at a time: landing gates, workflow `run` steps, AND
     /// `verify.run`-mediated agent/reviewer self-checks all share this ONE
     /// per-repo bound (TKT-01M0HNESEECWWFQF8X6VH1XSJ6). `0` (the default)

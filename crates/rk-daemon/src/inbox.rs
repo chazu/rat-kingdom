@@ -72,7 +72,7 @@ mod urgency {
 
 /// One row in the operator inbox: something awaiting a human, plus the exact
 /// command that resolves it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct InboxItem {
     /// Derived urgency; higher is more urgent. Rows sort by this, descending.
     pub urgency: u8,
@@ -84,8 +84,70 @@ pub struct InboxItem {
     pub scope: String,
     /// One-line description of what needs attention.
     pub detail: String,
-    /// The exact `rk` command that resolves this row.
-    pub action: String,
+    /// Structured routing. Display prose must never decide whether a row is
+    /// actionable, a human decision, or diagnostic stalled work.
+    pub disposition: InboxDisposition,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum InboxDisposition {
+    Actionable { command: String },
+    DecisionRequired { commands: Vec<String> },
+    Stalled { advice: String },
+}
+
+impl InboxDisposition {
+    fn actionable(command: impl Into<String>) -> Self {
+        Self::Actionable {
+            command: command.into(),
+        }
+    }
+
+    fn stalled(advice: impl Into<String>) -> Self {
+        Self::Stalled {
+            advice: advice.into(),
+        }
+    }
+}
+
+impl InboxItem {
+    pub fn action(&self) -> String {
+        match &self.disposition {
+            InboxDisposition::Actionable { command } => command.clone(),
+            InboxDisposition::DecisionRequired { commands } => commands.join("  |  "),
+            InboxDisposition::Stalled { advice } => advice.clone(),
+        }
+    }
+}
+
+impl Serialize for InboxItem {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut row = serializer.serialize_struct("InboxItem", 7)?;
+        row.serialize_field("urgency", &self.urgency)?;
+        row.serialize_field("kind", &self.kind)?;
+        row.serialize_field("subject", &self.subject)?;
+        row.serialize_field("scope", &self.scope)?;
+        row.serialize_field("detail", &self.detail)?;
+        row.serialize_field("disposition", &self.disposition)?;
+        // Retain the display field for existing CLI/MCP/persisted snapshot
+        // consumers. It is derived from the disposition, never read as policy.
+        row.serialize_field("action", &self.action())?;
+        row.end()
+    }
+}
+
+fn command_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_/.:".contains(&b))
+    {
+        arg.into()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }
 
 /// The branch-shaped inputs: events about work that was pushed or landed, plus
@@ -217,7 +279,8 @@ pub fn build(
             AgentState::Orphaned => "agent-orphaned",
             _ => unreachable!("filtered above"),
         };
-        let action = format!("rk respawn {}", a.name);
+        let disposition =
+            InboxDisposition::actionable(format!("rk respawn {}", command_arg(&a.name)));
         let detail = match &a.result {
             Some(r) if !r.is_empty() => format!("{} — {r}", a.task.as_deref().unwrap_or("-")),
             _ => a.task.clone().unwrap_or_else(|| "-".into()),
@@ -228,7 +291,7 @@ pub fn build(
             subject: a.name.clone(),
             scope: a.repo_name.clone(),
             detail,
-            action,
+            disposition,
         });
     }
 
@@ -246,7 +309,12 @@ pub fn build(
                     "{} parked at approval gate (step {})",
                     i.workflow, i.current_step
                 ),
-                action: format!("rk approve {id}  |  rk reject {id}", id = i.id),
+                disposition: InboxDisposition::DecisionRequired {
+                    commands: vec![
+                        format!("rk approve {}", command_arg(&i.id)),
+                        format!("rk reject {}", command_arg(&i.id)),
+                    ],
+                },
             });
         }
     }
@@ -286,7 +354,10 @@ pub fn build(
             subject: t.identity.clone(),
             scope: t.scope.clone(),
             detail,
-            action: format!("rk status {}", t.identity),
+            disposition: InboxDisposition::stalled(format!(
+                "rk status {}",
+                command_arg(&t.identity)
+            )),
         });
     }
 
@@ -318,7 +389,10 @@ pub fn build(
             subject: t.identity.clone(),
             scope: t.scope.clone(),
             detail: text.to_string(),
-            action: format!("rk scan need {}", t.scope),
+            disposition: InboxDisposition::stalled(format!(
+                "rk scan need {}",
+                command_arg(&t.scope)
+            )),
         });
     }
 
@@ -392,7 +466,7 @@ pub fn build(
             subject: branch.unwrap_or(&t.identity).to_string(),
             scope: t.scope.clone(),
             detail,
-            action,
+            disposition: InboxDisposition::stalled(action),
         });
     }
 
@@ -428,23 +502,41 @@ pub fn build(
             .payload
             .get("target")
             .and_then(|v| v.as_str())
-            .unwrap_or("main");
+            .filter(|target| !target.is_empty());
         let why = t
             .payload
             .get("detail")
             .and_then(|v| v.as_str())
             .filter(|d| !d.trim().is_empty())
             .unwrap_or("no detail recorded");
+        let advice = match target {
+            Some(target) if branch != "(unknown)" => {
+                let mut command = format!(
+                    "rk land {} --repo {} --target {}",
+                    command_arg(branch),
+                    command_arg(&t.scope),
+                    command_arg(target),
+                );
+                if let Some(task) = t
+                    .payload
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .filter(|task| !task.is_empty())
+                {
+                    command.push_str(&format!(" --task {}", command_arg(task)));
+                }
+                command
+            }
+            _ => format!("rk --json work {}", command_arg(&t.scope)),
+        };
+        let target = target.unwrap_or("(unknown)");
         items.push(InboxItem {
             urgency: urgency::UNLANDED,
             kind: "unlanded-branch".into(),
             subject: branch.to_string(),
             scope: t.scope.clone(),
             detail: format!("land did not merge {branch} → {target}: {why}"),
-            // No `rk` verb lands a named branch, so name the git that does. The
-            // row also clears if the operator decides the branch is redundant
-            // and deletes it.
-            action: format!("git checkout {target} && git merge {branch}"),
+            disposition: InboxDisposition::stalled(advice),
         });
     }
 
@@ -470,16 +562,16 @@ pub fn build(
 /// `need`. Manually `rk respawn`ing a still-retrying episode would race
 /// `transport_retry_sweep`'s own schedule, so the action differs too.
 fn transport_outage_item(a: &AgentRecord, outage: &TransportOutageState) -> InboxItem {
-    let (urgency, action, status) = if outage.ceiling_hit {
+    let (urgency, disposition, status) = if outage.ceiling_hit {
         (
             urgency::FAILED,
-            format!("rk respawn {}", a.name),
+            InboxDisposition::actionable(format!("rk respawn {}", command_arg(&a.name))),
             "exhausted its retry ceiling — needs a human",
         )
     } else {
         (
             urgency::OBSTACLE,
-            format!("rk status {}", a.name),
+            InboxDisposition::stalled(format!("rk status {}", command_arg(&a.name))),
             "auto-retrying under the castle-wide circuit breaker",
         )
     };
@@ -492,7 +584,7 @@ fn transport_outage_item(a: &AgentRecord, outage: &TransportOutageState) -> Inbo
             "{} pre-work transport failure ({:?}), attempt {} — {status}",
             outage.provider, outage.class, outage.attempts
         ),
-        action,
+        disposition,
     }
 }
 
@@ -526,7 +618,10 @@ fn transport_outage_need_item(t: &Tuple) -> InboxItem {
             "{provider} pre-work transport failure ({class}), attempt {attempts} — \
              exhausted its retry ceiling — needs a human (agent record archived/gone)"
         ),
-        action: format!("rk respawn {}", t.identity),
+        disposition: InboxDisposition::actionable(format!(
+            "rk respawn {}",
+            command_arg(&t.identity)
+        )),
     }
 }
 
@@ -627,7 +722,10 @@ fn open_suggestions(ballots: &Ballots<'_>) -> Vec<InboxItem> {
                 ballots.quorum,
                 window_left(t.expires_at, ballots.now),
             ),
-            action: format!("rk endorse {}", t.identity),
+            disposition: InboxDisposition::stalled(format!(
+                "rk endorse {}",
+                command_arg(&t.identity)
+            )),
         });
     }
     rows
@@ -667,7 +765,7 @@ pub(crate) fn stalled_landing_queue_rows(
                 q.oldest_branch,
                 waiting_for(q.oldest_age_secs),
             ),
-            action: "rk status --json  (see landing_queue)".into(),
+            disposition: InboxDisposition::stalled("rk --json daemon status"),
         })
         .collect()
 }
@@ -868,7 +966,7 @@ fn unresolved_workflow_failures(instances: &[Instance]) -> Vec<InboxItem> {
                 subject: newest.id.clone(),
                 scope: repo_name(&newest.repo),
                 detail,
-                action,
+                disposition: InboxDisposition::stalled(action),
             },
         ));
     }
@@ -963,7 +1061,7 @@ pub fn recovery_action_rows(actions: &[Tuple], acks: &[Tuple]) -> Vec<InboxItem>
                 subject,
                 scope: t.scope.clone(),
                 detail,
-                action: format!("rk inbox ack {id}"),
+                disposition: InboxDisposition::actionable(format!("rk inbox ack {id}")),
             }
         })
         .collect()
@@ -1145,7 +1243,7 @@ mod tests {
         assert_eq!(rows[0].subject, "Nibbles");
         assert_eq!(rows[0].kind, "recovery-action");
         assert_eq!(rows[0].urgency, urgency::OBSTACLE);
-        assert_eq!(rows[0].action, format!("rk inbox ack {}", live.id));
+        assert_eq!(rows[0].action(), format!("rk inbox ack {}", live.id));
 
         // Nothing acked: both rows stand.
         let rows = recovery_action_rows(&[stale.clone(), live.clone()], &[]);
@@ -1234,8 +1332,8 @@ mod tests {
         assert_eq!(*kinds.last().unwrap(), "need");
         // Gate row carries both resolving commands.
         let gate = inbox.iter().find(|i| i.kind == "workflow-gate").unwrap();
-        assert!(gate.action.contains("rk approve wf-gate"));
-        assert!(gate.action.contains("rk reject wf-gate"));
+        assert!(gate.action().contains("rk approve wf-gate"));
+        assert!(gate.action().contains("rk reject wf-gate"));
     }
 
     #[test]
@@ -1260,7 +1358,7 @@ mod tests {
         );
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].subject, "Gone");
-        assert_eq!(inbox[0].action, "rk respawn Gone");
+        assert_eq!(inbox[0].action(), "rk respawn Gone");
     }
 
     fn outage(ceiling_hit: bool) -> TransportOutageState {
@@ -1312,7 +1410,7 @@ mod tests {
         assert_eq!(inbox.len(), 1, "must be exactly one row: {inbox:#?}");
         assert_eq!(inbox[0].kind, "transport-outage");
         assert_eq!(inbox[0].urgency, urgency::OBSTACLE);
-        assert_eq!(inbox[0].action, "rk status Nibble");
+        assert_eq!(inbox[0].action(), "rk status Nibble");
     }
 
     /// Once the episode is exhausted (`ceiling_hit`), `escalate_transport_outage`
@@ -1338,7 +1436,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "must dedupe to one row: {inbox:#?}");
         assert_eq!(rows[0].urgency, urgency::FAILED);
-        assert_eq!(rows[0].action, "rk respawn Nibble");
+        assert_eq!(rows[0].action(), "rk respawn Nibble");
     }
 
     /// If the `AgentRecord` is gone (archived/pruned) by the time `rk inbox`
@@ -1367,7 +1465,7 @@ mod tests {
         );
         assert_eq!(rows[0].subject, "Ghost");
         assert_eq!(rows[0].urgency, urgency::FAILED);
-        assert_eq!(rows[0].action, "rk respawn Ghost");
+        assert_eq!(rows[0].action(), "rk respawn Ghost");
         assert!(rows[0].detail.contains("claude"));
         assert!(rows[0].detail.contains("unavailable"));
     }
@@ -1397,7 +1495,7 @@ mod tests {
         assert_eq!(row.subject, "rat/rat-9/tkt-9");
         assert!(row.detail.contains("rat/rat-9/tkt-9 → main"));
         assert!(row.detail.contains("https://forge/x/y/compare"));
-        assert!(row.action.contains("review & merge: https://forge/"));
+        assert!(row.action().contains("review & merge: https://forge/"));
     }
 
     #[test]
@@ -1550,8 +1648,50 @@ mod tests {
         // The reason git gave must reach the operator, not just "it failed".
         assert!(row.detail.contains("Merge conflict in lib.rs"));
         assert!(row
-            .action
-            .contains("git merge rat/dusty-2/steward-review-tkt-147"));
+            .action()
+            .contains("rk land rat/dusty-2/steward-review-tkt-147 --repo repo --target main"));
+    }
+
+    #[test]
+    fn dropped_land_advice_preserves_exact_target_and_quotes_repository_scope() {
+        let mut event = land("feature", false, false, "held");
+        event.scope = "repo with spaces".into();
+        event.payload["target"] = json!("release");
+        event.payload["task"] = json!("TKT-one");
+        let rows = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                lands: std::slice::from_ref(&event),
+                ..Default::default()
+            },
+            &Ballots::default(),
+        );
+        assert_eq!(
+            rows[0].action(),
+            "rk land feature --repo 'repo with spaces' --target release --task TKT-one"
+        );
+        assert!(matches!(
+            rows[0].disposition,
+            InboxDisposition::Stalled { .. }
+        ));
+
+        event.payload.as_object_mut().unwrap().remove("target");
+        let rows = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                lands: std::slice::from_ref(&event),
+                ..Default::default()
+            },
+            &Ballots::default(),
+        );
+        assert_eq!(rows[0].action(), "rk --json work 'repo with spaces'");
+        assert!(!rows[0].action().contains("--target main"));
     }
 
     #[test]
@@ -1747,7 +1887,7 @@ mod tests {
         assert!(row
             .detail
             .contains("rat-28 proposes: a pre-existing failure"));
-        assert_eq!(row.action, "rk endorse sug-8nsqa4132x");
+        assert_eq!(row.action(), "rk endorse sug-8nsqa4132x");
     }
 
     #[test]
@@ -2021,6 +2161,6 @@ mod tests {
         );
         assert_eq!(inbox[0].urgency, urgency::OBSTACLE);
         assert_eq!(inbox[0].detail, "merge conflict in lib.rs");
-        assert_eq!(inbox[0].action, "rk status Pip");
+        assert_eq!(inbox[0].action(), "rk status Pip");
     }
 }

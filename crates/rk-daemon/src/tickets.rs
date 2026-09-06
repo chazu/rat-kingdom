@@ -714,6 +714,66 @@ impl Tickets {
         Ok(true)
     }
 
+    /// Settle one exact revert without clearing a subsequent delivery or
+    /// reopening work again after a retry. The receipt and state change share
+    /// one SQLite transaction; a failed write cannot destroy the ticket.
+    pub(crate) async fn revert_delivery(
+        &self,
+        id: &str,
+        merge_commit: &str,
+        target: &str,
+        operation: RecordId,
+        status: &str,
+    ) -> rk_core::Result<()> {
+        if !matches!(status, "open" | "blocked") {
+            return Err(rk_core::Error::other("invalid revert ticket status"));
+        }
+        let _guard = self.lock.lock().await;
+        let existing = self
+            .get(id)?
+            .ok_or_else(|| rk_core::Error::other(format!("no such ticket: {id}")))?;
+        if existing.payload["revert_operations"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&json!(operation)))
+        {
+            return Ok(());
+        }
+        if let Some(delivery) = delivery_of(&existing) {
+            if delivery.merge_commit != merge_commit || delivery.target != target {
+                return Err(rk_core::Error::other(format!(
+                    "ticket {id} has a different delivery; revert remains unsettled"
+                )));
+            }
+        } else if !existing.payload[DELIVERY_FIELD].is_null() {
+            return Err(rk_core::Error::other(
+                "malformed ticket delivery; revert remains unsettled",
+            ));
+        }
+        let mut payload = existing.payload.clone();
+        let obj = payload
+            .as_object_mut()
+            .ok_or_else(|| rk_core::Error::other("ticket payload is not an object"))?;
+        let receipts = obj
+            .entry("revert_operations")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| rk_core::Error::other("malformed ticket revert receipts"))?;
+        receipts.push(json!(operation));
+        obj.remove(DELIVERY_FIELD);
+        obj.insert("status".into(), json!(status));
+        obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+        let revision = existing.id;
+        if !self
+            .space
+            .replace(revision, with_payload(existing, payload))?
+        {
+            return Err(rk_core::Error::other(
+                "ticket changed during revert finalization; retry",
+            ));
+        }
+        Ok(())
+    }
+
     /// The delivery record for `id`, if it exists and has landed.
     pub fn delivery(&self, id: &str) -> rk_core::Result<Option<DeliveryRecord>> {
         Ok(self.get(id)?.as_ref().and_then(delivery_of))
@@ -1352,6 +1412,37 @@ mod tests {
         );
         // Nothing left to clear on a second revert.
         assert!(!t.clear_delivery(&id, "open").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn exact_revert_preserves_new_delivery_and_replays_without_reopening_again() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        let operation = RecordId::new();
+        let delivered = record("first");
+        t.record_delivery(&id, &delivered).await.unwrap();
+        assert!(t
+            .revert_delivery(&id, "other", &delivered.target, operation, "open")
+            .await
+            .is_err());
+        assert!(t
+            .revert_delivery(&id, "first", "other-target", operation, "open")
+            .await
+            .is_err());
+        t.revert_delivery(&id, "first", &delivered.target, operation, "open")
+            .await
+            .unwrap();
+        t.record_delivery(&id, &record("second")).await.unwrap();
+        t.revert_delivery(&id, "first", &delivered.target, operation, "open")
+            .await
+            .unwrap();
+        let ticket = t.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["delivery"]["merge_commit"], "second");
+        assert_eq!(ticket.payload["status"], "closed");
+        assert!(t
+            .revert_delivery(&id, "first", &delivered.target, RecordId::new(), "open")
+            .await
+            .is_err());
     }
 
     /// A land is ground truth, so it must record from any prior status,

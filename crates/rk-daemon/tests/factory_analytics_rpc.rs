@@ -333,15 +333,17 @@ async fn factory_rpcs_report_missing_source_families_as_unobserved_not_zero() {
 
 #[tokio::test]
 async fn factory_analytics_reads_revert_fact_and_rework_verdict_end_to_end() {
-    let (_home, repo_dir, _layout, handle, space, mut client) = setup_with_space().await;
+    let (_home, _repo_dir, _layout, handle, space, mut client) = setup_with_space().await;
     run_factory_workflow(&mut client, "structured-outcomes").await;
     let agent_name = settled_agent_name(&mut client).await;
-    let repo_scope = repo_dir
-        .path()
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    // Production revert/verdict producers use the agent's registered scope,
+    // including when the checkout basename differs from the registration.
+    let agent = client
+        .call("agent.status", json!({"name": agent_name}))
+        .await
+        .unwrap();
+    let repo_scope = agent["agent"]["repo_name"].as_str().unwrap().to_string();
+    assert_eq!(repo_scope, "repo-a");
 
     space
         .out(Tuple::new(

@@ -5,7 +5,7 @@
 //! contribution to this module is its *interface*: a daemon-native consumer
 //! in this crate can run a fully-resolved named check in an arbitrary
 //! directory (a persistent gate worktree) through
-//! [`crate::workflow_exec::WorkflowEngine::run_check_in`] without any agent
+//! [`crate::managed_verification::ManagedVerification::run`] without any agent
 //! worktree or workflow context.
 //!
 //! This module adds the durable per-`(repo,target)` FIFO
@@ -74,6 +74,7 @@
 //! that live wiring.
 #![allow(dead_code)]
 
+use crate::delivery::{BlockedTarget, LandedDelivery, StaleTarget, TargetAdvance};
 use crate::landing_conflict::{
     self, ConflictContext, ConflictEvidence, ConflictPolicy, CONFLICT_DISPATCH_IDENTITY,
 };
@@ -1162,15 +1163,6 @@ struct ResolvedGatePlan {
     reason: String,
 }
 
-/// Classification of the one prepared-target advance implementation. Callers
-/// still own mode-specific reporting, but none may call `land_prepared`
-/// directly or reinterpret its stale/blocked flags independently.
-enum TargetAdvance {
-    Landed(Value),
-    Stale(Value),
-    Blocked(Value),
-}
-
 /// Which of the two landing-edge classes `GateConfig::protected_targets`
 /// (`LandingPolicy::protected_targets`, `.rk/repo.cue`) puts a candidate's
 /// `target` in — the switch between "run the full named check exactly once"
@@ -1347,9 +1339,9 @@ impl Default for GateConfig {
 pub(crate) enum LandingOutcome {
     /// Gates passed and the candidate either needed no LLM judgment
     /// (doc-only/trivial diff) or got an APPROVE (fresh or cached) — routed
-    /// advanced through `Supervisor::land_prepared`. Carries its result JSON
-    /// (`merged`, `delivered`, ...).
-    Landed(Value),
+    /// advanced through `Supervisor::land_prepared`. Carries the exact typed
+    /// delivery; JSON is produced only when responding to an external caller.
+    Landed(LandedDelivery),
     /// The candidate's source head already carried zero commits beyond its
     /// target when classified — an explicit no-op, never gated or reviewed
     /// (module doc, [`LANDING_EMPTY_IDENTITY`]). Carries the same
@@ -1610,18 +1602,24 @@ impl LandingPipeline {
         })
     }
 
-    /// Reclaim parked merge objects not referenced by any durable queue row.
+    /// Reclaim parked objects not referenced by a durable queue or revert.
     /// Run once during daemon startup; live candidates survive, while the
     /// narrow prepare-before-persist crash window cannot leak refs forever.
     pub(crate) fn sweep_orphaned_candidate_refs(
         &self,
         registered_paths: impl IntoIterator<Item = PathBuf>,
     ) -> usize {
-        let queued = self
+        let Ok(queued) = self
             .space
             .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
-            .unwrap_or_default();
-        let live: BTreeSet<String> = queued
+        else {
+            return 0;
+        };
+        let Ok(revert_candidates) = self.supervisor.pending_revert_candidates() else {
+            // Unreadable recovery evidence cannot authorize destructive GC.
+            return 0;
+        };
+        let mut live: BTreeSet<String> = queued
             .iter()
             .filter_map(|tuple| {
                 tuple
@@ -1632,6 +1630,10 @@ impl LandingPipeline {
             })
             .collect();
         let mut paths: BTreeSet<PathBuf> = registered_paths.into_iter().collect();
+        for (path, candidate_ref) in revert_candidates {
+            paths.insert(path);
+            live.insert(candidate_ref);
+        }
         paths.extend(queued.iter().filter_map(|tuple| {
             tuple
                 .payload
@@ -1694,7 +1696,7 @@ impl LandingPipeline {
             )));
         };
         let repo = rk_git::Repo::discover(repo_root)?;
-        let repo_name = repo.name();
+        let repo_name = self.supervisor.repository_name(&repo)?;
         let head_sha = repo.rev_parse(branch)?;
         let stat = repo.diff_stat(target, branch)?;
         let entry = LandingQueueEntry {
@@ -1768,7 +1770,7 @@ impl LandingPipeline {
                 continue;
             }
             return Ok(match outcome {
-                LandingOutcome::Landed(result) => result,
+                LandingOutcome::Landed(result) => result.to_json(),
                 LandingOutcome::Empty(result) => result,
                 LandingOutcome::GateHeld => json!({
                     "branch": branch, "target": target, "merged": false,
@@ -2276,14 +2278,11 @@ impl LandingPipeline {
         entry: &LandingQueueEntry,
         repo: &rk_git::Repo,
         candidate: &rk_git::PreparedMerge,
-        result: &Value,
+        result: &StaleTarget,
     ) -> rk_core::Result<LandingOutcome> {
         repo.discard_candidate(&candidate.candidate_ref)?;
         let seq = self.queue.requeue_tail(entry)?;
-        let actual = result
-            .get("actual_target_sha")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
+        let actual = &result.actual;
         self.space.out(
             Tuple::new(
                 Category::Event,
@@ -2294,7 +2293,7 @@ impl LandingPipeline {
                     "branch": entry.branch,
                     "target": entry.target,
                     "tested_sha": candidate.commit,
-                    "expected_target_sha": candidate.base,
+                    "expected_target_sha": result.expected,
                     "actual_target_sha": actual,
                     "seq": seq,
                     "text": format!(
@@ -2461,9 +2460,8 @@ impl LandingPipeline {
         } else {
             all_deleted = false;
         }
-        result["branch_deleted"] = Value::Bool(all_deleted);
-        result["batch_branches"] = json!(branch_names);
-        result["batch_size"] = json!(entries.len());
+        result.branch_deleted = all_deleted;
+        result.batch_branches = branch_names;
 
         let mut outcomes = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -2522,18 +2520,15 @@ impl LandingPipeline {
             all_deleted = false;
         }
 
-        let result = json!({
-            "branch": entries[0].branch,
-            "target": entries[0].target,
-            "delivered": true,
-            "merged": true,
-            "merge_commit": commit,
-            "content_free": commit == base,
-            "recovered": true,
-            "branch_deleted": all_deleted,
-            "batch_branches": entries.iter().map(|entry| entry.branch.clone()).collect::<Vec<_>>(),
-            "batch_size": entries.len(),
-        });
+        let mut result = LandedDelivery::new(
+            &entries[0].branch,
+            &entries[0].target,
+            commit,
+            commit == base,
+        )?;
+        result.recovered = true;
+        result.branch_deleted = all_deleted;
+        result.batch_branches = entries.iter().map(|entry| entry.branch.clone()).collect();
         let mut outcomes = Vec::with_capacity(entries.len());
         for entry in entries {
             if let Some(marker) = self.admission_marker(entry)? {
@@ -3640,7 +3635,7 @@ impl LandingPipeline {
         settled_attempt: &str,
     ) -> rk_core::Result<String> {
         let git_repo = rk_git::Repo::discover(repo_path)?;
-        let repo_name = git_repo.name();
+        let repo_name = self.supervisor.repository_name(&git_repo)?;
         let lookup = LandingQueueEntry {
             repo_name: repo_name.clone(),
             branch: branch.to_string(),
@@ -3742,7 +3737,7 @@ impl LandingPipeline {
         task: &str,
     ) -> rk_core::Result<Tuple> {
         let git_repo = rk_git::Repo::discover(repo_path)?;
-        let repo_name = git_repo.name();
+        let repo_name = self.supervisor.repository_name(&git_repo)?;
         let entry = self
             .queued_entry_for(&repo_name, branch, target, task)?
             .ok_or_else(|| {
@@ -3862,16 +3857,10 @@ impl LandingPipeline {
     fn worktree_blocked_gate(
         &self,
         entry: &LandingQueueEntry,
-        result: &Value,
+        result: &BlockedTarget,
     ) -> rk_core::Result<Tuple> {
-        let worktree_path = result
-            .get("worktree_path")
-            .and_then(Value::as_str)
-            .unwrap_or("(unknown)");
-        let detail = result
-            .get("detail")
-            .and_then(Value::as_str)
-            .unwrap_or("fast-forward refused");
+        let worktree_path = result.worktree_path.display();
+        let detail = &result.detail;
         self.escalate(
             entry,
             format!(
@@ -3890,10 +3879,7 @@ impl LandingPipeline {
                 entry.task,
                 entry.target,
                 entry.target,
-                result
-                    .get("tested_sha")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?"),
+                result.tested_sha,
                 entry.branch,
                 entry.repo_path,
                 entry.target,
@@ -4288,8 +4274,7 @@ impl LandingPipeline {
         candidate: &rk_git::PreparedMerge,
     ) -> rk_core::Result<TargetAdvance> {
         self.note_non_main_land_target(entry);
-        let result = self
-            .supervisor
+        self.supervisor
             .land_prepared(
                 Path::new(&entry.repo_path),
                 &entry.branch,
@@ -4297,14 +4282,7 @@ impl LandingPipeline {
                 keep_branch,
                 candidate,
             )
-            .await?;
-        if result.get("stale").and_then(Value::as_bool) == Some(true) {
-            Ok(TargetAdvance::Stale(result))
-        } else if result.get("blocked").and_then(Value::as_bool) == Some(true) {
-            Ok(TargetAdvance::Blocked(result))
-        } else {
-            Ok(TargetAdvance::Landed(result))
-        }
+            .await
     }
 
     /// The sole successful-land finalization transition. Delivery facts,
@@ -4313,7 +4291,7 @@ impl LandingPipeline {
     async fn finalize_landed(
         &self,
         entry: &LandingQueueEntry,
-        result: Value,
+        result: LandedDelivery,
     ) -> rk_core::Result<LandingOutcome> {
         self.record_delivery(entry, &result).await?;
         Ok(LandingOutcome::Landed(result))
@@ -4326,9 +4304,9 @@ impl LandingPipeline {
     /// delivered" question fell back to a live branch ref that the land had
     /// just deleted.
     ///
-    /// Skipped — deliberately, not as an error — when the merge produced no
-    /// merge commit (`merged: false`, a conflict the queue will surface) or
-    /// when the branch was `content_free` (an empty branch is not a delivery).
+    /// Skipped when the branch was `content_free` (an empty branch is not a
+    /// delivery). Every other landed outcome carries a required commit; stale
+    /// and blocked candidates cannot enter this transition.
     /// The merge already happened and is durable in git, so a failure here is
     /// propagated specifically to KEEP the durable `Landing` queue entry. A
     /// later pass recovers from that receipt and retries this idempotent
@@ -4340,9 +4318,9 @@ impl LandingPipeline {
     async fn record_delivery(
         &self,
         entry: &LandingQueueEntry,
-        result: &Value,
+        result: &LandedDelivery,
     ) -> rk_core::Result<()> {
-        if result.get("content_free").and_then(Value::as_bool) == Some(true) {
+        if result.content_free {
             info!(
                 task = %entry.task,
                 branch = %entry.branch,
@@ -4350,13 +4328,7 @@ impl LandingPipeline {
             );
             return Ok(());
         }
-        let Some(merge_commit) = result
-            .get("merge_commit")
-            .and_then(Value::as_str)
-            .filter(|c| !c.is_empty())
-        else {
-            return Ok(());
-        };
+        let merge_commit = result.merge_commit();
         // A non-ticket candidate (a bare named-branch land the reactor picked
         // up with no `--task`) still owns an agent generation whose merge
         // pointer must be derived — only the ticket-side write is skipped.
@@ -4505,11 +4477,8 @@ impl LandingPipeline {
         if !repo.is_ancestor(commit, &entry.target) {
             return Ok(None);
         }
-        let result = json!({
-            "branch": entry.branch, "target": entry.target, "delivered": true,
-            "merged": true, "merge_commit": commit, "content_free": commit == base,
-            "recovered": true,
-        });
+        let mut result = LandedDelivery::new(&entry.branch, &entry.target, commit, commit == base)?;
+        result.recovered = true;
         let outcome = self.finalize_landed(entry, result).await?;
         self.mark_processed(entry, &outcome)?;
         Ok(Some(outcome))
@@ -6158,7 +6127,13 @@ impl LandingPipeline {
             entry.repo_name.clone(),
             STEWARD_NEED_IDENTITY,
             "daemon",
-            json!({"agent": "steward", "task": entry.task, "text": text}),
+            json!({
+                "agent": "steward", "task": entry.task, "text": text,
+                "landing_incident": crate::current_needs::LandingIncident {
+                    branch: entry.branch.clone(), target: entry.target.clone(),
+                    head_sha: entry.head_sha.clone(), source_spawn: entry.source_spawn,
+                },
+            }),
         );
         self.space.out(tuple.clone())?;
         Ok(tuple)
@@ -6506,18 +6481,19 @@ impl LandingPipeline {
                 }
                 let retry_outcome = self
                     .engine
-                    .run_check_in(
-                        &id,
-                        &entry.repo_name,
-                        "daemon",
-                        &gate_dir,
-                        &resolved.command,
-                        &resolved,
-                        &env,
+                    .verification()
+                    .run(crate::managed_verification::CheckExecution {
+                        id: &id,
+                        repo: &entry.repo_name,
+                        agent: "daemon",
+                        dir: &gate_dir,
+                        command: &resolved.command,
+                        resolved: &resolved,
+                        env: &env,
                         timeout,
-                        None,
-                        Some(Arc::clone(&progress)),
-                    )
+                        previous_result: None,
+                        progress: Some(Arc::clone(&progress)),
+                    })
                     .await;
                 if !self
                     .finish_infra_retry(
@@ -6581,18 +6557,19 @@ impl LandingPipeline {
 
             let outcome = self
                 .engine
-                .run_check_in(
-                    &id,
-                    &entry.repo_name,
-                    "daemon",
-                    &gate_dir,
-                    &resolved.command,
-                    &resolved,
-                    &env,
+                .verification()
+                .run(crate::managed_verification::CheckExecution {
+                    id: &id,
+                    repo: &entry.repo_name,
+                    agent: "daemon",
+                    dir: &gate_dir,
+                    command: &resolved.command,
+                    resolved: &resolved,
+                    env: &env,
                     timeout,
-                    None,
-                    Some(Arc::clone(&progress)),
-                )
+                    previous_result: None,
+                    progress: Some(Arc::clone(&progress)),
+                })
                 .await;
             match outcome {
                 Ok(result) if result.get("verdict").and_then(Value::as_str) == Some("pass") => {}
@@ -6633,18 +6610,19 @@ impl LandingPipeline {
                     )?;
                     let retry_outcome = self
                         .engine
-                        .run_check_in(
-                            &id,
-                            &entry.repo_name,
-                            "daemon",
-                            &gate_dir,
-                            &resolved.command,
-                            &resolved,
-                            &env,
+                        .verification()
+                        .run(crate::managed_verification::CheckExecution {
+                            id: &id,
+                            repo: &entry.repo_name,
+                            agent: "daemon",
+                            dir: &gate_dir,
+                            command: &resolved.command,
+                            resolved: &resolved,
+                            env: &env,
                             timeout,
-                            None,
-                            Some(Arc::clone(&progress)),
-                        )
+                            previous_result: None,
+                            progress: Some(Arc::clone(&progress)),
+                        })
                         .await;
                     if !self
                         .finish_infra_retry(
@@ -7961,18 +7939,19 @@ workflow: {
             shared_cargo_target: false,
         };
         let result = engine
-            .run_check_in(
-                "landing-t1-interface",
-                "/repo",
-                "daemon",
-                gate_dir.path(),
-                &resolved.command,
-                &resolved,
-                &[],
-                Duration::from_secs(5),
-                None,
-                None,
-            )
+            .verification()
+            .run(crate::managed_verification::CheckExecution {
+                id: "landing-t1-interface",
+                repo: "/repo",
+                agent: "daemon",
+                dir: gate_dir.path(),
+                command: &resolved.command,
+                resolved: &resolved,
+                env: &[],
+                timeout: Duration::from_secs(5),
+                previous_result: None,
+                progress: None,
+            })
             .await
             .unwrap();
         assert_eq!(result["verdict"], "pass");
@@ -8448,14 +8427,12 @@ workflow: {
             panic!("expected Landed, got {:?}", outcomes[0]);
         };
         assert_eq!(
-            result["tested_sha"], result["merge_commit"],
+            result.to_json()["tested_sha"],
+            result.to_json()["merge_commit"],
             "the landed commit must be the exact object that passed gates"
         );
-        assert_eq!(
-            rev_parse(repo_dir.path(), "main"),
-            result["tested_sha"].as_str().unwrap()
-        );
-        assert_eq!(result["merged"], true, "result: {result}");
+        assert_eq!(rev_parse(repo_dir.path(), "main"), result.merge_commit());
+        assert!(result.delivered(), "result: {result:?}");
 
         let main_listing = Command::new("git")
             .arg("-C")
@@ -8560,7 +8537,7 @@ workflow: {
         let LandingOutcome::Landed(result) = &outcomes[0] else {
             panic!("expected Landed, got {:?}", outcomes[0]);
         };
-        assert_eq!(result["merged"], true, "result: {result}");
+        assert!(result.delivered(), "result: {result:?}");
 
         let stored = pipeline.tickets.get(&ticket.identity).unwrap().unwrap();
         assert_eq!(
@@ -8569,10 +8546,7 @@ workflow: {
             "landed ticket must reach a terminal state without an operator"
         );
         let record = crate::tickets::delivery_of(&stored).expect("delivery record");
-        assert_eq!(
-            record.merge_commit,
-            result["merge_commit"].as_str().unwrap()
-        );
+        assert_eq!(record.merge_commit, result.merge_commit());
         assert_eq!(record.target, "main");
 
         // The acceptance case the old branch-ref inference got wrong: landing
@@ -8797,7 +8771,7 @@ workflow: {
         let LandingOutcome::Landed(result) = &outcomes[0] else {
             panic!("expected Landed, got {:?}", outcomes[0]);
         };
-        assert_eq!(result["merged"], true, "result: {result}");
+        assert!(result.delivered(), "result: {result:?}");
 
         let events = space
             .scan(&Pattern::category(Category::Event).identity(LANDING_NON_MAIN_TARGET_IDENTITY))
@@ -9216,7 +9190,7 @@ workflow: {
         let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(
-            matches!(&outcomes[0], LandingOutcome::Landed(r) if r["merged"] == true),
+            matches!(&outcomes[0], LandingOutcome::Landed(r) if r.delivered()),
             "outcome: {:?}",
             outcomes[0]
         );
@@ -11256,7 +11230,7 @@ workflow: {
         let LandingOutcome::Landed(result) = &outcomes[0] else {
             panic!("expected Landed, got {:?}", outcomes[0]);
         };
-        assert_eq!(result["merged"], true, "result: {result}");
+        assert!(result.delivered(), "result: {result:?}");
 
         let main_listing = Command::new("git")
             .arg("-C")
@@ -11405,7 +11379,7 @@ workflow: {
         let LandingOutcome::Landed(result) = &outcomes[0] else {
             panic!("expected Landed, got {:?}", outcomes[0]);
         };
-        assert_eq!(result["merged"], true, "result: {result}");
+        assert!(result.delivered(), "result: {result:?}");
 
         let events = space
             .scan(&Pattern::category(Category::Event).identity(LANDING_NON_MAIN_TARGET_IDENTITY))
@@ -12130,6 +12104,9 @@ workflow: {
         let LandingOutcome::Escalated(produced) = &outcomes[0] else {
             panic!("expected Escalated, got {:?}", outcomes[0]);
         };
+        assert_eq!(produced.payload["landing_incident"]["head_sha"], head_sha);
+        assert_eq!(produced.payload["landing_incident"]["branch"], "feature");
+        assert_eq!(produced.payload["landing_incident"]["target"], "main");
 
         let main_after = rev_parse(repo_dir.path(), "main");
         assert_eq!(main_before, main_after, "branch must not have landed");
@@ -12172,7 +12149,7 @@ workflow: {
         assert_eq!(historical_rows[0].urgency, produced_rows[0].urgency);
         assert_eq!(historical_rows[0].subject, produced_rows[0].subject);
         assert_eq!(historical_rows[0].scope, produced_rows[0].scope);
-        assert_eq!(historical_rows[0].action, produced_rows[0].action);
+        assert_eq!(historical_rows[0].action(), produced_rows[0].action());
         let detail = &produced_rows[0].detail;
         for required in [
             "reviewer-stop",
@@ -12261,7 +12238,7 @@ workflow: {
         let LandingOutcome::Landed(result) = &outcomes[0] else {
             panic!("expected Landed, got {:?}", outcomes[0]);
         };
-        assert_eq!(result["merged"], true, "result: {result}");
+        assert!(result.delivered(), "result: {result:?}");
 
         assert_eq!(
             space
@@ -12317,7 +12294,7 @@ workflow: {
         let LandingOutcome::Landed(result) = &outcome else {
             panic!("expected Landed, got {outcome:?}");
         };
-        assert_eq!(result["merged"], true, "result: {result}");
+        assert!(result.delivered(), "result: {result:?}");
 
         let main_after = rev_parse(repo_dir.path(), "main");
         assert_ne!(
@@ -12447,7 +12424,7 @@ workflow: {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(&outcome, LandingOutcome::Landed(result) if result["merged"] == true),
+            matches!(&outcome, LandingOutcome::Landed(result) if result.delivered()),
             "expected the replacement verdict to land, got {outcome:?}"
         );
         assert_ne!(
@@ -13078,7 +13055,7 @@ checks: [
         let outcomes = pipeline.run_cycle().await.unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(
-            matches!(&outcomes[0], LandingOutcome::Landed(r) if r["merged"] == true),
+            matches!(&outcomes[0], LandingOutcome::Landed(r) if r.delivered()),
             "expected Landed, got {:?}",
             outcomes[0]
         );
@@ -13176,7 +13153,7 @@ checks: [
         assert!(
             outcomes
                 .iter()
-                .all(|o| matches!(o, LandingOutcome::Landed(r) if r["merged"] == true)),
+                .all(|o| matches!(o, LandingOutcome::Landed(r) if r.delivered())),
             "outcomes: {outcomes:?}"
         );
 
@@ -13962,7 +13939,7 @@ checks: [
         assert!(
             outcomes
                 .iter()
-                .all(|o| matches!(o, LandingOutcome::Landed(r) if r["merged"] == true)),
+                .all(|o| matches!(o, LandingOutcome::Landed(r) if r.delivered())),
             "outcomes: {outcomes:?}"
         );
 
@@ -14033,7 +14010,7 @@ checks: [
             .await
             .unwrap();
         assert!(
-            matches!(&routed, LandingOutcome::Landed(r) if r["merged"] == true),
+            matches!(&routed, LandingOutcome::Landed(r) if r.delivered()),
             "routed: {routed:?}"
         );
         let main_after = rev_parse(repo_dir.path(), "main");
@@ -14309,7 +14286,7 @@ checks: [
             .unwrap()
             .unwrap();
         assert!(
-            matches!(&routed, LandingOutcome::Landed(r) if r["merged"] == true),
+            matches!(&routed, LandingOutcome::Landed(r) if r.delivered()),
             "routed: {routed:?}"
         );
         let main_after = rev_parse(repo_dir.path(), "main");

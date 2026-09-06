@@ -2,8 +2,8 @@
 //! auto-merge. A dismissed rat's merge commit is recorded on its registry
 //! record; `agent.revert` revert-merges it on the target, reopens the rat's
 //! ticket (`open`, or `blocked` with `block`), and emits a `fact` tuple.
-//! The anchor is cleared on success so a second revert errors instead of
-//! reverting the revert.
+//! A durable operation survives interrupted finalization; replay returns the
+//! same revert and never reopens later work or mints another completion fact.
 
 mod fixture;
 mod support;
@@ -75,6 +75,241 @@ rk_done "done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"revert-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#,
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_revert_boundary_survives_a_daemon_restart_without_duplicate_effects() {
+    std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
+    for barrier in [
+        "revert-after-intent",
+        "revert-after-prepared",
+        "revert-after-git",
+        "revert-after-registry",
+        "revert-after-ticket",
+        "revert-after-evidence",
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        scratch_repo(repo_dir.path());
+        let layout = Layout::at(home.path());
+        let config = rk_core::config::Config::default();
+        let daemon = Daemon::new(layout.clone(), &config).unwrap();
+        let handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        let (name, ticket) = merge_one_rat(&mut client, repo_dir.path()).await;
+        let merged_tip = git_out(repo_dir.path(), &["rev-parse", "main"]);
+        std::fs::write(home.path().join("fault-barrier"), barrier).unwrap();
+        let request_name = name.clone();
+        let request = tokio::spawn(async move {
+            client
+                .call("agent.revert", json!({"name": request_name, "block": true}))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !home.path().join("fault-barrier.reached").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never reached {barrier}"));
+        handle.abort();
+        let _ = handle.await;
+        request.abort();
+        let _ = request.await;
+        // The process stays alive in this test; a real restart observes its
+        // predecessor's dead pid. Remove only the disposable test endpoint.
+        std::fs::remove_file(layout.pid_file()).ok();
+        std::fs::remove_file(layout.socket_path()).ok();
+        std::fs::remove_file(home.path().join("fault-barrier")).unwrap();
+        let tip_at_crash = git_out(repo_dir.path(), &["rev-parse", "main"]);
+        let already_advanced = !matches!(barrier, "revert-after-intent" | "revert-after-prepared");
+        assert_eq!(tip_at_crash != merged_tip, already_advanced, "{barrier}");
+        let operation = {
+            let space = rk_space::Space::open(&layout.db_path()).unwrap();
+            space
+                .scan(
+                    &rk_core::tuple::Pattern::category(rk_core::tuple::Category::Event)
+                        .identity("revert_operation"),
+                )
+                .unwrap()[0]
+                .payload["id"]
+                .clone()
+        };
+        if barrier == "revert-after-registry" {
+            let mut registry =
+                rk_daemon::agents::Registry::load(&home.path().join("agents.json")).unwrap();
+            let mut replacement = registry.get(&name).unwrap().clone();
+            registry
+                .archive(chrono::Utc::now() + chrono::Duration::seconds(1))
+                .unwrap();
+            replacement.spawn = Some(rk_core::id::SpawnId::new());
+            replacement.created_at = chrono::Utc::now();
+            replacement.merge_commit = Some("new-generation-delivery".into());
+            registry.insert(replacement).unwrap();
+        }
+        let daemon = Daemon::new(layout.clone(), &config).unwrap();
+        let handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        if barrier == "revert-after-prepared" {
+            // Startup GC must keep the only ref pinning the unadvanced revert.
+            let git = rk_git::Repo::discover(repo_dir.path()).unwrap();
+            assert_eq!(git.candidate_refs().unwrap().len(), 1);
+            git_out(repo_dir.path(), &["gc", "--prune=now"]);
+        }
+        let settled = client
+            .call(
+                "agent.revert",
+                json!({"name": name, "block": true, "operation": operation}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled["reverted"], true, "{barrier}: {settled}");
+        assert_eq!(settled["operation_id"], operation);
+        if barrier == "revert-after-registry" {
+            let current = client
+                .call("agent.status", json!({"name": name}))
+                .await
+                .unwrap();
+            assert_eq!(current["agent"]["merge_commit"], "new-generation-delivery");
+        }
+        let final_tip = git_out(repo_dir.path(), &["rev-parse", "main"]);
+        if already_advanced {
+            assert_eq!(tip_at_crash, final_tip, "{barrier}: duplicate Git effect");
+        }
+        assert!(!repo_dir.path().join("regression.txt").exists());
+        let current = client
+            .call("ticket.get", json!({"id": ticket}))
+            .await
+            .unwrap();
+        assert_eq!(current["ticket"]["payload"]["status"], "blocked");
+        assert!(current["ticket"]["payload"]["delivery"].is_null());
+        assert_eq!(
+            current["ticket"]["payload"]["revert_operations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // Reopen/claim later work before replaying the completed operation.
+        client
+            .call("ticket.reopen", json!({"id": ticket, "status": "open"}))
+            .await
+            .unwrap();
+        let again = client
+            .call(
+                "agent.revert",
+                json!({"name": name, "block": true, "operation": operation}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["operation_id"], settled["operation_id"]);
+        assert_eq!(again["revert_commit"], settled["revert_commit"]);
+        let current = client
+            .call("ticket.get", json!({"id": ticket}))
+            .await
+            .unwrap();
+        assert_eq!(
+            current["ticket"]["payload"]["status"], "open",
+            "replay must not reset newer work"
+        );
+        let facts = client
+            .call(
+                "space.scan",
+                json!({"category": "fact",
+            "identity": format!("merge-reverted-{name}")}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            facts["tuples"].as_array().unwrap().len(),
+            1,
+            "{barrier}: duplicate evidence"
+        );
+        assert!(client
+            .call(
+                "agent.revert",
+                json!({"name": name, "block": false, "operation": operation})
+            )
+            .await
+            .is_err());
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+#[tokio::test]
+async fn required_write_failures_remain_retryable_and_never_report_completion() {
+    std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new(layout.clone(), &rk_core::config::Config::default()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    let (name, ticket) = merge_one_rat(&mut client, repo_dir.path()).await;
+    let db = rusqlite::Connection::open(layout.db_path()).unwrap();
+    let registry = home.path().join("agents.json");
+    let saved_registry = home.path().join("agents.before-revert.json");
+    std::fs::rename(&registry, &saved_registry).unwrap();
+    std::fs::create_dir(&registry).unwrap();
+    let failed = client.call("agent.revert", json!({"name": name})).await;
+    assert!(
+        failed.is_err(),
+        "registry persistence failure must propagate"
+    );
+    let agent = client
+        .call("agent.status", json!({"name": name}))
+        .await
+        .unwrap();
+    assert!(
+        agent["agent"]["merge_commit"].is_string(),
+        "failed persistence restores memory"
+    );
+    std::fs::remove_dir(&registry).unwrap();
+    std::fs::rename(&saved_registry, &registry).unwrap();
+    let mut reverted_tip = Some(git_out(repo_dir.path(), &["rev-parse", "main"]));
+    for (stage, condition) in [
+        ("ticket", "NEW.category = 'task' AND json_extract(NEW.payload, '$.revert_operations') IS NOT NULL"),
+        ("evidence", "NEW.category = 'fact' AND NEW.identity LIKE 'merge-reverted-%'"),
+        ("completion", "NEW.identity = 'revert_operation' AND json_extract(NEW.payload, '$.phase.state') = 'complete'")
+    ] {
+        db.execute_batch(&format!("CREATE TRIGGER reject_revert_write BEFORE INSERT ON tuples
+            WHEN {condition} BEGIN SELECT RAISE(ABORT, 'injected {stage} write failure'); END;")).unwrap();
+        let result = client.call("agent.revert", json!({"name": name})).await;
+        assert!(result.is_err(), "{stage} failure must not report completion: {result:?}");
+        let tip = git_out(repo_dir.path(), &["rev-parse", "main"]);
+        if let Some(prior) = &reverted_tip { assert_eq!(&tip, prior, "{stage}: Git ran again"); }
+        reverted_tip = Some(tip);
+        let current = client.call("ticket.get", json!({"id": ticket})).await.unwrap();
+        if stage == "ticket" {
+            assert_eq!(current["ticket"]["payload"]["status"], "closed", "failed replacement keeps old ticket");
+            assert!(current["ticket"]["payload"]["delivery"].is_object());
+        } else {
+            assert_eq!(current["ticket"]["payload"]["status"], "open");
+            assert!(current["ticket"]["payload"]["delivery"].is_null());
+        }
+        db.execute_batch("DROP TRIGGER reject_revert_write;").unwrap();
+    }
+    let result = client
+        .call("agent.revert", json!({"name": name}))
+        .await
+        .unwrap();
+    assert_eq!(result["reverted"], true);
+    assert_eq!(
+        git_out(repo_dir.path(), &["rev-parse", "main"]),
+        reverted_tip.unwrap()
+    );
+    let facts = client
+        .call(
+            "space.scan",
+            json!({"category": "fact", "identity": format!("merge-reverted-{name}")}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(facts["tuples"].as_array().unwrap().len(), 1);
+    handle.abort();
+    let _ = handle.await;
 }
 
 /// Spawn a ticket-dispatched rat, wait for completion, dismiss (auto-merge).
@@ -209,10 +444,12 @@ async fn revert_undoes_merge_reopens_ticket_and_emits_fact() {
     assert_eq!(fact["payload"]["ticket_status"], "open");
     assert!(fact["payload"]["revert_commit"].as_str().is_some());
 
-    // The anchor is cleared: a second revert errors rather than reverting
-    // the revert.
-    let again = client.call("agent.revert", json!({"name": &name})).await;
-    assert!(again.is_err(), "second revert must error");
+    let again = client
+        .call("agent.revert", json!({"name": &name}))
+        .await
+        .unwrap();
+    assert_eq!(again["operation_id"], reverted["operation_id"]);
+    assert_eq!(again["revert_commit"], reverted["revert_commit"]);
 }
 
 /// The bug TKT-01M0P96ZSQAJGRE7WTGDBWAXJ9 exists to fix: before

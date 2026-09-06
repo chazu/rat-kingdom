@@ -699,6 +699,32 @@ impl Store {
         Ok(())
     }
 
+    pub fn replace(&mut self, expected: RecordId, tuple: &Tuple) -> rk_core::Result<bool> {
+        if expected == tuple.id {
+            return Err(Error::other("replacement requires a fresh record id"));
+        }
+        let tx = self.conn.transaction().map_err(sql_err)?;
+        let removed = tx
+            .execute(
+                "DELETE FROM tuples WHERE id = ?1 AND category = ?2 AND scope = ?3
+             AND identity = ?4 AND instance = ?5 AND lifecycle != 'furniture'",
+                rusqlite::params![
+                    expected.to_string(),
+                    tuple.category.as_str(),
+                    tuple.scope,
+                    tuple.identity,
+                    tuple.instance
+                ],
+            )
+            .map_err(sql_err)?;
+        if removed == 0 {
+            return Ok(false);
+        }
+        insert_tuple_tx(&tx, tuple)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(true)
+    }
+
     pub fn accept_sdlc_signal(
         &mut self,
         envelope: &SignalEnvelope,
@@ -1848,6 +1874,44 @@ mod tests {
 
     fn tuple(identity: &str, payload: serde_json::Value) -> Tuple {
         Tuple::new(Category::Event, "repo", identity, "castle", payload)
+    }
+
+    #[test]
+    fn replacement_rolls_back_removal_on_insert_failure_and_rejects_stale_revision() {
+        let mut store = Store::open_in_memory().unwrap();
+        let old = tuple("ticket", json!({"status": "closed"}));
+        store.insert(&old).unwrap();
+        let mut next = old.clone();
+        next.id = RecordId::new();
+        next.payload = json!({"status": "open"});
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_replacement BEFORE INSERT ON tuples
+            BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            )
+            .unwrap();
+        assert!(store.replace(old.id, &next).is_err());
+        assert_eq!(
+            store
+                .query(&Pattern::default().identity("ticket"), false, None)
+                .unwrap(),
+            vec![old.clone()]
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_replacement;")
+            .unwrap();
+        assert!(store.replace(old.id, &next).unwrap());
+        let mut stale = next.clone();
+        stale.id = RecordId::new();
+        assert!(!store.replace(old.id, &stale).unwrap());
+        assert_eq!(
+            store
+                .query(&Pattern::default().identity("ticket"), false, None)
+                .unwrap(),
+            vec![next]
+        );
     }
 
     #[test]

@@ -652,6 +652,37 @@ impl Repo {
         )
     }
 
+    /// Prepare and park a revert before advancing any target. The caller can
+    /// durably record this exact candidate, then recover an interrupted advance
+    /// by testing its ancestry instead of attempting a second revert.
+    pub fn prepare_revert(&self, commit: &str, target: &str) -> rk_core::Result<PrepareOutcome> {
+        self.validate_local_branch(target, "revert target")?;
+        let commit = self.rev_parse(commit)?;
+        let base = self.rev_parse(&format!("refs/heads/{target}"))?;
+        if !self.is_ancestor(&commit, &base) {
+            return Err(rk_core::Error::other(
+                "reverted merge is not on the recorded target",
+            ));
+        }
+        let built = self.in_temp_worktree(&base, |tmp| {
+            if let Err(error) = git_in(tmp, &["revert", "--no-edit", "-m", "1", &commit]) {
+                return Ok(Err(format!("revert conflict or failure: {error}")));
+            }
+            Ok(Ok(git_in(tmp, &["rev-parse", "HEAD"])?.trim().to_string()))
+        })?;
+        let commit = match built {
+            Ok(commit) => commit,
+            Err(detail) => return Ok(PrepareOutcome::Conflict { detail }),
+        };
+        let candidate_ref = format!("{CANDIDATE_REF_PREFIX}{commit}");
+        self.git(&["update-ref", &candidate_ref, &commit])?;
+        Ok(PrepareOutcome::Prepared(PreparedMerge {
+            commit,
+            base,
+            candidate_ref,
+        }))
+    }
+
     /// The shared engine behind [`merge_branch`](Repo::merge_branch) and
     /// [`revert_merge`](Repo::revert_merge): run `op` (a commit-producing git
     /// operation) in a temporary detached worktree of `target`, then advance

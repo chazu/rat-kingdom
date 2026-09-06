@@ -62,6 +62,11 @@ impl Inner {
             None
         };
 
+        self.offer(tuple)?;
+        Ok(sequence)
+    }
+
+    fn offer(&mut self, tuple: &Tuple) -> rk_core::Result<()> {
         let mut consumed = false;
         let consumable = tuple.lifecycle != Lifecycle::Furniture;
         // Drain-and-retain: offer to every matching rd waiter, and to the first
@@ -91,7 +96,7 @@ impl Inner {
         if consumed {
             self.store.delete(tuple.id)?;
         }
-        Ok(sequence)
+        Ok(())
     }
 }
 
@@ -324,6 +329,20 @@ impl Space {
             return Ok(false);
         }
         inner.insert_and_offer(&tuple, false)?;
+        drop(inner);
+        let _ = self.events.send(tuple);
+        Ok(true)
+    }
+
+    /// Replace one exact non-furniture revision atomically. A stale revision
+    /// returns false; an insert failure rolls back removal of the old tuple.
+    /// The replacement retains the same logical key and gets a new record id.
+    pub fn replace(&self, expected: rk_core::id::RecordId, tuple: Tuple) -> rk_core::Result<bool> {
+        let mut inner = self.lock();
+        if !inner.store.replace(expected, &tuple)? {
+            return Ok(false);
+        }
+        inner.offer(&tuple)?;
         drop(inner);
         let _ = self.events.send(tuple);
         Ok(true)

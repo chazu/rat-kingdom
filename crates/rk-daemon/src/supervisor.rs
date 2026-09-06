@@ -4,6 +4,7 @@
 //! pipeline.
 
 use crate::agents::{AgentProgress, AgentRecord, AgentState, Registry};
+use crate::managed_verification::VerificationResources;
 use crate::onboarding_sessions::{onboarding_branch, onboarding_worktree, ONBOARDER_ROLE};
 use crate::read_only_roles::{forces_read_only_harness, DIAGNOSTICIAN_ROLE, GROOMER_ROLE};
 use chrono::{DateTime, Utc};
@@ -27,6 +28,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::{debug, info, warn};
+
+#[path = "revert.rs"]
+mod revert;
 
 const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
 
@@ -623,25 +627,9 @@ pub struct Supervisor {
     /// Arc cycle (`LandingPipeline` already owns its `Supervisor`). In a live
     /// daemon, merge-mode `land` fails closed if this seam is absent.
     landing_pipeline: Mutex<Option<Weak<crate::landing::LandingPipeline>>>,
-    /// Serializes a repo-registered check's test-execution phase against
-    /// every other same-repo check opted into `sharedCargoTarget` (TKT-01M0CFA1RX36SJ7DV4YWGHQ9BT).
-    /// Only ever contended when [`shared_cargo_target`](Self::shared_cargo_target)
-    /// is also on — see [`TestExecLock`] for why.
-    test_exec_lock: TestExecLock,
-    /// Bounded per-repo admission queue for daemon-managed verification runs
-    /// (`WorkflowEngine::run_check_in`, gated to `sharedCargoTarget` checks —
-    /// TKT-01M0HNESEECWWFQF8X6VH1XSJ6). Distinct from [`test_exec_lock`](Self::test_exec_lock):
-    /// that lock serializes a shared-disk hazard down to exactly 1 concurrent
-    /// runner; this queue bounds CPU/wall-clock contention and its limit is a
-    /// configurable policy value that may be raised above 1. See
-    /// [`VerificationAdmission`].
-    verification_admission: VerificationAdmission,
-    /// In-flight `verify.run`-mediated verification executions, tracked so
-    /// their requesting agent's interrupt/dismiss/terminal death, or their
-    /// RPC caller's disconnect, can cancel the exact managed child process
-    /// group instead of leaving it orphaned under the daemon. See
-    /// [`ManagedVerificationRuns`].
-    managed_verification: ManagedVerificationRuns,
+    /// Verification owns its per-repo queues and exact-generation cancellation
+    /// registrations; the supervisor forwards configuration/lifecycle events.
+    verification: VerificationResources,
     /// `[policy] implementation_admission_limit` / `_by_repo` — the
     /// implementation lane's configured limits (TKT-01M0P2KM83Y4MD5QYETR3JCKF2).
     /// See [`LaneLimits`] and [`crate::agents::Lane::Implementation`].
@@ -908,268 +896,10 @@ impl MergeQueue {
     }
 }
 
-/// Serializes the *test-execution* phase of a repo-registered check against
-/// every other same-repo check that opts in
-/// ([`rk_workflow::Check::shared_cargo_target`], TKT-01M0CFA1RX36SJ7DV4YWGHQ9BT).
-///
-/// Only relevant when `[disk] shared_cargo_target` points every spawned
-/// agent's `CARGO_TARGET_DIR` at one shared `<RK_HOME>/cargo-target-cache/<repo>`
-/// directory (TKT-01M04D1QDBNCF0T0D0EHRVNJV5). Cargo's own target-dir lock
-/// only covers the *build* phase of a single `cargo test`/`cargo build`
-/// invocation — it is released as soon as that invocation's build finishes,
-/// before the invocation execs the test binaries it just resolved paths for.
-/// A second, concurrent invocation against the same shared dir can acquire
-/// cargo's lock in that gap, recompile, and garbage-collect a test binary the
-/// first invocation is about to exec, producing `could not execute process
-/// ... (never executed) ... No such file or directory`. Fully serializing
-/// every opted-in check's entire run (build + exec together, not just the
-/// exec sliver) closes the gap: as long as no other check touches the shared
-/// dir while one is mid-flight, nothing it resolved a path for can be pruned
-/// out from under it.
-///
-/// Keyed per repo only (the target dir is shared per repo, not per branch/
-/// worktree/target) — distinct from [`MergeQueue`], which keys on
-/// `(repo_root, target)` for a different resource (the git ref). One process
-/// (the daemon) holds this, so a plain per-key async `Mutex` is enough; no
-/// cross-process `flock` is needed even though the *contended resource*
-/// (the shared target dir) is filesystem state, because it is only ever
-/// touched by checks this same daemon spawns.
-#[derive(Default)]
-struct TestExecLock {
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl TestExecLock {
-    /// Acquire the lock for `repo`. The returned guard is held for one
-    /// check's entire run (every retry attempt); the next waiter proceeds
-    /// only once it drops. Unbounded here — [`WorkflowEngine::run_check_in`]
-    /// wraps the await in a `tokio::time::timeout` bounded by the check's own
-    /// declared timeout, so a caller never waits past that budget even though
-    /// this method alone cannot starve (every holder is itself bounded by its
-    /// own check timeout, so the queue always drains).
-    async fn acquire(&self, repo: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.locks.lock().unwrap();
-            Arc::clone(
-                locks
-                    .entry(repo.to_string())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        };
-        lock.lock_owned().await
-    }
-}
-
-/// Bounded per-repository admission queue for daemon-managed verification
-/// runs (TKT-01M0HNESEECWWFQF8X6VH1XSJ6): the ONE gate `run_check_in` sends
-/// every `sharedCargoTarget` check through, whether it was dispatched by a
-/// landing gate, a workflow `run` step, or the `verify.run` RPC an
-/// agent/reviewer's own completion check calls into instead of self-invoking
-/// a full suite. Keyed per repo, exactly like [`TestExecLock`] — the two are
-/// independent resources (this bounds CPU/wall-clock contention across
-/// concurrent full-suite runs; `TestExecLock` serializes a shared-disk build
-/// hazard down to 1), so a check that opts into `sharedCargoTarget` acquires
-/// BOTH, in the order [`WorkflowEngine::run_check_in`] declares them.
-///
-/// Backed by `tokio::sync::Semaphore`, which grants permits in acquire order
-/// (FIFO) — the fairness property the ticket asks to be provable. A repo's
-/// semaphore is created lazily, sized to its configured limit at that moment;
-/// changing the configured limit at runtime does not resize an
-/// already-created semaphore (matches this codebase's existing
-/// `TestExecLock`/`shared_cargo_target` precedent of reading config once at
-/// daemon startup, not live-reloading mid-flight).
-///
-/// RESTART RECOVERY IS AUTOMATIC: every field here is in-memory only, with no
-/// durable counterpart. A daemon restart drops this struct along with every
-/// outstanding `OwnedSemaphorePermit` it had handed out — there is no state
-/// to leak or to recover, because there is no state that survives the
-/// process. The next daemon simply starts every repo's semaphore fresh, full
-/// of permits. (Contrast a durable lease record, which WOULD need explicit
-/// restart-recovery logic to avoid permanently stranding a permit whose
-/// holder died with the old process — deliberately not built, since it would
-/// only add a way to leak what the in-memory design cannot.)
-#[derive(Default)]
-struct VerificationAdmission {
-    semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
-    /// Fleet-wide default WIP limit; `0` disables admission control (no
-    /// semaphore is ever created, so an unconfigured repo pays zero overhead
-    /// beyond the lookup itself).
-    default_limit: AtomicU64,
-    /// Per-repo overrides, keyed by repo name — same convention as
-    /// `rk_core::config::PolicyConfig::verification_admission_limit_by_repo`.
-    overrides: Mutex<HashMap<String, u32>>,
-}
-
-impl VerificationAdmission {
-    fn set_limits(&self, default_limit: u32, overrides: HashMap<String, u32>) {
-        self.default_limit
-            .store(u64::from(default_limit), Ordering::Relaxed);
-        *self.overrides.lock().unwrap() = overrides;
-    }
-
-    /// The configured WIP limit for `repo` — its own override if set, else
-    /// the fleet-wide default. `0` means admission control is off for this
-    /// repo.
-    fn limit_for(&self, repo: &str) -> u32 {
-        self.overrides
-            .lock()
-            .unwrap()
-            .get(repo)
-            .copied()
-            .unwrap_or(self.default_limit.load(Ordering::Relaxed) as u32)
-    }
-
-    /// Repos with an explicit per-repo override — a starting point for
-    /// capacity reporting (`Supervisor::capacity_summary`), which unions this
-    /// with any repo that currently has live agents.
-    fn overridden_repos(&self, out: &mut std::collections::BTreeSet<String>) {
-        out.extend(self.overrides.lock().unwrap().keys().cloned());
-    }
-
-    /// How many of `repo`'s configured permits are currently checked out, for
-    /// reporting only (`Supervisor::capacity_summary`) — never consulted for
-    /// admission itself. `0` whenever the limit is `0` (disabled) or no check
-    /// has ever run for `repo` (no semaphore created yet).
-    fn in_flight(&self, repo: &str) -> u32 {
-        let limit = self.limit_for(repo);
-        if limit == 0 {
-            return 0;
-        }
-        match self.semaphores.lock().unwrap().get(repo) {
-            Some(sem) => limit.saturating_sub(sem.available_permits() as u32),
-            None => 0,
-        }
-    }
-
-    /// Acquire one admission permit for `repo`, waiting in FIFO order behind
-    /// any earlier waiter. Returns the held permit together with how long
-    /// this call waited for it — the queue-wait half of the ticket's durable
-    /// timing requirement (the caller times execution itself). `None` when
-    /// admission control is disabled for `repo` (limit 0): every caller must
-    /// treat that as "proceed unbounded", matching pre-existing behaviour.
-    async fn acquire(
-        &self,
-        repo: &str,
-        limit: u32,
-    ) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
-        if limit == 0 {
-            return None;
-        }
-        let sem = {
-            let mut semaphores = self.semaphores.lock().unwrap();
-            Arc::clone(
-                semaphores
-                    .entry(repo.to_string())
-                    .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit as usize))),
-            )
-        };
-        let started = std::time::Instant::now();
-        // A semaphore is only ever closed by `close()`, which nothing here
-        // calls — this can never actually return `Err`.
-        let permit = sem
-            .acquire_owned()
-            .await
-            .expect("verification admission semaphore is never closed");
-        Some((permit, started.elapsed()))
-    }
-}
-
-/// One in-flight `verify.run`-mediated verification execution
-/// (TKT-01M0PA6C5WYRWS757R1SS2F2GR): a live post-deploy probe found that
-/// interrupting the requesting agent, or killing the RPC client blocked on
-/// `verify.run`, left the daemon-owned check process running under the
-/// daemon alone, still occupying its repo's admission slot. Registered by
-/// [`crate::workflow_exec::WorkflowEngine::verify_repo_check`] for the
-/// lifetime of exactly one call; `cancel` is the signal that call races its
-/// own execution against, so sending on it drops that execution's future —
-/// and with it, via the existing `ProcessGroupGuard`-on-drop discipline in
-/// `crate::workflow_exec`, SIGKILLs the check's entire live descendant
-/// process tree — not just its own leader group, which a check command
-/// (`mise run <task>`) can itself move part of its work out of.
-struct ManagedVerificationRun {
-    generation: Option<rk_core::id::SpawnId>,
-    agent: String,
-    request_key: String,
-    cancel: tokio::sync::watch::Sender<Option<&'static str>>,
-}
-
-/// Registry of in-flight [`ManagedVerificationRun`]s, keyed by an opaque
-/// monotonic id. In-memory only, exactly like [`VerificationAdmission`]: a
-/// daemon restart drops every entry, and a fresh daemon's own registry
-/// starts genuinely empty, so nothing about a dead generation's bookkeeping
-/// can ever block a new one's forward progress. The OS-level check child
-/// each entry corresponds to is a SEPARATE concern this in-memory registry
-/// cannot reach across a restart on its own (it lives in its own process
-/// group, reached only via the `cancel` signal above while this process is
-/// still alive) — durably marked and reaped instead by
-/// `crate::workflow_exec::ManagedChildMarker` /
-/// `reap_stale_managed_children`, which every `Daemon::run` runs before its
-/// accept loop can serve a single request.
-#[derive(Default)]
-struct ManagedVerificationRuns {
-    next_id: AtomicU64,
-    runs: Mutex<HashMap<u64, ManagedVerificationRun>>,
-}
-
-impl ManagedVerificationRuns {
-    fn register(
-        &self,
-        agent: &str,
-        generation: Option<rk_core::id::SpawnId>,
-        request_key: &str,
-    ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
-        let (cancel, rx) = tokio::sync::watch::channel(None);
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.runs.lock().unwrap().insert(
-            id,
-            ManagedVerificationRun {
-                generation,
-                agent: agent.to_string(),
-                request_key: request_key.to_string(),
-                cancel,
-            },
-        );
-        (id, rx)
-    }
-
-    fn unregister(&self, id: u64) {
-        self.runs.lock().unwrap().remove(&id);
-    }
-
-    /// Cancel every run belonging to `agent`, fenced to `generation` when
-    /// given: a namesake that has since taken over the name (a fresh
-    /// generation after a dismiss+respawn) is never touched by a signal meant
-    /// for its predecessor — the exact "never affects ... a newer
-    /// generation/namesake" guarantee the ticket asks for.
-    fn cancel_agent(
-        &self,
-        agent: &str,
-        generation: Option<rk_core::id::SpawnId>,
-        reason: &'static str,
-    ) {
-        for run in self.runs.lock().unwrap().values() {
-            if run.agent == agent && (generation.is_none() || run.generation == generation) {
-                let _ = run.cancel.send(Some(reason));
-            }
-        }
-    }
-
-    /// Cancel the one run correlated with `request_key` — an RPC connection
-    /// dying mid-call. Never touches a sibling call from the same agent on a
-    /// different connection, since each call mints its own key.
-    fn cancel_request(&self, request_key: &str, reason: &'static str) {
-        for run in self.runs.lock().unwrap().values() {
-            if run.request_key == request_key {
-                let _ = run.cancel.send(Some(reason));
-            }
-        }
-    }
-}
-
 /// Fleet-wide default + per-repo overrides for one capacity lane's limit
 /// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — the config-side counterpart to
 /// [`crate::agents::Lane`]. Deliberately holds only the configured NUMBER, not
-/// any occupancy state: unlike [`VerificationAdmission`] (which bounds check
+/// any occupancy state: unlike [`crate::managed_verification::VerificationAdmission`] (which bounds check
 /// runs that have no `AgentRecord` of their own), an implementation/review
 /// lane's occupancy is the durable `Registry` itself
 /// ([`Registry::live_or_reserved_lane_wip`](crate::agents::Registry::live_or_reserved_lane_wip)),
@@ -1201,7 +931,7 @@ impl LaneLimits {
     }
 
     /// Repos with an explicit per-repo override — see
-    /// [`VerificationAdmission::overridden_repos`], same reporting-only role.
+    /// [`crate::managed_verification::VerificationAdmission::overridden_repos`], same reporting-only role.
     fn overridden_repos(&self, out: &mut std::collections::BTreeSet<String>) {
         out.extend(self.overrides.lock().unwrap().keys().cloned());
     }
@@ -1322,9 +1052,7 @@ impl Supervisor {
             log,
             merge_queue: MergeQueue::default(),
             landing_pipeline: Mutex::new(None),
-            test_exec_lock: TestExecLock::default(),
-            verification_admission: VerificationAdmission::default(),
-            managed_verification: ManagedVerificationRuns::default(),
+            verification: VerificationResources::default(),
             implementation_admission_limits: LaneLimits::default(),
             review_admission_limits: LaneLimits::default(),
             min_free_disk_gb: AtomicU64::new(0),
@@ -1409,21 +1137,16 @@ impl Supervisor {
     }
 
     /// Whether spawned agents currently share one `CARGO_TARGET_DIR` per
-    /// repo — the precondition for [`TestExecLock`] contention to be
-    /// possible at all. [`WorkflowEngine::run_check_in`] reads this before
+    /// repo — the precondition for [`crate::managed_verification::TestExecLock`] contention to be
+    /// possible at all. [`crate::managed_verification::ManagedVerification::run`] reads this before
     /// bothering to acquire the lock, so the lock has zero effect (not even
     /// mutex overhead beyond the check) when the flag is off.
     pub(crate) fn shared_cargo_target_enabled(&self) -> bool {
         self.shared_cargo_target.load(Ordering::Relaxed)
     }
 
-    /// Acquire the shared-target-dir test-execution lock for `repo`. See
-    /// [`TestExecLock`] for what this serializes and why.
-    pub(crate) async fn acquire_test_exec_lock(
-        &self,
-        repo: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        self.test_exec_lock.acquire(repo).await
+    pub(crate) fn verification_resources(&self) -> &VerificationResources {
+        &self.verification
     }
 
     /// Set `[policy] verification_admission_limit` / `_by_repo`. Applied by
@@ -1434,53 +1157,24 @@ impl Supervisor {
         default_limit: u32,
         overrides: HashMap<String, u32>,
     ) {
-        self.verification_admission
+        self.verification
+            .admission
             .set_limits(default_limit, overrides);
     }
 
-    /// The configured verification admission WIP limit for `repo` (0 =
-    /// disabled). Exposed so a caller can decide whether to bother measuring
-    /// queue-wait/execution timing at all before calling
-    /// [`acquire_verification_admission`](Self::acquire_verification_admission).
-    pub(crate) fn verification_admission_limit_for(&self, repo: &str) -> u32 {
-        self.verification_admission
-            .limit_for(&self.verification_repo_identity(repo))
-    }
-
     /// Acquire one bounded per-repo verification admission permit for `repo`.
-    /// See [`VerificationAdmission`] for what this bounds, the FIFO fairness
+    /// See [`crate::managed_verification::VerificationAdmission`] for what this bounds, the FIFO fairness
     /// guarantee, and why a daemon restart can never leak one.
+    #[cfg(test)]
     pub(crate) async fn acquire_verification_admission(
         &self,
         repo: &str,
         limit: u32,
     ) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
-        self.verification_admission
+        self.verification
+            .admission
             .acquire(&self.verification_repo_identity(repo), limit)
             .await
-    }
-
-    /// Register one managed `verify.run` execution for cancellation binding.
-    /// Returns an opaque id (for
-    /// [`unregister_managed_verification`](Self::unregister_managed_verification))
-    /// and the receiver half the execution races itself against — see
-    /// [`ManagedVerificationRuns`].
-    pub(crate) fn register_managed_verification(
-        &self,
-        agent: &str,
-        generation: Option<rk_core::id::SpawnId>,
-        request_key: &str,
-    ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
-        self.managed_verification
-            .register(agent, generation, request_key)
-    }
-
-    /// Drop a managed run's registration once its call has returned (whatever
-    /// the outcome) — must be called exactly once per
-    /// [`register_managed_verification`](Self::register_managed_verification),
-    /// or a settled call would remain a live cancellation target forever.
-    pub(crate) fn unregister_managed_verification(&self, id: u64) {
-        self.managed_verification.unregister(id);
     }
 
     /// Cancel every managed verification run belonging to `agent`, fenced to
@@ -1493,7 +1187,8 @@ impl Supervisor {
         generation: Option<rk_core::id::SpawnId>,
         reason: &'static str,
     ) {
-        self.managed_verification
+        self.verification
+            .runs
             .cancel_agent(agent, generation, reason);
     }
 
@@ -1504,8 +1199,7 @@ impl Supervisor {
         request_key: &str,
         reason: &'static str,
     ) {
-        self.managed_verification
-            .cancel_request(request_key, reason);
+        self.verification.runs.cancel_request(request_key, reason);
     }
 
     /// Set `[policy] implementation_admission_limit` / `_by_repo`. Applied by
@@ -1551,7 +1245,7 @@ impl Supervisor {
         self.implementation_admission_limits
             .overridden_repos(&mut repos);
         self.review_admission_limits.overridden_repos(&mut repos);
-        self.verification_admission.overridden_repos(&mut repos);
+        self.verification.admission.overridden_repos(&mut repos);
         for record in self.list() {
             if record.state.is_live() {
                 repos.insert(record.repo_name.clone());
@@ -1571,10 +1265,12 @@ impl Supervisor {
             let (review_waiting, review_oldest_wait_secs) =
                 reg.lane_wait_stats(&repo, crate::agents::Lane::Review);
             let verify_limit = self
-                .verification_admission
+                .verification
+                .admission
                 .limit_for(&self.verification_repo_identity(&repo));
             let verify_in_flight = self
-                .verification_admission
+                .verification
+                .admission
                 .in_flight(&self.verification_repo_identity(&repo));
             out.insert(
                 repo,
@@ -1624,8 +1320,8 @@ impl Supervisor {
     }
 
     /// Normalize `repo` — whatever shape reached
-    /// [`WorkflowEngine::run_check_in`](crate::workflow_exec::WorkflowEngine::run_check_in)
-    /// — to the one stable identity every [`VerificationAdmission`] bound,
+    /// [`crate::managed_verification::ManagedVerification::run`](crate::managed_verification::ManagedVerification::run)
+    /// — to the one stable identity every [`crate::managed_verification::VerificationAdmission`] bound,
     /// and the durable event recording it, must agree on (continuation of
     /// TKT-01M0HNESEECWWFQF8X6VH1XSJ6). Four call paths reach `run_check_in`
     /// with two different shapes: a workflow `run` step or reactor dispatch
@@ -1643,17 +1339,7 @@ impl Supervisor {
     /// landing/`verify.run` use, and an unregistered path has no name to
     /// resolve to.
     pub(crate) fn verification_repo_identity(&self, repo: &str) -> String {
-        let path = std::path::Path::new(repo);
-        if path.is_absolute() {
-            if let Ok(registry) =
-                crate::repos::RepoRegistry::load(&self.layout.home().join("repos.json"))
-            {
-                if let Some(record) = registry.get_by_path(path) {
-                    return record.name.clone();
-                }
-            }
-        }
-        repo.to_string()
+        crate::managed_verification::repo_identity(&self.layout, repo)
     }
 
     /// Pause or resume new-agent admission ([`spawn`](Self::spawn)). Used by
@@ -1854,7 +1540,7 @@ impl Supervisor {
         }
         validate_role(&params.role)?;
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
-        let repo_name = repo.name();
+        let repo_name = self.repository_name(&repo)?;
         // Onboarding is the one pre-policy capability: its session id, fixed
         // branch/worktree, read-only role, and explicit base are daemon-owned.
         // Every ordinary worker still requires an activated repository policy.
@@ -4011,7 +3697,7 @@ impl Supervisor {
     /// Gather this generation's liveness evidence: whether its harness's own
     /// process still has a live verifier descendant underneath it (a `cargo
     /// test`/compiler its own tool-use launched, or an `rk verify` CLI call
-    /// blocked on the daemon — see [`crate::workflow_exec::process_liveness`]),
+    /// blocked on the daemon — see [`crate::managed_verification::process_liveness`]),
     /// and whether its bounded output (assistant text, tool use, stderr) has
     /// genuinely advanced within the same window the silence bar itself
     /// uses. Only called once a generation is already silent past that bar
@@ -4028,8 +3714,8 @@ impl Supervisor {
 
         let process = record
             .pid
-            .map(crate::workflow_exec::process_liveness)
-            .unwrap_or(crate::workflow_exec::ProcessLiveness {
+            .map(crate::managed_verification::process_liveness)
+            .unwrap_or(crate::managed_verification::ProcessLiveness {
                 child_alive: false,
                 live_verifier_descendants: 0,
             });
@@ -5794,6 +5480,16 @@ impl Supervisor {
         resolve_repository_policy(self.layout.home(), repo)
     }
 
+    /// Use the same registered identity as policy resolution. A directory's
+    /// basename is only a fallback for unregistered diagnostic/test repos.
+    pub(crate) fn repository_name(&self, repo: &Repo) -> rk_core::Result<String> {
+        let registry = crate::repos::RepoRegistry::load(&self.layout.home().join("repos.json"))?;
+        Ok(registry
+            .get_by_path(repo.root())
+            .map(|record| record.name.clone())
+            .unwrap_or_else(|| repo.name()))
+    }
+
     pub(crate) fn set_landing_pipeline(&self, pipeline: &Arc<crate::landing::LandingPipeline>) {
         *self
             .landing_pipeline
@@ -6467,109 +6163,6 @@ impl Supervisor {
         results
     }
 
-    /// Revert an agent branch's recorded landing — the undo for an unattended
-    /// delivery that turned out bad (steward/drain landed it, then main
-    /// broke). Revert-merges the merge commit recorded on the agent's record
-    /// by the landing path (serialized through the same per-target ref lock),
-    /// reopens the agent's ticket (`open`, or `blocked` with
-    /// `block` to hold it out of the auto-dispatch backlog), and emits a
-    /// `fact` tuple recording what was undone. A revert conflict or a target
-    /// moved mid-revert is a clean `reverted: false`, mirroring merge; an
-    /// agent that never merged (no-merge, PR-mode, or already reverted) is an
-    /// error.
-    pub async fn revert(&self, name: &str, block: bool) -> rk_core::Result<serde_json::Value> {
-        let record = self
-            .lock_registry()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
-        let Some(commit) = record.merge_commit.clone() else {
-            return Err(rk_core::Error::other(format!(
-                "{name} has no recorded merge commit to revert \
-                 (never merged, PR-mode, or already reverted)"
-            )));
-        };
-
-        let repo_path = record.repo_root.clone();
-        let repo = blocking_io("revert repo discovery", move || Repo::discover(&repo_path)).await?;
-        // Same per-target ref lock as landing: the revert takes its
-        // turn so it never races a concurrent auto-merge into this target.
-        let outcome = {
-            let _merge_guard = self
-                .merge_queue
-                .acquire(repo.root(), &record.target_branch)
-                .await;
-            let repo = repo.clone();
-            let target = record.target_branch.clone();
-            let commit = commit.clone();
-            blocking_io("revert merge", move || repo.revert_merge(&commit, &target)).await?
-        };
-        let reverted = outcome.merged;
-
-        let mut ticket_status: Option<&str> = None;
-        if reverted {
-            // Clear the anchor so a second `rk revert` errors instead of
-            // reverting the revert.
-            self.lock_registry().update(name, |r| {
-                r.merge_commit = None;
-            })?;
-            // Reopen the ticket the bad merge closed, so the work is durably
-            // back on the backlog rather than falsely done.
-            if let Some(task) = &record.task {
-                if task.starts_with(crate::tickets::ID_PREFIX) {
-                    let status = if block { "blocked" } else { "open" };
-                    // Clear the durable delivery record first (P1b). Reopening
-                    // the status alone is not enough: the record is what every
-                    // "is it delivered" question now reads, so a reverted merge
-                    // that left it standing would keep claiming the work
-                    // shipped while the commit is no longer in the target.
-                    match self.tickets.clear_delivery(task, status).await {
-                        Ok(true) => ticket_status = Some(status),
-                        Ok(false) => match self.tickets.reopen(task, status).await {
-                            Ok(_) => ticket_status = Some(status),
-                            Err(e) => {
-                                warn!(ticket = %task, error = %e, "failed to reopen ticket on revert");
-                            }
-                        },
-                        Err(e) => {
-                            warn!(ticket = %task, error = %e, "failed to clear delivery on revert");
-                        }
-                    }
-                }
-            }
-            let fact = Tuple::new(
-                Category::Fact,
-                record.repo_name.clone(),
-                format!("merge-reverted-{name}"),
-                self.castle.clone(),
-                json!({
-                    "agent": name,
-                    "branch": &record.branch,
-                    "target": &record.target_branch,
-                    "task": &record.task,
-                    "merge_commit": &commit,
-                    "revert_commit": &outcome.commit,
-                    "ticket_status": ticket_status,
-                    "detail": &outcome.detail,
-                }),
-            );
-            if let Err(e) = self.space.out(fact) {
-                warn!(error = %e, "failed to emit merge-reverted fact tuple");
-            }
-        }
-        info!(agent = name, reverted, merge_commit = %commit, "revert");
-        Ok(json!({
-            "agent": name,
-            "reverted": reverted,
-            "merge_commit": commit,
-            "revert_commit": outcome.commit,
-            "target": record.target_branch,
-            "task": record.task,
-            "ticket_status": ticket_status,
-            "detail": outcome.detail,
-        }))
-    }
-
     /// Land a NAMED branch into a target — the explicit `{branch, target}`
     /// delivery operation. Names neither an agent nor a worktree.
     ///
@@ -6592,13 +6185,19 @@ impl Supervisor {
         target: &str,
         keep_branch: bool,
         candidate: &rk_git::PreparedMerge,
-    ) -> rk_core::Result<serde_json::Value> {
+    ) -> rk_core::Result<crate::delivery::TargetAdvance> {
+        use crate::delivery::{
+            BlockedTarget, LandedDelivery, Publication, StaleTarget, TargetAdvance,
+        };
+
+        let mut delivery =
+            LandedDelivery::new(branch, target, &candidate.commit, candidate.is_empty())?;
         let repo_path = repo_root.to_path_buf();
         let repo = blocking_io("prepared land repo discovery", move || {
             Repo::discover(&repo_path)
         })
         .await?;
-        let repo_name = repo.name();
+        let repo_name = self.repository_name(&repo)?;
         let policy = self.repository_policy(&repo)?;
         // `target` is no longer an agent base at this boundary: the caller's
         // LandingQueueEntry already contains the exact destination resolved
@@ -6630,58 +6229,25 @@ impl Supervisor {
         match advance {
             rk_git::AdvanceOutcome::Advanced { .. } => {}
             rk_git::AdvanceOutcome::Stale { expected, actual } => {
-                return Ok(json!({
-                    "branch": branch,
-                    "target": target,
-                    "delivered": false,
-                    "merged": false,
-                    "stale": true,
-                    "tested_sha": candidate.commit,
-                    "expected_target_sha": expected,
-                    "actual_target_sha": actual,
-                    "detail": "target moved after gates; candidate must be rebuilt and retested",
-                }));
+                return Ok(TargetAdvance::Stale(StaleTarget { expected, actual }));
             }
-            // `target` is checked out (root or a linked worktree, e.g. an
-            // agent's own worktree on its own branch) and refused the
-            // fast-forward — a genuinely dirty checkout, not a contended
-            // race. Nothing landed, the ref never moved, and the candidate
-            // is still parked under its ref: fail closed and let the caller
-            // (the landing pipeline) raise a durable human recovery gate
-            // rather than silently retrying against the same dirty worktree.
-            rk_git::AdvanceOutcome::Blocked {
-                expected,
-                path,
-                detail,
-            } => {
-                return Ok(json!({
-                    "branch": branch,
-                    "target": target,
-                    "delivered": false,
-                    "merged": false,
-                    "blocked": true,
-                    "tested_sha": candidate.commit,
-                    "expected_target_sha": expected,
-                    "worktree_path": path.display().to_string(),
-                    "detail": format!(
+            rk_git::AdvanceOutcome::Blocked { path, detail, .. } => {
+                return Ok(TargetAdvance::Blocked(BlockedTarget {
+                    tested_sha: candidate.commit.clone(),
+                    detail: format!(
                         "{target} is checked out at {} and refused a fast-forward: {detail}",
                         path.display()
                     ),
+                    worktree_path: path,
                 }));
             }
         }
 
-        let mut delivery = BranchDelivery {
-            target: target.to_string(),
-            remote: policy.delivery.remote.clone(),
-            merged: true,
-            merge_commit: Some(candidate.commit.clone()),
-            content_free: candidate.is_empty(),
-            detail: format!("advanced {target} to pre-tested merge {}", candidate.commit),
-            ..BranchDelivery::default()
-        };
+        delivery.remote = policy.delivery.remote.clone();
+        delivery.detail = format!("advanced {target} to pre-tested merge {}", candidate.commit);
         repo.discard_candidate(&candidate.candidate_ref)?;
         if policy.delivery.mode == DeliveryMode::MergePush {
+            delivery.publication = Publication::PushPending;
             let repo = repo.clone();
             let target_to_push = target.to_string();
             let remote_to_push = delivery.remote.clone();
@@ -6691,7 +6257,7 @@ impl Supervisor {
             .await
             {
                 Ok(output) => {
-                    delivery.pushed = true;
+                    delivery.publication = Publication::Pushed;
                     delivery.detail = format!(
                         "{}; pushed {target} to {}: {}",
                         delivery.detail,
@@ -6707,8 +6273,7 @@ impl Supervisor {
                 }
             }
         }
-        delivery.delivered = policy.delivery.mode == DeliveryMode::Merge || delivery.pushed;
-        if delivery.delivered && policy.delivery.delete_source && !keep_branch {
+        if delivery.delivered() && policy.delivery.delete_source && !keep_branch {
             let repo = repo.clone();
             let source = branch.to_string();
             match blocking_io("prepared landing branch deletion", move || {
@@ -6724,31 +6289,16 @@ impl Supervisor {
                 ),
             }
         }
-        let result = json!({
-            "branch": branch,
-            "target": delivery.target,
-            "remote": delivery.remote,
-            "delivered": delivery.delivered,
-            "merged": delivery.merged,
-            "merge_commit": delivery.merge_commit,
-            "tested_sha": candidate.commit,
-            "content_free": delivery.content_free,
-            "pushed": delivery.pushed,
-            "pr_opened": false,
-            "detail": delivery.detail,
-            "branch_deleted": delivery.branch_deleted,
-            "stale": false,
-        });
-        self.emit_event(&repo_name, "branch_landed", result.clone());
+        self.emit_event(&repo_name, "branch_landed", delivery.to_json());
         info!(
             branch,
             target,
             tested_sha = %candidate.commit,
-            delivered = delivery.delivered,
-            pushed = delivery.pushed,
+            delivered = delivery.delivered(),
+            pushed = delivery.pushed(),
             "landed exact pre-tested merge"
         );
-        Ok(result)
+        Ok(TargetAdvance::Landed(delivery))
     }
 
     pub async fn land(
@@ -6761,7 +6311,7 @@ impl Supervisor {
     ) -> rk_core::Result<serde_json::Value> {
         let repo_path = repo_root.to_path_buf();
         let repo = blocking_io("land repo discovery", move || Repo::discover(&repo_path)).await?;
-        let repo_name = repo.name();
+        let repo_name = self.repository_name(&repo)?;
         let fork_point = self.recorded_fork_point(repo.root(), branch);
         let head_sha = repo.rev_parse(branch).ok();
         let policy = self.repository_policy(&repo)?;
@@ -6860,7 +6410,7 @@ impl Supervisor {
             Repo::discover(&repo_path)
         })
         .await?;
-        let repo_name = repo.name();
+        let repo_name = self.repository_name(&repo)?;
         let source_spawn = self
             .binding_for_branch(repo.root(), branch)
             .map(|(_, spawn)| spawn);
@@ -6957,7 +6507,7 @@ impl Supervisor {
             Repo::discover(&repo_path)
         })
         .await?;
-        let repo_name = repo.name();
+        let repo_name = self.repository_name(&repo)?;
         let fork_point = self.recorded_fork_point(repo.root(), branch);
         let head_sha = repo.rev_parse(branch).ok();
         let policy = self.repository_policy(&repo)?;
@@ -10635,7 +10185,7 @@ mod respawn_tests {
 
 /// Acceptance properties for the bounded per-repo verification admission
 /// queue (TKT-01M0HNESEECWWFQF8X6VH1XSJ6) that are properties of
-/// [`VerificationAdmission`]/[`Supervisor`] alone — FIFO fairness, the
+/// [`crate::managed_verification::VerificationAdmission`]/[`Supervisor`] alone — FIFO fairness, the
 /// configured bound, cross-repo independence, and restart recovery — as
 /// opposed to the [`crate::workflow_exec`] properties (exact exit
 /// provenance, the landing-gate/`verify.run` shared bound, proof reuse) that
@@ -10807,7 +10357,7 @@ mod verification_admission_tests {
             .unwrap();
     }
 
-    /// The resolution [`Supervisor::verification_admission_limit_for`],
+    /// The resolution [`crate::managed_verification::VerificationAdmission::limit_for`],
     /// [`Supervisor::acquire_verification_admission`], and
     /// `record_verification_admission_event` (`crate::workflow_exec`) all go
     /// through (continuation of TKT-01M0P5NM51SKT5ABXRCDZD07J3): a registered
@@ -11043,13 +10593,13 @@ mod stuck_liveness_tests {
         // the process table before asserting on it, rather than racing a
         // fixed sleep against however fast `sh` itself schedules.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::workflow_exec::process_liveness(pid).live_verifier_descendants == 0
+        while crate::managed_verification::process_liveness(pid).live_verifier_descendants == 0
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(
-            crate::workflow_exec::process_liveness(pid).live_verifier_descendants > 0,
+            crate::managed_verification::process_liveness(pid).live_verifier_descendants > 0,
             "the backgrounded fake cargo must be recognized before this test proceeds"
         );
 

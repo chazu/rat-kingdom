@@ -132,51 +132,41 @@ enum CurrentInboxClass {
 }
 
 fn classify_current_inbox(mut item: Value) -> (CurrentInboxClass, Value) {
-    let kind = item
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let action = item
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let actionable = match kind.as_str() {
-        "agent-failed" | "agent-orphaned" => action.starts_with("rk respawn "),
-        // A transport outage still in automatic retry is diagnostic only;
-        // the exhausted form's action changes to the bounded respawn command.
-        "transport-outage" => action.starts_with("rk respawn "),
-        "recovery-action" => action.starts_with("rk inbox ack "),
-        _ => false,
+    use crate::inbox::InboxDisposition;
+    let disposition = item
+        .get("disposition")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<InboxDisposition>(value).ok());
+    let class = match &disposition {
+        Some(InboxDisposition::Actionable { command }) if !command.trim().is_empty() => {
+            CurrentInboxClass::Actionable
+        }
+        Some(InboxDisposition::DecisionRequired { commands })
+            if !commands.is_empty()
+                && commands.iter().all(|command| !command.trim().is_empty()) =>
+        {
+            CurrentInboxClass::DecisionRequired
+        }
+        _ => CurrentInboxClass::Stalled,
     };
-    let decision_required = kind == "workflow-gate" && action.contains('|');
     if let Some(fields) = item.as_object_mut() {
         fields.insert("source".into(), json!("inbox"));
-        if actionable {
-            if let Some(command) = fields.remove("action") {
-                fields.insert("command".into(), command);
+        match (class, disposition) {
+            (CurrentInboxClass::Actionable, Some(InboxDisposition::Actionable { command })) => {
+                fields.remove("action");
+                fields.insert("command".into(), json!(command));
             }
-        } else if decision_required {
-            fields.insert(
-                "commands".into(),
-                json!(action
-                    .split('|')
-                    .map(str::trim)
-                    .filter(|command| !command.is_empty())
-                    .collect::<Vec<_>>()),
-            );
+            (
+                CurrentInboxClass::DecisionRequired,
+                Some(InboxDisposition::DecisionRequired { commands }),
+            ) => {
+                fields.insert("commands".into(), json!(commands));
+            }
+            _ => {}
         }
     }
-    let class = if actionable {
-        CurrentInboxClass::Actionable
-    } else if decision_required {
-        CurrentInboxClass::DecisionRequired
-    } else {
-        // Exhaustive visibility is the point: a new or malformed inbox kind
-        // defaults to stalled instead of disappearing from `rk work`.
-        CurrentInboxClass::Stalled
-    };
+    // Unknown or malformed dispositions stay visible as stalled. Neither raw
+    // kind nor command prose can promote a row to an executable next action.
     (class, item)
 }
 
@@ -267,41 +257,48 @@ async fn convergence_action_panic_is_observed_without_panicking_the_scheduler() 
 #[cfg(test)]
 #[test]
 fn current_work_classifies_every_inbox_row_without_silent_drops() {
-    let row = |kind: &str, action: &str| json!({"kind": kind, "action": action});
-    for (kind, action) in [
-        ("agent-failed", "rk respawn Tails"),
-        ("agent-orphaned", "rk respawn Tails"),
-        ("transport-outage", "rk respawn Tails"),
-        ("recovery-action", "rk inbox ack 01M10ABC"),
-    ] {
-        let (class, current) = classify_current_inbox(row(kind, action));
-        assert_eq!(class, CurrentInboxClass::Actionable);
-        assert_eq!(current["source"], "inbox");
-        assert_eq!(current["command"], action);
-        assert!(current.get("action").is_none());
-    }
-    for (kind, action, expected) in [
-        ("workflow-failed", "rk workflow status wf-1"),
-        ("workflow-gate", "rk approve wf-1 | rk reject wf-1"),
+    use crate::inbox::{InboxDisposition, InboxItem};
+    for (disposition, expected) in [
         (
-            "awaiting-review",
-            "review & merge: https://example.invalid/1",
+            InboxDisposition::Actionable {
+                command: "rk respawn Tails".into(),
+            },
+            CurrentInboxClass::Actionable,
         ),
-        ("transport-outage", "rk status Tails"),
-        ("landing-queue-stalled", "rk status --json"),
-    ]
-    .into_iter()
-    .map(|(kind, action)| {
-        let class = if kind == "workflow-gate" {
-            CurrentInboxClass::DecisionRequired
-        } else {
-            CurrentInboxClass::Stalled
+        (
+            InboxDisposition::DecisionRequired {
+                commands: vec!["rk approve wf-1".into(), "rk reject wf-1".into()],
+            },
+            CurrentInboxClass::DecisionRequired,
+        ),
+        (
+            InboxDisposition::Stalled {
+                advice: "inspect recorded evidence".into(),
+            },
+            CurrentInboxClass::Stalled,
+        ),
+    ] {
+        let row = InboxItem {
+            urgency: 1,
+            kind: "source-kind".into(),
+            subject: "subject".into(),
+            scope: "repo".into(),
+            detail: "detail".into(),
+            disposition,
         };
-        (kind, action, class)
-    }) {
-        let (class, current) = classify_current_inbox(row(kind, action));
-        assert_eq!(class, expected, "{kind}");
+        let (class, current) = classify_current_inbox(serde_json::to_value(&row).unwrap());
+        assert_eq!(class, expected);
         assert_eq!(current["source"], "inbox");
+        match class {
+            CurrentInboxClass::Actionable => {
+                assert_eq!(current["command"], row.action());
+                assert!(current.get("action").is_none());
+            }
+            CurrentInboxClass::DecisionRequired => {
+                assert_eq!(current["commands"].as_array().unwrap().len(), 2)
+            }
+            CurrentInboxClass::Stalled => assert_eq!(current["action"], row.action()),
+        }
     }
 }
 
@@ -332,6 +329,281 @@ async fn empty_current_work_has_exact_zero_counts_and_diagnostic_pointers() {
         .as_str()
         .unwrap()
         .contains("not the work itself"));
+}
+
+#[cfg(test)]
+#[test]
+fn current_work_disposition_is_authoritative_over_command_prose() {
+    let (class, row) = classify_current_inbox(json!({
+        "kind": "transport-outage",
+        "action": "rk respawn Tails",
+        "disposition": {"kind": "stalled", "advice": "automatic retry still owns this episode"},
+    }));
+    assert_eq!(class, CurrentInboxClass::Stalled);
+    assert!(row.get("command").is_none());
+
+    let (class, row) = classify_current_inbox(json!({
+        "kind": "workflow-gate",
+        "action": "display wording without a separator",
+        "disposition": {"kind": "decision-required", "commands": ["rk approve wf-1", "rk reject wf-1"]},
+    }));
+    assert_eq!(class, CurrentInboxClass::DecisionRequired);
+    assert_eq!(
+        row["commands"],
+        json!(["rk approve wf-1", "rk reject wf-1"])
+    );
+
+    for disposition in [
+        json!(null),
+        json!({"kind": "future-class"}),
+        json!({"kind": "actionable"}),
+    ] {
+        let (class, _) = classify_current_inbox(json!({
+            "kind": "agent-failed", "action": "rk respawn Tails", "disposition": disposition,
+        }));
+        assert_eq!(
+            class,
+            CurrentInboxClass::Stalled,
+            "unknown disposition remains visible"
+        );
+    }
+}
+
+#[cfg(test)]
+mod current_need_tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    fn git(path: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn need(task: &str, at: chrono::DateTime<Utc>, incident: Option<Value>) -> Tuple {
+        let mut row = Tuple::new(
+            Category::Need,
+            "tenant",
+            "steward",
+            "daemon",
+            json!({"agent": "steward", "task": task, "text": "historical incident"}),
+        );
+        row.created_at = at;
+        if let Some(incident) = incident {
+            row.payload["landing_incident"] = incident;
+        }
+        row
+    }
+
+    fn held(task: &str, head: &str, outcome: &str, at: chrono::DateTime<Utc>) -> Tuple {
+        let mut row = Tuple::new(
+            Category::Event,
+            "tenant",
+            "landing_processed",
+            "daemon",
+            json!({"task": task, "head_sha": head, "branch": "old-candidate", "target": "main", "outcome": outcome}),
+        );
+        row.created_at = at;
+        row
+    }
+
+    #[tokio::test]
+    async fn current_work_retires_delivered_gate_and_rework_incidents_but_keeps_recurrence() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-b", "replacement"]);
+        std::fs::write(repo.join("delivered.txt"), "replacement work\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "replacement"]);
+        git(&repo, &["checkout", "main"]);
+        git(
+            &repo,
+            &["merge", "--no-ff", "replacement", "-m", "approved delivery"],
+        );
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+        let daemon =
+            Daemon::new(Layout::at(temp.path().join("home")), &Default::default()).unwrap();
+        daemon
+            .repos
+            .lock()
+            .unwrap()
+            .add(crate::repos::RepoRecord {
+                name: "tenant".into(),
+                path: repo.canonicalize().unwrap(),
+                host: None,
+                created_at: Utc::now(),
+                activated_policy: None,
+            })
+            .unwrap();
+        let before = Utc::now() - ChronoDuration::minutes(10);
+        for (task, outcome) in [("TKT-gate", "gate-held"), ("TKT-rework", "rework-filed")] {
+            daemon
+                .space
+                .out(Tuple::new(
+                    Category::Task,
+                    "tenant",
+                    task,
+                    "daemon",
+                    json!({"title": task, "status": "in_progress"}),
+                ))
+                .unwrap();
+            daemon.space.out(need(task, before, None)).unwrap();
+            daemon
+                .space
+                .out(held(
+                    task,
+                    &base,
+                    outcome,
+                    before + ChronoDuration::seconds(1),
+                ))
+                .unwrap();
+        }
+        let work = daemon
+            .current_work_value(Some("tenant".into()))
+            .await
+            .unwrap();
+        assert_eq!(work["counts"]["stalled"], 2);
+        let delivered_at = before + ChronoDuration::minutes(1);
+        for task in ["TKT-gate", "TKT-rework"] {
+            daemon
+                .tickets
+                .record_delivery(
+                    task,
+                    &crate::tickets::DeliveryRecord {
+                        branch: "replacement".into(),
+                        target: "main".into(),
+                        merge_commit: commit.clone(),
+                        landed_at: delivered_at.to_rfc3339(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let work = daemon
+            .current_work_value(Some("tenant".into()))
+            .await
+            .unwrap();
+        assert_eq!(work["counts"]["stalled"], 0, "{work}");
+        assert_eq!(
+            daemon
+                .space
+                .scan(&Pattern::category(Category::Need))
+                .unwrap()
+                .len(),
+            2,
+            "retirement must not delete historical evidence"
+        );
+
+        let mut newer = need(
+            "TKT-gate",
+            delivered_at + ChronoDuration::seconds(1),
+            Some(json!({"branch": "recurrence", "target": "main", "head_sha": commit})),
+        );
+        newer.payload["text"] = json!("newer recurrence");
+        daemon.space.out(newer).unwrap();
+        let work = daemon
+            .current_work_value(Some("tenant".into()))
+            .await
+            .unwrap();
+        assert_eq!(work["counts"]["stalled"], 1, "{work}");
+        assert_eq!(work["stalled"][0]["detail"], "newer recurrence");
+
+        // An explicit incident from before delivery is retired too; malformed
+        // new metadata cannot fall back to the legacy temporal inference.
+        daemon
+            .space
+            .out(need(
+                "TKT-rework",
+                before + ChronoDuration::seconds(2),
+                Some(json!({
+                    "branch": "old-candidate", "target": "main", "head_sha": base,
+                    "source_spawn": rk_core::id::SpawnId::new(),
+                })),
+            ))
+            .unwrap();
+        let work = daemon
+            .current_work_value(Some("tenant".into()))
+            .await
+            .unwrap();
+        assert_eq!(work["counts"]["stalled"], 1, "{work}");
+
+        for incident in [
+            json!({"branch": "other", "target": "release", "head_sha": base}),
+            json!({"target": "main"}),
+        ] {
+            daemon
+                .space
+                .out(need("TKT-gate", before, Some(incident)))
+                .unwrap();
+        }
+        // Incomplete history cannot promote legacy rows to resolved. Explicit
+        // identities remain usable without scanning their old hold markers.
+        let rows = daemon
+            .space
+            .scan(&Pattern::category(Category::Need))
+            .unwrap();
+        let candidates =
+            crate::current_needs::resolution_candidates(&rows, &[], &daemon.tickets, true).unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        // A current delivery pointer alone is insufficient when Git cannot
+        // verify its commit on the recorded destination.
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Task,
+                "tenant",
+                "TKT-missing",
+                "daemon",
+                json!({"title": "missing", "status": "open"}),
+            ))
+            .unwrap();
+        daemon
+            .tickets
+            .record_delivery(
+                "TKT-missing",
+                &crate::tickets::DeliveryRecord {
+                    branch: "replacement".into(),
+                    target: "main".into(),
+                    merge_commit: "0".repeat(40),
+                    landed_at: delivered_at.to_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+        daemon
+            .space
+            .out(need(
+                "TKT-missing",
+                before,
+                Some(json!({
+                    "branch": "old-candidate", "target": "main", "head_sha": base,
+                })),
+            ))
+            .unwrap();
+        let work = daemon
+            .current_work_value(Some("tenant".into()))
+            .await
+            .unwrap();
+        // The extra same-time gate incident also makes that legacy binding
+        // ambiguous. Its historical row must remain conservative.
+        assert_eq!(work["counts"]["stalled"], 5, "{work}");
+    }
 }
 
 #[cfg(test)]
@@ -2938,7 +3210,11 @@ impl Daemon {
                     Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
                 };
                 reply(
-                    match self.supervisor.revert(&params.name, params.block).await {
+                    match self
+                        .supervisor
+                        .revert_exact(&params.name, params.block, params.operation)
+                        .await
+                    {
                         Ok(v) => Response::ok(id, v),
                         Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
                     },
@@ -3363,7 +3639,7 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return Err(e),
         };
-        let needs = match scan(Pattern::category(Category::Need)) {
+        let mut needs = match scan(Pattern::category(Category::Need)) {
             Ok(t) => t,
             Err(e) => return Err(e),
         };
@@ -3455,6 +3731,37 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return Err(e),
         };
+        let processed = scan(Pattern::category(Category::Event).identity("landing_processed"))?;
+        let resolutions = crate::current_needs::resolution_candidates(
+            &needs,
+            &processed,
+            &self.tickets,
+            source_truncated,
+        )?;
+        let mut by_repo: HashMap<String, HashSet<(String, String)>> = HashMap::new();
+        for candidate in &resolutions {
+            by_repo
+                .entry(candidate.repo.clone())
+                .or_default()
+                .insert((candidate.merge_commit.clone(), candidate.target.clone()));
+        }
+        let mut proven = HashSet::new();
+        for (scope, pairs) in by_repo {
+            let ancestry = self
+                .merge_commit_ancestry(&scope, pairs.into_iter().collect())
+                .await?;
+            for candidate in resolutions
+                .iter()
+                .filter(|candidate| candidate.repo == scope)
+            {
+                if ancestry.get(&(candidate.merge_commit.clone(), candidate.target.clone()))
+                    == Some(&rk_git::Ancestry::Present)
+                {
+                    proven.insert(candidate.need_id);
+                }
+            }
+        }
+        needs.retain(|need| !proven.contains(&need.id));
         let mut items = crate::inbox::build(
             &agents,
             &instances,
@@ -10915,6 +11222,8 @@ struct RevertParams {
     /// Reopen the agent's ticket as `blocked` instead of `open`.
     #[serde(default)]
     block: bool,
+    #[serde(default)]
+    operation: Option<RecordId>,
 }
 
 #[derive(Deserialize)]

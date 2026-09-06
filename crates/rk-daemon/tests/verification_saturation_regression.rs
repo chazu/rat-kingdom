@@ -92,19 +92,14 @@ fn marker_check_body(shared: &Path, fail: bool) -> String {
 
 /// `n` checks named `sat-0`..`sat-{n-1}` sharing one repo's verification
 /// admission lane; the LAST one is the deliberately failing check.
-fn write_saturation_checks(repo: &Path, shared: &Path, n: usize) {
+fn write_saturation_checks(repo: &Path, shared: &Path, n: usize, shared_cargo_target: bool) {
     let mut checks = String::from("checks: [\n");
     for i in 0..n {
         let fail = i == n - 1;
         let body = marker_check_body(shared, fail);
-        // `sharedCargoTarget: true` is what actually routes a check through
-        // the per-repo verification admission queue at all
-        // (`workflow_exec.rs::run_check_in`: `admission_limit` is 0 —
-        // disabled — for any check that doesn't opt in). This mirrors the
-        // repo's own real `.rk/checks.cue` `verify` check, the one entry
-        // this whole ticket's admission queue exists to bound.
+        // General admission applies equally to shell and Cargo checks.
         checks.push_str(&format!(
-            "    {{name: \"sat-{i}\", command: \"{}\", timeout: \"10s\", environmentPolicy: \"strip_rk_spawn\", sharedCargoTarget: true}},\n",
+            "    {{name: \"sat-{i}\", command: \"{}\", timeout: \"10s\", environmentPolicy: \"strip_rk_spawn\", sharedCargoTarget: {shared_cargo_target}}},\n",
             cue_command(&body)
         ));
     }
@@ -140,7 +135,7 @@ async fn wip4_admission_saturation_stays_bounded_starves_nothing_and_keeps_exact
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_name = init_repo(repo_dir.path());
     let shared = tempfile::tempdir().unwrap();
-    write_saturation_checks(repo_dir.path(), shared.path(), N_CHECKS);
+    write_saturation_checks(repo_dir.path(), shared.path(), N_CHECKS, false);
 
     let layout = Layout::at(home.path());
     let space = Space::open_in_memory().unwrap();
@@ -605,7 +600,7 @@ async fn shared_cargo_target_checks_serialize_to_one_regardless_of_admission_hea
     let repo_name = init_repo(repo_dir.path());
     let shared = tempfile::tempdir().unwrap();
     const N: usize = 3;
-    write_saturation_checks(repo_dir.path(), shared.path(), N);
+    write_saturation_checks(repo_dir.path(), shared.path(), N, true);
     // write_saturation_checks's last check deliberately fails (exit 7) —
     // irrelevant here since this test only cares about peak concurrency,
     // but drop its stderr expectation by not asserting on exit codes below.

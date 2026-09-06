@@ -1673,6 +1673,28 @@ fn shell_assignment(word: &str) -> bool {
 }
 
 fn command_exists(command: &str, root: &Path) -> bool {
+    // POSIX special builtins are supplied by the shell, not PATH entries.
+    // A fail-closed check using `... || exit 1` must not be reported as
+    // missing an executable named `exit`.
+    if matches!(
+        command,
+        ":" | "."
+            | "break"
+            | "continue"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "readonly"
+            | "return"
+            | "set"
+            | "shift"
+            | "times"
+            | "trap"
+            | "unset"
+    ) {
+        return true;
+    }
     if command.contains('/') {
         let path = Path::new(command);
         return if path.is_absolute() {
@@ -1932,6 +1954,11 @@ mod tests {
 
     #[test]
     fn shell_check_tool_detection_ignores_assignments_operators_and_quoted_prose() {
+        assert!(command_exists("exit", Path::new(".")));
+        assert!(!command_exists(
+            "rk-first-repo-nonexistent-tool",
+            Path::new(".")
+        ));
         assert_eq!(
             command_tool(
                 "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep x"

@@ -114,12 +114,14 @@ impl RepoRegistry {
         self.repos.get(name)
     }
 
-    /// Resolve the deterministic first alias registered for a canonical path.
+    /// Resolve the deterministic first alias registered for this path,
+    /// including a symlink spelling of the registered canonical checkout.
     pub fn get_by_path(&self, path: &Path) -> Option<&RepoRecord> {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut matches = self
             .repos
             .values()
-            .filter(|record| record.path == path)
+            .filter(|record| record.path == path || record.path == canonical)
             .collect::<Vec<_>>();
         matches.sort_by(|left, right| left.name.cmp(&right.name));
         matches.into_iter().next()
@@ -180,6 +182,21 @@ mod tests {
             host: None,
             activated_policy: None,
         }
+    }
+
+    #[test]
+    fn path_lookup_resolves_symlinks_to_the_registered_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let link = dir.path().join("linked-checkout");
+        std::os::unix::fs::symlink(&checkout, &link).unwrap();
+        let canonical = std::fs::canonicalize(&checkout).unwrap();
+        let mut reg = RepoRegistry::load(&dir.path().join("repos.json")).unwrap();
+        reg.add(record("named-repo", canonical.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(reg.get_by_path(&link).unwrap().name, "named-repo");
+        assert!(reg.get_by_path(dir.path()).is_none());
     }
 
     #[test]
