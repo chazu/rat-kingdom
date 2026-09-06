@@ -66,3 +66,37 @@ fn install_skill_preserves_customizations_unless_force_is_explicit() {
         .unwrap()
         .contains("rk --json factory snapshot"));
 }
+
+#[test]
+fn explicit_upgrade_removes_retired_python_payloads() {
+    let home = tempfile::tempdir().unwrap();
+    let destination = home.path().join(".jcode/skills/factory-foreman");
+    fs::create_dir_all(destination.join("scripts")).unwrap();
+    fs::create_dir_all(destination.join("dashboard/templates")).unwrap();
+    for path in [
+        "SKILL.md",
+        "REFERENCE.md",
+        "scripts/factory_foreman.py",
+        "dashboard/render_factory_dashboard.py",
+        "dashboard/templates/factory-dashboard.md",
+    ] {
+        fs::write(destination.join(path), "previous release\n").unwrap();
+    }
+    let refused = run(home.path(), &["factory", "install-skill"]);
+    assert!(!refused.status.success());
+    assert!(destination.join("scripts/factory_foreman.py").exists());
+
+    let upgraded = run(home.path(), &["factory", "install-skill", "--force"]);
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
+    assert!(!destination.join("scripts").exists());
+    assert!(!destination.join("dashboard").exists());
+    let skill = fs::read_to_string(destination.join("SKILL.md")).unwrap();
+    assert!(skill.contains("rk factory render"));
+    assert!(!skill.contains("python3"));
+    assert!(!home.path().join(".rat-kingdom").exists());
+}

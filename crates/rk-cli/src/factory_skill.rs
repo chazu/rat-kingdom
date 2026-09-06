@@ -14,22 +14,6 @@ const SKILL_FILES: &[(&str, &str)] = &[
         "REFERENCE.md",
         include_str!("../../../.jcode/skills/factory-foreman/REFERENCE.md"),
     ),
-    (
-        "scripts/factory_foreman.py",
-        include_str!("../../../.jcode/skills/factory-foreman/scripts/factory_foreman.py"),
-    ),
-    (
-        "dashboard/render_factory_dashboard.py",
-        include_str!(
-            "../../../.jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py"
-        ),
-    ),
-    (
-        "dashboard/templates/factory-dashboard.md",
-        include_str!(
-            "../../../.jcode/skills/factory-foreman/dashboard/templates/factory-dashboard.md"
-        ),
-    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -200,25 +184,7 @@ fn write_skill_files(destination: &Path) -> Result<()> {
         }
         fs::write(&path, contents)
             .with_context(|| format!("write embedded skill file {}", path.display()))?;
-        set_script_permissions(&path, relative)?;
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_script_permissions(path: &Path, relative: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if relative.ends_with(".py") {
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)
-            .with_context(|| format!("mark skill script executable {}", path.display()))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_script_permissions(_path: &Path, _relative: &str) -> Result<()> {
     Ok(())
 }
 
@@ -253,7 +219,7 @@ mod tests {
         assert!(skill.contains("rk --json factory propose-workflow"));
         assert!(!skill.contains("Use this repository-local skill"));
         assert!(destination.join("REFERENCE.md").is_file());
-        assert!(destination.join("scripts/factory_foreman.py").is_file());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub enum FactoryCommand {
     InstallMcp(FactoryInstallMcpArgs),
     /// Open a Rust-native read-only factory dashboard, auto-starting the daemon.
     Dashboard(FactoryDashboardArgs),
+    /// Render saved native snapshot and replay files without contacting the daemon.
+    Render(FactoryRenderArgs),
     /// Read the native factory snapshot without starting the daemon.
     Snapshot(FactorySnapshotArgs),
     /// Read or watch the native factory event feed without starting the daemon.
@@ -82,6 +84,23 @@ pub struct FactoryDashboardArgs {
     /// Print one bounded Markdown snapshot instead of opening the terminal UI.
     #[arg(long)]
     pub plain: bool,
+}
+
+#[derive(Args)]
+pub struct FactoryRenderArgs {
+    /// Saved JSON response from `rk --json factory snapshot`.
+    #[arg(long)]
+    snapshot: PathBuf,
+    /// Saved JSON response from `rk --json factory events replay`.
+    #[arg(long)]
+    events: PathBuf,
+    /// Write the rendered view here instead of stdout.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long, default_value_t = 20)]
+    row_limit: usize,
+    #[arg(long, default_value_t = 20)]
+    event_limit: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +368,7 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
                 );
             }
         }
+        FactoryCommand::Render(args) => render_saved_dashboard(args, json_output)?,
         FactoryCommand::Snapshot(args) => {
             let mut client = Client::connect(layout).await?;
             let params = snapshot_params(args);
@@ -839,6 +859,75 @@ fn dashboard_replay_params(args: &FactoryDashboardArgs, cursor: u64) -> Value {
     Value::Object(map)
 }
 
+fn render_saved_dashboard(args: FactoryRenderArgs, json_output: bool) -> Result<()> {
+    // Deliberately synchronous file IO: this path never constructs a Client.
+    let snapshot: Value = serde_json::from_slice(
+        &fs::read(&args.snapshot)
+            .with_context(|| format!("read snapshot {}", args.snapshot.display()))?,
+    )
+    .context("parse saved native factory snapshot")?;
+    let replay: Value = serde_json::from_slice(
+        &fs::read(&args.events)
+            .with_context(|| format!("read replay {}", args.events.display()))?,
+    )
+    .context("parse saved native factory replay")?;
+    if snapshot["schema"] != 1
+        || !snapshot["snapshot"].is_object()
+        || snapshot["cursor"].as_u64().is_none()
+    {
+        return Err(anyhow!("expected a native factory snapshot (schema 1, numeric cursor, nested snapshot object); recapture obsolete artifacts"));
+    }
+    if replay["schema"] != 1
+        || !replay["events"].is_array()
+        || !replay["truncated"].is_boolean()
+        || !(replay["boundary"].is_null() || replay["boundary"].as_u64().is_some())
+        || replay["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["cursor"].as_u64().is_none() || event["kind"].as_str().is_none())
+    {
+        return Err(anyhow!("expected a native factory replay (schema 1, events with numeric cursors and kinds, boolean truncated and numeric or null boundary)"));
+    }
+    let rendered = if json_output {
+        serde_json::to_string_pretty(&json!({
+            "schema": "factory.dashboard.v1", "source": "saved",
+            "snapshot": snapshot, "events": replay,
+        }))? + "\n"
+    } else {
+        render_dashboard_from(
+            &snapshot,
+            &replay,
+            None,
+            args.row_limit,
+            args.event_limit,
+            DashboardSource::Saved,
+        )
+    };
+    if let Some(output) = args.output {
+        if let Ok(existing) = output.canonicalize() {
+            if existing == args.snapshot.canonicalize()?
+                || existing == args.events.canonicalize()?
+            {
+                return Err(anyhow!(
+                    "dashboard output must not overwrite its source evidence"
+                ));
+            }
+        }
+        fs::write(&output, rendered)
+            .with_context(|| format!("write dashboard {}", output.display()))?;
+    } else {
+        print!("{rendered}");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum DashboardSource {
+    Live,
+    Saved,
+}
+
 fn render_dashboard(
     envelope: &Value,
     replay: &Value,
@@ -846,23 +935,88 @@ fn render_dashboard(
     row_limit: usize,
     event_limit: usize,
 ) -> String {
+    render_dashboard_from(
+        envelope,
+        replay,
+        repo,
+        row_limit,
+        event_limit,
+        DashboardSource::Live,
+    )
+}
+
+fn render_dashboard_from(
+    envelope: &Value,
+    replay: &Value,
+    repo: Option<&str>,
+    row_limit: usize,
+    event_limit: usize,
+    source: DashboardSource,
+) -> String {
     let snapshot = &envelope["snapshot"];
     let mut out = String::new();
-    let repository = repo.unwrap_or("all registered repositories");
+    let repository = repo.unwrap_or(match source {
+        DashboardSource::Live => "all registered repositories",
+        DashboardSource::Saved => "scope recorded in saved rows",
+    });
     let cursor = envelope["cursor"].as_u64().unwrap_or(0);
     let resync = &snapshot["repo_resync"];
     let resyncing = resync["required"].as_bool().unwrap_or(false);
 
     writeln!(out, "# Factory Dashboard\n").unwrap();
     writeln!(out, "- Repository: `{}`", markdown_text(repository)).unwrap();
-    writeln!(out, "- Connection: **CONNECTED**").unwrap();
+    match source {
+        DashboardSource::Live => writeln!(out, "- Connection: **CONNECTED**").unwrap(),
+        DashboardSource::Saved => {
+            writeln!(out, "- Data source: **SAVED** snapshot and event replay").unwrap();
+            writeln!(
+                out,
+                "- Connection: **NOT CONNECTED** (current daemon state unobserved)"
+            )
+            .unwrap();
+        }
+    }
     writeln!(out, "- Cursor: `{cursor}`").unwrap();
+    let mut degraded = Vec::new();
+    for field in ["agents", "workflows", "tickets", "inbox"] {
+        if !snapshot[field].is_array() {
+            degraded.push(format!("{field} unavailable"));
+        }
+    }
+    if snapshot["inbox_error"].as_str().is_some() {
+        degraded.push("inbox unavailable".into());
+    }
+    if !snapshot["budget"].is_object() {
+        degraded.push("budget unavailable".into());
+    }
+    if !snapshot["approvals"]["proposals"].is_array() || !snapshot["approvals"]["grants"].is_array()
+    {
+        degraded.push("approvals unavailable".into());
+    }
+    if !resync["required"].is_boolean() {
+        degraded.push("resync state unavailable".into());
+    }
     writeln!(
         out,
         "- State: **{}**\n",
-        if resyncing { "RESYNCING" } else { "OK" }
+        if !degraded.is_empty() {
+            "DEGRADED"
+        } else if resyncing {
+            "RESYNCING"
+        } else {
+            "OK"
+        }
     )
     .unwrap();
+    if !degraded.is_empty() {
+        writeln!(out, "- Degraded data: {}\n", degraded.join(", ")).unwrap();
+        if resyncing {
+            writeln!(out, "- Resync: **RESYNCING**\n").unwrap();
+        }
+    }
+    if matches!(source, DashboardSource::Saved) {
+        writeln!(out, "Saved approval labels and digests are historical evidence; execution still requires current daemon authorization.\n").unwrap();
+    }
 
     render_approvals(&mut out, &snapshot["approvals"], row_limit);
     render_rows(
@@ -915,6 +1069,10 @@ fn render_dashboard(
 
 fn render_approvals(out: &mut String, approvals: &Value, row_limit: usize) {
     writeln!(out, "## Approvals\n").unwrap();
+    if !approvals["proposals"].is_array() || !approvals["grants"].is_array() {
+        writeln!(out, "_unavailable_\n").unwrap();
+        return;
+    }
     let proposals = approvals["proposals"]
         .as_array()
         .map(Vec::as_slice)
@@ -955,8 +1113,11 @@ fn render_rows(
     row_limit: usize,
     newest_first: bool,
 ) {
-    let rows = rows.map(Vec::as_slice).unwrap_or(&[]);
     writeln!(out, "## {heading}\n").unwrap();
+    let Some(rows) = rows else {
+        writeln!(out, "_unavailable_\n").unwrap();
+        return;
+    };
     writeln!(out, "- Total: {}\n", rows.len()).unwrap();
     if rows.is_empty() {
         writeln!(out, "_none_\n").unwrap();
@@ -1043,7 +1204,12 @@ fn cell(value: &Value) -> String {
 }
 
 fn markdown_text(value: &str) -> String {
-    value.replace(['\n', '\r'], " ")
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('`', "\\`")
+        .replace(['\n', '\r'], " ")
 }
 
 fn plain(value: &Value) -> String {

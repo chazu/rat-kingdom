@@ -1,126 +1,68 @@
 # Factory Foreman Reference
 
-This reference supports the `factory-foreman` skill for Rat Kingdom factory, fleet health, RK inbox, workflow failures, factory triage, dispatch work, and software factory requests.
+## Native evidence
 
-## Categories
+Use `rk --json factory snapshot --repo <repo>` and
+`rk --json factory events replay --repo <repo> --limit 256` for bounded,
+read-only inspection. These commands fail if the daemon is unavailable. The
+interactive `factory dashboard` can start the daemon and is for human operators.
 
-Triage categories emitted by the helper include:
+The snapshot response has numeric `schema: 1`, numeric `cursor`, and a nested
+`snapshot` object containing agents, workflows, tickets, inbox, budget, approvals,
+and repository resync state. Replay has numeric `schema: 1`, an `events` array,
+boolean `truncated`, and nullable numeric `boundary`. Events have numeric `cursor`
+and string `kind`; process watch output as NDJSON, one event per line.
 
-- `missing-rk-executable`: `rk` is unavailable to a worker or environment.
-- `empty-harness-result`: a workflow returned no declared harness result.
-- `named-check-failure`: a named check such as `cargo test` or `cargo clippy` failed.
-- `workflow-timeout`: a workflow instance exceeded its timeout.
-- `orphaned-agent`: an agent appears detached from an active workflow.
-- `budget-pressure`: a workflow instance is close to its configured budget.
-- `permission-or-authority`: a worker lacks permission or authority for the requested action.
-- `stale-or-moved-base`: a workflow appears based on stale or moved repository state.
-- `unknown`: evidence did not match a known category and must be preserved.
+Preserve missing sources as unobserved. Inspect native workflow states, inbox
+rows, current work, and check evidence before proposing a cause. Use
+`rk --json work <repo>` for current decisions, actionable work, ready tickets,
+and stalls; use snapshot/replay for context and history. The retired Python
+classifier's prose-derived categories are not an additional source of truth.
+`factory scorecards` and `factory recommend` are structured, advisory analytics;
+they do not change routing or authorize dispatch.
 
-## JSON schema
-
-`triage --format json` returns a top-level object shaped like:
-
-```json
-{
-  "schema": 1,
-  "repo": "repository name",
-  "findings": [
-    {
-      "category": "named-check-failure",
-      "severity": "high",
-      "subject": "cargo test",
-      "summary": "Named check failed.",
-      "evidence": "observed output or JSON field",
-      "recommended_next_step": "Inspect and rerun the named check before landing.",
-      "workflow_instance": "workflow id when known",
-      "agent": "agent id when known"
-    }
-  ],
-  "snapshot": {
-    "schema": "factory-foreman.snapshot.v1",
-    "generated_at": "1970-01-01T00:00:00Z",
-    "repo": "repository name",
-    "healthy": false,
-    "observations": {
-      "agents": {"ok": true, "command": "rk --json list", "data": {}},
-      "inbox": {"ok": true, "command": "rk --json inbox", "data": {}},
-      "workflows": {"ok": true, "command": "rk --json workflow list", "data": {}},
-      "definitions": {"ok": true, "command": "rk --json workflow defs --repo <repo>", "data": {}},
-      "cost": {"ok": true, "command": "rk --json cost --fleet", "data": {}},
-      "repository": {"ok": true, "command": "rk --json repo show <repo>", "data": {}},
-      "tickets": {"ok": true, "command": "rk --json ticket list --repo <repo>", "data": {}}
-    },
-    "errors": []
-  },
-  "snapshot_health": {
-    "healthy": false,
-    "errors": []
-  },
-  "observations": {
-    "definitions": {"ok": true, "command": "rk --json workflow defs --repo <repo>", "data": {}}
-  }
-}
-```
-
-A failed observation remains in top-level `observations` and nested `snapshot.observations` with `ok: false` and an `error`. Report that degradation before drawing conclusions.
-
-## Dashboard renderer input and output
-
-The bundled legacy dashboard renderer consumes JSON artifacts that have already been obtained from typed factory read interfaces:
-
-- `--snapshot PATH`: one JSON document from `factory.snapshot`, containing the current connection state and factory projection such as approvals, workflow runs, agents, tickets, inbox, budget, degraded sources, and repository resync state when present. The renderer displays the snapshot source so readers can distinguish live data from saved or replayed data.
-- `--events PATH`: one JSON document from `factory.events.replay`, containing replay metadata such as cursor, typed replay `boundary`, `truncated`, and the recent event list. Event rows use typed event `kind`; legacy `boundary_cursor` and `type` aliases are tolerated for old artifacts.
-- `--output PATH`: the Markdown file to create or replace.
-
-Run the globally installed copy from any repository:
+## Saved rendering
 
 ```bash
-python3 ~/.jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
-  --snapshot "$JCODE_SCRATCH_DIR/factory-snapshot.json" \
-  --events "$JCODE_SCRATCH_DIR/factory-events.json" \
-  --output "$JCODE_SCRATCH_DIR/factory-dashboard.md"
+rk factory render --snapshot factory-snapshot.json \
+  --events factory-events.json --output factory-dashboard.md \
+  --row-limit 20 --event-limit 20
 ```
 
-The output is deterministic Markdown with sections for data source, connection and resync state, approvals, workflow runs, agents, tickets, inbox, budget, recent events, and degraded data. Replay truncation and its boundary must remain visible so a reader does not mistake a partial replay for complete history. A running resync is rendered as resyncing, while stale or failed inputs remain visibly degraded. Malformed `connection` values are rendered as malformed input instead of raising a traceback.
+This finite offline command reads the two files and writes Markdown (stdout
+when `--output` is omitted). It never contacts or starts the daemon or initializes
+RK state. Its SAVED / NOT CONNECTED labels distinguish historical input from
+current observations. Missing source families are DEGRADED, resync and replay
+truncation remain visible, and approval labels and digests are display data only.
+The command rejects obsolete flattened snapshots and string event cursors; capture
+new native responses instead. Global `--json` emits a `factory.dashboard.v1`
+envelope with `source: "saved"` and the two original responses.
 
-The renderer uses only the Python standard library. Its boundary is intentionally strict:
-
-- no daemon connection or daemon startup;
-- no `rk` CLI subprocesses;
-- no `rk-mcp` subprocesses or MCP server/tool behavior;
-- no proposal approval, workflow execution, or other mutation;
-- no authority beyond the contents of the supplied files.
-
-MCP and CLI are upstream ways to acquire typed JSON, not dependencies called by the renderer. A Jcode side panel may display the generated Markdown, but neither the renderer nor the side panel is a source of truth or an execution boundary. Daemon state remains authoritative, including whether a proposal is actually approved. Typed execution requires daemon-verifiable exact digest approval; the Phase 1 helper remains a fallback for legacy/manual proposal validation only.
-
-## Approval examples
-
-Valid later-user approvals include:
-
-- `Approve proposal_id abc123 and its displayed digest exactly as shown.`
-- `Approve the exact saved factory proposal in factory-proposal.json.`
-
-Invalid approvals include:
-
-- Approval in the same assistant turn as proposal rendering.
-- `Looks good` without the exact proposal ID and digest.
-- Approval after any workflow, repo, parameter, coordinator, proposal field, or digest changed.
-
-For the legacy Phase 1 fallback, run:
+## Typed proposals and approval
 
 ```bash
-python3 ~/.jcode/skills/factory-foreman/scripts/factory_foreman.py validate-proposal --proposal-file <file> --approved-id <proposal_id>
+rk --json factory propose-workflow <workflow> --repo <repo> > proposal.json
+# After a later user message approves this exact saved proposal:
+rk --json factory approve --proposal-file proposal.json
+rk --json factory execute-action --proposal-file proposal.json
 ```
 
-The helper output is inspection-only legacy data. Do not execute its returned `argv`. Native execution must use a saved typed factory proposal and daemon-recorded approval of the exact canonical digest. Require a new proposal and approval for any change.
+Prefer the equivalent typed MCP tools when available. Preserve the proposal ID,
+canonical digest, and typed execution action. A later user approval must identify
+the exact previously rendered proposal. A changed action, scope, parameter,
+coordinator, nonce, or expiry requires a new proposal and approval. The daemon
+reloads the durable proposal, verifies identity, digest and lifecycle, and owns
+execution. Retired argv hashes cannot be converted into native approvals.
 
-## Recovery behavior
+## Recovery
 
-- Ambiguous repo: stop and ask for the repository name.
-- Degraded snapshot: preserve successful observations, name failed observations, and lower confidence.
-- Duplicate ticket: recommend updating the existing ticket instead of creating another.
-- No suitable workflow definition: state the gap and avoid dispatch until the user chooses or defines a workflow.
-- Validation mismatch: stop, render a new proposal, and request new approval.
-- Workflow execution accepted: monitor `rk --json workflow status <id>` or `rk --json workflow watch <id>`.
-- `workflow watch --json` emits NDJSON. Process one line at a time, document each meaningful event, and do not parse the whole stream as one JSON document.
-- Approval wait: report the waiting state and the actor or gate needed when present.
+- Ambiguous repository: resolve the registered name before scoped reads.
+- Unavailable daemon: report the failed read; do not turn inspection into startup.
+- Degraded snapshot: preserve successful evidence and name the missing sources.
+- Truncated replay or resync: acquire a fresh snapshot and resume from its cursor.
+- Unknown failure: preserve the original structured evidence and label hypotheses.
+- Existing ticket: inspect its identity and status before proposing duplicate work.
+- No suitable workflow: report the gap before proposing dispatch.
+- Validation mismatch or expiry: render a new proposal for later approval.
+- Accepted dispatch: monitor `rk --json workflow status <id>` or
+  `rk --json workflow watch <id>` through completion, failure, or a gate wait.

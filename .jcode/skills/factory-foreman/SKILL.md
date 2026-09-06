@@ -35,36 +35,40 @@ factory propose-workflow`, `factory approve`, and `factory execute-action`
 shell-outs when the server is unavailable. The MCP tools and CLI commands use
 the same daemon-owned canonical digest and approval boundary.
 
-Never execute a mutating Rat Kingdom command unless a later user message explicitly approves the exact proposal rendered in this conversation. Require daemon-verifiable approval of the exact canonical digest before dispatch. The bundled Python helper is only a legacy fallback for deterministic triage and manual proposal preparation.
+Never execute a mutating Rat Kingdom command unless a later user message explicitly approves the exact proposal rendered in this conversation. Require daemon-verifiable approval of the exact canonical digest before dispatch.
 
-See [REFERENCE.md](REFERENCE.md) for categories, schemas, approval examples, and recovery behavior.
+See [REFERENCE.md](REFERENCE.md) for native evidence, saved rendering, approval examples, and recovery behavior.
 
 ## What this skill does
 
 1. Resolve the requested registered repository without guessing.
 2. Read the native factory snapshot and recent event replay.
 3. Report degraded or unavailable sources before drawing conclusions.
-4. Triage stalled or failed workflows, inbox pressure, pending approvals, budget signals, ticket duplication, event lag, and resync requirements.
+4. Read `rk --json work <repo>` for current work and triage stalled or failed workflows, inbox pressure, pending approvals, budget signals, ticket duplication, event lag, and resync requirements.
 5. Read scorecards and recommendations when the user asks about recurring performance or routing problems.
 6. Separate observed evidence from hypotheses and recommend an existing workflow where possible.
 7. Prepare an exact typed proposal when mutation is warranted, using the typed MCP proposal tool when available or the CLI fallback below, then stop for human approval.
 8. After a later approval, forward the saved proposal through the daemon's digest-bound approval and execution path and monitor the resulting workflow.
 9. For product work, use RK's product-to-code contracts to validate initiative, research, ticket graph, impact evidence, dispatch, and independent verification artifacts.
 
-## Optional legacy rendering
+## Saved evidence rendering
 
-When typed factory snapshot and event replay JSON are available, prefer them as the dashboard inputs and render the repository-owned Markdown view with:
+Capture the native responses through the read commands above, then render them offline:
 
 ```bash
-python3 ~/.jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
-  --snapshot <factory-snapshot.json> \
-  --events <factory-events-replay.json> \
-  --output <factory-dashboard.md>
+rk factory render --snapshot <factory-snapshot.json> \
+  --events <factory-events-replay.json> --output <factory-dashboard.md>
 ```
 
-The renderer is a pure Python, standard-library presentation step. It reads the two existing JSON files and writes deterministic Markdown to `--output`. It does not start or contact the Rat Kingdom daemon, invoke `rk`, invoke `rk-mcp`, expose an MCP tool, or dispatch any action. Obtain snapshot and replay data separately through an authorized typed MCP or CLI read path, then pass the saved files to the renderer. The view displays whether inputs are live or replayed, consumes typed replay `boundary` metadata and event `kind` fields, and tolerates legacy aliases only for backwards-compatible display.
+This command reads saved JSON and writes Markdown without contacting or starting
+a daemon. The view labels its source SAVED and the connection NOT CONNECTED;
+it cannot certify current daemon health or current approval state. Numeric cursors,
+replay truncation and boundary, resync, degraded sources, and proposal digests
+remain visible. Obsolete flattened helper snapshots must be recaptured through
+`factory snapshot`; they are not native evidence.
 
-Opening the generated Markdown in a Jcode side panel is optional. The file is a status view, not a control plane. Approval labels, proposal digests, replay boundaries, degraded sources, and resync state are display data only and confer no execution authority.
+A Jcode side panel can display the Markdown. Displaying approval data confers no
+execution authority. The native daemon still verifies the exact typed proposal.
 
 ## Workflow
 
@@ -72,7 +76,7 @@ Opening the generated Markdown in a Jcode side panel is optional. The file is a 
 2. Run the native read-only snapshot, replay, and relevant analytics commands first. This is the only default action.
 3. Report snapshot degradation before conclusions. If any observation failed, state which command failed and how that limits confidence.
 4. Separate observed evidence from hypotheses. Label command output, JSON fields, inbox rows, workflow states, and ticket matches as evidence. Label inferred causes or suggested next actions as hypotheses.
-5. Deduplicate existing tickets before proposing new work. Search or inspect ticket data from triage before recommending another ticket.
+5. Deduplicate existing tickets before proposing new work. Inspect native ticket identities and coalesce keys before recommending another ticket; title similarity alone is not a duplicate proof.
 6. Recommend an existing workflow definition where possible. Prefer a workflow already listed by `workflow defs --repo <repo>` over inventing a new shape.
 7. Render and save the exact typed dispatch proposal using `propose_workflow_run` when the `rk` MCP server is available; otherwise use `rk --json factory propose-workflow`. Include its `proposal_id`, digest, and execution action, and preserve the proposal file or tool result exactly.
 8. Stop and request approval for that exact proposal and digest. Do not continue to approval or dispatch in the same turn.
