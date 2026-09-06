@@ -4,6 +4,16 @@
 execution source of truth; this document defines release scope, milestone
 ordering, and exit criteria.*
 
+For current source navigation and the later evidence checkpoint, see
+[architecture and acceptance map](architecture.md). The dated status table
+below is historical; milestone acceptance still follows the exit criteria here.
+
+The [2026-09-06 qualification design](2026-09-06-r1-qualification-deliverables.md)
+proposes four next deliverables: complete the external audit, make pilot
+requirements executable, release the dispatch and reliability repairs, and run
+a fresh foreign pilot. It is reserved for later review and does not change the
+milestone gates below.
+
 ## Objective
 
 Ship Rat Kingdom as a hands-off swarm orchestrator for a trusted,
