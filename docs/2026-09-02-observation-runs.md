@@ -17,6 +17,8 @@ rk observe start \
   --name foreign-tenant \
   --ticket TKT-... \
   --interval 30s \
+  --rpc-timeout 5s \
+  --sample-timeout 20s \
   --stale-after 15m \
   --max-landing-age 10m \
   --max-ready-age 15m \
@@ -30,6 +32,7 @@ until Ctrl-C and then writes `report.json`. Evidence remains usable if the
 observer is terminated abruptly:
 
 ```sh
+rk observe resume "$RUN"
 rk observe sample "$RUN"
 rk observe report "$RUN" --finalize
 ```
@@ -37,6 +40,12 @@ rk observe report "$RUN" --finalize
 `sample` and `report` return nonzero when collection or thresholds fail. The
 report treats partial RPC samples as a failure, so an unsupported or broken
 read surface cannot silently turn into zero metrics.
+
+`resume` continues the original immutable manifest and duration window. Time
+offline remains a gap. Only one collector can own a run. Each RPC and the whole
+sequence have deadlines; a timeout closes that connection, skips remaining reads
+and records a partial sample with the failed method and elapsed time. Cadence
+skips missed ticks rather than issuing catch-up bursts.
 
 ## Record interventions
 
@@ -70,6 +79,12 @@ An observation directory contains:
 - `manifest.json`: immutable scope, ticket set, build, interval, and thresholds.
 - `samples.jsonl`: append-only external samples with raw bounded read models,
   event deltas, and per-sample metrics.
+- `collector.json`: replaceable checkpoint of the event cursor, sequence and
+  current ready streaks. Normal collection reads only new evidence. Missing or
+  invalid checkpoints rebuild by streaming `samples.jsonl`.
+- `recovery/*.partial`: original bytes of interrupted appends. Recovery preserves
+  complete rows and quarantines an incomplete final row before resuming. This is
+  explicit failure evidence for the report's interrupted-append check.
 - `interventions/*.json`: atomic typed intervention records.
 - `report.json`: reproducible derived result.
 
@@ -103,6 +118,20 @@ run, including archived records, as a run-window delta. It is not the live-fleet
 `rk cost --fleet`. Agent results, transcripts, and historical King checkpoints
 are excluded from samples; only fields needed to join, attribute, and audit the
 run are retained.
+
+For explicit `--ticket` roots, the cohort includes daemon-created landing and
+conflict corrections linked by their durable coalescing identity. Generic parent
+links and matching prose do not establish membership. Expansion is bounded by
+`--max-lineage-depth` (8) and `--max-lineage-tickets` (256 descendants); exceeding
+either records incomplete coverage and fails the run. Correction usage counts
+toward the roots, and a live descendant keeps its ancestors from appearing
+ownerless. Unrelated agents are excluded. Requested-ticket throughput and
+`correction_deliveries` remain separate. Interventions may reference a root or a
+correction already present in saved samples.
+
+Reports replay the manifest, samples, interventions and recovery evidence; the
+checkpoint is unnecessary. Older evidence cannot gain omitted correction data
+retroactively. Collector fixes require a fresh pre-registered pilot.
 
 For the supervised foreign-tenant pilot, a passing report requires zero daemon
 outage samples, convergence violations, forced landings, duplicate dispatches,

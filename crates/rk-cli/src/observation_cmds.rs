@@ -14,6 +14,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[path = "observation_store.rs"]
+mod store;
+use store::ObservationLog;
+
 const SCHEMA_VERSION: u32 = 1;
 const MANIFEST: &str = "manifest.json";
 const SAMPLES: &str = "samples.jsonl";
@@ -26,6 +30,8 @@ pub enum ObservationCommand {
     Start(StartArgs),
     /// Append one read-only sample to an existing run.
     Sample(RunPathArgs),
+    /// Resume collection using the original immutable scope and thresholds.
+    Resume(RunPathArgs),
     /// Record one typed intervention as an atomic evidence file.
     Record(RecordArgs),
     /// Derive a report from the run's immutable evidence.
@@ -41,8 +47,18 @@ pub struct StartArgs {
     /// Observe only these ticket identities; empty means the whole repository.
     #[arg(long = "ticket")]
     tickets: Vec<String>,
+    /// Maximum correction depth beyond the explicitly selected roots.
+    #[arg(long, default_value_t = default_lineage_depth())]
+    max_lineage_depth: usize,
+    /// Maximum additional correction tickets in the selected cohort.
+    #[arg(long, default_value_t = default_lineage_tickets())]
+    max_lineage_tickets: usize,
     #[arg(long, default_value = "30s")]
     interval: String,
+    #[arg(long, default_value = "5s")]
+    rpc_timeout: String,
+    #[arg(long, default_value = "20s")]
+    sample_timeout: String,
     /// Stop after this duration; otherwise run until Ctrl-C.
     #[arg(long)]
     duration: Option<String>,
@@ -105,8 +121,16 @@ struct Manifest {
     name: String,
     repo: String,
     tickets: Vec<String>,
+    #[serde(default = "default_lineage_depth")]
+    max_lineage_depth: usize,
+    #[serde(default = "default_lineage_tickets")]
+    max_lineage_tickets: usize,
     started_at: DateTime<Utc>,
     interval_secs: u64,
+    #[serde(default = "default_rpc_timeout")]
+    rpc_timeout_secs: u64,
+    #[serde(default = "default_sample_timeout")]
+    sample_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     planned_duration_secs: Option<u64>,
     thresholds: Thresholds,
@@ -162,6 +186,10 @@ struct Sample {
     #[serde(skip_serializing_if = "Option::is_none")]
     reconcile: Option<Value>,
     tickets: Vec<Value>,
+    /// Selected correction ticket -> canonical ancestor ticket. This is
+    /// structured coalesce-key provenance, never inferred from titles.
+    #[serde(default)]
+    lineage: BTreeMap<String, String>,
     agents: Vec<Value>,
     /// Highest repository event id seen, even when it predates this run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +197,17 @@ struct Sample {
     /// New repository events since the preceding sample.
     events: Vec<Value>,
     metrics: SampleMetrics,
+    #[serde(default)]
+    sampling: SamplingEvidence,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SamplingEvidence {
+    elapsed_ms: u64,
+    gap_secs: u64,
+    rpc_timeouts: Vec<String>,
+    deadline_exceeded: bool,
+    recovered_appends: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,10 +242,14 @@ struct Report {
     max_sample_gap_secs: u64,
     unavailable_samples: u64,
     partial_samples: u64,
+    #[serde(default)]
+    recovered_appends: u64,
     build_mismatch_samples: u64,
     daemon_restarts: u64,
     king_replacements: u64,
     delivered_during_run: u64,
+    #[serde(default)]
+    correction_deliveries: u64,
     throughput_per_hour: f64,
     attributed_cost_usd: f64,
     attributed_tokens: u64,
@@ -232,6 +275,7 @@ pub async fn run(layout: &Layout, command: ObservationCommand, as_json: bool) ->
             let sample = append_sample(layout, &args.run).await?;
             print_value(&serde_json::to_value(sample)?, as_json)
         }
+        ObservationCommand::Resume(args) => collect_run(layout, &args.run, as_json).await,
         ObservationCommand::Record(args) => record(args, as_json),
         ObservationCommand::Report(args) => report(args, as_json),
     }
@@ -261,8 +305,12 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
         name: nonempty(args.name, "--name")?,
         repo: nonempty(args.repo, "--repo")?,
         tickets: args.tickets,
+        max_lineage_depth: args.max_lineage_depth,
+        max_lineage_tickets: args.max_lineage_tickets,
         started_at,
         interval_secs: interval.as_secs(),
+        rpc_timeout_secs: positive_duration(&args.rpc_timeout, "--rpc-timeout")?.as_secs(),
+        sample_timeout_secs: positive_duration(&args.sample_timeout, "--sample-timeout")?.as_secs(),
         planned_duration_secs: duration.map(|value| value.as_secs()),
         thresholds: Thresholds {
             stale_after_secs: parse_duration(&args.stale_after)?.as_secs(),
@@ -291,9 +339,28 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
             run_dir.display()
         );
     }
-    let deadline = duration.map(|d| tokio::time::Instant::now() + d);
+    collect_run(layout, &run_dir, as_json).await
+}
+
+async fn collect_run(layout: &Layout, run_dir: &Path, as_json: bool) -> Result<()> {
+    let manifest = load_manifest(run_dir)?;
+    let mut log = ObservationLog::open(run_dir, &manifest)?;
+    let interval = Duration::from_secs(manifest.interval_secs);
+    let end = manifest
+        .planned_duration_secs
+        .map(|secs| {
+            let duration = chrono::Duration::from_std(Duration::from_secs(secs))?;
+            manifest
+                .started_at
+                .checked_add_signed(duration)
+                .context("observation duration exceeds the clock range")
+        })
+        .transpose()?;
+    let mut cadence = tokio::time::interval(interval);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    cadence.tick().await;
     loop {
-        let sample = append_sample(layout, &run_dir).await?;
+        let sample = collect_sample(layout, &manifest, &mut log).await?;
         if as_json {
             println!("{}", serde_json::to_string(&sample)?);
         } else {
@@ -312,11 +379,18 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
                 sample.metrics.cost_usd,
             );
         }
-        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+        if end.is_some_and(|end| Utc::now() >= end) {
             break;
         }
         let interrupted = tokio::select! {
-            _ = tokio::time::sleep(interval) => false,
+            _ = cadence.tick() => false,
+            _ = async {
+                if let Some(end) = end {
+                    tokio::time::sleep(end.signed_duration_since(Utc::now()).to_std().unwrap_or_default()).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => true,
             result = tokio::signal::ctrl_c() => {
                 result.context("install Ctrl-C handler")?;
                 true
@@ -326,7 +400,7 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
             break;
         }
     }
-    let derived = derive_report(&run_dir)?;
+    let derived = derive_report(run_dir)?;
     write_json_atomic(&run_dir.join(REPORT), &derived)?;
     if as_json {
         println!("{}", serde_json::to_string(&derived)?);
@@ -344,13 +418,19 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
 
 async fn append_sample(layout: &Layout, run_dir: &Path) -> Result<Sample> {
     let manifest = load_manifest(run_dir)?;
-    let prior = load_samples(run_dir)?;
-    let sequence = prior.last().map_or(1, |sample| sample.sequence + 1);
-    let after_id = prior
-        .iter()
-        .filter_map(|sample| sample.event_cursor.as_deref())
-        .max()
-        .map(str::to_string);
+    let mut log = ObservationLog::open(run_dir, &manifest)?;
+    collect_sample(layout, &manifest, &mut log).await
+}
+
+async fn collect_sample(
+    layout: &Layout,
+    manifest: &Manifest,
+    log: &mut ObservationLog,
+) -> Result<Sample> {
+    let sequence = log.next_sequence();
+    let after_id = log.event_cursor().map(str::to_string);
+    let started = tokio::time::Instant::now();
+    let mut reader = SampleReader::new(manifest)?;
     let mut sample = Sample {
         schema_version: SCHEMA_VERSION,
         sequence,
@@ -362,20 +442,23 @@ async fn append_sample(layout: &Layout, run_dir: &Path) -> Result<Sample> {
         work: None,
         reconcile: None,
         tickets: Vec::new(),
+        lineage: BTreeMap::new(),
         agents: Vec::new(),
         event_cursor: None,
         events: Vec::new(),
         metrics: SampleMetrics::default(),
+        sampling: SamplingEvidence::default(),
     };
-    let mut client = match Client::connect(layout).await {
-        Ok(client) => client,
-        Err(error) => {
-            sample.errors.push(format!("connect: {error}"));
-            append_json_line(&run_dir.join(SAMPLES), &sample)?;
-            return Ok(sample);
-        }
-    };
-    sample.daemon_reachable = true;
+    sample.sampling.gap_secs = log.gap(manifest.started_at, sample.observed_at);
+    sample.sampling.recovered_appends = log.recoveries().to_vec();
+    for path in &sample.sampling.recovered_appends {
+        sample
+            .errors
+            .push(format!("interrupted append evidence: {path}"));
+    }
+    reader.connect(layout, &mut sample.errors).await;
+    sample.daemon_reachable = reader.client.is_some();
+    let mut client = reader;
     sample.status = call(&mut client, "status", json!({}), &mut sample.errors).await;
     sample.king = call(&mut client, "king.status", json!({}), &mut sample.errors)
         .await
@@ -402,33 +485,21 @@ async fn append_sample(layout: &Layout, run_dir: &Path) -> Result<Sample> {
     )
     .await
     {
-        sample.tickets = values(&value, "tickets")
-            .into_iter()
-            .map(compact_ticket)
-            .collect();
-        if manifest.tickets.is_empty() {
-            sample.tickets.retain(|ticket| {
-                ticket_is_nonterminal(ticket)
-                    || ticket["payload"]["delivery"]["landed_at"]
-                        .as_str()
-                        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                        .is_some_and(|at| at.with_timezone(&Utc) >= manifest.started_at)
-            });
-        } else {
-            sample.tickets.retain(|ticket| {
-                ticket["identity"]
-                    .as_str()
-                    .is_some_and(|id| manifest.tickets.iter().any(|wanted| wanted == id))
-                    || ticket["alias"]
-                        .as_str()
-                        .is_some_and(|id| manifest.tickets.iter().any(|wanted| wanted == id))
-            });
+        if value["truncated"] == true {
+            sample
+                .errors
+                .push("ticket.list: truncated source; correction lineage may be incomplete".into());
         }
+        (sample.tickets, sample.lineage) =
+            select_tickets(values(&value, "tickets"), manifest, &mut sample.errors);
     }
     let selected_tasks: BTreeSet<String> = sample
         .tickets
         .iter()
-        .filter_map(|ticket| ticket["identity"].as_str().map(str::to_string))
+        .flat_map(|ticket| [ticket["identity"].as_str(), ticket["alias"].as_str()])
+        .flatten()
+        .map(str::to_string)
+        .chain(manifest.tickets.iter().cloned())
         .collect();
     if let Some(value) = call(
         &mut client,
@@ -453,14 +524,33 @@ async fn append_sample(layout: &Layout, run_dir: &Path) -> Result<Sample> {
                         || parse_time(&agent["updated_at"])
                             .is_some_and(|at| at >= manifest.started_at))
             })
-            .map(compact_agent)
+            .map(|agent| {
+                let mut agent = compact_agent(agent);
+                if let Some(task) = agent["task"].as_str() {
+                    if let Some(ticket) = sample
+                        .tickets
+                        .iter()
+                        .find(|ticket| ticket["alias"].as_str() == Some(task))
+                    {
+                        agent["observed_task"] = json!(task);
+                        agent["task"] = ticket["identity"].clone();
+                    }
+                }
+                agent
+            })
             .collect();
     }
-    let mut event_params = json!({"category": "event", "scope": manifest.repo, "newest": true});
+    let mut event_params =
+        json!({"category": "event", "scope": manifest.repo, "newest": after_id.is_none()});
     if let Some(after_id) = &after_id {
         event_params["after_id"] = json!(after_id);
     }
     if let Some(value) = call(&mut client, "space.scan", event_params, &mut sample.errors).await {
+        if value["truncated"] == true {
+            sample.errors.push(
+                "space.scan: truncated event page; further history remains unobserved".into(),
+            );
+        }
         sample.events = values(&value, "tuples");
         sample.event_cursor = sample
             .events
@@ -478,33 +568,118 @@ async fn append_sample(layout: &Layout, run_dir: &Path) -> Result<Sample> {
             .events
             .sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     }
-    sample.metrics = derive_sample_metrics(&sample, &manifest, &prior);
-    append_json_line(&run_dir.join(SAMPLES), &sample)?;
+    sample.metrics = derive_metrics_with_ready_age(&sample, manifest, |ticket| {
+        log.ready_age(ticket, sample.observed_at)
+    });
+    sample.sampling.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    sample.sampling.rpc_timeouts = client.timeouts;
+    sample.sampling.deadline_exceeded = client.deadline_exceeded;
+    log.append(&sample)?;
     Ok(sample)
 }
 
+fn default_rpc_timeout() -> u64 {
+    5
+}
+fn default_sample_timeout() -> u64 {
+    20
+}
+
+struct SampleReader {
+    client: Option<Client>,
+    deadline: tokio::time::Instant,
+    rpc_timeout: Duration,
+    timeouts: Vec<String>,
+    deadline_exceeded: bool,
+}
+
+impl SampleReader {
+    fn new(manifest: &Manifest) -> Result<Self> {
+        Ok(Self {
+            client: None,
+            deadline: tokio::time::Instant::now()
+                .checked_add(Duration::from_secs(manifest.sample_timeout_secs))
+                .context("sample deadline exceeds the clock range")?,
+            rpc_timeout: Duration::from_secs(manifest.rpc_timeout_secs),
+            timeouts: Vec::new(),
+            deadline_exceeded: false,
+        })
+    }
+    async fn connect(&mut self, layout: &Layout, errors: &mut Vec<String>) {
+        match tokio::time::timeout_at(self.next_deadline(), Client::connect(layout)).await {
+            Ok(Ok(client)) => self.client = Some(client),
+            Ok(Err(error)) => errors.push(format!("connect: {error}")),
+            Err(_) => self.timed_out("connect", errors),
+        }
+    }
+    fn next_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+            .checked_add(self.rpc_timeout)
+            .map_or(self.deadline, |deadline| deadline.min(self.deadline))
+    }
+    fn timed_out(&mut self, method: &str, errors: &mut Vec<String>) {
+        self.deadline_exceeded |= tokio::time::Instant::now() >= self.deadline;
+        self.timeouts.push(method.into());
+        errors.push(format!(
+            "{method}: {} deadline exceeded; remaining reads skipped",
+            if self.deadline_exceeded {
+                "sample"
+            } else {
+                "RPC"
+            }
+        ));
+        // A late response must never be mistaken for the next method's reply.
+        self.client = None;
+    }
+}
+
 async fn call(
-    client: &mut Client,
+    reader: &mut SampleReader,
     method: &str,
     params: Value,
     errors: &mut Vec<String>,
 ) -> Option<Value> {
-    match client.call(method, params).await {
-        Ok(value) => Some(value),
-        Err(error) => {
+    if reader.client.is_some() && tokio::time::Instant::now() >= reader.deadline {
+        reader.timed_out(method, errors);
+        return None;
+    }
+    let deadline = reader.next_deadline();
+    let client = reader.client.as_mut()?;
+    match tokio::time::timeout_at(deadline, client.call(method, params)).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(error)) => {
             errors.push(format!("{method}: {error}"));
+            None
+        }
+        Err(_) => {
+            reader.timed_out(method, errors);
             None
         }
     }
 }
 
-fn derive_sample_metrics(sample: &Sample, manifest: &Manifest, prior: &[Sample]) -> SampleMetrics {
-    let live_tasks: BTreeSet<String> = sample
+fn derive_metrics_with_ready_age(
+    sample: &Sample,
+    manifest: &Manifest,
+    ready_age: impl Fn(&str) -> u64,
+) -> SampleMetrics {
+    let mut live_tasks: BTreeSet<String> = sample
         .agents
         .iter()
         .filter(|agent| matches!(agent["state"].as_str(), Some("spawning" | "running")))
         .filter_map(|agent| agent["task"].as_str().map(str::to_string))
         .collect();
+    for task in live_tasks.clone() {
+        let mut current = task.as_str();
+        let mut visited = BTreeSet::new();
+        while let Some(parent) = sample.lineage.get(current) {
+            if !visited.insert(parent) {
+                break;
+            }
+            live_tasks.insert(parent.clone());
+            current = parent;
+        }
+    }
     let ready = ready_ticket_ids(sample);
     let selected_ready: BTreeSet<String> = sample
         .tickets
@@ -548,10 +723,12 @@ fn derive_sample_metrics(sample: &Sample, manifest: &Manifest, prior: &[Sample])
         }
     }
     if let Some(status) = &sample.status {
-        let queues = status["landing_queue"]
+        let queues: Vec<_> = status["landing_queue"]
             .as_array()
-            .cloned()
-            .unwrap_or_default();
+            .into_iter()
+            .flatten()
+            .filter(|queue| queue["repo"].as_str() == Some(manifest.repo.as_str()))
+            .collect();
         metrics.landing_depth = queues.iter().filter_map(|q| q["depth"].as_u64()).sum();
         metrics.oldest_landing_age_secs = queues
             .iter()
@@ -579,7 +756,7 @@ fn derive_sample_metrics(sample: &Sample, manifest: &Manifest, prior: &[Sample])
             .count() as u64;
         metrics.oldest_ready_age_secs = selected_ready
             .iter()
-            .map(|ticket| continuous_ready_age_secs(sample, prior, ticket))
+            .map(|ticket| ready_age(ticket))
             .max()
             .unwrap_or(0);
     }
@@ -608,6 +785,14 @@ fn ready_ticket_ids(sample: &Sample) -> BTreeSet<String> {
         .collect()
 }
 
+#[cfg(test)]
+fn derive_sample_metrics(sample: &Sample, manifest: &Manifest, prior: &[Sample]) -> SampleMetrics {
+    derive_metrics_with_ready_age(sample, manifest, |ticket| {
+        continuous_ready_age_secs(sample, prior, ticket)
+    })
+}
+
+#[cfg(test)]
 fn continuous_ready_age_secs(sample: &Sample, prior: &[Sample], ticket: &str) -> u64 {
     let mut ready_since = sample.observed_at;
     for previous in prior.iter().rev() {
@@ -627,7 +812,15 @@ fn continuous_ready_age_secs(sample: &Sample, prior: &[Sample], ticket: &str) ->
 fn record(args: RecordArgs, as_json: bool) -> Result<()> {
     let manifest = load_manifest(&args.run)?;
     if let Some(ticket) = &args.ticket {
-        if !manifest.tickets.is_empty() && !manifest.tickets.contains(ticket) {
+        if !manifest.tickets.is_empty()
+            && !manifest.tickets.contains(ticket)
+            && !load_samples(&args.run)?.iter().any(|sample| {
+                sample.tickets.iter().any(|row| {
+                    row["identity"].as_str() == Some(ticket)
+                        || row["alias"].as_str() == Some(ticket)
+                })
+            })
+        {
             bail!("ticket {ticket} is outside observation run {}", manifest.id);
         }
     }
@@ -705,10 +898,15 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
             .filter_map(|sample| sample.status.as_ref()?.get("pid")?.as_u64()),
     );
     let king_replacements = transitions(samples.iter().filter_map(king_generation));
-    let delivered_during_run = latest_tickets(&samples)
-        .values()
+    let delivered = latest_tickets(&samples)
+        .into_values()
         .filter(|ticket| delivery_in_window(ticket, manifest.started_at, ended_at))
+        .collect::<Vec<_>>();
+    let delivered_during_run = delivered
+        .iter()
+        .filter(|ticket| manifest.tickets.is_empty() || selected_root(ticket, &manifest.tickets))
         .count() as u64;
+    let correction_deliveries = delivered.len() as u64 - delivered_during_run;
     let (attributed_cost_usd, attributed_tokens) = attributed_usage(&samples, manifest.started_at);
     let max_landing_depth = max_metric(&samples, |m| m.landing_depth);
     let max_landing_age_secs = max_metric(&samples, |m| m.oldest_landing_age_secs);
@@ -735,6 +933,22 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         *intervention_counts.entry(class.into()).or_insert(0) += 1;
     }
     let mut checks = BTreeMap::new();
+    let recovery_dir = run_dir.join("recovery");
+    let recovered_appends = if recovery_dir.exists() {
+        fs::read_dir(recovery_dir)?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .iter()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "partial")
+            })
+            .count() as u64
+    } else {
+        0
+    };
+    check(&mut checks, "interrupted-appends", recovered_appends, 0);
     check(
         &mut checks,
         "daemon-availability",
@@ -836,10 +1050,12 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         max_sample_gap_secs,
         unavailable_samples,
         partial_samples,
+        recovered_appends,
         build_mismatch_samples,
         daemon_restarts,
         king_replacements,
         delivered_during_run,
+        correction_deliveries,
         throughput_per_hour: if elapsed_secs == 0 {
             0.0
         } else {
@@ -1070,15 +1286,129 @@ fn compact_ticket(ticket: Value) -> Value {
     json!({
         "identity": ticket["identity"],
         "alias": ticket["alias"],
+        "scope": ticket["scope"],
         "created_at": ticket["created_at"],
         "payload": {
             "status": ticket["payload"]["status"],
             "updated_at": ticket["payload"]["updated_at"],
             "title": ticket["payload"]["title"],
             "priority": ticket["payload"]["priority"],
+            "created_by": ticket["payload"]["created_by"],
+            "coalesce_key": ticket["payload"]["coalesce_key"],
+            "parent": ticket["payload"]["parent"],
             "delivery": ticket["payload"]["delivery"],
         }
     })
+}
+
+fn default_lineage_depth() -> usize {
+    8
+}
+fn default_lineage_tickets() -> usize {
+    256
+}
+
+fn selected_root(ticket: &Value, roots: &[String]) -> bool {
+    [ticket["identity"].as_str(), ticket["alias"].as_str()]
+        .into_iter()
+        .flatten()
+        .any(|id| roots.iter().any(|root| root == id))
+}
+
+fn correction_parent<'a>(ticket: &'a Value, repo: &str) -> Option<&'a str> {
+    if ticket["scope"].as_str() != Some(repo) || ticket["payload"]["created_by"] != "daemon" {
+        return None;
+    }
+    let key = ticket["payload"]["coalesce_key"].as_str()?;
+    let tail = ["landing-rework", "landing-conflict-rework"]
+        .into_iter()
+        .find_map(|kind| key.strip_prefix(&format!("{kind}:{repo}:")))?;
+    let fields = tail.split(':').collect::<Vec<_>>();
+    (fields.len() == 4 && fields.iter().all(|part| !part.is_empty())).then(|| fields[3])
+}
+
+fn select_tickets(
+    all: Vec<Value>,
+    manifest: &Manifest,
+    errors: &mut Vec<String>,
+) -> (Vec<Value>, BTreeMap<String, String>) {
+    let all = all
+        .into_iter()
+        .filter(|ticket| ticket["scope"].as_str() == Some(manifest.repo.as_str()))
+        .collect::<Vec<_>>();
+    let aliases: BTreeMap<_, _> = all
+        .iter()
+        .filter_map(|ticket| Some((ticket["alias"].as_str()?, ticket["identity"].as_str()?)))
+        .collect();
+    let canonical = |id: &str| aliases.get(id).copied().unwrap_or(id).to_string();
+    let parents: BTreeMap<String, String> = all
+        .iter()
+        .filter_map(|ticket| {
+            Some((
+                ticket["identity"].as_str()?.to_string(),
+                canonical(correction_parent(ticket, &manifest.repo)?),
+            ))
+        })
+        .collect();
+    let mut selected: BTreeSet<_> = all
+        .iter()
+        .filter(|ticket| {
+            if manifest.tickets.is_empty() {
+                ticket_is_nonterminal(ticket)
+                    || parse_time(&ticket["payload"]["delivery"]["landed_at"])
+                        .is_some_and(|at| at >= manifest.started_at)
+            } else {
+                selected_root(ticket, &manifest.tickets)
+            }
+        })
+        .filter_map(|ticket| ticket["identity"].as_str().map(str::to_string))
+        .collect();
+    if !manifest.tickets.is_empty() {
+        let roots = selected.len();
+        let mut limited = false;
+        for _ in 0..manifest.max_lineage_depth {
+            let children = parents
+                .iter()
+                .filter(|(child, parent)| !selected.contains(*child) && selected.contains(*parent))
+                .map(|(child, _)| child.clone())
+                .collect::<Vec<_>>();
+            if children.is_empty() {
+                break;
+            }
+            for child in children {
+                if selected.len().saturating_sub(roots) >= manifest.max_lineage_tickets {
+                    limited = true;
+                    break;
+                }
+                selected.insert(child);
+            }
+            if limited {
+                break;
+            }
+        }
+        limited |= parents
+            .iter()
+            .any(|(child, parent)| !selected.contains(child) && selected.contains(parent));
+        if limited {
+            errors.push(
+                "ticket lineage reached its frozen depth/count bound; cohort is incomplete".into(),
+            );
+        }
+    }
+    let lineage = parents
+        .into_iter()
+        .filter(|(child, parent)| selected.contains(child) && selected.contains(parent))
+        .collect();
+    let tickets = all
+        .into_iter()
+        .filter(|ticket| {
+            ticket["identity"]
+                .as_str()
+                .is_some_and(|id| selected.contains(id))
+        })
+        .map(compact_ticket)
+        .collect();
+    (tickets, lineage)
 }
 
 fn ticket_is_nonterminal(ticket: &Value) -> bool {
@@ -1121,6 +1451,12 @@ fn load_manifest(run_dir: &Path) -> Result<Manifest> {
     if manifest.schema_version != SCHEMA_VERSION {
         bail!("unsupported observation schema {}", manifest.schema_version);
     }
+    if manifest.interval_secs == 0
+        || manifest.rpc_timeout_secs == 0
+        || manifest.sample_timeout_secs == 0
+    {
+        bail!("observation interval and deadlines must be greater than zero");
+    }
     Ok(manifest)
 }
 
@@ -1158,6 +1494,7 @@ fn load_interventions(run_dir: &Path) -> Result<Vec<Intervention>> {
         .collect()
 }
 
+#[cfg(test)]
 fn append_json_line(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut file = OpenOptions::new().append(true).open(path)?;
     serde_json::to_writer(&mut file, value)?;
@@ -1187,6 +1524,14 @@ fn default_root(layout: &Layout) -> PathBuf {
         .parent()
         .unwrap_or(layout.home())
         .join(".rat-kingdom-observations")
+}
+
+fn positive_duration(value: &str, flag: &str) -> Result<Duration> {
+    let duration = parse_duration(value)?;
+    if duration.is_zero() {
+        bail!("{flag} must be greater than zero");
+    }
+    Ok(duration)
 }
 
 fn parse_duration(value: &str) -> Result<Duration> {
@@ -1250,6 +1595,380 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    async fn fixture_daemon(
+        layout: &Layout,
+        tickets: Vec<Value>,
+        agents: Vec<Value>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        layout.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(layout.socket_path()).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut methods = Vec::new();
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                methods.push(method.to_string());
+                let value = match method {
+                    "status" => json!({"pid": 1, "build_version": "test", "landing_queue": []}),
+                    "king.status" => json!({"state": {}}),
+                    "work.current" => {
+                        json!({"ready_tickets": [], "actionable": [], "decision_required": [], "stalled": []})
+                    }
+                    "reconcile.report" => json!({"violations": []}),
+                    "ticket.list" => json!({"tickets": tickets}),
+                    "agent.list" => json!({"agents": agents}),
+                    "space.scan" => json!({"tuples": [], "truncated": false}),
+                    _ => panic!("unexpected observation RPC {method}"),
+                };
+                let response = json!({"id": request["id"], "result": value,
+                    "server_version": rk_core::version::BUILD_VERSION});
+                stream
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            methods
+        })
+    }
+
+    #[tokio::test]
+    async fn selected_lineage_attributes_correction_usage_liveness_and_parent_staleness() {
+        let (dir, manifest) = fixture();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let ticket = |id: &str, key: Option<&str>| {
+            json!({
+                "identity": id, "scope": "repo", "created_at": manifest.started_at,
+                "payload": {"created_by": "daemon", "status": "in_progress",
+                    "updated_at": manifest.started_at, "coalesce_key": key}
+            })
+        };
+        let rows = vec![
+            ticket("TKT-1", None),
+            ticket(
+                "TKT-child",
+                Some("landing-rework:repo:feature:head:main:TKT-1"),
+            ),
+            ticket(
+                "TKT-grandchild",
+                Some("landing-conflict-rework:repo:correction:head:feature:TKT-child"),
+            ),
+            ticket(
+                "TKT-unrelated",
+                Some("landing-rework:repo:other:head:main:TKT-other"),
+            ),
+        ];
+        let agent = |id: &str, cost: f64| {
+            json!({"spawn": id, "name": id, "task": id,
+            "repo_name": "repo", "state": "running", "created_at": manifest.started_at,
+            "updated_at": manifest.started_at, "cost_usd": cost, "usage": {"output": 20}})
+        };
+        let daemon = fixture_daemon(
+            &layout,
+            rows,
+            vec![agent("TKT-grandchild", 3.0), agent("TKT-unrelated", 100.0)],
+        )
+        .await;
+        let collected = append_sample(&layout, dir.path()).await.unwrap();
+        assert_eq!(collected.tickets.len(), 3);
+        assert_eq!(collected.metrics.live_agents, 1);
+        assert_eq!(collected.metrics.cost_usd, 3.0);
+        assert_eq!(collected.metrics.tokens, 20);
+        assert_eq!(
+            collected.metrics.stale_tickets, 0,
+            "a live correction descendant owns progress for its held ancestors"
+        );
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(report.attributed_cost_usd, 3.0);
+        assert_eq!(report.attributed_tokens, 20);
+        assert_eq!(daemon.await.unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_rpc_finishes_a_partial_sample_with_deadline_evidence() {
+        use tokio::io::AsyncBufReadExt;
+        let (dir, manifest) = fixture();
+        let mut value = serde_json::to_value(manifest).unwrap();
+        value["rpc_timeout_secs"] = json!(1);
+        value["sample_timeout_secs"] = json!(2);
+        fs::write(dir.path().join(MANIFEST), value.to_string()).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(layout.socket_path()).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result =
+            tokio::time::timeout(Duration::from_secs(3), append_sample(&layout, dir.path())).await;
+        server.abort();
+        let collected = result
+            .expect("a stalled daemon must not block observation indefinitely")
+            .unwrap();
+        assert!(
+            collected
+                .errors
+                .iter()
+                .any(|error| error.contains("deadline")),
+            "{:?}",
+            collected.errors
+        );
+        assert_eq!(load_samples(dir.path()).unwrap().len(), 1);
+        assert!(!derive_report(dir.path()).unwrap().passed);
+    }
+
+    #[test]
+    fn observation_checkpoint_replays_only_the_uncheckpointed_tail() {
+        let (dir, manifest) = fixture();
+        let mut first = sample(1, "2026-09-02T00:00:30Z");
+        first.work = Some(json!({"ready_tickets": [{"id": "TKT-1"}]}));
+        first.event_cursor = Some("cursor-1".into());
+        append_json_line(&dir.path().join(SAMPLES), &first).unwrap();
+        let log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        assert_eq!(log.replayed_samples, 1);
+        assert!(
+            ObservationLog::open(dir.path(), &manifest).is_err(),
+            "one run has exactly one collector owner"
+        );
+        drop(log);
+        let log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        assert_eq!(
+            log.replayed_samples, 0,
+            "normal sampling must not reread history"
+        );
+        drop(log);
+
+        let mut second = sample(2, "2026-09-02T00:01:00Z");
+        second.work = first.work.clone();
+        second.event_cursor = Some("cursor-2".into());
+        // Simulate a crash after the durable append, before its checkpoint.
+        append_json_line(&dir.path().join(SAMPLES), &second).unwrap();
+        let log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        assert_eq!(log.replayed_samples, 1);
+        assert_eq!(log.next_sequence(), 3);
+        assert_eq!(log.event_cursor(), Some("cursor-2"));
+        assert_eq!(
+            log.ready_age("TKT-1", "2026-09-02T00:01:30Z".parse().unwrap()),
+            60
+        );
+        drop(log);
+        let report = serde_json::to_value(derive_report(dir.path()).unwrap()).unwrap();
+        fs::write(dir.path().join("collector.json"), "damaged cache").unwrap();
+        let rebuilt = ObservationLog::open(dir.path(), &manifest).unwrap();
+        assert_eq!(rebuilt.replayed_samples, 2);
+        assert_eq!(rebuilt.next_sequence(), 3);
+        assert_eq!(
+            rebuilt.ready_age("TKT-1", "2026-09-02T00:01:30Z".parse().unwrap()),
+            60
+        );
+        assert_eq!(
+            serde_json::to_value(derive_report(dir.path()).unwrap()).unwrap(),
+            report,
+            "report replay is independent of the collector checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn sample_deadline_bounds_a_sequence_of_individually_timely_rpcs() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (dir, mut manifest) = fixture();
+        manifest.rpc_timeout_secs = 2;
+        manifest.sample_timeout_secs = 1;
+        write_json_atomic(&dir.path().join(MANIFEST), &manifest).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(layout.socket_path()).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let response = json!({"id": request["id"], "result": {},
+                    "server_version": rk_core::version::BUILD_VERSION});
+                if stream
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let collected =
+            tokio::time::timeout(Duration::from_secs(3), append_sample(&layout, dir.path()))
+                .await
+                .unwrap()
+                .unwrap();
+        server.abort();
+        assert!(collected.status.is_some());
+        assert!(collected.king.is_none());
+        assert!(collected.sampling.deadline_exceeded);
+        assert_eq!(collected.sampling.rpc_timeouts, ["king.status"]);
+        assert!(collected.sampling.elapsed_ms < 2000);
+        assert!(!derive_report(dir.path()).unwrap().passed);
+    }
+
+    #[test]
+    fn correction_deliveries_do_not_inflate_root_throughput() {
+        let (dir, manifest) = fixture();
+        let mut observed = sample(1, "2026-09-02T00:01:00Z");
+        observed.tickets = ["TKT-1", "TKT-correction"]
+            .into_iter()
+            .map(|id| {
+                json!({"identity": id, "scope": manifest.repo, "payload": {
+                "status": "done", "delivery": {"landed_at": observed.observed_at,
+                    "merge_commit": "commit", "target": "main"}}})
+            })
+            .collect();
+        observed
+            .lineage
+            .insert("TKT-correction".into(), "TKT-1".into());
+        observed.status = Some(json!({"landing_queue": [
+            {"repo": "repo", "depth": 1, "oldest_age_secs": 10},
+            {"repo": "unrelated", "depth": 90, "oldest_age_secs": 9000}
+        ]}));
+        observed.metrics = derive_sample_metrics(&observed, &manifest, &[]);
+        assert_eq!(observed.metrics.landing_depth, 1);
+        assert_eq!(observed.metrics.oldest_landing_age_secs, 10);
+        append_json_line(&dir.path().join(SAMPLES), &observed).unwrap();
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(report.delivered_during_run, 1);
+        assert_eq!(report.correction_deliveries, 1);
+        record(
+            RecordArgs {
+                run: dir.path().into(),
+                class: InterventionClass::Mechanical,
+                summary: "correction recovered".into(),
+                ticket: Some("TKT-correction".into()),
+                actor: None,
+                evidence: vec![],
+            },
+            false,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_append_is_preserved_and_resume_records_the_gap() {
+        let (dir, manifest) = fixture();
+        let mut log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        log.append(&sample(1, "2026-09-02T00:00:30Z")).unwrap();
+        drop(log);
+        let committed = fs::read(dir.path().join(SAMPLES)).unwrap();
+        let fragment = b"{\"schema_version\":1,\"sequence\":2,";
+        OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(SAMPLES))
+            .unwrap()
+            .write_all(fragment)
+            .unwrap();
+        let manifest_bytes = fs::read(dir.path().join(MANIFEST)).unwrap();
+        let home = dir.path().join("absent-daemon");
+        let recovered = append_sample(&Layout::at(&home), dir.path()).await.unwrap();
+        assert_eq!(recovered.sequence, 2);
+        assert!(recovered.sampling.gap_secs > manifest.interval_secs * 2);
+        assert_eq!(recovered.sampling.recovered_appends.len(), 1);
+        let evidence = dir.path().join(&recovered.sampling.recovered_appends[0]);
+        assert_eq!(fs::read(evidence).unwrap(), fragment);
+        assert!(fs::read(dir.path().join(SAMPLES))
+            .unwrap()
+            .starts_with(&committed));
+        assert_eq!(load_samples(dir.path()).unwrap().len(), 2);
+        assert_eq!(fs::read(dir.path().join(MANIFEST)).unwrap(), manifest_bytes);
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(report.recovered_appends, 1);
+        assert!(!report.checks["interrupted-appends"].passed);
+        assert!(!report.passed);
+        assert!(
+            !home.exists(),
+            "observing a missing daemon must not initialize it"
+        );
+    }
+
+    #[test]
+    fn lineage_bounds_and_provenance_prevent_unrelated_attribution() {
+        let (_, mut manifest) = fixture();
+        let row = |id: &str, key: Option<&str>| {
+            json!({
+                "identity": id, "scope": "repo", "payload": {"status": "open", "created_by": "daemon", "coalesce_key": key}
+            })
+        };
+        let mut root = row("TKT-1", None);
+        root["alias"] = json!("root-alias");
+        let child = row(
+            "TKT-child",
+            Some("landing-rework:repo:branch:sha:main:root-alias"),
+        );
+        let grandchild = row(
+            "TKT-grandchild",
+            Some("landing-conflict-rework:repo:child:sha:branch:TKT-child"),
+        );
+        let mut unrelated = row("TKT-manual", None);
+        unrelated["payload"]["parent"] = json!("TKT-1");
+        let foreign = row(
+            "TKT-foreign",
+            Some("landing-rework:another-repo:branch:sha:main:TKT-1"),
+        );
+        let mut errors = Vec::new();
+        manifest.max_lineage_depth = 1;
+        let (tickets, lineage) = select_tickets(
+            vec![
+                root.clone(),
+                child.clone(),
+                grandchild.clone(),
+                unrelated.clone(),
+                foreign.clone(),
+            ],
+            &manifest,
+            &mut errors,
+        );
+        assert_eq!(tickets.len(), 2);
+        assert_eq!(lineage["TKT-child"], "TKT-1");
+        assert_eq!(
+            errors.len(),
+            1,
+            "a bounded-out correction must not look fully observed"
+        );
+        errors.clear();
+        manifest.max_lineage_depth = 8;
+        manifest.max_lineage_tickets = 1;
+        let (tickets, _) = select_tickets(
+            vec![root.clone(), child.clone(), grandchild.clone()],
+            &manifest,
+            &mut errors,
+        );
+        assert_eq!(tickets.len(), 2);
+        assert_eq!(errors.len(), 1);
+        errors.clear();
+        manifest.max_lineage_tickets = 256;
+        let (tickets, _) = select_tickets(
+            vec![root, child, grandchild, unrelated, foreign],
+            &manifest,
+            &mut errors,
+        );
+        assert_eq!(tickets.len(), 3);
+        assert!(errors.is_empty());
+    }
+
     fn fixture() -> (TempDir, Manifest) {
         let dir = TempDir::new().unwrap();
         fs::create_dir(dir.path().join(INTERVENTIONS)).unwrap();
@@ -1259,8 +1978,12 @@ mod tests {
             name: "release-soak".into(),
             repo: "repo".into(),
             tickets: vec!["TKT-1".into()],
+            max_lineage_depth: default_lineage_depth(),
+            max_lineage_tickets: default_lineage_tickets(),
             started_at: "2026-09-02T00:00:00Z".parse().unwrap(),
             interval_secs: 30,
+            rpc_timeout_secs: default_rpc_timeout(),
+            sample_timeout_secs: default_sample_timeout(),
             planned_duration_secs: None,
             thresholds: Thresholds {
                 stale_after_secs: 900,
@@ -1293,10 +2016,12 @@ mod tests {
             work: Some(json!({"actionable": [], "decision_required": [], "stalled": []})),
             reconcile: Some(json!({"violations": []})),
             tickets: vec![],
+            lineage: BTreeMap::new(),
             agents: vec![],
             event_cursor: None,
             events: vec![],
             metrics: SampleMetrics::default(),
+            sampling: SamplingEvidence::default(),
         }
     }
 
