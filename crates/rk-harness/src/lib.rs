@@ -6,6 +6,7 @@ pub mod claude;
 pub mod codex;
 pub mod fake;
 pub mod jcode;
+pub mod maki;
 pub mod transport;
 
 use serde::{Deserialize, Serialize};
@@ -364,8 +365,9 @@ pub fn make_harness(kind: &str) -> rk_core::Result<Box<dyn Harness>> {
         "codex" => Ok(Box::new(codex::CodexHarness)),
         "fake" => Ok(Box::new(fake::FakeHarness)),
         "jcode" => Ok(Box::new(jcode::JcodeHarness)),
+        "maki" => Ok(Box::new(maki::MakiHarness)),
         other => Err(rk_core::Error::other(format!(
-            "unknown harness kind: {other} (available: claude, codex, jcode, fake)"
+            "unknown harness kind: {other} (available: claude, codex, jcode, maki, fake)"
         ))),
     }
 }
