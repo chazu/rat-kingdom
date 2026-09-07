@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 pub struct HerdrMux;
@@ -88,7 +89,12 @@ impl HerdrMux {
                     .and_then(|p| p["pane_id"].as_str().map(String::from))
             })
             .ok_or_else(|| rk_core::Error::other("new herdr workspace has no pane"))?;
-        if let Err(error) = Self::start_in_pane(name, &argv[0], &pane, &argv[1..]) {
+        let started = retry_while_pane_busy(
+            || Self::start_in_pane(name, &argv[0], &pane, &argv[1..]),
+            PANE_READY_TIMEOUT,
+            PANE_READY_POLL,
+        );
+        if let Err(error) = started {
             let _ = run_herdr(&["workspace", "close", &workspace]);
             return Err(error);
         }
@@ -353,6 +359,40 @@ impl NotificationSink for HerdrSink {
     }
 }
 
+/// Herdr refuses `agent start` until the pane's shell has reached its
+/// interactive prompt. A freshly created workspace answers `agent_pane_busy`
+/// for the first seconds while the login shell runs its startup files (longer
+/// on a cold cache after a reboot), so the very first attempt is expected to
+/// lose that race. Bound the wait rather than fail the spawn.
+const PANE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const PANE_READY_POLL: Duration = Duration::from_millis(250);
+
+/// Herdr reports the not-yet-ready shell as a structured `agent_pane_busy`
+/// error on stderr, which `run_herdr` folds into the error text.
+fn is_pane_busy(error: &rk_core::Error) -> bool {
+    error.to_string().contains("agent_pane_busy")
+}
+
+/// Repeat `attempt` while it fails only because the pane's shell is not ready
+/// yet. Any other error, a success, or the deadline ends the loop; the final
+/// busy error is returned unchanged so the caller still sees Herdr's reason.
+fn retry_while_pane_busy<T>(
+    mut attempt: impl FnMut() -> rk_core::Result<T>,
+    timeout: Duration,
+    poll: Duration,
+) -> rk_core::Result<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match attempt() {
+            Err(error) if is_pane_busy(&error) && Instant::now() < deadline => {
+                debug!("herdr pane shell not ready yet; retrying agent start");
+                std::thread::sleep(poll);
+            }
+            other => return other,
+        }
+    }
+}
+
 fn run_herdr(args: &[&str]) -> rk_core::Result<String> {
     let out = Command::new("herdr")
         .args(args)
@@ -443,6 +483,66 @@ pub fn interactive_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn busy() -> rk_core::Error {
+        rk_core::Error::other(
+            r#"herdr agent start king --kind codex --pane w1R:p1 failed: {"error":{"code":"agent_pane_busy","message":"agent target pane w1R:p1 is not an available shell"},"id":"cli:agent:start"}"#,
+        )
+    }
+
+    #[test]
+    fn agent_start_waits_out_a_pane_whose_shell_is_still_starting() {
+        let mut attempts = 0;
+        let started = retry_while_pane_busy(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(busy())
+                } else {
+                    Ok("w1R:p1")
+                }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(started, "w1R:p1");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn agent_start_does_not_retry_other_herdr_failures() {
+        let mut attempts = 0;
+        let error = retry_while_pane_busy(
+            || -> rk_core::Result<()> {
+                attempts += 1;
+                Err(rk_core::Error::other(
+                    "herdr agent start failed: agent_not_found",
+                ))
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("agent_not_found"), "{error}");
+    }
+
+    #[test]
+    fn agent_start_gives_up_with_the_busy_reason_after_the_deadline() {
+        let mut attempts = 0;
+        let error = retry_while_pane_busy(
+            || -> rk_core::Result<()> {
+                attempts += 1;
+                Err(busy())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert!(attempts > 1, "expected repeated attempts, got {attempts}");
+        assert!(error.to_string().contains("agent_pane_busy"), "{error}");
+    }
 
     #[test]
     fn interactive_argv_shapes() {
