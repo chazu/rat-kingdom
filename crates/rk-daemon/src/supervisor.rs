@@ -9941,6 +9941,14 @@ mod respawn_tests {
             .await
             .unwrap();
         assert!(occupying.state.is_live());
+        // Same fake-harness race as
+        // `implementation_lane_admits_the_longest_waiting_request_first`:
+        // `occupying`'s real `bash -c` subprocess can terminalize the record
+        // on its own before the next `.await`, freeing the lane early. Pin
+        // it back to `Running` first.
+        sup.lock_registry()
+            .update(&occupying.name, |r| r.state = AgentState::Running)
+            .unwrap();
         let overflow = sup
             .spawn_async(spawn_params(repo.path(), "impl-overflow"), 0)
             .await;
@@ -10014,9 +10022,31 @@ mod respawn_tests {
             .await
             .unwrap();
         assert!(occupying.state.is_live());
+        // `occupying`'s fake harness (crates/rk-harness/src/fake.rs) is a
+        // real `bash -c` subprocess whose background event-processing task
+        // (spawned in `Supervisor::spawn`) races this test independently: it
+        // can terminalize the record on its own (`Completed` via its
+        // scripted lifecycle, or `Failed` if the child dies to resource
+        // exhaustion) at any `.await` point below, freeing the lane's only
+        // slot before this test intends to and admitting a refusal check
+        // instead of refusing it. Confirmed by direct reproduction
+        // (TKT-kujaj-libar-mopud): under concurrent host CPU/process load,
+        // `occupying` flips to `Failed` between spawning it and the very
+        // next `spawn_async` call often enough to fail
+        // `first_refusal`'s assertion. What this test actually exercises is
+        // the FIFO admission queue, not the fake harness's own lifecycle, so
+        // pin the record back to `Running` before every check that depends
+        // on the lane staying saturated — closing the race without
+        // weakening any admission assertion.
+        let pin_occupying_running = || {
+            sup.lock_registry()
+                .update(&occupying.name, |r| r.state = AgentState::Running)
+                .unwrap();
+        };
 
         // Two DISTINCT logical requests, both refused while the lane is full —
         // "first-in-line" strictly before "second-in-line" is queued.
+        pin_occupying_running();
         let first_params = spawn_params(repo.path(), "first-in-line");
         let first_refusal = sup.spawn_async(first_params.clone(), 0).await;
         assert!(matches!(
@@ -10024,6 +10054,7 @@ mod respawn_tests {
             Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED
         ));
 
+        pin_occupying_running();
         let second_params = spawn_params(repo.path(), "second-in-line");
         let second_refusal = sup.spawn_async(second_params.clone(), 0).await;
         assert!(matches!(
@@ -10051,6 +10082,13 @@ mod respawn_tests {
             first_retry.is_ok(),
             "the longest-waiting request must be admitted once a slot frees: {first_retry:?}"
         );
+        // Same race as `pin_occupying_running` above, now for the newly
+        // admitted `first_retry` record: pin it to `Running` so its own
+        // real fake-harness subprocess cannot free the lane early before
+        // the next check.
+        sup.lock_registry()
+            .update(&first_retry.unwrap().name, |r| r.state = AgentState::Running)
+            .unwrap();
 
         // With the first now occupying the lane's only slot again, the second
         // waiter is STILL refused — proving the first retry didn't leave the
@@ -10080,6 +10118,15 @@ mod respawn_tests {
         let occupying = before_restart
             .spawn_async(spawn_params(repo.path(), "occupying"), 0)
             .await
+            .unwrap();
+        // Same fake-harness race as
+        // `implementation_lane_admits_the_longest_waiting_request_first`:
+        // `occupying`'s real `bash -c` subprocess can terminalize the record
+        // on its own before the next `.await`, freeing the lane early. Pin
+        // it back to `Running` first.
+        before_restart
+            .lock_registry()
+            .update(&occupying.name, |r| r.state = AgentState::Running)
             .unwrap();
         let queued_params = spawn_params(repo.path(), "queued-before-restart");
         let refusal = before_restart.spawn_async(queued_params.clone(), 0).await;
@@ -10138,6 +10185,14 @@ mod respawn_tests {
         let occupying = sup
             .spawn_async(spawn_params(repo.path(), "occupying"), 0)
             .await
+            .unwrap();
+        // Same fake-harness race as
+        // `implementation_lane_admits_the_longest_waiting_request_first`:
+        // `occupying`'s real `bash -c` subprocess can terminalize the record
+        // on its own before the next `.await`, freeing the lane early. Pin
+        // it back to `Running` first.
+        sup.lock_registry()
+            .update(&occupying.name, |r| r.state = AgentState::Running)
             .unwrap();
         let waiter_params = spawn_params(repo.path(), "waiter");
         let refusal = sup.spawn_async(waiter_params.clone(), 0).await;
