@@ -10087,7 +10087,9 @@ mod respawn_tests {
         // real fake-harness subprocess cannot free the lane early before
         // the next check.
         sup.lock_registry()
-            .update(&first_retry.unwrap().name, |r| r.state = AgentState::Running)
+            .update(&first_retry.unwrap().name, |r| {
+                r.state = AgentState::Running
+            })
             .unwrap();
 
         // With the first now occupying the lane's only slot again, the second
