@@ -422,7 +422,7 @@ pub async fn apply(plan: RepairPlan, ctx: &ApplyContext<'_>) -> rk_core::Result<
                     scope: &scope,
                     evidence: &evidence,
                 };
-                execute(focus, action, ctx).await?
+                execute(focus, &subject, action, ctx).await?
             }
         };
         results.push(RepairResult {
@@ -445,6 +445,7 @@ pub async fn apply(plan: RepairPlan, ctx: &ApplyContext<'_>) -> rk_core::Result<
 
 async fn execute(
     focus: RepairFocus<'_>,
+    subject: &str,
     action: RepairAction,
     ctx: &ApplyContext<'_>,
 ) -> rk_core::Result<Outcome> {
@@ -456,9 +457,7 @@ async fn execute(
     let detail = action.describe();
     let subject_and_cas = match &action {
         RepairAction::CloseDelivered { merge_commit } => {
-            // The violation id is `<kind>:<ticket-id>` (`reconcile::Violation::id`);
-            // the ticket id is the only variable component.
-            let ticket_id = subject_from_violation_id(focus.violation_id, focus.kind);
+            let ticket_id = subject.to_string();
             (
                 ticket_id.clone(),
                 ctx.tickets
@@ -467,7 +466,7 @@ async fn execute(
             )
         }
         RepairAction::ClearStaleOwnership { status, assignee } => {
-            let ticket_id = subject_from_violation_id(focus.violation_id, focus.kind);
+            let ticket_id = subject.to_string();
             // The ticket-side CAS below only re-checks `status`/`assignee`
             // against the ticket's own live payload — it has no way to see
             // that the *reason* those fields were ever eligible to clear
@@ -510,16 +509,6 @@ async fn execute(
             detail: "ticket no longer exists".to_string(),
         }),
     }
-}
-
-/// `reconcile::Violation::id` is `format!("{kind}:{subject}")` for both
-/// repairable kinds (never a compound key), so the subject is everything
-/// after the first `kind:` prefix.
-fn subject_from_violation_id(violation_id: &str, kind: &str) -> String {
-    violation_id
-        .strip_prefix(&format!("{kind}:"))
-        .unwrap_or(violation_id)
-        .to_string()
 }
 
 fn already_applied(space: &Space, violation_id: &str) -> rk_core::Result<bool> {
@@ -935,6 +924,66 @@ mod tests {
         let stored = tickets.get("TKT-1").unwrap().unwrap();
         assert_eq!(stored.payload["status"], "open");
         assert_eq!(stored.payload["assignee"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_later_owner_generation_is_not_suppressed_by_the_first_repair_marker() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        seed(
+            &space,
+            "TKT-1",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+
+        let first_owner = agent("Whisker", Some("TKT-1"), AgentState::Dismissed);
+        let first_plan = plan(
+            "myrepo",
+            &tickets.list(Some("myrepo".into()), None, None).unwrap(),
+            std::slice::from_ref(&first_owner),
+            &HashSet::new(),
+            &HashSet::new(),
+            &RepairFacts::default(),
+        );
+        let first_id = first_plan.items[0].violation_id.clone();
+        let first = apply(first_plan, &ctx(&tickets, &space, &[first_owner]))
+            .await
+            .unwrap();
+        assert!(matches!(first.results[0].outcome, Outcome::Applied { .. }));
+
+        tickets
+            .update(
+                "TKT-1",
+                crate::tickets::TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Scurry".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let second_owner = agent("Scurry", Some("TKT-1"), AgentState::Dismissed);
+        let second_plan = plan(
+            "myrepo",
+            &tickets.list(Some("myrepo".into()), None, None).unwrap(),
+            std::slice::from_ref(&second_owner),
+            &HashSet::new(),
+            &HashSet::new(),
+            &RepairFacts::default(),
+        );
+        let second_id = second_plan.items[0].violation_id.clone();
+        assert_ne!(second_id, first_id);
+        let second = apply(second_plan, &ctx(&tickets, &space, &[second_owner]))
+            .await
+            .unwrap();
+        assert!(matches!(second.results[0].outcome, Outcome::Applied { .. }));
+
+        let stored = tickets.get("TKT-1").unwrap().unwrap();
+        assert_eq!(stored.payload["status"], "open");
+        assert_eq!(stored.payload["assignee"], Value::Null);
+        let pattern = Pattern::category(Category::Event).identity(REPAIR_APPLIED_IDENTITY);
+        assert_eq!(space.scan(&pattern).unwrap().len(), 2);
     }
 
     #[tokio::test]

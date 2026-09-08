@@ -342,6 +342,19 @@ pub(crate) fn resolve_owner<'a>(
     }
 }
 
+/// Stable only for one ownership generation. A ticket may be repaired,
+/// claimed by another rat, and later need the same repair again; including
+/// the spawn keeps the second contradiction distinct from the first one's
+/// durable decision and repair journals.
+fn terminal_assignee_violation_id(ticket_id: &str, agent: &AgentRecord) -> String {
+    format!(
+        "{}:{}:{}",
+        kind::TERMINAL_ASSIGNEE_ACTIVE_WORK,
+        ticket_id,
+        agent.spawn_id()
+    )
+}
+
 pub(crate) fn terminal_assignee_active_work(
     tickets: &[Tuple],
     agents: &[AgentRecord],
@@ -366,13 +379,14 @@ pub(crate) fn terminal_assignee_active_work(
             let mut evidence = vec![
                 format!("ticket:{}", t.identity),
                 format!("agent:{}", agent.name),
+                format!("agent.spawn:{}", agent.spawn_id()),
                 format!("agent.state:{:?}", agent.state),
             ];
             if let Some(wi) = &agent.workflow_instance {
                 evidence.push(format!("workflow_instance:{wi}"));
             }
             Some(Violation {
-                id: format!("{}:{}", kind::TERMINAL_ASSIGNEE_ACTIVE_WORK, t.identity),
+                id: terminal_assignee_violation_id(&t.identity, agent),
                 kind: kind::TERMINAL_ASSIGNEE_ACTIVE_WORK.into(),
                 scope: t.scope.clone(),
                 subject: t.identity.clone(),
@@ -808,11 +822,7 @@ fn terminal_assignee_with_handoffs(
             evidence.push(format!("workflow_instance:{workflow}"));
         }
         violations.push(Violation {
-            id: format!(
-                "{}:{}",
-                kind::TERMINAL_ASSIGNEE_ACTIVE_WORK,
-                ticket.identity
-            ),
+            id: terminal_assignee_violation_id(&ticket.identity, agent),
             kind: kind::TERMINAL_ASSIGNEE_ACTIVE_WORK.into(),
             scope: ticket.scope.clone(),
             subject: ticket.identity.clone(),

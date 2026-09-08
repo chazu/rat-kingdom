@@ -846,6 +846,123 @@ async fn orchestrator_fixture_resolves_through_the_lease_and_a_rate_held_decisio
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_terminal_owner_generation_is_a_new_attention_item() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(QUICK_DONE));
+    let mut cfg = allow(&["terminal-assignee-active-work"]);
+    cfg.orchestrator_rate_cap = 10;
+    let mut client = daemon_with_policy(home.path(), cfg).await;
+    let repo = repo_name_of(repo_dir.path());
+    client
+        .call(
+            "repo.add",
+            json!({"name": repo, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    let first_owner = spawn_completed_agent(&mut client, repo_dir.path(), "owner-one").await;
+    let sentinel_owner =
+        spawn_completed_agent(&mut client, repo_dir.path(), "owner-sentinel").await;
+    write_ticket(
+        &mut client,
+        &repo,
+        "TKT-REASSIGNED",
+        ticket_payload("in_progress", json!({"assignee": first_owner})),
+    )
+    .await;
+    write_ticket(
+        &mut client,
+        &repo,
+        "TKT-Z-SENTINEL",
+        ticket_payload("in_progress", json!({"assignee": sentinel_owner})),
+    )
+    .await;
+    let first = reconcile_violation(
+        &mut client,
+        &repo,
+        "terminal-assignee-active-work",
+        "TKT-REASSIGNED",
+    )
+    .await;
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let lease = client
+        .call("lease.acquire", json!({"repo": repo, "holder": "orch-1"}))
+        .await
+        .unwrap();
+    let generation = lease["generation"].as_u64().unwrap();
+    let first_result = decide(
+        &mut client,
+        &repo,
+        &first_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_result["resolved"], true);
+
+    let sentinel = attention_next(&mut client, &repo)
+        .await
+        .expect("the later-sorting sentinel must advance the cursor past the first ticket");
+    assert_eq!(sentinel["subject"], "TKT-Z-SENTINEL");
+    let sentinel_id = sentinel["id"].as_str().unwrap();
+    let sentinel_result = decide(
+        &mut client,
+        &repo,
+        sentinel_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sentinel_result["resolved"], true);
+
+    let second_owner = spawn_completed_agent(&mut client, repo_dir.path(), "owner-two").await;
+    client
+        .call(
+            "ticket.update",
+            json!({
+                "id": "TKT-REASSIGNED",
+                "status": "in_progress",
+                "assignee": second_owner,
+            }),
+        )
+        .await
+        .unwrap();
+    let second = attention_next(&mut client, &repo)
+        .await
+        .expect("attention must wrap to a new generation whose ticket sorts before the cursor");
+    assert_eq!(second["subject"], "TKT-REASSIGNED");
+    let second_id = second["id"].as_str().unwrap().to_string();
+    assert_ne!(
+        second_id, first_id,
+        "a later ownership generation must not replay the first owner's terminal decision"
+    );
+
+    let second_result = decide(
+        &mut client,
+        &repo,
+        &second_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_result["resolved"], true);
+    assert_eq!(second_result["replay"], false);
+    let repaired = get_ticket(&mut client, "TKT-REASSIGNED").await;
+    assert_eq!(repaired["payload"]["status"], "open");
+    assert_eq!(repaired["payload"]["assignee"], Value::Null);
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
 // ---------------------------------------------------------------------
 // A resumed decide call for a violation whose data already changed
 // out-of-band (modelling a crash between a prior attempt's mutation and

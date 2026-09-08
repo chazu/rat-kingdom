@@ -5314,11 +5314,23 @@ impl Daemon {
         cursor: Option<&str>,
     ) -> rk_core::Result<Option<crate::attention::AttentionItem>> {
         let mut after = cursor.map(str::to_string);
+        let mut wrapped = cursor.is_none();
         loop {
-            let Some(item) =
-                crate::attention::next_attention(report, &self.authority_policy, after.as_deref())
-            else {
-                return Ok(None);
+            let item =
+                crate::attention::next_attention(report, &self.authority_policy, after.as_deref());
+            let Some(item) = item else {
+                if wrapped {
+                    return Ok(None);
+                }
+                // The report is a changing set, not an append-only stream:
+                // a ticket whose earlier ownership was repaired can acquire
+                // a new, generation-specific violation that sorts before the
+                // cursor. Wrap exactly once so such items remain reachable;
+                // terminal decisions below still prevent old settled items
+                // from being offered again.
+                after = None;
+                wrapped = true;
+                continue;
             };
             if self
                 .find_decision(&report.scope, &item.violation.id)?
