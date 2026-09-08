@@ -2254,6 +2254,32 @@ workflow: {
     }
 
     #[test]
+    fn maki_is_an_allowed_agent_profile_harness() {
+        let source = r#"
+workflow: {
+    name: "maki-worker"
+    agents: {default: {harness: "maki", model: "anthropic/claude-fable-5.1"}}
+    steps: [{type: "spawn", task: {title: "work"}}]
+}
+"#;
+        let workflow = load_str(source, &HashMap::new()).unwrap();
+        assert_eq!(workflow.agents["default"].harness.as_deref(), Some("maki"));
+    }
+
+    #[test]
+    fn unknown_agent_profile_harness_is_rejected_at_schema_validation() {
+        let source = r#"
+workflow: {
+    name: "bogus-worker"
+    agents: {default: {harness: "not-a-real-harness"}}
+    steps: [{type: "spawn", task: {title: "work"}}]
+}
+"#;
+        let err = load_str(source, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
     fn missing_required_param_is_rejected() {
         let err = load_str(SAMPLE, &HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("taskId"), "{err}");

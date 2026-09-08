@@ -214,6 +214,48 @@ async fn restricted_role_maki_spawn_is_rejected_before_any_durable_side_effect()
     let _ = client.call("stop", json!({})).await;
 }
 
+#[tokio::test]
+async fn unknown_harness_kind_is_rejected_before_any_durable_side_effect() {
+    let _env_lock = env_lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _daemon = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
+
+    let branches_before = git_branches(repo.path());
+
+    // A near-miss typo of a real harness kind, not a registered one: proves
+    // the daemon resolves and validates the harness before journaling a
+    // durable row, same as the restricted-role rejection above.
+    let error = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo.path().to_string_lossy(),
+                "task": "unknown-harness",
+                "harness": "makiz",
+                "base": "main",
+            }),
+        )
+        .await
+        .expect_err("an unregistered harness kind must be rejected");
+    assert!(error.to_string().contains("unknown harness kind"));
+
+    assert_eq!(git_branches(repo.path()), branches_before);
+    let agents = client.call("agent.list", json!({})).await.unwrap();
+    assert!(
+        agents["agents"].as_array().unwrap().is_empty(),
+        "a rejected spawn must leave no durable agent record: {agents}"
+    );
+
+    let _ = client.call("stop", json!({})).await;
+}
+
 fn git_branches(dir: &Path) -> String {
     let output = Command::new("git")
         .arg("-C")

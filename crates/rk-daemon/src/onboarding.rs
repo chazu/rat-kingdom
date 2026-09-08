@@ -607,6 +607,21 @@ fn add_harness_readiness(report: &mut AssessmentReport, harness: &str) {
                 ),
             )]);
         }
+        if harness == "maki" {
+            // Executable presence alone does not prove a working, authenticated
+            // Maki: the SDK stream-json transport this adapter drives was
+            // verified against 0.5.2, and `total_cost_usd` on an unauthenticated
+            // turn is indistinguishable from the zero the adapter already
+            // discards for unpriced turns. Neither check belongs in routine
+            // readiness, since both would be, or could trigger, a paid request.
+            finding = finding.recommend(
+                "Confirm the installed `maki` is at least version 0.5.2 (`maki --version`) \
+                 and that a provider is authenticated (`maki auth status`) before dispatching \
+                 work; onboarding does not run either check to avoid a paid request as routine \
+                 readiness.",
+                None,
+            );
+        }
         report.findings.push(finding);
     } else {
         report.findings.push(
@@ -1950,6 +1965,38 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.kind == expected_kind && finding.summary.contains("jcode")));
+    }
+
+    #[test]
+    fn maki_readiness_uses_the_standard_executable_check_and_adds_version_auth_guidance() {
+        let dir = fixture();
+        let registered = vec![record("fixture", dir.path())];
+        let report = inspect(
+            "fixture",
+            &registered,
+            &InspectContext {
+                default_harness: "maki".into(),
+                require_named_checks: false,
+            },
+        );
+        let expected_kind = if command_exists("maki", Path::new(".")) {
+            FindingKind::HarnessReady
+        } else {
+            FindingKind::HarnessMissing
+        };
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == expected_kind && finding.summary.contains("maki"))
+            .expect("maki harness finding present");
+        if expected_kind == FindingKind::HarnessReady {
+            let recommendation = finding
+                .recommendation
+                .as_ref()
+                .expect("maki readiness must recommend a version/auth check");
+            assert!(recommendation.action.contains("0.5.2"));
+            assert!(recommendation.action.contains("maki auth status"));
+        }
     }
 
     #[test]

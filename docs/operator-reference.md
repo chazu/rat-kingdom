@@ -17,6 +17,7 @@ Structured harness events drive the lifecycle.
 | `claude` (Claude Code) | default harness | at least one harness |
 | `codex` (Codex CLI) | second harness | optional |
 | [`jcode`](https://jcode.sh/docs) | multi-provider NDJSON harness | optional |
+| [`maki`](https://maki.sh/docs) >= 0.5.2 | headless Claude-compatible stream-json harness | optional |
 | [`herdr`](https://herdr.dev) | attachable interactive rats | optional |
 
 ## Install
@@ -159,7 +160,7 @@ because they answer different questions — a branch may hold the only copy of a
 rat's work, a transcript only narrates work that lives elsewhere — so combine
 them (`--reap-git --reap-logs`) when you want everything reclaimed.
 
-Spawn options: `--harness claude|codex|jcode|fake`, `--model`, `--role
+Spawn options: `--harness claude|codex|jcode|maki|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),
 `--permission-mode`, `--attach` (below). `rk dismiss` now only stops the rat,
 removes its worktree, and preserves its branch; it never lands code (`--no-merge`
@@ -247,6 +248,58 @@ socket. Onboarding ignores worker permissions and forces the adapter's
 [`crates/rk-harness/src/jcode.rs`](../crates/rk-harness/src/jcode.rs), while profile,
 direct-spawn, respawn, and status coverage lives in the workflow, daemon, and
 CLI test suites.
+
+### Maki configuration and precedence
+
+`maki` is a headless-only harness in v1: ordinary mutable rats only. It is
+rejected before any durable spawn side effect for `onboarder`, `diagnostician`,
+and `groomer` (no tested read-only/plan enforcement exists yet) and for
+`--attach` (no interactive argv or Herdr detection has been added). Selection,
+precedence, `rk respawn`, and `rk status` follow the same field-by-field
+resolution as every other harness: direct/inline spawn override; routed tier;
+workflow named profile; global profile with the same name; workflow default;
+global default; `[harness].default`.
+
+```bash
+maki auth login openai          # or an API key provider; verify with `maki auth status`
+maki --version                  # confirm >= 0.5.2 before dispatching work
+rk spawn --harness maki --task fix-login --model openai/gpt-5.5 \
+  --prompt "Fix the login bug, verify, commit, and run rk done"
+```
+
+Models are provider-qualified (`anthropic/claude-fable-5.1`, `openai/gpt-5.5`,
+...), matching what `--model` passes straight through to `maki`. Ordinary
+workers default to `danger-full-access`; both it and `bypassPermissions`
+translate to Maki's `--dangerously-skip-permissions`, the same "cannot wait for
+approval in a headless worker" reasoning as Codex/jcode. Every launch also
+passes `--no-plugins --no-commands --disallowed-tools Task,Memory`: the first
+two suppress user/project `init.lua` and custom commands, and the explicit
+deny list is required in addition because Maki's built-in `Task` (native
+subagent dispatch) and `Memory` (writes outside the worktree) tools ship with
+the Lua host and load regardless of `--no-plugins`. Global/project MCP servers
+and other ambient authority are not otherwise sandboxed in v1 — do not deploy
+managed Maki workers into a config root carrying credentials or MCP servers
+they should not exercise.
+
+Mid-session steering (`caps().steer`) is deliberately `false`: Maki's SDK
+input only deserializes `message.content` from a `user` record, so the
+`rk_control` side-band metadata Claude's protocol carries alongside every
+control message has no daemon-verifiable trust boundary on Maki's side. The
+one unavoidable exception is the initial prompt, which still rides the same
+control channel because stream-json input mode has no CLI-argument
+equivalent for it. `resume` (`--session <id>`) and `interrupt` are both
+supported and preserved across `rk respawn`, same as the other harnesses.
+
+Cost accounting never trusts a self-reported `total_cost_usd` of exactly
+`0` — Maki serializes that value both for unpriced/OAuth-backed turns (e.g.
+the ChatGPT Coding Plan) and for a turn that failed before any billing, so
+treating it as authoritative could silently overwrite Rat Kingdom's own
+pricing-based estimate and defeat a USD budget cap (`caps().reports_cost_usd`
+is `false`). Token usage is always preserved regardless, so token caps remain
+the reliable guardrail for unpriced/OAuth accounting. See
+[`crates/rk-harness/src/maki.rs`](../crates/rk-harness/src/maki.rs) for the
+adapter proof and `crates/rk-daemon/tests/maki_lifecycle.rs` for the RPC-level
+lifecycle, isolation-flag, and rejection coverage.
 
 Workflow runs can opt into a stable coordinator ownership scope with
 `rk workflow run <name> --coordinator <session-id>`. The coordinator can then
@@ -432,7 +485,11 @@ proposal submission plus their final `rk done` event. Proposal submission only
 journals immutable advice: it does not edit the worktree or castle. Onboarders
 cannot approve or decline proposals, spawn agents, mutate tickets/repos,
 approve workflows, use ordinary rat tuple writes, or gain operator authority by
-clearing `RK_AGENT`/`RK_AUTH_TOKEN`.
+clearing `RK_AGENT`/`RK_AUTH_TOKEN`. `--harness maki` is rejected for this role
+outright — `repo onboard start` and a direct `agent.spawn` both fail before any
+durable side effect, because Maki v1 has no tested read-only/plan enforcement.
+Onboarding, diagnostician, and groomer dispatch must use `claude`, `codex`, or
+`jcode` instead.
 
 Before a proposal is journaled, the daemon runs `git apply --check` against the
 assessed tree and proves the patch changes exactly its declared target. A
@@ -1245,7 +1302,7 @@ baseline. A toolchain bump may add lints over code that was clean when written
 unrelated change.
 
 Crate map: `rk-core` (tuple model, config, priming), `rk-space` (tuplespace),
-`rk-git` (worktrees/merges), `rk-harness` (claude/codex/jcode/fake adapters),
+`rk-git` (worktrees/merges), `rk-harness` (claude/codex/jcode/maki/fake adapters),
 `rk-ledger` (pricing/budgets), `rk-workflow` (CUE definitions), `rk-sync`
 (git-notes replication), `rk-mux` (herdr), `rk-daemon` (supervisor, executor,
 server), `rk-cli` (`rk`).

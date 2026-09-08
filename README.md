@@ -8,7 +8,8 @@ workflows and landing; the CLI presents the current work and its next actions.
 ## Install
 
 You need Git, Rust, the [CUE CLI](https://cuelang.org), and an authenticated coding
-harness: Claude Code, Codex CLI or Jcode. Herdr is optional for interactive attach.
+harness: Claude Code, Codex CLI, Jcode, or Maki (headless-only in v1, ordinary
+mutable roles only). Herdr is optional for interactive attach.
 The repository's `mise.toml` records its development tools and verification tasks.
 
 ```bash
