@@ -10940,8 +10940,11 @@ mod stuck_liveness_tests {
         // The shell has not necessarily forked the fake cargo yet the instant
         // `spawn()` returns — wait for the descendant to actually show up in
         // the process table before asserting on it, rather than racing a
-        // fixed sleep against however fast `sh` itself schedules.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // fixed sleep against however fast `sh` itself schedules. 2s was
+        // observed to be too tight under full-suite parallel load, where
+        // process-table (`ps`) latency and CPU contention can blow the
+        // deadline even though the descendant is alive (flaky, not broken).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while crate::managed_verification::process_liveness(pid).live_verifier_descendants == 0
             && std::time::Instant::now() < deadline
         {
