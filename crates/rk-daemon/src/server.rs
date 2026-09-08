@@ -815,6 +815,13 @@ pub struct Daemon {
     /// compaction or pane replacement. Wake injection itself tolerates replay;
     /// hibernation is intentionally single-flight.
     king_cycle_lock: tokio::sync::Mutex<()>,
+    /// The absent-generation case warns once and detaches (see `king_cycle`),
+    /// but any OTHER `king_cycle` error (e.g. a Herdr status task panicking)
+    /// has no such durable latch. Remembering the last logged message here so
+    /// the periodic loop only warns when it changes keeps a genuinely
+    /// repeating failure from re-flooding the log every poll the way the
+    /// absent-generation case used to.
+    king_last_cycle_error: std::sync::Mutex<Option<String>>,
     /// The authority-ladder policy (`[policy]` in `config.toml`), built once
     /// at startup — see `crate::authority::AuthorityPolicy` for why nothing
     /// mutates this at runtime.
@@ -1316,6 +1323,7 @@ impl Daemon {
             orchestrator_lease,
             king,
             king_cycle_lock: tokio::sync::Mutex::new(()),
+            king_last_cycle_error: std::sync::Mutex::new(None),
             authority_policy: crate::authority::AuthorityPolicy::default(),
             tickets,
             coordinator_sessions,
@@ -1965,8 +1973,32 @@ impl Daemon {
                     _ = tick.tick() => {}
                     _ = king_shutdown.changed() => break,
                 }
-                if let Err(error) = king_daemon.king_cycle().await {
-                    warn!(%error, "King control-loop cycle failed");
+                match king_daemon.king_cycle().await {
+                    Ok(_) => {
+                        if let Ok(mut last) = king_daemon.king_last_cycle_error.lock() {
+                            *last = None;
+                        }
+                    }
+                    Err(error) => {
+                        // The absent-generation case is already latched by
+                        // `detach_absent` (it clears the registration, so the
+                        // next cycle short-circuits before reaching this
+                        // branch at all). Any OTHER repeating failure has no
+                        // such durable latch, so dedup here: warn only when
+                        // the message actually changes, not on every poll.
+                        let message = error.to_string();
+                        let should_warn = match king_daemon.king_last_cycle_error.lock() {
+                            Ok(mut last) => {
+                                let changed = last.as_deref() != Some(message.as_str());
+                                *last = Some(message.clone());
+                                changed
+                            }
+                            Err(_) => true,
+                        };
+                        if should_warn {
+                            warn!(error = %message, "King control-loop cycle failed");
+                        }
+                    }
                 }
             }
         });
@@ -4985,6 +5017,33 @@ impl Daemon {
         Ok((snapshot, summary, has_work))
     }
 
+    /// Durable, one-shot attention item for `rk inbox`: the same
+    /// `Category::Obstacle` shape `emit_sweep_obstacle` uses for stuck/runaway
+    /// agents, so the King's absence surfaces through the one queue an
+    /// operator already watches instead of only a log line.
+    fn emit_king_detached_obstacle(&self, registration: &crate::king::KingRegistration) {
+        let tuple = Tuple::new(
+            Category::Obstacle,
+            SYSTEM_SCOPE,
+            registration.name.clone(),
+            self.castle.clone(),
+            json!({
+                "type": "king_detached",
+                "holder": registration.holder,
+                "generation": registration.generation,
+                "text": format!(
+                    "King '{}' (holder {}) generation {} is absent; run `rk king spawn` \
+                     for a fresh session or `rk king register` against a live one — \
+                     checkpoints and wake history are preserved for `rk king restore`",
+                    registration.name, registration.holder, registration.generation
+                ),
+            }),
+        );
+        if let Err(error) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
+            warn!(%error, "failed to emit King-detached obstacle");
+        }
+    }
+
     async fn king_cycle(&self) -> rk_core::Result<Value> {
         use sha2::Digest as _;
 
@@ -5001,9 +5060,28 @@ impl Daemon {
                     rk_core::Error::other(format!("Herdr status task failed: {error}"))
                 })?;
         let Some(herdr_state) = herdr_state else {
-            return Err(rk_core::Error::other(
-                "registered King generation is absent; run `rk king register` against the replacement",
-            ));
+            // The Herdr side of a King is a terminal session: unpersisted, so
+            // any Herdr/process/machine restart leaves this registration
+            // pointing at nothing. The King is optional — an absent one must
+            // not degrade the daemon's log — so detach once (checkpoints and
+            // wake history survive for a replacement to `rk king restore`)
+            // instead of returning an `Err` this loop would otherwise log on
+            // every single poll forever.
+            let now = (self.request_clock)();
+            self.king.detach_absent(
+                "registered King generation is absent".into(),
+                now,
+            )?;
+            warn!(
+                holder = %registration.holder,
+                name = %registration.name,
+                generation = registration.generation,
+                "King control-loop: registered generation is absent, detaching \
+                 (checkpoints and wake history preserved) — run `rk king spawn` \
+                 or `rk king register` to recover"
+            );
+            self.emit_king_detached_obstacle(&registration);
+            return Ok(json!({"registered": false, "action": "detached"}));
         };
 
         let now = (self.request_clock)();
