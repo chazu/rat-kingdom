@@ -7918,7 +7918,7 @@ mod respawn_tests {
         let record = spawning_record(SpawnJournal {
             params: &params,
             repo: &repo,
-            repo_name: "repo".into(),
+            repo_name: "repo",
             name: "Nibble".into(),
             branch: "rat/nibble/task".into(),
             fork_point: "base".into(),
