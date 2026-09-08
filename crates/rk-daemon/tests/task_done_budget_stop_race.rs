@@ -103,6 +103,30 @@ async fn wait_for_state(client: &mut Client, name: &str, want: &[&str]) -> Strin
     panic!("agent {name} never reached one of {want:?}, last seen: {last}");
 }
 
+// `reconcile_task_done` CASes the record to `Completed` and only then calls
+// `route_completion`, which publishes `harness_result` (see
+// `Supervisor::reconcile_task_done`) — the two are not atomic. A caller that
+// has just observed `Completed` via `wait_for_state` can still race a
+// single, unretried `harness_result_events` read against that window; under
+// host contention the window widens enough to lose it. Poll the same way
+// `wait_for_state` does instead of assuming immediate consistency.
+async fn wait_for_harness_result_events(
+    client: &mut Client,
+    repo: &str,
+    agent: &str,
+    want: usize,
+) -> Vec<Value> {
+    let mut last = Vec::new();
+    for _ in 0..300 {
+        last = harness_result_events(client, repo, agent).await;
+        if last.len() >= want {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    last
+}
+
 async fn harness_result_events(client: &mut Client, repo: &str, agent: &str) -> Vec<Value> {
     let res = client
         .call(
@@ -544,7 +568,7 @@ async fn restart_mid_reconcile_barrier_still_completes_the_generation() {
         state, "completed",
         "the generation must converge to Completed on the successor daemon"
     );
-    let events = harness_result_events(&mut client, &repo_name, &name).await;
+    let events = wait_for_harness_result_events(&mut client, &repo_name, &name, 1).await;
     assert_eq!(
         events.len(),
         1,
