@@ -93,6 +93,31 @@ pub(crate) fn transport_breaker_open_refused(provider: &str) -> String {
     )
 }
 
+/// Fixed prefix of the error [`Supervisor::spawn`] returns when `(repo,
+/// task)` already has a live-or-reserved owner (TKT-pumod-hubir-robik) —
+/// distinct from the WIP/lane refusals above because it is not a capacity
+/// signal: the free slot this call wanted exists, but admitting it anyway
+/// would dispatch a second generation onto work another one is already
+/// doing. Unlike a WIP/lane refusal, retrying this immediately is not
+/// useful — it stays refused until the existing owner settles — so this is
+/// deliberately NOT treated as a fleet-capacity refusal by
+/// [`crate::workflow_exec::is_fleet_wip_refusal`].
+pub(crate) const DUPLICATE_TASK_REFUSED_PREFIX: &str = "duplicate dispatch refused for task";
+
+fn duplicate_task_refused(task: &str, owner: &str) -> String {
+    if owner.is_empty() {
+        format!(
+            "{DUPLICATE_TASK_REFUSED_PREFIX} '{task}': another spawn for the same task is \
+             already being admitted"
+        )
+    } else {
+        format!(
+            "{DUPLICATE_TASK_REFUSED_PREFIX} '{task}': '{owner}' already holds a live \
+             generation for it"
+        )
+    }
+}
+
 // Review-tiering diff_class thresholds (Phase 0 of the steward remediation).
 // The steward trigger reads `diff_class` off the completion payload to decide
 // whether a diff is worth an LLM reviewer's judgment at all; these bounds are
@@ -1657,6 +1682,24 @@ impl Supervisor {
                 reg.release_wip(fleet_wip_cap);
                 return Err(rk_core::Error::other(lane_refused));
             }
+            // Implementation lane only: a reviewer legitimately gets more
+            // than one live generation on the identical task by design —
+            // shadow review runs a secondary reviewer alongside the primary
+            // for comparison, and a review-death replacement is dispatched
+            // before the dead generation's row is guaranteed to have settled
+            // out of `is_live()`. Neither is the TKT-pumod-hubir-robik bug
+            // (two tier-routed dispatches racing onto the same
+            // IMPLEMENTATION task); dedup only that lane.
+            if lane == crate::agents::Lane::Implementation {
+                if let Err(owner) = reg.try_reserve_task(&repo_name, &params.task) {
+                    reg.release_wip(fleet_wip_cap);
+                    reg.release_lane_wip(&repo_name, lane, lane_cap);
+                    return Err(rk_core::Error::other(duplicate_task_refused(
+                        &params.task,
+                        &owner,
+                    )));
+                }
+            }
             reg.reserve_name()
         };
         let (branch, worktree) = if params.role == ONBOARDER_ROLE {
@@ -1670,6 +1713,7 @@ impl Supervisor {
                 reg.release_name(&name);
                 reg.release_wip(fleet_wip_cap);
                 reg.release_lane_wip(&repo_name, lane, lane_cap);
+                reg.release_task(&repo_name, &params.task);
                 return Err(rk_core::Error::other(
                     "onboarder task must be a stable onb- session id",
                 ));
@@ -1711,21 +1755,24 @@ impl Supervisor {
             reg.release_name(&name);
             reg.release_wip(fleet_wip_cap);
             reg.release_lane_wip(&repo_name, lane, lane_cap);
+            reg.release_task(&repo_name, &params.task);
             return Err(e);
         }
         // The reservation's job is done: this spawn now has a live registry
         // row (state `Spawning`), which itself counts toward the fleet-WIP
-        // ceiling (and this repo's lane ceiling) from here on — worktree
-        // creation and harness launch (both potentially slow) proceed without
-        // holding the reservation, and any failure from here is recorded on
-        // that row via `mark_spawn_failed`, which naturally frees its slot by
-        // leaving the live count (for both ceilings alike, since
-        // `live_or_reserved_lane_wip` filters on `state.is_live()` the same
-        // way `live_or_reserved_wip` does).
+        // ceiling (and this repo's lane ceiling, and this task's ownership)
+        // from here on — worktree creation and harness launch (both
+        // potentially slow) proceed without holding the reservation, and any
+        // failure from here is recorded on that row via `mark_spawn_failed`,
+        // which naturally frees its slot by leaving the live count (for both
+        // ceilings alike, since `live_or_reserved_lane_wip` filters on
+        // `state.is_live()` the same way `live_or_reserved_wip` does; and for
+        // task ownership, since `live_task_owner` filters the same way too).
         {
             let mut reg = self.lock_registry();
             reg.release_wip(fleet_wip_cap);
             reg.release_lane_wip(&repo_name, lane, lane_cap);
+            reg.release_task(&repo_name, &params.task);
         }
         if let Err(e) = repo.create_worktree(&worktree, &branch, &target_branch) {
             self.mark_spawn_failed(&name, &e);
@@ -10011,7 +10058,15 @@ mod respawn_tests {
 
         // A relaunch of the same task is a second GENERATION, not a second
         // launch phase — the span key must absorb it, exactly as a restart or
-        // a replayed event is absorbed.
+        // a replayed event is absorbed. Settle the first generation first
+        // (TKT-pumod-hubir-robik's duplicate-task admission check refuses a
+        // relaunch while a prior generation for the same task is still
+        // live — this test's concern is span keying, not admission racing,
+        // so it relaunches the deliberate way: after the predecessor has
+        // ended, same as `rk respawn`).
+        sup.lock_registry()
+            .update(&launched.name, |r| r.state = AgentState::Completed)
+            .unwrap();
         sup.spawn_async(spawn_params(repo.path(), "TKT-launch"), 0)
             .await
             .unwrap();
@@ -10158,6 +10213,84 @@ mod respawn_tests {
             .await
             .expect("the failed attempt's reservation must have been released");
         assert!(record.state.is_live());
+    }
+
+    /// TKT-pumod-hubir-robik: two `agent.spawn` calls for the identical
+    /// `(repo, task)` arriving close enough together that neither has a live
+    /// registry row yet must not both admit — reproduces the Glossolalia
+    /// pilot-repeat duplicate dispatch (two tier-routed spawns for
+    /// `TKT-rusur-fihar-tubog`, 1.21s apart, both admitted; $0.62/~695k
+    /// tokens burned on the loser). `fleet_wip_cap` is passed as 0
+    /// (disabled) throughout, isolating the new task-identity check as the
+    /// only thing under test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duplicate_task_admission_is_atomic_under_concurrent_spawns() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let sup = Arc::clone(&sup);
+                let params = spawn_params(repo.path(), "TKT-rusur-fihar-tubog");
+                tokio::spawn(async move { sup.spawn_async(params, 0).await })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(handles.len());
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(
+                |r| matches!(r, Err(e) if e.to_string().starts_with(DUPLICATE_TASK_REFUSED_PREFIX)),
+            )
+            .count();
+        assert_eq!(
+            admitted, 1,
+            "exactly one spawn for the same task must be admitted: {results:?}"
+        );
+        assert_eq!(
+            refused, 4,
+            "the other 4 concurrent attempts for the identical task must be refused cleanly, \
+             not double-launched: {results:?}"
+        );
+        assert_eq!(
+            sup.list().len(),
+            1,
+            "exactly the 1 admitted spawn should have a registry row"
+        );
+    }
+
+    /// A settled (non-live) prior generation must never block a genuine
+    /// respawn of the same task — only a currently live owner does. Without
+    /// this, `rk respawn` / the crashed-generation retry sweep would be
+    /// permanently wedged the first time any task's generation failed.
+    #[tokio::test]
+    async fn duplicate_task_check_does_not_block_respawn_after_settlement() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let first = sup
+            .spawn_async(spawn_params(repo.path(), "TKT-respawn-me"), 0)
+            .await
+            .unwrap();
+        sup.lock_registry()
+            .update(&first.name, |r| r.state = AgentState::Failed)
+            .unwrap();
+
+        let respawned = sup
+            .spawn_async(spawn_params(repo.path(), "TKT-respawn-me"), 0)
+            .await;
+        assert!(
+            respawned.is_ok(),
+            "a settled generation must not block a respawn of the same task: {respawned:?}"
+        );
     }
 
     /// The implementation lane (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) is scoped per
