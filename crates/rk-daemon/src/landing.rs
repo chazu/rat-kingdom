@@ -3679,6 +3679,11 @@ impl LandingPipeline {
     /// which recovers `head_sha` from an existing settlement marker, cancel
     /// runs BEFORE any settlement exists for this attempt, so the live
     /// queue entry is the only durable source left.
+    ///
+    /// `task` is matched against [`Tickets::id_spellings`], not by raw
+    /// equality: the operator only has the spelling a human can type, which
+    /// need not be the spelling captured in the entry at enqueue time (a
+    /// legacy `TKT-<ULID>` ticket vs. its proquint alias).
     fn queued_entry_for(
         &self,
         repo_name: &str,
@@ -3686,9 +3691,14 @@ impl LandingPipeline {
         target: &str,
         task: &str,
     ) -> rk_core::Result<Option<LandingQueueEntry>> {
+        let spellings = self.tickets.id_spellings(task)?;
         for tuple in self.queue.scan_current(repo_name, Some(target))? {
             if tuple.payload.get("branch").and_then(Value::as_str) == Some(branch)
-                && tuple.payload.get("task").and_then(Value::as_str) == Some(task)
+                && tuple
+                    .payload
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .is_some_and(|entry_task| spellings.iter().any(|s| s == entry_task))
             {
                 let entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
                     .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
@@ -15431,6 +15441,77 @@ checks: [
             "error: {error}"
         );
         assert!(tuples(&space, Category::Event, REVIEW_CEILING_SETTLED_IDENTITY).is_empty());
+    }
+
+    /// `queued_entry_for` must find the entry regardless of which spelling
+    /// of a legacy ticket is used: the entry can be enqueued under a
+    /// `TKT-<ULID>` identity while an operator's `cancel-review` call only
+    /// knows the proquint alias (or vice versa). A raw string comparison
+    /// between the two spellings would silently report "no candidate" even
+    /// though the entry is right there in the queue.
+    #[tokio::test]
+    async fn queued_entry_for_matches_either_spelling_of_a_legacy_ticket() {
+        let home = tempfile::tempdir().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+
+        let legacy_identity = "TKT-01J000000000000000000777";
+        let legacy_payload = json!({
+            "title": "legacy ticket",
+            "status": "open",
+            "parent": Value::Null,
+            "priority": "normal",
+            "labels": Vec::<String>::new(),
+            "depends_on": Vec::<String>::new(),
+            "assignee": Value::Null,
+            "created_by": "castle",
+            "created_at": "2026-08-19T00:00:00Z",
+            "updated_at": "2026-08-19T00:00:00Z",
+        });
+        let legacy_tuple = Tuple::new(
+            Category::Task,
+            "system",
+            legacy_identity,
+            "castle",
+            legacy_payload,
+        )
+        .with_lifecycle(Lifecycle::Session);
+        space.out(legacy_tuple.clone()).unwrap();
+        let alias = pipeline
+            .tickets
+            .alias_of(&legacy_tuple)
+            .expect("a legacy ULID ticket has a deterministic proquint alias");
+
+        // Enqueued under the ULID spelling...
+        let entry = LandingQueueEntry {
+            repo_name: rk_git::Repo::discover(repo_dir.path()).unwrap().name(),
+            task: legacy_identity.to_string(),
+            ..review_candidate_entry(repo_dir.path(), &head_sha)
+        };
+        pipeline.queue.enqueue(entry.clone()).unwrap();
+
+        // ...is found whether looked up by the same spelling or the alias
+        // an operator who only knows the proquint form would type. Compare
+        // by `head_sha` rather than the whole entry: `enqueue` stamps
+        // queue-internal bookkeeping (`seq`, `enqueued_at`, ...) onto the
+        // durable copy that the in-memory `entry` never had.
+        let by_ulid = pipeline
+            .queued_entry_for(
+                &entry.repo_name,
+                &entry.branch,
+                &entry.target,
+                legacy_identity,
+            )
+            .unwrap()
+            .expect("found by the spelling it was enqueued under");
+        assert_eq!(by_ulid.head_sha, entry.head_sha);
+
+        let by_alias = pipeline
+            .queued_entry_for(&entry.repo_name, &entry.branch, &entry.target, &alias)
+            .unwrap()
+            .expect("found by the alias spelling an operator would type");
+        assert_eq!(by_alias.head_sha, entry.head_sha);
     }
 
     /// The explicit, bounded re-enqueue action: requires a prior ceiling
