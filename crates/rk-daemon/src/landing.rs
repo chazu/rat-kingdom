@@ -4731,16 +4731,30 @@ impl LandingPipeline {
     }
 
     /// Spawn's durable journal proves this exact dispatch crossed its commit point.
-    fn rework_agent_was_journaled(&self, ctx: &ReworkContext) -> bool {
-        self.supervisor.list_all().into_iter().any(|record| {
+    ///
+    /// `record.task` is stored verbatim from `SpawnParams.task` and is never
+    /// canonicalized, so it carries whichever spelling of `ctx.rework_ticket`
+    /// the dispatch happened to use. Match against every spelling
+    /// ([`crate::tickets::Tickets::id_spellings`]) rather than the raw string.
+    fn rework_agent_was_journaled(&self, ctx: &ReworkContext) -> rk_core::Result<bool> {
+        let spellings = self.tickets.id_spellings(&ctx.rework_ticket)?;
+        Ok(self.supervisor.list_all().into_iter().any(|record| {
             record.role == "rat"
-                && record.task.as_deref() == Some(ctx.rework_ticket.as_str())
+                && record
+                    .task
+                    .as_deref()
+                    .is_some_and(|t| spellings.iter().any(|s| s == t))
                 && record.target_branch == ctx.branch
                 && record.fork_point.as_deref() == Some(ctx.head_sha.as_str())
-        })
+        }))
     }
 
     /// Cumulative chain spend, including terminal and archived agents.
+    ///
+    /// Both `ctx.task` and each dispatch marker's `rework_ticket` are
+    /// internally minted ids that may carry either spelling of a legacy
+    /// ticket; expand each to every spelling before matching against
+    /// `record.task` so an alias-spelled agent record still counts.
     fn rework_chain_spend(&self, ctx: &ReworkContext) -> rk_core::Result<f64> {
         let rework_tickets: BTreeSet<String> = self
             .rework_dispatch_markers(ctx)?
@@ -4753,6 +4767,11 @@ impl LandingPipeline {
                     .map(str::to_string)
             })
             .collect();
+        let mut spellings: BTreeSet<String> =
+            self.tickets.id_spellings(&ctx.task)?.into_iter().collect();
+        for ticket in &rework_tickets {
+            spellings.extend(self.tickets.id_spellings(ticket)?);
+        }
         let spent = self
             .supervisor
             .list_all()
@@ -4762,7 +4781,7 @@ impl LandingPipeline {
                     && a.role == "rat"
                     && a.task
                         .as_deref()
-                        .is_some_and(|task| task == ctx.task || rework_tickets.contains(task))
+                        .is_some_and(|task| spellings.contains(task))
             })
             .map(|a| a.cost_usd)
             .sum();
@@ -4980,7 +4999,7 @@ impl LandingPipeline {
             // Marker-before-spawn needs a journal check to distinguish success
             // from the interruption window.
             if marker.payload.get("state").and_then(Value::as_str) == Some("dispatching")
-                && !self.rework_agent_was_journaled(&ctx)
+                && !self.rework_agent_was_journaled(&ctx)?
                 && !self.rework_dispatch_has_state(&ctx, "dispatch-interrupted")?
             {
                 let attempt = marker
@@ -5325,16 +5344,30 @@ impl LandingPipeline {
     }
 
     /// Spawn's durable journal proves this exact dispatch crossed its commit point.
-    fn conflict_agent_was_journaled(&self, ctx: &ConflictContext) -> bool {
-        self.supervisor.list_all().into_iter().any(|record| {
+    ///
+    /// `record.task` is stored verbatim from `SpawnParams.task` and is never
+    /// canonicalized, so it carries whichever spelling of `ctx.rework_ticket`
+    /// the dispatch happened to use. Match against every spelling
+    /// ([`crate::tickets::Tickets::id_spellings`]) rather than the raw string.
+    fn conflict_agent_was_journaled(&self, ctx: &ConflictContext) -> rk_core::Result<bool> {
+        let spellings = self.tickets.id_spellings(&ctx.rework_ticket)?;
+        Ok(self.supervisor.list_all().into_iter().any(|record| {
             record.role == "rat"
-                && record.task.as_deref() == Some(ctx.rework_ticket.as_str())
+                && record
+                    .task
+                    .as_deref()
+                    .is_some_and(|t| spellings.iter().any(|s| s == t))
                 && record.target_branch == ctx.branch
                 && record.fork_point.as_deref() == Some(ctx.head_sha.as_str())
-        })
+        }))
     }
 
     /// Cumulative chain spend, including terminal and archived agents.
+    ///
+    /// Both `ctx.task` and each dispatch marker's `rework_ticket` are
+    /// internally minted ids that may carry either spelling of a legacy
+    /// ticket; expand each to every spelling before matching against
+    /// `record.task` so an alias-spelled agent record still counts.
     fn conflict_chain_spend(&self, ctx: &ConflictContext) -> rk_core::Result<f64> {
         let correction_tickets: BTreeSet<String> = self
             .conflict_dispatch_markers(ctx)?
@@ -5347,6 +5380,11 @@ impl LandingPipeline {
                     .map(str::to_string)
             })
             .collect();
+        let mut spellings: BTreeSet<String> =
+            self.tickets.id_spellings(&ctx.task)?.into_iter().collect();
+        for ticket in &correction_tickets {
+            spellings.extend(self.tickets.id_spellings(ticket)?);
+        }
         let spent = self
             .supervisor
             .list_all()
@@ -5356,7 +5394,7 @@ impl LandingPipeline {
                     && a.role == "rat"
                     && a.task
                         .as_deref()
-                        .is_some_and(|task| task == ctx.task || correction_tickets.contains(task))
+                        .is_some_and(|task| spellings.contains(task))
             })
             .map(|a| a.cost_usd)
             .sum();
@@ -5417,7 +5455,7 @@ impl LandingPipeline {
             // Marker-before-spawn needs a journal check to distinguish success
             // from the interruption window.
             if marker.payload.get("state").and_then(Value::as_str) == Some("dispatching")
-                && !self.conflict_agent_was_journaled(&ctx)
+                && !self.conflict_agent_was_journaled(&ctx)?
                 && !self.conflict_dispatch_has_state(&ctx, "dispatch-interrupted")?
             {
                 let attempt = marker
@@ -5744,6 +5782,7 @@ impl LandingPipeline {
         // `Server::execute_orchestrator`/`attention.decide` would then
         // journal as a resolved decision and advance the lease cursor past
         // — with zero worker ever dispatched.
+        let already_journaled = self.conflict_agent_was_journaled(&ctx)?;
         match state.as_str() {
             landing_conflict::CONFLICT_STATE_AWAITING_DECISION => {}
             "dispatched" => {
@@ -5753,7 +5792,7 @@ impl LandingPipeline {
                     ctx.rework_ticket
                 ));
             }
-            "dispatching" if self.conflict_agent_was_journaled(&ctx) => {
+            "dispatching" if already_journaled => {
                 // The spawn DID succeed — only the terminal "dispatched"
                 // marker write never completed. Converging on success here
                 // is correct, not a guess: the supervisor's own durable
