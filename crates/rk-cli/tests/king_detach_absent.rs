@@ -130,10 +130,7 @@ async fn absent_generation_detaches_once_and_recovers_on_respawn() {
     std::fs::remove_file(&agent_path).unwrap();
 
     let detached = client.call("king.tick", json!({})).await.unwrap();
-    assert_eq!(
-        detached,
-        json!({"registered": false, "action": "detached"})
-    );
+    assert_eq!(detached, json!({"registered": false, "action": "detached"}));
 
     // Every subsequent cycle with nothing registered is a silent no-op — the
     // same path as never-registered — not a repeated failure.
@@ -147,10 +144,7 @@ async fn absent_generation_detaches_once_and_recovers_on_respawn() {
     let detachment = &status["state"]["detached"];
     assert_eq!(detachment["holder"], "king");
     assert_eq!(detachment["generation"], first_generation);
-    assert!(detachment["reason"]
-        .as_str()
-        .unwrap()
-        .contains("absent"));
+    assert!(detachment["reason"].as_str().unwrap().contains("absent"));
 
     // A later `rk king spawn` (or `rk king register`) clears the detached
     // state and resumes normal cycling under a new generation.

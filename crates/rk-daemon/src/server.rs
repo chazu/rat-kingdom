@@ -5068,10 +5068,8 @@ impl Daemon {
             // instead of returning an `Err` this loop would otherwise log on
             // every single poll forever.
             let now = (self.request_clock)();
-            self.king.detach_absent(
-                "registered King generation is absent".into(),
-                now,
-            )?;
+            self.king
+                .detach_absent("registered King generation is absent".into(), now)?;
             warn!(
                 holder = %registration.holder,
                 name = %registration.name,

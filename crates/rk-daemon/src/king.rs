@@ -904,13 +904,7 @@ mod tests {
 
         // A later register (spawn or manual) clears the marker.
         store
-            .register(
-                "king-a".into(),
-                "king".into(),
-                identity("two"),
-                0,
-                now,
-            )
+            .register("king-a".into(), "king".into(), identity("two"), 0, now)
             .unwrap();
         assert!(store.snapshot().unwrap().detached.is_none());
     }
