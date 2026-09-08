@@ -990,6 +990,115 @@ impl Registry {
         self.task_reservations.remove(&Self::task_key(repo, task));
     }
 
+    /// NUL-joined key for the `(repo, task, workflow_instance)` triple
+    /// [`try_reserve_review_task`](Registry::try_reserve_review_task) admits
+    /// against. Distinct from [`task_key`](Registry::task_key) by construction
+    /// (it always carries a third NUL-separated segment, even when
+    /// `workflow_instance` is absent), so the two key shapes can never
+    /// collide in `task_reservations`.
+    fn review_task_key(repo: &str, task: &str, workflow_instance: Option<&str>) -> String {
+        format!("{repo}\u{0}{task}\u{0}{}", workflow_instance.unwrap_or(""))
+    }
+
+    /// Same as [`live_task_owner`](Registry::live_task_owner), but additionally
+    /// requires the candidate row's `workflow_instance` to match
+    /// `workflow_instance` exactly (both `None`, or both the identical `Some`
+    /// id). This is what lets the Review lane's dedup positively distinguish an
+    /// intentional additional reviewer generation from a genuine duplicate
+    /// dispatch of the identical one — see
+    /// [`try_reserve_review_task`](Registry::try_reserve_review_task).
+    fn live_review_task_owner(
+        &self,
+        repo: &str,
+        task: &str,
+        workflow_instance: Option<&str>,
+    ) -> Option<&str> {
+        self.agents
+            .values()
+            .find(|r| {
+                r.repo_name == repo
+                    && r.task.as_deref() == Some(task)
+                    && r.state.is_live()
+                    && r.workflow_instance.as_deref() == workflow_instance
+            })
+            .map(|r| r.name.as_str())
+    }
+
+    /// The Review lane's counterpart to
+    /// [`try_reserve_task`](Registry::try_reserve_task) (TKT-hodag-rofaj-komol).
+    /// A blanket `(repo, task)` key is wrong for reviewers: shadow review
+    /// (`landing.rs launch_shadow_review`) deliberately runs a second live
+    /// reviewer against the identical task for comparison, and review-death
+    /// retry (`landing.rs request_review_retry`) deliberately dispatches a
+    /// replacement before the dead generation's row is guaranteed to have
+    /// settled out of `is_live()` — both are legitimate multi-generation
+    /// patterns the plain task key would have wrongly refused.
+    ///
+    /// The landing pipeline already mints a distinct, deterministic
+    /// `workflow_instance` id per logical reviewer generation for the same
+    /// task (`landing::review_instance_id` for the primary,
+    /// `landing::review_retry_instance_id` for each retry, that id plus
+    /// `-shadow` for the shadow) — see `docs/2026-09-08-tkt-hodag-rofaj-komol-review-lane-dedup.md`.
+    /// Keying the reservation on `(repo, task, workflow_instance)` instead of
+    /// just `(repo, task)` admits all three of those without change, while
+    /// still refusing a second spawn that repeats the identical
+    /// `workflow_instance` (including two `None`s, the shape of a manual or
+    /// tier-routed reviewer dispatch outside any workflow) — the actual
+    /// accidental-duplicate case this ticket closes.
+    ///
+    /// Same empty-`task`/refusal/release contract as `try_reserve_task`; pair
+    /// with [`release_review_task`](Registry::release_review_task).
+    pub fn try_reserve_review_task(
+        &mut self,
+        repo: &str,
+        task: &str,
+        workflow_instance: Option<&str>,
+    ) -> Result<(), String> {
+        if task.is_empty() {
+            return Ok(());
+        }
+        if let Some(owner) = self.live_review_task_owner(repo, task, workflow_instance) {
+            return Err(owner.to_string());
+        }
+        let key = Self::review_task_key(repo, task, workflow_instance);
+        if !self.task_reservations.insert(key) {
+            return Err(String::new());
+        }
+        Ok(())
+    }
+
+    /// Release a reservation taken by
+    /// [`try_reserve_review_task`](Registry::try_reserve_review_task).
+    /// `repo`/`task`/`workflow_instance` must match the paired call
+    /// (`task == ""` reserved nothing, so releases nothing).
+    pub fn release_review_task(&mut self, repo: &str, task: &str, workflow_instance: Option<&str>) {
+        if task.is_empty() {
+            return;
+        }
+        self.task_reservations
+            .remove(&Self::review_task_key(repo, task, workflow_instance));
+    }
+
+    /// Lane-dispatching release: the Implementation lane's reservation is
+    /// keyed on `(repo, task)` alone ([`release_task`](Registry::release_task)),
+    /// the Review lane's additionally on `workflow_instance`
+    /// ([`release_review_task`](Registry::release_review_task)). Pairs with
+    /// whichever of [`try_reserve_task`](Registry::try_reserve_task) /
+    /// [`try_reserve_review_task`](Registry::try_reserve_review_task) admitted
+    /// for `lane` in [`Supervisor::spawn`](crate::supervisor::Supervisor::spawn).
+    pub(crate) fn release_task_for_lane(
+        &mut self,
+        repo: &str,
+        lane: Lane,
+        task: &str,
+        workflow_instance: Option<&str>,
+    ) {
+        match lane {
+            Lane::Implementation => self.release_task(repo, task),
+            Lane::Review => self.release_review_task(repo, task, workflow_instance),
+        }
+    }
+
     /// Durably record that `key` was refused admission to `(repo, lane)`. A
     /// repeat refusal for a key already queued is treated as a liveness
     /// heartbeat: `last_seen` is refreshed and persisted at most once every
