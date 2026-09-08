@@ -4779,7 +4779,9 @@ impl LandingPipeline {
             .filter(|a| {
                 a.repo_name == ctx.repo
                     && a.role == "rat"
-                    && a.task.as_deref().is_some_and(|task| spellings.contains(task))
+                    && a.task
+                        .as_deref()
+                        .is_some_and(|task| spellings.contains(task))
             })
             .map(|a| a.cost_usd)
             .sum();
@@ -5390,7 +5392,9 @@ impl LandingPipeline {
             .filter(|a| {
                 a.repo_name == ctx.repo
                     && a.role == "rat"
-                    && a.task.as_deref().is_some_and(|task| spellings.contains(task))
+                    && a.task
+                        .as_deref()
+                        .is_some_and(|task| spellings.contains(task))
             })
             .map(|a| a.cost_usd)
             .sum();
