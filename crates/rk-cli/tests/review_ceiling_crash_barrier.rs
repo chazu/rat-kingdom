@@ -53,6 +53,25 @@ use std::time::{Duration, Instant};
 /// Serializing removes the contention these tests create for each other
 /// without weakening what any single one proves or touching any other
 /// binary's concurrency.
+///
+/// This does NOT make the file immune to a `60s`-bound miss under a full
+/// `cargo test --workspace` (or `mise run verify-full`) pass: that run's
+/// wall-clock length makes it far more likely to overlap host-level
+/// contention this file cannot see or serialize against — another rat's
+/// concurrent build/test in a sibling worktree, disk/CPU pressure, scheduler
+/// variance — than a short standalone `--test review_ceiling_crash_barrier`
+/// run. TKT-lonam-kupoz-makoz investigated one such single failure (green in
+/// isolation, green on immediate rerun) and confirmed it is this same
+/// generic, widely-recorded "flaky under full-workspace parallel load" class
+/// (see fleet artifact `structural-eval-test-parallelism`,
+/// 01M0BJNKZEKPCYSVA4R0AVHYS9, and the many prior tickets in this pattern) —
+/// NOT a timing bug in the durable-marker-write-vs-retry window itself, which
+/// stays deterministic regardless of host speed because it is pinned by the
+/// `fault-barrier`/`fault-barrier.reached` file handshake above, not a sleep.
+/// A structural fix (bounded cross-agent parallelism, or per-test process
+/// isolation via cargo-nextest) is tracked at the fleet level and needs
+/// operator sign-off before adoption; it is out of scope for a single test
+/// file to work around.
 static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire [`TEST_SERIAL`] for the calling test's whole body. Recovers from
