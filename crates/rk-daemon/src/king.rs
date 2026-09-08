@@ -57,6 +57,21 @@ pub struct KingRegistration {
     pub registered_at: DateTime<Utc>,
 }
 
+/// Records that a registration was unbound because its Herdr generation
+/// vanished (crash, restart, machine reboot) rather than by an explicit
+/// `rk king dismiss`. Kept so `rk king status` (and anything reading
+/// [`KingState`]) can tell "never registered" apart from "was registered,
+/// then disappeared", and so the control loop only needs to detect the
+/// absence once instead of on every poll.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KingDetachment {
+    pub holder: String,
+    pub name: String,
+    pub generation: u64,
+    pub detached_at: DateTime<Utc>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextLifecycle {
@@ -85,6 +100,10 @@ pub struct KingCheckpoint {
 #[serde(default)]
 pub struct KingState {
     pub registration: Option<KingRegistration>,
+    /// Set when `registration` was cleared by detection of an absent Herdr
+    /// generation rather than an explicit dismiss. Cleared by the next
+    /// `register` (spawn or manual register both call it).
+    pub detached: Option<KingDetachment>,
     pub wakes: VecDeque<KingWake>,
     pub last_snapshot: Value,
     pub last_resolved_digest: Option<String>,
@@ -103,6 +122,7 @@ impl Default for KingState {
     fn default() -> Self {
         Self {
             registration: None,
+            detached: None,
             wakes: VecDeque::new(),
             last_snapshot: Value::Null,
             last_resolved_digest: None,
@@ -191,6 +211,7 @@ impl KingStore {
             registered_at: now,
         };
         state.registration = Some(registration.clone());
+        state.detached = None;
         state.context = ContextLifecycle::Dirty;
         state.last_activity_at = Some(now);
         state.idle_since = None;
@@ -225,6 +246,50 @@ impl KingStore {
         state.restore_last_injected_at = None;
         self.persist(&state)?;
         Ok(registration)
+    }
+
+    /// Unbind a registration whose Herdr generation is absent (crash, restart,
+    /// machine reboot). The Herdr side of a King is opaque and unpersisted, so
+    /// a control-loop cycle can only learn this by asking; unlike `unregister`
+    /// this is a detection, not a command, so it also leaves a `detached`
+    /// marker recording why — the same shape `unregister` produces (unsettled
+    /// work replayed to the next generation, checkpoints and wake history
+    /// untouched) but distinguishable from "never registered" by callers that
+    /// care, such as `rk king status`.
+    ///
+    /// Returns `None` (persisting nothing) if nothing was registered, so a
+    /// caller can safely call this without first checking — the same shape as
+    /// `unregister`.
+    pub fn detach_absent(
+        &self,
+        reason: String,
+        now: DateTime<Utc>,
+    ) -> rk_core::Result<Option<KingRegistration>> {
+        let mut state = self.lock()?;
+        let Some(registration) = state.registration.take() else {
+            return Ok(None);
+        };
+        state.detached = Some(KingDetachment {
+            holder: registration.holder.clone(),
+            name: registration.name.clone(),
+            generation: registration.generation,
+            detached_at: now,
+            reason,
+        });
+        for wake in state.wakes.iter_mut().filter(|wake| wake.active()) {
+            wake.state = WakeState::Pending;
+            wake.updated_at = now;
+            wake.last_injected_at = None;
+            wake.claimed_at = None;
+        }
+        state.context = ContextLifecycle::Clean;
+        state.idle_since = None;
+        state.last_activity_at = None;
+        state.compact_started_at = None;
+        state.pending_restore = None;
+        state.restore_last_injected_at = None;
+        self.persist(&state)?;
+        Ok(Some(registration))
     }
 
     /// Observe a fresh authoritative snapshot and return a wake that should be
@@ -803,5 +868,44 @@ mod tests {
         assert!(state.registration.is_none());
         assert_eq!(state.wakes.back().unwrap().state, WakeState::Pending);
         assert_eq!(state.context, ContextLifecycle::Clean);
+    }
+
+    #[test]
+    fn detach_absent_clears_registration_once_and_leaves_a_marker() {
+        let (_dir, store) = store();
+        let now = Utc::now();
+        let wake = store
+            .observe("a".into(), "one".into(), Value::Null, true, 10, now)
+            .unwrap()
+            .unwrap();
+        store.claim(&wake.id, "king-a", now).unwrap();
+
+        let removed = store
+            .detach_absent("generation absent".into(), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.identity.session_id, "one");
+        let state = store.snapshot().unwrap();
+        assert!(state.registration.is_none());
+        let detached = state.detached.expect("detached marker recorded");
+        assert_eq!(detached.holder, "king-a");
+        assert_eq!(detached.generation, removed.generation);
+        assert_eq!(detached.reason, "generation absent");
+        // Replays unsettled work exactly like an explicit `unregister`.
+        assert_eq!(state.wakes.back().unwrap().state, WakeState::Pending);
+        assert_eq!(state.context, ContextLifecycle::Clean);
+
+        // Calling it again with nothing registered is a no-op, not an error —
+        // the control loop must be able to call it unconditionally.
+        assert!(store
+            .detach_absent("generation absent".into(), now)
+            .unwrap()
+            .is_none());
+
+        // A later register (spawn or manual) clears the marker.
+        store
+            .register("king-a".into(), "king".into(), identity("two"), 0, now)
+            .unwrap();
+        assert!(store.snapshot().unwrap().detached.is_none());
     }
 }
