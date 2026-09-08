@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
+use rk_core::action::canonical_digest;
 use rk_core::{id::RecordId, paths::Layout};
 use rk_daemon::Client;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,12 @@ const MANIFEST: &str = "manifest.json";
 const SAMPLES: &str = "samples.jsonl";
 const INTERVENTIONS: &str = "interventions";
 const REPORT: &str = "report.json";
+const CONTRACT_SCHEMA_VERSION: u32 = 1;
+const QUALIFICATION_EVALUATOR_VERSION: u32 = 1;
+const CONTRACT: &str = "contract.json";
+const EXERCISES: &str = "exercises";
+const QUALIFICATION: &str = "qualification.json";
+const DEFAULT_MIN_CONTINUATION_SAMPLES: u64 = 1;
 
 #[derive(Subcommand)]
 pub enum ObservationCommand {
@@ -34,8 +41,12 @@ pub enum ObservationCommand {
     Resume(RunPathArgs),
     /// Record one typed intervention as an atomic evidence file.
     Record(RecordArgs),
+    /// Record one named continuity exercise as an atomic evidence file.
+    Exercise(ExerciseArgs),
     /// Derive a report from the run's immutable evidence.
     Report(ReportArgs),
+    /// Evaluate the run against its frozen acceptance contract.
+    Qualify(QualifyArgs),
 }
 
 #[derive(Args)]
@@ -75,6 +86,10 @@ pub struct StartArgs {
     max_cost_usd: Option<f64>,
     #[arg(long, default_value_t = 0)]
     max_unavailable_samples: u64,
+    /// Repository-owned acceptance contract to freeze into this run.
+    /// The frozen copy and its digest, not this path, are the run's authority.
+    #[arg(long)]
+    contract: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -105,6 +120,32 @@ pub struct ReportArgs {
     finalize: bool,
 }
 
+#[derive(Args)]
+pub struct ExerciseArgs {
+    run: PathBuf,
+    #[arg(long, value_enum)]
+    kind: ExerciseKind,
+    /// Exact identity observed before the exercise (e.g. a daemon pid or King session id).
+    #[arg(long)]
+    before: String,
+    /// Exact identity observed after the exercise. Equal to `--before` fails the exercise:
+    /// a PID or King-identity change alone is not proof of continuation either way.
+    #[arg(long)]
+    after: String,
+    #[arg(long)]
+    ticket: Option<String>,
+    #[arg(long, default_value = "")]
+    note: String,
+}
+
+#[derive(Args)]
+pub struct QualifyArgs {
+    run: PathBuf,
+    /// Persist the derived qualification result as qualification.json as well as printing it.
+    #[arg(long)]
+    finalize: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum InterventionClass {
@@ -112,6 +153,17 @@ pub enum InterventionClass {
     Llm,
     HumanGate,
     AdHoc,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExerciseKind {
+    WorkerDeath,
+    NamedCheckFailure,
+    MergeConflict,
+    DaemonRollover,
+    KingReplacement,
+    Custom,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +320,136 @@ struct Report {
     evidence: BTreeMap<String, String>,
 }
 
+/// A versioned, typed acceptance section frozen into a run. A repository-owned
+/// input may propose one; the frozen copy and its digest, not the input file,
+/// are the run's authority (D2, docs/2026-09-06-r1-qualification-deliverables.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcceptanceContract {
+    schema_version: u32,
+    workload: WorkloadRequirement,
+    duration: DurationRequirement,
+    liveness: LivenessRequirement,
+    #[serde(default)]
+    exercises: Vec<ExerciseRequirement>,
+    interventions: InterventionPolicy,
+    build_identity: BuildIdentityRequirement,
+    resources: ResourceRequirement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkloadRequirement {
+    /// Explicit root selection this contract governs; empty means the whole
+    /// repository scope declared by the run's manifest.
+    #[serde(default)]
+    roots: Vec<String>,
+    min_root_deliveries: u64,
+    #[serde(default)]
+    min_correction_deliveries: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurationRequirement {
+    min_elapsed_secs: u64,
+    max_sample_gap_secs: u64,
+    #[serde(default)]
+    coverage_tolerance_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LivenessRequirement {
+    /// Consumes D1's stall/hold evidence once landed; until then this bounds
+    /// the interim proxy signals the collector already retains.
+    max_stale_tickets: u64,
+    max_unclassified_holds: u64,
+    max_stall_incidents: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExerciseRequirement {
+    kind: ExerciseKind,
+    #[serde(default = "default_min_count")]
+    min_count: u64,
+    #[serde(default)]
+    min_continuation_samples: u64,
+}
+
+fn default_min_count() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InterventionPolicy {
+    /// Empty means every class is structurally allowed, subject to `max_ad_hoc`.
+    #[serde(default)]
+    allowed_classes: Vec<InterventionClass>,
+    /// R1 qualification requires this to be zero.
+    max_ad_hoc: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildIdentityRequirement {
+    frozen_build: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ResourceRequirement {
+    #[serde(default)]
+    max_spend_usd: Option<f64>,
+    max_landing_age_secs: u64,
+    max_ready_age_secs: u64,
+    max_duplicate_dispatches: u64,
+    max_duplicate_landings: u64,
+    max_forced_landings: u64,
+    max_reconcile_violations: u64,
+}
+
+/// The run-directory-resident authority for a contract: the frozen copy plus
+/// the digest that later replay revalidates against.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FrozenContract {
+    contract: AcceptanceContract,
+    digest: String,
+    source: Option<String>,
+    frozen_at: DateTime<Utc>,
+}
+
+/// A durable, typed record of one continuity exercise: an exact before/after
+/// identity pair plus the moment it was declared to have occurred. A PID or
+/// King-identity change alone is not proof of continuation; `derive_qualification`
+/// additionally requires subsequent evidence of continuation without repeat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Exercise {
+    schema_version: u32,
+    id: String,
+    kind: ExerciseKind,
+    occurred_at: DateTime<Utc>,
+    before_identity: String,
+    after_identity: String,
+    ticket: Option<String>,
+    note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QualificationCheck {
+    requirement: String,
+    passed: bool,
+    detail: String,
+}
+
+/// The qualification decision for one run against its frozen contract. Distinct
+/// from `Report`: a run without a contract can still produce a general `Report`,
+/// but only a `QualificationResult` can claim an M3/M4 qualification outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QualificationResult {
+    schema_version: u32,
+    run_id: String,
+    contract_schema_version: u32,
+    contract_digest: String,
+    evaluator_version: u32,
+    checks: Vec<QualificationCheck>,
+    qualified: bool,
+}
+
 pub async fn run(layout: &Layout, command: ObservationCommand, as_json: bool) -> Result<()> {
     match command {
         ObservationCommand::Start(args) => start(layout, args, as_json).await,
@@ -277,7 +459,9 @@ pub async fn run(layout: &Layout, command: ObservationCommand, as_json: bool) ->
         }
         ObservationCommand::Resume(args) => collect_run(layout, &args.run, as_json).await,
         ObservationCommand::Record(args) => record(args, as_json),
+        ObservationCommand::Exercise(args) => exercise(args, as_json),
         ObservationCommand::Report(args) => report(args, as_json),
+        ObservationCommand::Qualify(args) => qualify(args, as_json),
     }
 }
 
@@ -299,6 +483,7 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
     fs::create_dir(&run_dir)
         .with_context(|| format!("create observation run {}", run_dir.display()))?;
     fs::create_dir(run_dir.join(INTERVENTIONS))?;
+    fs::create_dir(run_dir.join(EXERCISES))?;
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
         id,
@@ -327,6 +512,9 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
         observer_build: rk_core::version::BUILD_VERSION.to_string(),
     };
     write_new_json(&run_dir.join(MANIFEST), &manifest)?;
+    if let Some(path) = &args.contract {
+        freeze_contract(&run_dir, path, &manifest, duration)?;
+    }
     OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -340,6 +528,59 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
         );
     }
     collect_run(layout, &run_dir, as_json).await
+}
+
+/// Validate and freeze a repository-owned acceptance contract before measured
+/// work starts. The frozen copy plus its digest become `contract.json`; there
+/// is no update path, so a contract change requires a new run.
+fn freeze_contract(
+    run_dir: &Path,
+    source: &Path,
+    manifest: &Manifest,
+    planned_duration: Option<Duration>,
+) -> Result<()> {
+    let raw = fs::read_to_string(source)
+        .with_context(|| format!("read acceptance contract {}", source.display()))?;
+    let contract: AcceptanceContract = serde_json::from_str(&raw)
+        .with_context(|| format!("parse acceptance contract {}", source.display()))?;
+    if contract.schema_version != CONTRACT_SCHEMA_VERSION {
+        bail!(
+            "unsupported acceptance contract schema {} (expected {})",
+            contract.schema_version,
+            CONTRACT_SCHEMA_VERSION
+        );
+    }
+    if !contract.workload.roots.is_empty() {
+        if manifest.tickets.is_empty() {
+            bail!(
+                "acceptance contract declares root tickets but the run has whole-repository scope"
+            );
+        }
+        for root in &contract.workload.roots {
+            if !manifest.tickets.contains(root) {
+                bail!("acceptance contract root {root} is outside this run's observed tickets");
+            }
+        }
+    }
+    match planned_duration {
+        Some(planned) if planned.as_secs() < contract.duration.min_elapsed_secs => bail!(
+            "planned run duration {}s is shorter than the contract's minimum elapsed requirement {}s",
+            planned.as_secs(),
+            contract.duration.min_elapsed_secs
+        ),
+        None if contract.duration.min_elapsed_secs > 0 => bail!(
+            "acceptance contract requires a minimum elapsed duration but the run has no planned --duration"
+        ),
+        _ => {}
+    }
+    let digest = canonical_digest(&contract)?;
+    let frozen = FrozenContract {
+        contract,
+        digest,
+        source: Some(source.display().to_string()),
+        frozen_at: Utc::now(),
+    };
+    write_new_json(&run_dir.join(CONTRACT), &frozen)
 }
 
 async fn collect_run(layout: &Layout, run_dir: &Path, as_json: bool) -> Result<()> {
@@ -847,6 +1088,31 @@ fn record(args: RecordArgs, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+fn exercise(args: ExerciseArgs, as_json: bool) -> Result<()> {
+    let exercise = Exercise {
+        schema_version: SCHEMA_VERSION,
+        id: RecordId::new().to_string(),
+        kind: args.kind,
+        occurred_at: Utc::now(),
+        before_identity: nonempty(args.before, "--before")?,
+        after_identity: nonempty(args.after, "--after")?,
+        ticket: args.ticket,
+        note: args.note,
+    };
+    fs::create_dir_all(args.run.join(EXERCISES))?;
+    let path = args
+        .run
+        .join(EXERCISES)
+        .join(format!("{}.json", exercise.id));
+    write_new_json(&path, &exercise)?;
+    if as_json {
+        println!("{}", serde_json::to_string(&exercise)?);
+    } else {
+        println!("recorded {} ({:?})", exercise.id, exercise.kind);
+    }
+    Ok(())
+}
+
 fn report(args: ReportArgs, as_json: bool) -> Result<()> {
     let report = derive_report(&args.run)?;
     if args.finalize {
@@ -859,6 +1125,22 @@ fn report(args: ReportArgs, as_json: bool) -> Result<()> {
     }
     if !report.passed {
         bail!("observation thresholds failed");
+    }
+    Ok(())
+}
+
+fn qualify(args: QualifyArgs, as_json: bool) -> Result<()> {
+    let result = derive_qualification(&args.run)?;
+    if args.finalize {
+        write_json_atomic(&args.run.join(QUALIFICATION), &result)?;
+    }
+    if as_json {
+        println!("{}", serde_json::to_string(&result)?);
+    } else {
+        print_qualification(&result);
+    }
+    if !result.qualified {
+        bail!("acceptance contract requirements not met");
     }
     Ok(())
 }
@@ -1088,6 +1370,359 @@ fn check(checks: &mut BTreeMap<String, Check>, name: &str, observed: u64, limit:
             passed: observed <= limit,
         },
     );
+}
+
+/// Evaluate one run against its frozen acceptance contract. Pure over the
+/// run's immutable evidence files: no daemon RPC and no LLM call, so replay is
+/// deterministic for a given contract and evaluator version. A run with no
+/// frozen contract has no qualification claim to evaluate, only a general
+/// `Report`.
+fn derive_qualification(run_dir: &Path) -> Result<QualificationResult> {
+    let frozen = load_contract(run_dir)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} has no frozen acceptance contract; only a general report is available",
+            run_dir.display()
+        )
+    })?;
+    let contract = &frozen.contract;
+    let manifest = load_manifest(run_dir)?;
+    let samples = load_samples(run_dir)?;
+    let report = derive_report(run_dir)?;
+    let interventions = load_interventions(run_dir)?;
+    let exercises = load_exercises(run_dir)?;
+
+    let mut checks = Vec::new();
+    let mut require = |requirement: &str, passed: bool, detail: String| {
+        checks.push(QualificationCheck {
+            requirement: requirement.into(),
+            passed,
+            detail,
+        });
+    };
+
+    require(
+        "workload/root-deliveries",
+        report.delivered_during_run >= contract.workload.min_root_deliveries,
+        format!(
+            "{} root deliveries against a minimum of {}; idle elapsed time alone cannot satisfy workload",
+            report.delivered_during_run, contract.workload.min_root_deliveries
+        ),
+    );
+    require(
+        "workload/correction-deliveries",
+        report.correction_deliveries >= contract.workload.min_correction_deliveries,
+        format!(
+            "{} correction deliveries against a minimum of {}",
+            report.correction_deliveries, contract.workload.min_correction_deliveries
+        ),
+    );
+
+    require(
+        "duration/elapsed",
+        report.elapsed_secs >= contract.duration.min_elapsed_secs,
+        format!(
+            "{}s elapsed against a minimum of {}s",
+            report.elapsed_secs, contract.duration.min_elapsed_secs
+        ),
+    );
+    let gap_budget = contract
+        .duration
+        .max_sample_gap_secs
+        .saturating_add(contract.duration.coverage_tolerance_secs);
+    require(
+        "duration/sample-gap",
+        report.max_sample_gap_secs <= gap_budget,
+        format!(
+            "max sample gap {}s against a budget of {}s ({}s tolerance)",
+            report.max_sample_gap_secs, gap_budget, contract.duration.coverage_tolerance_secs
+        ),
+    );
+
+    require(
+        "liveness/stale-tickets",
+        report.max_stale_tickets <= contract.liveness.max_stale_tickets,
+        format!(
+            "max {} stale tickets against a limit of {}",
+            report.max_stale_tickets, contract.liveness.max_stale_tickets
+        ),
+    );
+    require(
+        "liveness/unclassified-holds",
+        report.max_unclassified_holds <= contract.liveness.max_unclassified_holds,
+        format!(
+            "max {} unclassified holds against a limit of {}",
+            report.max_unclassified_holds, contract.liveness.max_unclassified_holds
+        ),
+    );
+    let stall_incidents = transitions(
+        samples
+            .iter()
+            .map(|sample| sample.metrics.unclassified_holds > 0),
+    );
+    require(
+        "liveness/stall-incidents",
+        stall_incidents <= contract.liveness.max_stall_incidents,
+        format!(
+            "{stall_incidents} stall onset(s) against a limit of {} (interim proxy pending D1's typed stall evidence)",
+            contract.liveness.max_stall_incidents
+        ),
+    );
+
+    for wanted in &contract.exercises {
+        let matching: Vec<&Exercise> = exercises
+            .iter()
+            .filter(|candidate| candidate.kind == wanted.kind)
+            .collect();
+        require(
+            &format!("exercise/{}/count", exercise_kind_name(wanted.kind)),
+            matching.len() as u64 >= wanted.min_count,
+            format!(
+                "{} recorded {} exercise(s) against a minimum of {}",
+                matching.len(),
+                exercise_kind_name(wanted.kind),
+                wanted.min_count
+            ),
+        );
+        let min_continuation = if wanted.min_continuation_samples == 0 {
+            DEFAULT_MIN_CONTINUATION_SAMPLES
+        } else {
+            wanted.min_continuation_samples
+        };
+        for candidate in &matching {
+            let identity_changed = candidate.before_identity != candidate.after_identity;
+            let continued =
+                identity_changed && exercise_continuation(&samples, candidate, min_continuation);
+            require(
+                &format!(
+                    "exercise/{}/{}/continuation",
+                    exercise_kind_name(wanted.kind),
+                    candidate.id
+                ),
+                continued,
+                if !identity_changed {
+                    "before/after identities are identical; a PID or King-identity change alone is not required, but an unchanged identity proves no transition occurred".into()
+                } else {
+                    format!(
+                        "requires >= {min_continuation} subsequent live sample(s) with no repeated landing side effects"
+                    )
+                },
+            );
+        }
+    }
+
+    let ad_hoc = interventions
+        .iter()
+        .filter(|intervention| intervention.class == InterventionClass::AdHoc)
+        .count() as u64;
+    require(
+        "interventions/ad-hoc-limit",
+        ad_hoc <= contract.interventions.max_ad_hoc,
+        format!(
+            "{ad_hoc} ad-hoc intervention(s) against a limit of {} (R1 requires zero)",
+            contract.interventions.max_ad_hoc
+        ),
+    );
+    let disallowed = if contract.interventions.allowed_classes.is_empty() {
+        0
+    } else {
+        interventions
+            .iter()
+            .filter(|intervention| {
+                !contract
+                    .interventions
+                    .allowed_classes
+                    .contains(&intervention.class)
+            })
+            .count()
+    };
+    require(
+        "interventions/allowed-classes",
+        disallowed == 0,
+        format!("{disallowed} intervention(s) outside the contract's allowed classes"),
+    );
+
+    require(
+        "build-identity/frozen-build",
+        manifest.observer_build == contract.build_identity.frozen_build,
+        format!(
+            "observer build {} against the frozen build {}",
+            manifest.observer_build, contract.build_identity.frozen_build
+        ),
+    );
+    require(
+        "build-identity/build-parity",
+        report.build_mismatch_samples == 0,
+        format!(
+            "{} sample(s) observed a build other than the run's own observer build",
+            report.build_mismatch_samples
+        ),
+    );
+
+    require(
+        "resources/landing-age",
+        report.max_landing_age_secs <= contract.resources.max_landing_age_secs,
+        format!(
+            "max landing age {}s against a limit of {}s",
+            report.max_landing_age_secs, contract.resources.max_landing_age_secs
+        ),
+    );
+    require(
+        "resources/ready-age",
+        report.max_ready_age_secs <= contract.resources.max_ready_age_secs,
+        format!(
+            "max ready age {}s against a limit of {}s",
+            report.max_ready_age_secs, contract.resources.max_ready_age_secs
+        ),
+    );
+    require(
+        "resources/duplicate-dispatches",
+        report.duplicate_dispatches <= contract.resources.max_duplicate_dispatches,
+        format!(
+            "{} duplicate dispatch(es) against a limit of {}",
+            report.duplicate_dispatches, contract.resources.max_duplicate_dispatches
+        ),
+    );
+    require(
+        "resources/duplicate-landings",
+        report.duplicate_landings <= contract.resources.max_duplicate_landings,
+        format!(
+            "{} duplicate landing(s) against a limit of {}",
+            report.duplicate_landings, contract.resources.max_duplicate_landings
+        ),
+    );
+    require(
+        "resources/forced-landings",
+        report.forced_landings <= contract.resources.max_forced_landings,
+        format!(
+            "{} forced landing(s) against a limit of {}",
+            report.forced_landings, contract.resources.max_forced_landings
+        ),
+    );
+    require(
+        "resources/reconcile-violations",
+        report.max_reconcile_violations <= contract.resources.max_reconcile_violations,
+        format!(
+            "max {} reconciliation violation(s) against a limit of {}",
+            report.max_reconcile_violations, contract.resources.max_reconcile_violations
+        ),
+    );
+    if let Some(limit) = contract.resources.max_spend_usd {
+        require(
+            "resources/spend-usd",
+            report.attributed_cost_usd <= limit,
+            format!(
+                "attributed spend {:.4} USD against a limit of {limit:.4} USD",
+                report.attributed_cost_usd
+            ),
+        );
+    }
+
+    require(
+        "general-report",
+        report.passed,
+        format!(
+            "the run's own observation report passed={}; a qualification cannot pass under a failing general report",
+            report.passed
+        ),
+    );
+
+    let qualified = checks.iter().all(|entry| entry.passed);
+    Ok(QualificationResult {
+        schema_version: SCHEMA_VERSION,
+        run_id: manifest.id,
+        contract_schema_version: contract.schema_version,
+        contract_digest: frozen.digest,
+        evaluator_version: QUALIFICATION_EVALUATOR_VERSION,
+        checks,
+        qualified,
+    })
+}
+
+fn exercise_kind_name(kind: ExerciseKind) -> &'static str {
+    match kind {
+        ExerciseKind::WorkerDeath => "worker-death",
+        ExerciseKind::NamedCheckFailure => "named-check-failure",
+        ExerciseKind::MergeConflict => "merge-conflict",
+        ExerciseKind::DaemonRollover => "daemon-rollover",
+        ExerciseKind::KingReplacement => "king-replacement",
+        ExerciseKind::Custom => "custom",
+    }
+}
+
+/// An exercise proves continuation, not merely a transition: the run must
+/// stay live for the required number of subsequent samples, and any landing
+/// evidence for the exercised ticket after the exercise must not repeat a
+/// prior landing (the "without repeated side effects" acceptance bar).
+fn exercise_continuation(
+    samples: &[Sample],
+    exercise: &Exercise,
+    min_continuation_samples: u64,
+) -> bool {
+    let after: Vec<&Sample> = samples
+        .iter()
+        .filter(|sample| sample.observed_at > exercise.occurred_at)
+        .collect();
+    let live_after = after
+        .iter()
+        .filter(|sample| sample.daemon_reachable)
+        .count() as u64;
+    if live_after < min_continuation_samples {
+        return false;
+    }
+    let repeats = duplicate_landings(after.iter().flat_map(|sample| &sample.events).filter(
+        |event| {
+            exercise
+                .ticket
+                .as_deref()
+                .is_none_or(|ticket| event["payload"]["task"].as_str() == Some(ticket))
+        },
+    ));
+    repeats == 0
+}
+
+fn load_contract(run_dir: &Path) -> Result<Option<FrozenContract>> {
+    let path = run_dir.join(CONTRACT);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let frozen: FrozenContract = serde_json::from_reader(
+        File::open(&path).with_context(|| format!("open {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    if frozen.contract.schema_version != CONTRACT_SCHEMA_VERSION {
+        bail!(
+            "unsupported acceptance contract schema {}",
+            frozen.contract.schema_version
+        );
+    }
+    let recomputed = canonical_digest(&frozen.contract)?;
+    if recomputed != frozen.digest {
+        bail!(
+            "frozen acceptance contract digest mismatch in {}: evidence was modified after freezing",
+            path.display()
+        );
+    }
+    Ok(Some(frozen))
+}
+
+fn load_exercises(run_dir: &Path) -> Result<Vec<Exercise>> {
+    let dir = run_dir.join(EXERCISES);
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut paths = fs::read_dir(&dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    paths
+        .into_iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|path| {
+            serde_json::from_reader(File::open(&path)?)
+                .with_context(|| format!("parse {}", path.display()))
+        })
+        .collect()
 }
 
 fn latest_tickets(samples: &[Sample]) -> BTreeMap<String, Value> {
@@ -1588,6 +2223,29 @@ fn print_report(report: &Report) {
         );
     }
     println!("  interventions {:?}", report.interventions);
+}
+
+fn print_qualification(result: &QualificationResult) {
+    println!(
+        "{} · contract {} (schema {}) · evaluator {} · {}",
+        result.run_id,
+        &result.contract_digest[..12.min(result.contract_digest.len())],
+        result.contract_schema_version,
+        result.evaluator_version,
+        if result.qualified {
+            "QUALIFIED"
+        } else {
+            "NOT QUALIFIED"
+        },
+    );
+    for check in &result.checks {
+        println!(
+            "  {:<32} {:<4} {}",
+            check.requirement,
+            if check.passed { "PASS" } else { "FAIL" },
+            check.detail,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2288,5 +2946,327 @@ mod tests {
         assert_eq!(parse_duration("15m").unwrap().as_secs(), 900);
         assert_eq!(parse_duration("2h").unwrap().as_secs(), 7200);
         assert_eq!(parse_duration("1d").unwrap().as_secs(), 86400);
+    }
+
+    fn contract_fixture(manifest: &Manifest) -> AcceptanceContract {
+        AcceptanceContract {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            workload: WorkloadRequirement {
+                roots: vec![],
+                min_root_deliveries: 0,
+                min_correction_deliveries: 0,
+            },
+            duration: DurationRequirement {
+                min_elapsed_secs: 0,
+                max_sample_gap_secs: 3600,
+                coverage_tolerance_secs: 0,
+            },
+            liveness: LivenessRequirement {
+                max_stale_tickets: 0,
+                max_unclassified_holds: 0,
+                max_stall_incidents: 0,
+            },
+            exercises: vec![],
+            interventions: InterventionPolicy {
+                allowed_classes: vec![],
+                max_ad_hoc: 0,
+            },
+            build_identity: BuildIdentityRequirement {
+                frozen_build: manifest.observer_build.clone(),
+            },
+            resources: ResourceRequirement {
+                max_spend_usd: None,
+                max_landing_age_secs: manifest.thresholds.max_landing_age_secs,
+                max_ready_age_secs: manifest.thresholds.max_ready_age_secs,
+                max_duplicate_dispatches: 0,
+                max_duplicate_landings: 0,
+                max_forced_landings: 0,
+                max_reconcile_violations: 0,
+            },
+        }
+    }
+
+    fn freeze_test_contract(dir: &TempDir, contract: &AcceptanceContract) -> String {
+        let digest = canonical_digest(contract).unwrap();
+        let frozen = FrozenContract {
+            contract: contract.clone(),
+            digest: digest.clone(),
+            source: Some("test".into()),
+            frozen_at: Utc::now(),
+        };
+        write_new_json(&dir.path().join(CONTRACT), &frozen).unwrap();
+        digest
+    }
+
+    fn delivered_ticket(id: &str, at: DateTime<Utc>) -> Value {
+        json!({"identity": id, "scope": "repo", "payload": {
+            "status": "done", "delivery": {"landed_at": at,
+                "merge_commit": "commit", "target": "main"}}})
+    }
+
+    #[test]
+    fn qualify_requires_a_frozen_contract() {
+        let (dir, _) = fixture();
+        append_json_line(
+            &dir.path().join(SAMPLES),
+            &sample(1, "2026-09-02T00:00:30Z"),
+        )
+        .unwrap();
+        let error = derive_qualification(dir.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("no frozen acceptance contract"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn frozen_contract_digest_detects_post_freeze_tampering() {
+        let (dir, manifest) = fixture();
+        let contract = contract_fixture(&manifest);
+        freeze_test_contract(&dir, &contract);
+        assert!(load_contract(dir.path()).unwrap().is_some());
+        let mut tampered =
+            serde_json::to_value(load_contract(dir.path()).unwrap().unwrap()).unwrap();
+        tampered["contract"]["interventions"]["max_ad_hoc"] = json!(99);
+        fs::write(dir.path().join(CONTRACT), tampered.to_string()).unwrap();
+        let error = load_contract(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"), "{error}");
+    }
+
+    #[test]
+    fn freeze_contract_validates_scope_and_duration_before_measured_work_starts() {
+        let (dir, manifest) = fixture();
+        let mut out_of_scope = contract_fixture(&manifest);
+        out_of_scope.workload.roots = vec!["TKT-not-observed".into()];
+        let error =
+            freeze_contract(dir.path(), Path::new("/nonexistent"), &manifest, None).unwrap_err();
+        assert!(
+            error.to_string().contains("read acceptance contract"),
+            "{error}"
+        );
+
+        let source = dir.path().join("contract-input.json");
+        fs::write(&source, serde_json::to_string(&out_of_scope).unwrap()).unwrap();
+        let error = freeze_contract(dir.path(), &source, &manifest, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside this run's observed tickets"),
+            "{error}"
+        );
+
+        let mut needs_duration = contract_fixture(&manifest);
+        needs_duration.duration.min_elapsed_secs = 600;
+        fs::write(&source, serde_json::to_string(&needs_duration).unwrap()).unwrap();
+        let error = freeze_contract(dir.path(), &source, &manifest, None).unwrap_err();
+        assert!(
+            error.to_string().contains("no planned --duration"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn qualification_fails_with_no_useful_workload() {
+        let (dir, manifest) = fixture();
+        let mut contract = contract_fixture(&manifest);
+        contract.workload.min_root_deliveries = 1;
+        freeze_test_contract(&dir, &contract);
+        append_json_line(
+            &dir.path().join(SAMPLES),
+            &sample(1, "2026-09-02T00:00:30Z"),
+        )
+        .unwrap();
+        let result = derive_qualification(dir.path()).unwrap();
+        assert!(!result.qualified);
+        let workload = result
+            .checks
+            .iter()
+            .find(|check| check.requirement == "workload/root-deliveries")
+            .unwrap();
+        assert!(!workload.passed, "{workload:?}");
+    }
+
+    #[test]
+    fn qualification_passes_with_useful_workload_and_zero_interventions() {
+        let (dir, manifest) = fixture();
+        let mut contract = contract_fixture(&manifest);
+        contract.workload.min_root_deliveries = 1;
+        let digest = freeze_test_contract(&dir, &contract);
+        let mut delivered = sample(1, "2026-09-02T00:01:00Z");
+        delivered.tickets = vec![delivered_ticket("TKT-1", delivered.observed_at)];
+        append_json_line(&dir.path().join(SAMPLES), &delivered).unwrap();
+        let result = derive_qualification(dir.path()).unwrap();
+        assert!(
+            result.checks.iter().all(|check| check.passed),
+            "{:?}",
+            result.checks
+        );
+        assert!(result.qualified);
+        assert_eq!(result.contract_digest, digest);
+        assert_eq!(result.evaluator_version, QUALIFICATION_EVALUATOR_VERSION);
+    }
+
+    #[test]
+    fn qualification_fails_on_a_missing_required_exercise() {
+        let (dir, manifest) = fixture();
+        let mut contract = contract_fixture(&manifest);
+        contract.exercises = vec![ExerciseRequirement {
+            kind: ExerciseKind::WorkerDeath,
+            min_count: 1,
+            min_continuation_samples: 1,
+        }];
+        freeze_test_contract(&dir, &contract);
+        append_json_line(
+            &dir.path().join(SAMPLES),
+            &sample(1, "2026-09-02T00:00:30Z"),
+        )
+        .unwrap();
+        let result = derive_qualification(dir.path()).unwrap();
+        assert!(!result.qualified);
+        let count = result
+            .checks
+            .iter()
+            .find(|check| check.requirement == "exercise/worker-death/count")
+            .unwrap();
+        assert!(!count.passed, "{count:?}");
+    }
+
+    #[test]
+    fn qualification_fails_when_a_recorded_exercise_shows_no_identity_change() {
+        let (dir, manifest) = fixture();
+        let mut contract = contract_fixture(&manifest);
+        contract.exercises = vec![ExerciseRequirement {
+            kind: ExerciseKind::DaemonRollover,
+            min_count: 1,
+            min_continuation_samples: 1,
+        }];
+        freeze_test_contract(&dir, &contract);
+        append_json_line(
+            &dir.path().join(SAMPLES),
+            &sample(1, "2026-09-02T00:00:30Z"),
+        )
+        .unwrap();
+        exercise(
+            ExerciseArgs {
+                run: dir.path().into(),
+                kind: ExerciseKind::DaemonRollover,
+                before: "pid-1".into(),
+                after: "pid-1".into(),
+                ticket: None,
+                note: "no-op restart".into(),
+            },
+            true,
+        )
+        .unwrap();
+        let result = derive_qualification(dir.path()).unwrap();
+        assert!(!result.qualified);
+        let continuation = result
+            .checks
+            .iter()
+            .find(|check| {
+                check.requirement.starts_with("exercise/daemon-rollover/")
+                    && check.requirement.ends_with("/continuation")
+            })
+            .unwrap();
+        assert!(!continuation.passed, "{continuation:?}");
+        assert!(
+            continuation.detail.contains("identical"),
+            "{continuation:?}"
+        );
+    }
+
+    #[test]
+    fn qualification_fails_when_an_exercise_is_followed_by_a_repeated_landing() {
+        let (dir, manifest) = fixture();
+        let mut contract = contract_fixture(&manifest);
+        contract.exercises = vec![ExerciseRequirement {
+            kind: ExerciseKind::WorkerDeath,
+            min_count: 1,
+            min_continuation_samples: 1,
+        }];
+        freeze_test_contract(&dir, &contract);
+        append_json_line(
+            &dir.path().join(SAMPLES),
+            &sample(1, "2026-09-02T00:00:30Z"),
+        )
+        .unwrap();
+        exercise(
+            ExerciseArgs {
+                run: dir.path().into(),
+                kind: ExerciseKind::WorkerDeath,
+                before: "gen-1".into(),
+                after: "gen-2".into(),
+                ticket: Some("TKT-1".into()),
+                note: "worker killed and respawned".into(),
+            },
+            true,
+        )
+        .unwrap();
+        let mut after = sample(2, "2026-09-02T00:02:00Z");
+        after.events = vec![
+            json!({"id": "e1", "identity":"landing_processed", "payload":{"task":"TKT-1", "head_sha":"a", "target":"main", "outcome":"landed"}}),
+            json!({"id": "e2", "identity":"landing_processed", "payload":{"task":"TKT-1", "head_sha":"b", "target":"main", "outcome":"landed"}}),
+        ];
+        append_json_line(&dir.path().join(SAMPLES), &after).unwrap();
+        let result = derive_qualification(dir.path()).unwrap();
+        assert!(!result.qualified);
+        let continuation = result
+            .checks
+            .iter()
+            .find(|check| {
+                check.requirement.starts_with("exercise/worker-death/")
+                    && check.requirement.ends_with("/continuation")
+            })
+            .unwrap();
+        assert!(!continuation.passed, "{continuation:?}");
+    }
+
+    #[test]
+    fn qualification_fails_on_excess_ad_hoc_intervention() {
+        let (dir, manifest) = fixture();
+        let contract = contract_fixture(&manifest);
+        freeze_test_contract(&dir, &contract);
+        append_json_line(
+            &dir.path().join(SAMPLES),
+            &sample(1, "2026-09-02T00:00:30Z"),
+        )
+        .unwrap();
+        record(
+            RecordArgs {
+                run: dir.path().into(),
+                class: InterventionClass::AdHoc,
+                summary: "human rescued a stuck landing".into(),
+                ticket: None,
+                actor: None,
+                evidence: vec![],
+            },
+            true,
+        )
+        .unwrap();
+        let result = derive_qualification(dir.path()).unwrap();
+        assert!(!result.qualified);
+        let ad_hoc = result
+            .checks
+            .iter()
+            .find(|check| check.requirement == "interventions/ad-hoc-limit")
+            .unwrap();
+        assert!(!ad_hoc.passed, "{ad_hoc:?}");
+    }
+
+    #[test]
+    fn qualification_replay_is_deterministic_for_the_same_contract_and_evaluator() {
+        let (dir, manifest) = fixture();
+        let mut contract = contract_fixture(&manifest);
+        contract.workload.min_root_deliveries = 1;
+        freeze_test_contract(&dir, &contract);
+        let mut delivered = sample(1, "2026-09-02T00:01:00Z");
+        delivered.tickets = vec![delivered_ticket("TKT-1", delivered.observed_at)];
+        append_json_line(&dir.path().join(SAMPLES), &delivered).unwrap();
+        let first = serde_json::to_value(derive_qualification(dir.path()).unwrap()).unwrap();
+        let second = serde_json::to_value(derive_qualification(dir.path()).unwrap()).unwrap();
+        assert_eq!(
+            first, second,
+            "replay of immutable evidence must be deterministic"
+        );
     }
 }
