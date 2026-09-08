@@ -562,6 +562,16 @@ pub struct Registry {
     /// per distinct `(repo, lane, key)` currently refused admission. See
     /// [`LaneWaiter`] and [`Registry::try_reserve_lane_wip`].
     lane_waiters: Vec<LaneWaiter>,
+    /// Outstanding per-`(repo, task)` admission reservations taken by
+    /// [`try_reserve_task`](Registry::try_reserve_task) and not yet resolved
+    /// by [`release_task`](Registry::release_task). Closes the same kind of
+    /// TOCTOU window `wip_reservations`/`lane_reservations` close, but keyed
+    /// on task IDENTITY rather than a count: two `agent.spawn` calls minted
+    /// close enough together that neither has an `insert`ed registry row yet
+    /// (TKT-pumod-hubir-robik — a tier-routed re-dispatch onto a ticket that
+    /// had just become ready again, 1.21s apart) must not both admit onto the
+    /// same task. In-memory only, same rationale as `reserved`.
+    task_reservations: HashSet<String>,
 }
 
 /// One durably-recorded waiter for a saturated capacity lane
@@ -735,6 +745,7 @@ impl Registry {
             lane_reservations: HashMap::new(),
             lane_waiters_path,
             lane_waiters,
+            task_reservations: HashSet::new(),
         })
     }
 
@@ -914,6 +925,177 @@ impl Registry {
         }
         if let Some(count) = self.lane_reservations.get_mut(&lane.key(repo)) {
             *count = count.saturating_sub(1);
+        }
+    }
+
+    /// NUL-joined key for the `(repo, task)` pair `try_reserve_task` admits
+    /// against — same unambiguous-joiner convention as `Lane::key`.
+    fn task_key(repo: &str, task: &str) -> String {
+        format!("{repo}\u{0}{task}")
+    }
+
+    /// The name of a currently LIVE agent already working `task` in `repo`,
+    /// if any. Scans the live map only — a settled (completed/failed/
+    /// dismissed) generation is not an owner, so a genuine respawn of a task
+    /// whose prior attempt already ended is never blocked by this check.
+    fn live_task_owner(&self, repo: &str, task: &str) -> Option<&str> {
+        self.agents
+            .values()
+            .find(|r| r.repo_name == repo && r.task.as_deref() == Some(task) && r.state.is_live())
+            .map(|r| r.name.as_str())
+    }
+
+    /// Atomically check for an existing live-or-reserved owner of `(repo,
+    /// task)` and reserve it in the same critical section — always called
+    /// with the registry lock held, from inside
+    /// [`Supervisor::spawn`](crate::supervisor::Supervisor::spawn), alongside
+    /// [`try_reserve_wip`](Registry::try_reserve_wip) and
+    /// [`try_reserve_lane_wip`](Registry::try_reserve_lane_wip), so two
+    /// concurrent `agent.spawn` calls for the identical task can never both
+    /// admit (TKT-pumod-hubir-robik).
+    ///
+    /// An empty `task` is never deduplicated: many spawns (ad hoc dispatch,
+    /// most reviewer legs) carry no ticket at all, and treating `""` as a
+    /// shared identity would wrongly serialize all of them onto one slot.
+    ///
+    /// On refusal, returns the blocking owner's name (or `""` when the
+    /// conflict is with another in-flight reservation that has no registry
+    /// row yet). On success, the caller must eventually call
+    /// [`release_task`](Registry::release_task) with the same `repo`/`task`
+    /// exactly once: either explicitly on a failure path, or immediately once
+    /// the spawn's registry row goes live (from then on the live row itself
+    /// carries the ownership, matching how `try_reserve_wip`/
+    /// `try_reserve_lane_wip` hand off to the live count).
+    pub fn try_reserve_task(&mut self, repo: &str, task: &str) -> Result<(), String> {
+        if task.is_empty() {
+            return Ok(());
+        }
+        if let Some(owner) = self.live_task_owner(repo, task) {
+            return Err(owner.to_string());
+        }
+        let key = Self::task_key(repo, task);
+        if !self.task_reservations.insert(key) {
+            return Err(String::new());
+        }
+        Ok(())
+    }
+
+    /// Release a reservation taken by [`try_reserve_task`](Registry::try_reserve_task).
+    /// `repo`/`task` must match the paired call (`task == ""` reserved
+    /// nothing, so releases nothing).
+    pub fn release_task(&mut self, repo: &str, task: &str) {
+        if task.is_empty() {
+            return;
+        }
+        self.task_reservations.remove(&Self::task_key(repo, task));
+    }
+
+    /// NUL-joined key for the `(repo, task, workflow_instance)` triple
+    /// [`try_reserve_review_task`](Registry::try_reserve_review_task) admits
+    /// against. Distinct from [`task_key`](Registry::task_key) by construction
+    /// (it always carries a third NUL-separated segment, even when
+    /// `workflow_instance` is absent), so the two key shapes can never
+    /// collide in `task_reservations`.
+    fn review_task_key(repo: &str, task: &str, workflow_instance: Option<&str>) -> String {
+        format!("{repo}\u{0}{task}\u{0}{}", workflow_instance.unwrap_or(""))
+    }
+
+    /// Same as [`live_task_owner`](Registry::live_task_owner), but additionally
+    /// requires the candidate row's `workflow_instance` to match
+    /// `workflow_instance` exactly (both `None`, or both the identical `Some`
+    /// id). This is what lets the Review lane's dedup positively distinguish an
+    /// intentional additional reviewer generation from a genuine duplicate
+    /// dispatch of the identical one — see
+    /// [`try_reserve_review_task`](Registry::try_reserve_review_task).
+    fn live_review_task_owner(
+        &self,
+        repo: &str,
+        task: &str,
+        workflow_instance: Option<&str>,
+    ) -> Option<&str> {
+        self.agents
+            .values()
+            .find(|r| {
+                r.repo_name == repo
+                    && r.task.as_deref() == Some(task)
+                    && r.state.is_live()
+                    && r.workflow_instance.as_deref() == workflow_instance
+            })
+            .map(|r| r.name.as_str())
+    }
+
+    /// The Review lane's counterpart to
+    /// [`try_reserve_task`](Registry::try_reserve_task) (TKT-hodag-rofaj-komol).
+    /// A blanket `(repo, task)` key is wrong for reviewers: shadow review
+    /// (`landing.rs launch_shadow_review`) deliberately runs a second live
+    /// reviewer against the identical task for comparison, and review-death
+    /// retry (`landing.rs request_review_retry`) deliberately dispatches a
+    /// replacement before the dead generation's row is guaranteed to have
+    /// settled out of `is_live()` — both are legitimate multi-generation
+    /// patterns the plain task key would have wrongly refused.
+    ///
+    /// The landing pipeline already mints a distinct, deterministic
+    /// `workflow_instance` id per logical reviewer generation for the same
+    /// task (`landing::review_instance_id` for the primary,
+    /// `landing::review_retry_instance_id` for each retry, that id plus
+    /// `-shadow` for the shadow) — see `docs/2026-09-08-tkt-hodag-rofaj-komol-review-lane-dedup.md`.
+    /// Keying the reservation on `(repo, task, workflow_instance)` instead of
+    /// just `(repo, task)` admits all three of those without change, while
+    /// still refusing a second spawn that repeats the identical
+    /// `workflow_instance` (including two `None`s, the shape of a manual or
+    /// tier-routed reviewer dispatch outside any workflow) — the actual
+    /// accidental-duplicate case this ticket closes.
+    ///
+    /// Same empty-`task`/refusal/release contract as `try_reserve_task`; pair
+    /// with [`release_review_task`](Registry::release_review_task).
+    pub fn try_reserve_review_task(
+        &mut self,
+        repo: &str,
+        task: &str,
+        workflow_instance: Option<&str>,
+    ) -> Result<(), String> {
+        if task.is_empty() {
+            return Ok(());
+        }
+        if let Some(owner) = self.live_review_task_owner(repo, task, workflow_instance) {
+            return Err(owner.to_string());
+        }
+        let key = Self::review_task_key(repo, task, workflow_instance);
+        if !self.task_reservations.insert(key) {
+            return Err(String::new());
+        }
+        Ok(())
+    }
+
+    /// Release a reservation taken by
+    /// [`try_reserve_review_task`](Registry::try_reserve_review_task).
+    /// `repo`/`task`/`workflow_instance` must match the paired call
+    /// (`task == ""` reserved nothing, so releases nothing).
+    pub fn release_review_task(&mut self, repo: &str, task: &str, workflow_instance: Option<&str>) {
+        if task.is_empty() {
+            return;
+        }
+        self.task_reservations
+            .remove(&Self::review_task_key(repo, task, workflow_instance));
+    }
+
+    /// Lane-dispatching release: the Implementation lane's reservation is
+    /// keyed on `(repo, task)` alone ([`release_task`](Registry::release_task)),
+    /// the Review lane's additionally on `workflow_instance`
+    /// ([`release_review_task`](Registry::release_review_task)). Pairs with
+    /// whichever of [`try_reserve_task`](Registry::try_reserve_task) /
+    /// [`try_reserve_review_task`](Registry::try_reserve_review_task) admitted
+    /// for `lane` in [`Supervisor::spawn`](crate::supervisor::Supervisor::spawn).
+    pub(crate) fn release_task_for_lane(
+        &mut self,
+        repo: &str,
+        lane: Lane,
+        task: &str,
+        workflow_instance: Option<&str>,
+    ) {
+        match lane {
+            Lane::Implementation => self.release_task(repo, task),
+            Lane::Review => self.release_review_task(repo, task, workflow_instance),
         }
     }
 
