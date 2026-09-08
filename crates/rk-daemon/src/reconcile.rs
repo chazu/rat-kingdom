@@ -217,6 +217,19 @@ pub struct HandoffFacts {
     pub admission_grace_secs: i64,
     pub completions: Vec<CompletionHandoff>,
     pub landings: Vec<LandingHandoff>,
+    /// `ticket.identity -> every spelling that names it`
+    /// ([`crate::tickets::Tickets::id_spellings`]), pre-resolved by the
+    /// caller so this module stays pure. `landing.task`/`completion.task`
+    /// are captured verbatim from whatever spelling their caller used at
+    /// spawn/enqueue time — a legacy ticket's `TKT-<ULID>` identity or its
+    /// proquint alias — never canonicalized. Matching them against the raw
+    /// ticket identity alone misses a handoff recorded under the other
+    /// spelling and lets a real in-flight handoff read as abandoned
+    /// (`kind::TERMINAL_ASSIGNEE_ACTIVE_WORK`, `Authority::Orchestrator`,
+    /// inviting a live redispatch onto work that already landed or
+    /// completed). A ticket identity missing from this map falls back to
+    /// itself as its only spelling.
+    pub id_spellings: HashMap<String, Vec<String>>,
 }
 
 /// Git's own answer to the questions this module needs asked of it,
@@ -742,9 +755,15 @@ fn terminal_assignee_with_handoffs(
             continue;
         }
         let spawn = agent.spawn_id().to_string();
+        let default_spellings = [ticket.identity.clone()];
+        let spellings: &[String] = facts
+            .id_spellings
+            .get(&ticket.identity)
+            .map(Vec::as_slice)
+            .unwrap_or(&default_spellings);
 
         if let Some(landing) = facts.landings.iter().find(|landing| {
-            landing.task == ticket.identity
+            spellings.iter().any(|spelling| spelling == &landing.task)
                 && landing.source_spawn.as_deref() == Some(spawn.as_str())
         }) {
             handoffs.push(ActiveHandoff {
@@ -759,7 +778,9 @@ fn terminal_assignee_with_handoffs(
         }
 
         let completion = facts.completions.iter().find(|completion| {
-            completion.task == ticket.identity
+            spellings
+                .iter()
+                .any(|spelling| spelling == &completion.task)
                 && completion.agent == agent.name
                 && completion.spawn == spawn
         });
@@ -1146,6 +1167,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
             landings: Vec::new(),
+            id_spellings: HashMap::new(),
         };
 
         let report = build_with_handoffs(
@@ -1182,6 +1204,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
             landings: Vec::new(),
+            id_spellings: HashMap::new(),
         };
 
         let report = build_with_handoffs(
@@ -1221,6 +1244,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
             landings: Vec::new(),
+            id_spellings: HashMap::new(),
         };
 
         let report = build_with_handoffs(
@@ -1280,6 +1304,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: Vec::new(),
             landings: vec![exact.clone()],
+            id_spellings: HashMap::new(),
         };
         let report = build_with_handoffs(
             "myrepo",
@@ -1320,6 +1345,90 @@ mod tests {
         );
         assert_eq!(report.violations.len(), 1);
         assert!(report.handoffs.is_empty());
+    }
+
+    /// `landing.task`/`completion.task` are captured verbatim from whatever
+    /// spelling their caller used at spawn/enqueue time. A legacy ticket
+    /// addressed by its proquint alias has handoff records keyed on the
+    /// alias while `ticket.identity` stays the canonical `TKT-<ULID>`
+    /// spelling; without `HandoffFacts::id_spellings` neither raw `==`
+    /// comparison matches, and a genuine in-flight handoff reads as
+    /// abandoned instead.
+    #[test]
+    fn handoffs_match_across_legacy_alias_spellings() {
+        let now = Utc::now();
+        let ulid_id = "TKT-01J000000000000000000404";
+        let alias = "kuvip-dozor-fitat-samun";
+        let t = ticket(
+            ulid_id,
+            "myrepo",
+            "in_progress",
+            serde_json::json!({"assignee": "Whisker"}),
+        );
+        let mut spellings = HashMap::new();
+        spellings.insert(
+            ulid_id.to_string(),
+            vec![ulid_id.to_string(), alias.to_string()],
+        );
+
+        // Landing recorded under the alias.
+        let a = agent("Whisker", Some(ulid_id), AgentState::Completed);
+        let landing_facts = HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: vec![LandingHandoff {
+                task: alias.to_string(),
+                source_spawn: Some(a.spawn_id().to_string()),
+                status: "awaiting_review".into(),
+                age_secs: 5,
+            }],
+            id_spellings: spellings.clone(),
+        };
+        let report = build_with_handoffs(
+            "myrepo",
+            std::slice::from_ref(&t),
+            std::slice::from_ref(&a),
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &landing_facts,
+        );
+        assert!(
+            report.violations.is_empty(),
+            "alias-spelled landing must be recognized as an in-flight handoff, not a violation"
+        );
+        assert_eq!(report.handoffs[0].phase, "landing");
+
+        // Completion recorded under the alias.
+        let mut rat = a.clone();
+        rat.role = "rat".into();
+        let event = clean_completion(&rat, alias, now - chrono::Duration::seconds(30));
+        let completion_facts = HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
+            landings: Vec::new(),
+            id_spellings: spellings,
+        };
+        let report = build_with_handoffs(
+            "myrepo",
+            &[t],
+            &[rat],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &completion_facts,
+        );
+        assert!(
+            report.violations.is_empty(),
+            "alias-spelled completion must be recognized as an in-flight handoff, not a violation"
+        );
+        assert_eq!(report.handoffs[0].phase, "completion_pending_admission");
     }
 
     #[test]

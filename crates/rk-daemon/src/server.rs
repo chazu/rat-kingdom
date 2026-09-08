@@ -3982,11 +3982,26 @@ impl Daemon {
             .max(300)
             .try_into()
             .unwrap_or(i64::MAX);
+        // Pre-resolved here, not inside `reconcile::build_with_handoffs`,
+        // because that module is a pure function over already-scanned data
+        // with no `Tickets`/space access of its own (see its module doc).
+        // `landing.task`/`completion.task` are captured verbatim from
+        // whatever spelling their caller used at spawn/enqueue time — a
+        // legacy ticket's `TKT-<ULID>` identity or its proquint alias.
+        let id_spellings: HashMap<String, Vec<String>> = tickets
+            .iter()
+            .filter_map(|ticket| {
+                let spellings = self.tickets.id_spellings(&ticket.identity).ok()?;
+                Some((ticket.identity.clone(), spellings))
+            })
+            .collect();
+
         let handoff_facts = crate::reconcile::HandoffFacts {
             now: (self.request_clock)(),
             admission_grace_secs,
             completions,
             landings: landing_handoffs,
+            id_spellings,
         };
 
         // Both branch-shaped self-clearing checks reuse the exact machinery
