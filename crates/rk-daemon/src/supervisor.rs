@@ -8270,6 +8270,52 @@ mod respawn_tests {
             .contains("does not support trusted mid-session steering"));
     }
 
+    /// `interrupt` is harness-agnostic (every `runner::launch`-based adapter
+    /// always wires a `kill_tx`, unlike the steer channel), but this proves
+    /// it end to end against a live maki session over the same
+    /// `Supervisor::interrupt` path an `agent.interrupt` RPC uses, rather
+    /// than assuming the generic mechanism happens to cover maki too.
+    #[tokio::test]
+    async fn interrupt_stops_a_live_maki_session() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "maki".into();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let fake_maki = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            fake_maki.path(),
+            "#!/bin/sh\ntrap 'exit 0' INT\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fake_maki.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let mut env = HashMap::new();
+        env.insert(
+            "RK_MAKI_BIN".into(),
+            fake_maki.path().to_string_lossy().into_owned(),
+        );
+        let spec = LaunchSpec {
+            prompt: "do the task".into(),
+            cwd: repo.path().to_path_buf(),
+            env,
+            ..Default::default()
+        };
+        let session = make_harness("maki").unwrap().launch(&spec).unwrap();
+        sup.track_session("Nibble", session.control.clone());
+
+        sup.interrupt("Nibble")
+            .await
+            .expect("a live maki session must accept SIGINT");
+        assert_eq!(sup.status("Nibble").unwrap().state, AgentState::Stopped);
+    }
+
     /// Probe O6/O8, REVIEWER path: a reviewer that pauses must not fail its
     /// review workflow, and a genuinely dead one must still terminalize.
     ///
