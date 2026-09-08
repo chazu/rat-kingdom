@@ -70,7 +70,7 @@ pub fn orchestrator_action_for(v: &Violation) -> Option<&'static str> {
         // the backlog so a live rat can pick it back up. Exactly the
         // "redispatch" judgment call `reconcile.rs` names as this kind's
         // reason for Orchestrator authority.
-        kind::TERMINAL_ASSIGNEE_ACTIVE_WORK => Some("ticket.reopen_if_in_progress"),
+        kind::TERMINAL_ASSIGNEE_ACTIVE_WORK => Some("ticket.repair_clear_stale_ownership"),
         // The dispatch decision `landing_conflict.rs`'s own doc comment
         // names as needing fleet-wide context: a bounded correction agent
         // was evidenced and held (`LandingPipeline::dispatch_held_conflict`)

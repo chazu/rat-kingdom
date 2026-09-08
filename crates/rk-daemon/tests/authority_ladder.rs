@@ -766,6 +766,11 @@ async fn orchestrator_fixture_resolves_through_the_lease_and_a_rate_held_decisio
     assert_eq!(result_a["held"], false);
     let ticket_a = get_ticket(&mut client, "TKT-ORCH-A").await;
     assert_eq!(ticket_a["payload"]["status"], "open");
+    assert_eq!(
+        ticket_a["payload"]["assignee"],
+        Value::Null,
+        "the terminal owner must be cleared or the same violation immediately reappears"
+    );
 
     // The lease's cursor advanced past item_a's own id.
     let lease_after_a = client
@@ -818,6 +823,7 @@ async fn orchestrator_fixture_resolves_through_the_lease_and_a_rate_held_decisio
     assert_eq!(resumed["held"], false);
     let ticket_b_resolved = get_ticket(&mut client, "TKT-ORCH-B").await;
     assert_eq!(ticket_b_resolved["payload"]["status"], "open");
+    assert_eq!(ticket_b_resolved["payload"]["assignee"], Value::Null);
     let resolved_updated_at = ticket_b_resolved["payload"]["updated_at"].clone();
 
     // NOW it is resolved and self-cleared: `terminal-assignee-active-work`
@@ -825,7 +831,7 @@ async fn orchestrator_fixture_resolves_through_the_lease_and_a_rate_held_decisio
     // decision journal is consulted BEFORE a fresh report is ever built, so
     // a further decide call for the SAME id still returns the same terminal
     // record as `replay: true` — not "not found" — and never calls
-    // `Tickets::reopen_if_in_progress` again.
+    // `Tickets::repair_clear_stale_ownership` again.
     let replay = decide(&mut client, repo, &id_b, Some("orch-1"), Some(generation))
         .await
         .unwrap();

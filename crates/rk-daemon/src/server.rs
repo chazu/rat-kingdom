@@ -6094,17 +6094,73 @@ impl Daemon {
         }
     }
 
-    /// The one registered orchestrator repair this tracer bullet wires up:
-    /// hand the ticket back to the backlog via the SAME atomic CAS the B9
-    /// orphaned-ticket sweep uses, so a live rat can redispatch it.
+    /// Registered orchestrator repairs. Stale ownership is cleared through
+    /// the evidence-fenced `(status, assignee)` CAS rather than the older
+    /// status-only reopen: leaving the terminal assignee attached makes the
+    /// same contradiction reappear as soon as the ticket returns to active
+    /// work.
     async fn execute_orchestrator(
         &self,
         v: &crate::reconcile::Violation,
     ) -> rk_core::Result<String> {
         match v.kind.as_str() {
             crate::reconcile::kind::TERMINAL_ASSIGNEE_ACTIVE_WORK => {
-                let reopened = self.tickets.reopen_if_in_progress(&v.subject).await?;
-                Ok(format!("{} reopened: {reopened}", v.subject))
+                let ticket = self.tickets.get(&v.subject)?.ok_or_else(|| {
+                    rk_core::Error::other(format!("{} no longer exists", v.subject))
+                })?;
+                let status = ticket
+                    .payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("open")
+                    .to_string();
+                if !matches!(status.as_str(), "claimed" | "in_progress") {
+                    return Err(rk_core::Error::other(format!(
+                        "{} ownership repair drifted: status is now {status}",
+                        v.subject
+                    )));
+                }
+                let assignee = ticket
+                    .payload
+                    .get("assignee")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let agents = self.supervisor.list();
+                let owner =
+                    crate::reconcile::resolve_owner(&v.subject, assignee.as_deref(), &agents)
+                        .filter(|owner| owner.state.is_archivable())
+                        .ok_or_else(|| {
+                            rk_core::Error::other(format!(
+                                "{} ownership repair drifted: no terminal owner remains",
+                                v.subject
+                            ))
+                        })?;
+                let evidenced_owner = v
+                    .evidence
+                    .iter()
+                    .find_map(|entry| entry.strip_prefix("agent:"));
+                if evidenced_owner != Some(owner.name.as_str()) {
+                    return Err(rk_core::Error::other(format!(
+                        "{} ownership repair drifted: evidenced owner {:?}, current owner {}",
+                        v.subject, evidenced_owner, owner.name
+                    )));
+                }
+                match self
+                    .tickets
+                    .repair_clear_stale_ownership(&v.subject, &status, assignee.as_deref())
+                    .await?
+                {
+                    crate::tickets::CasOutcome::Applied(_) => {
+                        Ok(format!("{} reopened and stale assignee cleared", v.subject))
+                    }
+                    crate::tickets::CasOutcome::Drifted { detail } => Err(rk_core::Error::other(
+                        format!("{} ownership repair drifted: {detail}", v.subject),
+                    )),
+                    crate::tickets::CasOutcome::Gone => Err(rk_core::Error::other(format!(
+                        "{} no longer exists",
+                        v.subject
+                    ))),
+                }
             }
             // `v.subject` is the held branch (`reconcile::conflict_held_landing`'s
             // own violation shape); `dispatch_held_conflict` is the only
