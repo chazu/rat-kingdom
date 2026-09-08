@@ -230,4 +230,19 @@ mod tests {
         }
         assert!(role_harness_profile(GROOMER_ROLE, "jcode").is_err());
     }
+
+    /// Maki v1 has no tested allow-list/enforced read-only profile, so every
+    /// restricted role must fail closed by construction: no arm in the
+    /// `match harness` for "maki" means the fallback `other` case always
+    /// returns an error, before any durable spawn side effect. This locks
+    /// that omission in as a regression guard rather than relying on it
+    /// staying accidentally true.
+    #[test]
+    fn restricted_roles_fail_closed_for_maki_pending_a_tested_read_only_profile() {
+        for role in [ONBOARDER_ROLE, DIAGNOSTICIAN_ROLE, GROOMER_ROLE] {
+            let error = role_harness_profile(role, "maki")
+                .expect_err("maki has no enforced read-only mode yet");
+            assert!(error.to_string().contains("no enforced read-only mode"));
+        }
+    }
 }

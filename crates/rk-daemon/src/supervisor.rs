@@ -209,9 +209,11 @@ fn default_permission_mode(harness: &str) -> &'static str {
         "claude" => "bypassPermissions",
         // A rat's coordination contract includes `rk done`, tuple writes, and
         // ticket operations. Codex's workspace-write sandbox blocks the Unix
-        // socket outside the worktree, while jcode exposes no narrower enforced
-        // sandbox. Record the full authority both harnesses actually need.
-        "codex" | "jcode" => "danger-full-access",
+        // socket outside the worktree, jcode exposes no narrower enforced
+        // sandbox, and Maki's own permission modes stop short of what a
+        // headless, unattended rat needs to reach it either. Record the full
+        // authority all three harnesses actually need.
+        "codex" | "jcode" | "maki" => "danger-full-access",
         _ => "workspace-write",
     }
 }
@@ -289,7 +291,7 @@ fn respawn_permission_mode(record: &AgentRecord) -> rk_core::Result<String> {
 }
 
 fn validate_permission_mode(harness: &str, permission_mode: &str) -> rk_core::Result<()> {
-    if !matches!(harness, "codex" | "jcode") {
+    if !matches!(harness, "codex" | "jcode" | "maki") {
         return Ok(());
     }
 
@@ -5369,9 +5371,38 @@ impl Supervisor {
         }
     }
 
+    /// A harness's transport can end up with a live control channel for a
+    /// reason unrelated to trusted mid-session steering — Maki's stream-json
+    /// input mode has no CLI-argument prompt, so its adapter wires the same
+    /// channel purely to deliver the one unavoidable initial message, even
+    /// though `caps().steer` stays `false` because Maki drops the
+    /// daemon-authenticated `rk_control` side-band metadata that makes a
+    /// steer turn verifiable. A live `steer_tx` is therefore not proof an
+    /// operator's mid-session guidance is trusted or even distinguishable
+    /// from ordinary conversation text; `caps().steer` is the actual signal,
+    /// and this must be checked before ever handing an operator's message to
+    /// that channel. The adapter's own internal initial-prompt delivery calls
+    /// `SessionControl::steer` directly on its session handle and never goes
+    /// through here, so it is unaffected by this gate.
+    fn assert_steerable(&self, name: &str) -> rk_core::Result<()> {
+        let harness_kind = self
+            .lock_registry()
+            .get(name)
+            .map(|r| r.harness.clone())
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if make_harness(&harness_kind)?.caps().steer {
+            Ok(())
+        } else {
+            Err(rk_core::Error::other(format!(
+                "{harness_kind} does not support trusted mid-session steering"
+            )))
+        }
+    }
+
     pub async fn steer(&self, name: &str, message: &str) -> rk_core::Result<()> {
         let control = self.lock_controls().get(name).cloned();
         if let Some(control) = control {
+            self.assert_steerable(name)?;
             return control.steer(message).await;
         }
         // Attach-mode rats steer through their herdr pane.
@@ -5407,6 +5438,7 @@ impl Supervisor {
     ) -> rk_core::Result<()> {
         let control = self.lock_controls().get(name).cloned();
         if let Some(control) = control {
+            self.assert_steerable(name)?;
             return control.steer_envelope(envelope).await;
         }
         if self
@@ -7631,6 +7663,7 @@ mod respawn_tests {
     fn autonomous_harnesses_default_to_socket_capable_permission_modes() {
         assert_eq!(default_permission_mode("codex"), "danger-full-access");
         assert_eq!(default_permission_mode("jcode"), "danger-full-access");
+        assert_eq!(default_permission_mode("maki"), "danger-full-access");
         assert_eq!(default_permission_mode("claude"), "bypassPermissions");
     }
 
@@ -7840,9 +7873,94 @@ mod respawn_tests {
         assert_eq!(onboarder.permission_mode, "plan");
     }
 
+    /// Mirrors `jcode_global_defaults_apply_to_direct_spawn_and_survive_respawn`
+    /// for Maki: profile/direct precedence resolves to `danger-full-access`
+    /// (translated by the adapter into Maki's `--dangerously-skip-permissions`),
+    /// respawn carries the same model/mode forward via `respawn_permission_mode`
+    /// preserving whatever is durably recorded, and a restricted role explicitly
+    /// requesting `maki` is rejected before any durable spawn side effect
+    /// rather than silently widening into an unrestricted mutable harness.
+    #[test]
+    fn maki_global_defaults_apply_to_direct_spawn_and_survive_respawn() {
+        let profile = AgentProfile {
+            harness: Some("maki".into()),
+            model: Some("anthropic/claude-fable-5.1".into()),
+            permission_mode: Some("danger-full-access".into()),
+        };
+        let mut params = SpawnParams {
+            repo: "/tmp/repo".into(),
+            task: "task".into(),
+            prompt: None,
+            role: "rat".into(),
+            coordination: None,
+            harness: None,
+            parent: None,
+            base: None,
+            review: None,
+            model: None,
+            permission_mode: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+            profile: None,
+            resolved_profile: None,
+        };
+
+        let worker = effective_agent_config("claude", &profile, &params).unwrap();
+        assert_eq!(worker.harness, "maki");
+        assert_eq!(worker.model.as_deref(), Some("anthropic/claude-fable-5.1"));
+        assert_eq!(worker.permission_mode, "danger-full-access");
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let repo = Repo::discover(repo_dir.path()).unwrap();
+        let record = spawning_record(SpawnJournal {
+            params: &params,
+            repo: &repo,
+            repo_name: "repo".into(),
+            name: "Nibble".into(),
+            branch: "rat/nibble/task".into(),
+            fork_point: "base".into(),
+            worktree: repo_dir.path().join("worktree"),
+            target_branch: "main".into(),
+            harness: worker.harness,
+            model: worker.model,
+            permission_mode: worker.permission_mode,
+        });
+        assert_eq!(record.model.as_deref(), Some("anthropic/claude-fable-5.1"));
+        assert_eq!(
+            record.permission_mode.as_deref(),
+            Some("danger-full-access")
+        );
+        assert_eq!(
+            respawn_permission_mode(&record).unwrap(),
+            "danger-full-access"
+        );
+        assert!(make_harness(&record.harness).unwrap().caps().resume);
+
+        params.model = Some("anthropic/claude-haiku-4-5".into());
+        params.permission_mode = Some("bypassPermissions".into());
+        let direct_override = effective_agent_config("claude", &profile, &params).unwrap();
+        assert_eq!(direct_override.harness, "maki");
+        assert_eq!(
+            direct_override.model.as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+        assert_eq!(direct_override.permission_mode, "bypassPermissions");
+
+        params.role = ONBOARDER_ROLE.into();
+        params.harness = Some("maki".into());
+        params.model = None;
+        params.permission_mode = None;
+        let onboarder = effective_agent_config("claude", &profile, &params)
+            .expect_err("a restricted role explicitly requesting maki must fail closed");
+        assert!(onboarder.to_string().contains("no enforced read-only mode"));
+    }
+
     #[test]
     fn full_access_harnesses_reject_modes_that_block_or_misstate_rk_socket_access() {
-        for harness in ["codex", "jcode"] {
+        for harness in ["codex", "jcode", "maki"] {
             assert!(validate_permission_mode(harness, "danger-full-access").is_ok());
             assert!(validate_permission_mode(harness, "bypassPermissions").is_ok());
             for mode in ["read-only", "workspace-write"] {
@@ -7877,6 +7995,12 @@ mod respawn_tests {
             permission_mode("onboarder", "unknown").is_err(),
             "a harness without an enforced read-only mode must fail closed"
         );
+        assert!(
+            permission_mode("onboarder", "maki").is_err(),
+            "maki has no tested read-only profile yet and must fail closed for restricted roles"
+        );
+        assert!(permission_mode("diagnostician", "maki").is_err());
+        assert!(permission_mode("groomer", "maki").is_err());
         assert_eq!(
             permission_mode("rat", "codex").unwrap(),
             "danger-full-access"
@@ -8022,6 +8146,128 @@ mod respawn_tests {
         let settled = sup.status("Nibble").unwrap();
         assert_eq!(settled.state, AgentState::Completed);
         assert_eq!(settled.usage, usage);
+    }
+
+    /// Maki serializes an unpriced/failed-before-billing turn as
+    /// `total_cost_usd: 0`, and its adapter already maps that to `cost_usd:
+    /// None` rather than `Some(0.0)` (see `maki::parse_event_line`) so this
+    /// generic `Completed` handling never even sees an authoritative zero to
+    /// apply. This test proves the daemon side of that contract end to end:
+    /// the incremental, pricing-table-driven estimate `Usage` accumulated
+    /// survives a `Completed` event that carries no self-reported cost,
+    /// instead of a zero silently overwriting real accounting and defeating
+    /// a USD budget cap.
+    #[test]
+    fn a_zero_or_absent_maki_cost_never_overwrites_the_pricing_based_estimate() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "maki".into();
+        rec.model = Some("haiku".into());
+        rec.state = AgentState::Running;
+        let generation = rec.created_at;
+        let spawn = rec.spawn_id();
+        sup.lock_registry().insert(rec).unwrap();
+
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Usage {
+                usage: TokenUsage {
+                    input: 10_000,
+                    output: 5_000,
+                    ..Default::default()
+                },
+            },
+        );
+        let accumulated = sup.status("Nibble").unwrap().cost_usd;
+        assert!(
+            accumulated > 0.0,
+            "the vendored haiku price must have accumulated a nonzero estimate"
+        );
+
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Completed {
+                result: "API error (402): insufficient credit".into(),
+                is_error: true,
+                usage: TokenUsage::default(),
+                cost_usd: None,
+                session_id: Some("s-1".into()),
+            },
+        );
+
+        assert_eq!(
+            sup.status("Nibble").unwrap().cost_usd,
+            accumulated,
+            "a Completed event with no self-reported cost must never reset accounting to zero"
+        );
+    }
+
+    /// Maki wires its control channel purely to deliver the one
+    /// CLI-argument-less initial prompt (see `maki::launch`), so
+    /// `SessionControl::can_steer()` is true even though `caps().steer` is
+    /// `false` because Maki drops the daemon-authenticated `rk_control`
+    /// side-band that makes a steer turn verifiable. `Supervisor::steer`/
+    /// `steer_envelope` must consult the capability, not the channel, before
+    /// ever handing an operator's mid-session message to Maki.
+    #[tokio::test]
+    async fn steer_is_rejected_for_maki_despite_its_live_initial_prompt_channel() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "maki".into();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let fake_maki = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            fake_maki.path(),
+            "#!/bin/sh\ntrap 'exit 0' INT\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fake_maki.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let mut env = HashMap::new();
+        env.insert(
+            "RK_MAKI_BIN".into(),
+            fake_maki.path().to_string_lossy().into_owned(),
+        );
+        let spec = LaunchSpec {
+            prompt: "do the task".into(),
+            cwd: repo.path().to_path_buf(),
+            env,
+            ..Default::default()
+        };
+        let session = make_harness("maki").unwrap().launch(&spec).unwrap();
+        assert!(
+            session.control.can_steer(),
+            "maki's channel is wired for its own initial-prompt delivery"
+        );
+        sup.track_session("Nibble", session.control.clone());
+
+        let error = sup.steer("Nibble", "please also run the tests").await;
+        let error = error.expect_err("caps().steer=false must reject operator steering");
+        assert!(error
+            .to_string()
+            .contains("does not support trusted mid-session steering"));
+
+        let envelope = ControlEnvelope::new("m1", "operator", "Nibble", "g1", "g1", "also this");
+        let error = sup.steer_envelope("Nibble", &envelope).await;
+        let error = error.expect_err("caps().steer=false must reject the typed path too");
+        assert!(error
+            .to_string()
+            .contains("does not support trusted mid-session steering"));
     }
 
     /// Probe O6/O8, REVIEWER path: a reviewer that pauses must not fail its
