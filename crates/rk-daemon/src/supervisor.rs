@@ -10245,9 +10245,9 @@ mod respawn_tests {
         let admitted = results.iter().filter(|r| r.is_ok()).count();
         let refused = results
             .iter()
-            .filter(|r| {
-                matches!(r, Err(e) if e.to_string().starts_with(DUPLICATE_TASK_REFUSED_PREFIX))
-            })
+            .filter(
+                |r| matches!(r, Err(e) if e.to_string().starts_with(DUPLICATE_TASK_REFUSED_PREFIX)),
+            )
             .count();
         assert_eq!(
             admitted, 1,
