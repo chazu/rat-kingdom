@@ -231,3 +231,70 @@ async fn gated_merge_rejection_ends_cleanly_unmerged() {
     );
     // See the sibling test: RK_FAKE_HARNESS_CMD is intentionally left set.
 }
+
+/// A parked gate's `inbox.list` row carries the launching ticket's canonical
+/// identity (TKT-rahit-hihud-vusuv) — the workflow instance stays the row's
+/// `subject`; `ticket` is additional authoritative evidence resolved from the
+/// instance's own `taskId` launch param against the real ticket store, not
+/// from agent bookkeeping or a guess.
+#[tokio::test]
+async fn gated_merge_gate_row_carries_the_launching_ticket_identity() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = init_repo();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
+
+    // Same registered name `register_repo` gave the daemon, so the ticket's
+    // scope matches the instance's own repo scope.
+    let repo_scope = repo_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let created = client
+        .call(
+            "ticket.new",
+            json!({"title": "risky merge", "scope": repo_scope}),
+        )
+        .await
+        .unwrap();
+    let ticket_id = created["ticket"]["identity"].as_str().unwrap().to_string();
+
+    let id = run_to_gate(&mut client, repo_dir.path(), &ticket_id).await;
+
+    let inbox = client.call("inbox.list", json!({})).await.unwrap();
+    let rows = inbox["items"].as_array().unwrap();
+    let gate = rows
+        .iter()
+        .find(|r| r["kind"] == "workflow-gate" && r["subject"] == id)
+        .expect("parked gate row must be in the inbox");
+    assert_eq!(gate["ticket"], json!(ticket_id));
+
+    // `work.current` re-buckets the same row and must preserve the field.
+    let current = client.call("work.current", json!({})).await.unwrap();
+    let all_current: Vec<&serde_json::Value> = ["actionable", "decision_required", "stalled"]
+        .iter()
+        .flat_map(|bucket| current[bucket].as_array().into_iter().flatten())
+        .collect();
+    let current_gate = all_current
+        .iter()
+        .find(|r| r["kind"] == "workflow-gate" && r["subject"] == id)
+        .expect("parked gate row must be in work.current");
+    assert_eq!(current_gate["ticket"], json!(ticket_id));
+
+    // Clean up: unpark so the daemon shutdown doesn't leave a dangling agent.
+    client
+        .call(
+            "workflow.approve",
+            json!({"instance": id, "approved": false, "by": "operator", "reason": "test cleanup"}),
+        )
+        .await
+        .unwrap();
+    wait_completed(&mut client, &id).await;
+}

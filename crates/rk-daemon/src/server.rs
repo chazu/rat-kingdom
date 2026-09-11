@@ -282,6 +282,7 @@ fn current_work_classifies_every_inbox_row_without_silent_drops() {
             urgency: 1,
             kind: "source-kind".into(),
             subject: "subject".into(),
+            ticket: None,
             scope: "repo".into(),
             detail: "detail".into(),
             disposition,
@@ -4003,6 +4004,18 @@ impl Daemon {
                 now: chrono::Utc::now(),
             },
         );
+        // Resolve the workflow-gate rows' authoritative ticket identity here,
+        // not inside `build`: only the daemon holds `&self.tickets`, and
+        // `inbox::build` stays a pure function with no storage access so its
+        // ~30 existing test/reconcile/landing call sites are untouched by
+        // this producer (TKT-rahit-hihud-vusuv).
+        for item in items.iter_mut() {
+            if item.kind == "workflow-gate" {
+                if let Some(instance) = instances.iter().find(|i| i.id == item.subject) {
+                    item.ticket = crate::inbox::resolve_gate_ticket(instance, &self.tickets);
+                }
+            }
+        }
         items.extend(crate::inbox::recovery_action_rows(
             &recovery_actions,
             &recovery_acks,

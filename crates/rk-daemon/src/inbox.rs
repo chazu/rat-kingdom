@@ -80,6 +80,15 @@ pub struct InboxItem {
     pub kind: String,
     /// Subject the row is about (agent name, instance id, or tuple identity).
     pub subject: String,
+    /// The ticket this row's work is authoritatively bound to, if any —
+    /// currently populated only for a `workflow-gate` row whose parked
+    /// instance launched with a `taskId` param that resolves (via
+    /// [`crate::tickets::Tickets::resolve`], same-repo only) to a real
+    /// ticket. `None` covers every other row kind, an unresolved/foreign/
+    /// ambiguous `taskId`, and a gate with no `taskId` at all — this field
+    /// is authoritative evidence, never a guess, so absence must read as
+    /// "unknown", not "no ticket".
+    pub ticket: Option<String>,
     /// Isolation scope (usually a repo name).
     pub scope: String,
     /// One-line description of what needs attention.
@@ -124,10 +133,11 @@ impl InboxItem {
 impl Serialize for InboxItem {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut row = serializer.serialize_struct("InboxItem", 7)?;
+        let mut row = serializer.serialize_struct("InboxItem", 8)?;
         row.serialize_field("urgency", &self.urgency)?;
         row.serialize_field("kind", &self.kind)?;
         row.serialize_field("subject", &self.subject)?;
+        row.serialize_field("ticket", &self.ticket)?;
         row.serialize_field("scope", &self.scope)?;
         row.serialize_field("detail", &self.detail)?;
         row.serialize_field("disposition", &self.disposition)?;
@@ -289,6 +299,7 @@ pub fn build(
             urgency: urgency::FAILED,
             kind: kind.into(),
             subject: a.name.clone(),
+            ticket: None,
             scope: a.repo_name.clone(),
             detail,
             disposition,
@@ -304,6 +315,12 @@ pub fn build(
                 urgency: urgency::PARKED_GATE,
                 kind: "workflow-gate".into(),
                 subject: i.id.clone(),
+                // Resolved by the caller (`server.rs::inbox_value`), which
+                // alone holds `&Tickets` — see `resolve_gate_ticket`. Left
+                // unresolved here so this pure builder needs no daemon
+                // storage access and every other test/caller of `build`
+                // stays untouched.
+                ticket: None,
                 scope: repo_name(&i.repo),
                 detail: format!(
                     "{} parked at approval gate (step {})",
@@ -352,6 +369,7 @@ pub fn build(
             urgency,
             kind: "obstacle".into(),
             subject: t.identity.clone(),
+            ticket: None,
             scope: t.scope.clone(),
             detail,
             disposition: InboxDisposition::stalled(format!(
@@ -387,6 +405,7 @@ pub fn build(
             urgency: urgency::NEED,
             kind: "need".into(),
             subject: t.identity.clone(),
+            ticket: None,
             scope: t.scope.clone(),
             detail: text.to_string(),
             disposition: InboxDisposition::stalled(if rk_core::bbs::is_question(t) {
@@ -465,6 +484,7 @@ pub fn build(
             urgency: urgency::AWAITING_REVIEW,
             kind: "awaiting-review".into(),
             subject: branch.unwrap_or(&t.identity).to_string(),
+            ticket: None,
             scope: t.scope.clone(),
             detail,
             disposition: InboxDisposition::stalled(action),
@@ -535,6 +555,7 @@ pub fn build(
             urgency: urgency::UNLANDED,
             kind: "unlanded-branch".into(),
             subject: branch.to_string(),
+            ticket: None,
             scope: t.scope.clone(),
             detail: format!("land did not merge {branch} → {target}: {why}"),
             disposition: InboxDisposition::stalled(advice),
@@ -547,6 +568,42 @@ pub fn build(
     // spawn time, instances by start time, tuples oldest-first) within a rank.
     items.sort_by_key(|b| std::cmp::Reverse(b.urgency));
     items
+}
+
+/// The authoritative ticket a parked `workflow-gate` row's instance is bound
+/// to, if any. Called by the caller of [`build`] (`server.rs::inbox_value`,
+/// which alone holds `&Tickets`) for each `workflow-gate` row it just built,
+/// keyed back to its instance by `InboxItem::subject == Instance::id`.
+///
+/// The only source consulted is the instance's own launch param — `taskId`,
+/// the one key every shipped workflow definition sets (`examples/workflows/
+/// *.cue`) — resolved through [`crate::tickets::Tickets::resolve`], which
+/// already canonicalizes a legacy ULID ticket's deterministic proquint alias
+/// to its one true identity. `taskId` is free text a caller can set to
+/// anything (a title, a slug), so three cases all fail closed to `None`
+/// rather than inventing an association:
+///
+/// - no `taskId` param, or one that names no ticket at all (`resolve` ->
+///   `Ok(None)`, e.g. a hand-run `--param taskId=risky-change`);
+/// - an ambiguous legacy alias (`resolve` -> `Err`, ` .ok()` folds this to
+///   `None` rather than guessing between the collision's two tickets);
+/// - a real ticket that resolves, but in a DIFFERENT repo scope than this
+///   instance's own — a `taskId` collision across two isolated repos must
+///   never borrow evidence from an unrelated ticket.
+///
+/// Returns the ticket's canonical durable identity (never the caller's raw
+/// spelling), so every consumer compares against one spelling regardless of
+/// which alias the workflow happened to launch with.
+pub(crate) fn resolve_gate_ticket(
+    instance: &Instance,
+    tickets: &crate::tickets::Tickets,
+) -> Option<String> {
+    let raw = instance.params.get("taskId")?.as_str()?;
+    let ticket = tickets.resolve(raw).ok().flatten()?;
+    if ticket.scope != repo_name(&instance.repo) {
+        return None;
+    }
+    Some(ticket.identity)
 }
 
 /// One row for an agent whose generation is mid (or exhausted from) a
@@ -580,6 +637,7 @@ fn transport_outage_item(a: &AgentRecord, outage: &TransportOutageState) -> Inbo
         urgency,
         kind: "transport-outage".into(),
         subject: a.name.clone(),
+        ticket: None,
         scope: a.repo_name.clone(),
         detail: format!(
             "{} pre-work transport failure ({:?}), attempt {} — {status}",
@@ -614,6 +672,7 @@ fn transport_outage_need_item(t: &Tuple) -> InboxItem {
         urgency: urgency::FAILED,
         kind: "transport-outage".into(),
         subject: t.identity.clone(),
+        ticket: None,
         scope: t.scope.clone(),
         detail: format!(
             "{provider} pre-work transport failure ({class}), attempt {attempts} — \
@@ -717,6 +776,7 @@ fn open_suggestions(ballots: &Ballots<'_>) -> Vec<InboxItem> {
             urgency: urgency::OPEN_SUGGESTION,
             kind: "open-suggestion".into(),
             subject: t.identity.clone(),
+            ticket: None,
             scope: t.scope.clone(),
             detail: format!(
                 "{count}/{} endorsers{} — {by} proposes: {text}",
@@ -759,6 +819,7 @@ pub(crate) fn stalled_landing_queue_rows(
             urgency: urgency::LANDING_QUEUE_STALLED,
             kind: "landing-queue-stalled".into(),
             subject: format!("{} → {}", q.repo, q.target),
+            ticket: None,
             scope: q.repo.clone(),
             detail: format!(
                 "{} queued, oldest ({}) waiting {}",
@@ -965,6 +1026,7 @@ fn unresolved_workflow_failures(instances: &[Instance]) -> Vec<InboxItem> {
                 urgency: urgency::FAILED,
                 kind: "workflow-failed".into(),
                 subject: newest.id.clone(),
+                ticket: None,
                 scope: repo_name(&newest.repo),
                 detail,
                 disposition: InboxDisposition::stalled(action),
@@ -1060,6 +1122,7 @@ pub fn recovery_action_rows(actions: &[Tuple], acks: &[Tuple]) -> Vec<InboxItem>
                 urgency,
                 kind: "recovery-action".into(),
                 subject,
+                ticket: None,
                 scope: t.scope.clone(),
                 detail,
                 disposition: InboxDisposition::actionable(format!("rk inbox ack {id}")),
@@ -1100,9 +1163,11 @@ fn repo_name(repo: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tickets::Tickets;
     use chrono::Utc;
-    use rk_core::tuple::{Category, Tuple};
+    use rk_core::tuple::{Category, Lifecycle, Tuple};
     use rk_harness::TokenUsage;
+    use rk_space::Space;
 
     fn agent(name: &str, state: AgentState) -> AgentRecord {
         AgentRecord {
@@ -1174,6 +1239,119 @@ mod tests {
             trigger: None,
             stale_timeout_secs: None,
         }
+    }
+
+    /// Write a raw ticket tuple directly to `space`, skipping `Tickets::create`
+    /// so a test can name either a proquint or a ULID-shaped legacy identity.
+    fn seed_ticket(space: &Space, scope: &str, identity: &str) -> Tuple {
+        let payload = json!({
+            "title": "t",
+            "status": "open",
+            "parent": null,
+            "priority": "normal",
+            "labels": Vec::<String>::new(),
+            "depends_on": Vec::<String>::new(),
+            "assignee": null,
+            "created_by": "castle",
+            "created_at": "2026-08-19T00:00:00Z",
+            "updated_at": "2026-08-19T00:00:00Z",
+        });
+        let tuple = Tuple::new(Category::Task, scope, identity, "castle", payload)
+            .with_lifecycle(Lifecycle::Session);
+        space.out(tuple.clone()).unwrap();
+        tuple
+    }
+
+    fn with_task_id(mut i: Instance, task_id: &str) -> Instance {
+        i.params.insert("taskId".into(), json!(task_id));
+        i
+    }
+
+    #[test]
+    fn resolve_gate_ticket_binds_a_taskid_that_resolves_in_the_same_repo() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        let ticket = seed_ticket(&space, "repo", "TKT-babad-bisub-lodob");
+        let i = with_task_id(
+            instance("wf-gate", InstanceStatus::Running, Some("approval")),
+            &ticket.identity,
+        );
+        assert_eq!(
+            resolve_gate_ticket(&i, &tickets),
+            Some(ticket.identity.clone())
+        );
+    }
+
+    #[test]
+    fn resolve_gate_ticket_canonicalizes_a_legacy_alias_spelling() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        let legacy = seed_ticket(&space, "repo", "TKT-01J000000000000000000001");
+        let alias = tickets
+            .alias_of(&legacy)
+            .expect("legacy ticket has an alias");
+        // The workflow launched with the ALIAS spelling; the row must still
+        // report the one true durable identity, not the caller's spelling.
+        let i = with_task_id(
+            instance("wf-gate", InstanceStatus::Running, Some("approval")),
+            &alias,
+        );
+        assert_eq!(resolve_gate_ticket(&i, &tickets), Some(legacy.identity));
+    }
+
+    #[test]
+    fn resolve_gate_ticket_is_none_without_evidence() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+
+        // No taskId param at all.
+        let no_param = instance("wf-gate", InstanceStatus::Running, Some("approval"));
+        assert_eq!(resolve_gate_ticket(&no_param, &tickets), None);
+
+        // A taskId that names no ticket — the common case, a free-text slug
+        // like the examples/workflows/*.cue docs use.
+        let untracked = with_task_id(
+            instance("wf-gate", InstanceStatus::Running, Some("approval")),
+            "risky-change",
+        );
+        assert_eq!(resolve_gate_ticket(&untracked, &tickets), None);
+    }
+
+    #[test]
+    fn resolve_gate_ticket_refuses_a_foreign_repo_ticket() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        // Ticket lives in a different repo scope than the instance ("repo",
+        // set by the `instance()` helper via its /home/x/dev/repo path).
+        let ticket = seed_ticket(&space, "other-repo", "TKT-babad-bisub-lodob");
+        let i = with_task_id(
+            instance("wf-gate", InstanceStatus::Running, Some("approval")),
+            &ticket.identity,
+        );
+        assert_eq!(resolve_gate_ticket(&i, &tickets), None);
+    }
+
+    #[test]
+    fn resolve_gate_ticket_refuses_an_ambiguous_legacy_alias() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        // A verified FNV-1a-64 (low 48 bits) collision, reused from
+        // tickets.rs's own `resolve_refuses_an_ambiguous_alias_collision` —
+        // these two distinct ULID-shaped identities alias to the exact same
+        // proquint spelling.
+        let one = seed_ticket(&space, "repo", "TKT-0000000000000000000172232D");
+        let two = seed_ticket(&space, "repo", "TKT-000000000000000000060BC260");
+        let alias_one = tickets.alias_of(&one).unwrap();
+        assert_eq!(
+            alias_one,
+            tickets.alias_of(&two).unwrap(),
+            "test fixture assumption broken: these identities no longer collide"
+        );
+        let i = with_task_id(
+            instance("wf-gate", InstanceStatus::Running, Some("approval")),
+            &alias_one,
+        );
+        assert_eq!(resolve_gate_ticket(&i, &tickets), None);
     }
 
     fn obstacle(identity: &str, payload: serde_json::Value) -> Tuple {
