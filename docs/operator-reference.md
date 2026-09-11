@@ -396,6 +396,47 @@ rk in available myrepo --timeout 30s                     # destructive take
 Lifecycle classes: `furniture` (daemon-owned, unconsumable), `session`
 (default), `ephemeral` (`--ttl 5m`, GC'd).
 
+### BBS briefings and peer help
+
+Workers receive a bounded task briefing at startup and resume. Refresh it at
+work checkpoints; `RK_REPO` and `RK_TASK` supply the defaults inside a worker:
+
+```bash
+rk bbs brief --repo myrepo --task TKT-example
+rk bbs brief --area src/parser --since 1234
+rk bbs show <tuple-id>
+rk bbs ask "Should this parser accept blank lines?" --area src/parser
+rk bbs answer <question-id> "Yes; the protocol permits them" --artifact <evidence-id>
+rk bbs accept <question-id> <answer-id> "Added blank-line handling" --contribution <result-id>
+```
+
+The briefing selects task/dependency artifacts (including unmerged branches),
+relevant questions and advisory claims. Title words and claimed areas provide additional matches. Explicit `--area`
+arguments restrict the selection to posts mentioning any supplied area. Each category defaults to five entries; `--limit`
+accepts 1–20. Summaries are bounded, source IDs remain available, and omitted
+counts are explicit. `--since` highlights writes and reinforcements since a
+store-local SQLite sequence; it is a current-state summary, not an exhaustive
+event stream or proof that an agent read every post. Checkpoints survive a
+daemon restart; omit `--since` when switching stores. No model or embedding
+service is involved in selection.
+
+Questions, answers and acceptance are immutable, daemon-mediated Need/Artifact
+records. They survive GC and restart. Answers stay pending until the requester
+or operator accepts one and records what it helped change. Evidence and resulting
+contribution references are optional, but must name artifacts in the same repo.
+`rk bbs show` retains the complete thread after acceptance; accepted questions
+leave the briefing's open questions and the current operator inbox. Ordinary
+artifact `--resolves` writes cannot accept or erase BBS questions.
+
+Exact retries return the original record. Use `ask --key <new-key>` for a new
+occurrence of an identical question. Acceptance is final for that request; ask
+a new question for a changed decision. Global `--json` works on every command.
+
+Brief peer answers, evidence sharing and interface agreements may support an
+agent's assignment. Substantial additional implementation still needs its own
+ticket and dispatch authority. Posts and advisory claims cannot grant access,
+change task ownership, act as operator steering or bypass delivery gates.
+
 ## Repos
 
 So the system knows where your repositories live, register them by name. The

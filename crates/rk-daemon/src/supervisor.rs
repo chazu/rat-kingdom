@@ -1813,6 +1813,7 @@ impl Supervisor {
             base: Some(instruction_base.clone()),
             review: params.review.clone(),
             parent: params.parent.clone(),
+            briefing: self.bbs_briefing(&repo_name, Some(&params.task)),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
             verification_checks: self.scan_verification_checks(&worktree),
@@ -2204,6 +2205,7 @@ impl Supervisor {
             base: Some(instruction_base),
             review: record.review.clone(),
             parent: record.parent.clone(),
+            briefing: self.bbs_briefing(&record.repo_name, record.task.as_deref()),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
             verification_checks: self.scan_verification_checks(&worktree),
@@ -3083,6 +3085,21 @@ impl Supervisor {
             }
             if floor_usage.total() > usage.total() {
                 *usage = floor_usage;
+            }
+        }
+    }
+
+    fn bbs_briefing(&self, repo: &str, task: Option<&str>) -> Option<rk_core::bbs::Briefing> {
+        let task = task?;
+        match crate::bbs::brief(
+            &self.space,
+            &self.tickets,
+            &crate::bbs::BriefParams::for_task(repo, task),
+        ) {
+            Ok(briefing) => Some(briefing),
+            Err(error) => {
+                warn!(%error, repo, task, "BBS briefing unavailable; worker can retry rk bbs brief");
+                None
             }
         }
     }
@@ -4392,6 +4409,7 @@ impl Supervisor {
             base: Some(instruction_base),
             review: record.review.clone(),
             parent: record.parent.clone(),
+            briefing: self.bbs_briefing(&record.repo_name, record.task.as_deref()),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
             verification_checks: self.scan_verification_checks(&worktree),

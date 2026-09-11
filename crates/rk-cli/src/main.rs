@@ -2,6 +2,7 @@
 
 mod agent_cmds;
 mod attention_cmds;
+mod bbs_cmds;
 mod critical_path;
 mod factory_cmds;
 mod factory_dashboard;
@@ -62,6 +63,11 @@ enum Command {
     Rd(space_cmds::ReadArgs),
     /// List all matching tuples (non-blocking; --hot/--top rank strongest-first).
     Scan(space_cmds::HotScanArgs),
+    /// Discover peer work and exchange help through the tuplespace.
+    Bbs {
+        #[command(subcommand)]
+        command: bbs_cmds::BbsCommand,
+    },
     /// Stream tuples live as they are written.
     Watch(space_cmds::ScanArgs),
     /// Read or follow bounded coordinator attention and middle-rat rollups.
@@ -970,6 +976,7 @@ fn print_prime(role: String, json_output: bool) -> Result<()> {
         base: std::env::var("RK_BASE").ok(),
         review: review_context_from_env(),
         parent: std::env::var("RK_PARENT").ok(),
+        briefing: None,
         facts: Vec::new(),
         // `rk prime` inspects the template shape; live conventions are scanned
         // and injected by the supervisor at spawn time.
@@ -1137,6 +1144,7 @@ async fn main() -> Result<()> {
         Command::Rd(args) => {
             space_cmds::blocking_read(&layout, args, false, cli.json, &castle_display).await?
         }
+        Command::Bbs { command } => bbs_cmds::run(&layout, command, cli.json).await?,
         Command::Scan(args) => space_cmds::scan(&layout, args, cli.json, &castle_display).await?,
         Command::Watch(args) => space_cmds::watch(&layout, args).await?,
         Command::Monitor(args) => {

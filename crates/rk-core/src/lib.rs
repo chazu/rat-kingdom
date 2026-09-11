@@ -1,6 +1,7 @@
 //! Core types for rat-kingdom: tuple model, ids, errors, config, and path layout.
 
 pub mod action;
+pub mod bbs;
 pub mod config;
 pub mod error;
 pub mod exec;

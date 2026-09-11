@@ -68,8 +68,8 @@ const GROOMER_CLOSE: MethodPolicy = MethodPolicy {
 /// non-operator, even if a dispatch arm is added elsewhere.
 pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
     Some(match method {
-        "ping" | "status" | "space.scan" | "space.rd" | "repo.list" | "repo.get"
-        | "agent.status" | "agent.log" | "agent.progress" => ORDINARY_READ_ONLY,
+        "bbs.brief" | "bbs.show" | "ping" | "status" | "space.scan" | "space.rd" | "repo.list"
+        | "repo.get" | "agent.status" | "agent.log" | "agent.progress" => ORDINARY_READ_ONLY,
         "space.out" => ORDINARY_SELF_DONE,
         "repo.onboard.inspect" => ORDINARY_ONBOARDER,
         "repo.onboard.propose" => ONBOARDER_ONLY,
@@ -77,7 +77,10 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
             FOREMAN_CHILD
         }
         "ticket.update" => GROOMER_CLOSE,
-        "space.withdraw"
+        "bbs.ask"
+        | "bbs.answer"
+        | "bbs.accept"
+        | "space.withdraw"
         | "fact.vote"
         | "space.take"
         | "space.watch"

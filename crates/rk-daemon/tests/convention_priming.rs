@@ -70,6 +70,69 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"captured p
 }
 
 #[tokio::test]
+async fn bbs_briefing_refreshes_on_worker_resume() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    scratch_repo(repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", capture_prime());
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
+    let scope = repo.path().file_name().unwrap().to_string_lossy();
+    client.call("space.out", json!({"category":"artifact","scope":scope,"identity":"interface","instance":"peer","payload":{"task":"bbs-resume","summary":"Initial interface evidence"}})).await.unwrap();
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({"repo":repo.path(),"task":"bbs-resume","harness":"fake"}),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap();
+    let branch = spawned["agent"]["branch"].as_str().unwrap();
+    for _ in 0..250 {
+        let status = client
+            .call("agent.status", json!({"name":name}))
+            .await
+            .unwrap();
+        if status["agent"]["state"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let first = git_out(repo.path(), &["show", &format!("{branch}:primed.txt")]);
+    assert!(first.contains("Initial interface evidence"));
+    client.call("space.out",json!({"category":"artifact","scope":scope,"identity":"new-interface","instance":"peer","payload":{"task":"bbs-resume","summary":"New evidence after the first turn"}})).await.unwrap();
+    client
+        .call("agent.respawn", json!({"name":name}))
+        .await
+        .unwrap();
+    let mut refreshed = false;
+    for _ in 0..250 {
+        let status = client
+            .call("agent.status", json!({"name":name}))
+            .await
+            .unwrap();
+        if status["agent"]["state"] == "completed" {
+            let current = git_out(repo.path(), &["show", &format!("{branch}:primed.txt")]);
+            if current.contains("New evidence after the first turn") {
+                refreshed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refreshed, "resumed worker must receive fresh peer evidence");
+    client
+        .call("agent.dismiss", json!({"name":name}))
+        .await
+        .unwrap();
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn promoted_convention_reaches_spawned_rat_prompt() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
@@ -117,6 +180,11 @@ async fn promoted_convention_reaches_spawned_rat_prompt() {
         )
         .await
         .unwrap();
+
+    let peer_artifact = client.call("space.out", json!({
+        "category":"artifact", "scope":repo_scope, "identity":"peer-interface",
+        "instance":"peer", "payload":{"task":"prime-1", "summary":"Peer discovered a newline interface", "branch":"rat/peer/interface"}
+    })).await.unwrap();
 
     let spawned = client
         .call(
@@ -206,6 +274,10 @@ async fn promoted_convention_reaches_spawned_rat_prompt() {
     }
 
     let primed = git_out(repo_dir.path(), &["show", "main:primed.txt"]);
+    assert!(primed.contains("Peer discovered a newline interface"));
+    assert!(primed.contains(peer_artifact["id"].as_str().unwrap()));
+    assert!(primed.contains("rat/peer/interface"));
+    assert!(primed.contains("rk bbs brief --since"));
     assert!(
         primed.contains("## Standing conventions"),
         "prompt should carry a Standing conventions section:\n{primed}"

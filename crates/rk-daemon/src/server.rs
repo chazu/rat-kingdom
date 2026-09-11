@@ -830,6 +830,7 @@ pub struct Daemon {
     coordinator_sessions: std::sync::Mutex<crate::coordinator::CoordinatorSessions>,
     /// Serializes read/append cycles for one agent's effective fact vote.
     fact_vote_lock: std::sync::Mutex<()>,
+    bbs_write_lock: std::sync::Mutex<()>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
     request_clock: RequestClock,
@@ -1328,6 +1329,7 @@ impl Daemon {
             tickets,
             coordinator_sessions,
             fact_vote_lock: std::sync::Mutex::new(()),
+            bbs_write_lock: std::sync::Mutex::new(()),
             started: Instant::now(),
             shutdown_tx,
             request_clock: Utc::now,
@@ -3034,6 +3036,47 @@ impl Daemon {
                 self.supervisor.set_dispatch_paused(false);
                 reply(Response::ok(id, json!({"paused": false})))
             }
+            "bbs.ask" | "bbs.answer" | "bbs.accept" => {
+                let _guard = self
+                    .bbs_write_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let record = self.supervisor.status(&req.caller);
+                reply(
+                    match crate::bbs::write(
+                        &self.space,
+                        &self.tickets,
+                        &req.caller,
+                        record.as_ref(),
+                        &req.method,
+                        &req.params,
+                    ) {
+                        Ok(result) => Response::ok(id, result),
+                        Err(error) => Response::err(id, error.code, error.message),
+                    },
+                )
+            }
+            "bbs.brief" => {
+                let result =
+                    parse_params::<crate::bbs::BriefParams>(&req.params).and_then(|params| {
+                        crate::bbs::brief(&self.space, &self.tickets, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(briefing) => Response::ok(id, json!(briefing)),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.show" => {
+                let result = req.params["id"]
+                    .as_str()
+                    .ok_or_else(|| "tuple id required".to_string())
+                    .and_then(|id| crate::bbs::show(&self.space, id).map_err(|e| e.to_string()));
+                reply(match result {
+                    Ok(tuple) => Response::ok(id, tuple),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
             "space.out" => reply(self.handle_out(req)),
             "ingest.event" => reply(self.handle_ingest_event(req)),
             "ingest.state" => reply(self.handle_ingest_state(req)),
@@ -3675,6 +3718,16 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return Err(e),
         };
+        // Accepted BBS requests remain durable history, not current needs.
+        let mut open_needs = Vec::with_capacity(needs.len());
+        for need in needs {
+            if !rk_core::bbs::is_question(&need)
+                || !crate::bbs::question_accepted(&self.space, &need)?
+            {
+                open_needs.push(need);
+            }
+        }
+        needs = open_needs;
         // Open PRs/MRs: a PR-mode landing emits a `pull_request_opened`
         // event, then the run completes — nothing else tracks the pushed branch.
         let pull_requests =
@@ -10029,6 +10082,18 @@ impl Daemon {
                 // so `fromAgent` consumers can use one trustworthy join key.
                 payload.insert("spawn".into(), json!(record.spawn_id()));
             }
+        }
+        if is_agent
+            && (params.payload.get("bbs_kind").is_some()
+                || ["bbs-question-", "bbs-answer-", "bbs-accept-"]
+                    .iter()
+                    .any(|prefix| params.identity.starts_with(prefix)))
+        {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "BBS lifecycle records must use rk bbs ask/answer/accept",
+            );
         }
         if is_agent && params.category == Category::Artifact && params.identity == "review" {
             if let Some(review) = self

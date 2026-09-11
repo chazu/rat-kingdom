@@ -16,6 +16,16 @@ daemon **reactor** as the keystone. Most of the work below was delivered by the
 fleet reviewing and merging *itself* through the steward loop (see _How this was
 built_).
 
+### BBS collaboration (2026-09-10)
+
+- Task-scoped peer briefings now accompany worker startup/resume, with
+  `rk bbs brief` for checkpoint refreshes and `rk bbs show` for source evidence.
+- Durable `rk bbs ask`, `answer`, and requester-controlled `accept` preserve
+  question/answer/contribution links, with retry-safe writes and no automatic
+  acceptance when a peer posts an answer.
+- Worker guidance explicitly permits bounded peer assistance while retaining
+  assignment ownership, role restrictions and delivery gates.
+
 ### Removed
 
 - **`axe` harness adapter** — deleted (`rk-harness/src/axe.rs`, the `axe` arm of

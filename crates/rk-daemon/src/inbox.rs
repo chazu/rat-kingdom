@@ -389,10 +389,11 @@ pub fn build(
             subject: t.identity.clone(),
             scope: t.scope.clone(),
             detail: text.to_string(),
-            disposition: InboxDisposition::stalled(format!(
-                "rk scan need {}",
-                command_arg(&t.scope)
-            )),
+            disposition: InboxDisposition::stalled(if rk_core::bbs::is_question(t) {
+                format!("rk bbs show {}", t.id)
+            } else {
+                format!("rk scan need {}", command_arg(&t.scope))
+            }),
         });
     }
 

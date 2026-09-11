@@ -754,7 +754,7 @@ impl Reactor {
         }
         let mut buckets: HashMap<(String, String), Bucket> = HashMap::new();
         for t in all {
-            if t.instance == REACTOR_INSTANCE {
+            if t.instance == REACTOR_INSTANCE || rk_core::bbs::is_question(t) {
                 continue;
             }
             if !matches!(t.category, Category::Obstacle | Category::Need) {
@@ -908,6 +908,11 @@ impl Reactor {
         let Some(wall) = self.find_wall(target)? else {
             return Ok(false);
         };
+        // BBS acceptance is requester-owned and retains the whole thread.
+        // A generic --resolves artifact cannot consume that question.
+        if rk_core::bbs::is_question(&wall) {
+            return Ok(false);
+        }
         let Some(text) = wall.payload.get("text").and_then(Value::as_str) else {
             return Ok(false);
         };
