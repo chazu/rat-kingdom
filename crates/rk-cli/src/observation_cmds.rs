@@ -1302,7 +1302,11 @@ fn advance_sample_progress(
             .insert(key.clone());
         let declared_since = landing_wait_since(sample, &agent)
             .into_iter()
-            .chain(declared_gate_wait_since(interventions, &agent, sample.observed_at))
+            .chain(declared_gate_wait_since(
+                interventions,
+                &agent,
+                sample.observed_at,
+            ))
             .min();
         let (reading, state) = advance_progress_state(
             states.get(&key),
@@ -1505,7 +1509,8 @@ fn derive_sample_metrics_with_interventions(
     for previous in prior {
         advance_sample_progress(&mut states, previous, &manifest.thresholds, interventions);
     }
-    let progress = advance_sample_progress(&mut states, sample, &manifest.thresholds, interventions);
+    let progress =
+        advance_sample_progress(&mut states, sample, &manifest.thresholds, interventions);
     derive_metrics_with_ready_age(
         sample,
         manifest,
@@ -3440,11 +3445,15 @@ mod tests {
             1
         );
         let mut samples = vec![first.clone(), second.clone()];
-        assert_eq!(replay_progress(&mut samples, &manifest.thresholds, &[]).len(), 1);
+        assert_eq!(
+            replay_progress(&mut samples, &manifest.thresholds, &[]).len(),
+            1
+        );
         assert_eq!(samples[1].metrics.progress_stalled_tickets, 1);
         // Starting observation after the wait expired is already a stall.
         assert_eq!(
-            advance_sample_progress(&mut BTreeMap::new(), &second, &manifest.thresholds, &[]).stalled,
+            advance_sample_progress(&mut BTreeMap::new(), &second, &manifest.thresholds, &[])
+                .stalled,
             1
         );
         let mut missing = first;
@@ -3854,11 +3863,15 @@ mod tests {
         // never excuse.
         let mut wrong_ticket = matching.clone();
         wrong_ticket.ticket = Some("TKT-2".into());
-        assert!(declared_gate_wait_since(std::slice::from_ref(&wrong_ticket), &agent, now).is_none());
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&wrong_ticket), &agent, now).is_none()
+        );
 
         let mut wrong_owner = matching.clone();
         wrong_owner.owner = Some("Other-Rat".into());
-        assert!(declared_gate_wait_since(std::slice::from_ref(&wrong_owner), &agent, now).is_none());
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&wrong_owner), &agent, now).is_none()
+        );
 
         let mut missing_owner = matching.clone();
         missing_owner.owner = None;
@@ -3869,7 +3882,9 @@ mod tests {
 
         let mut wrong_spawn = matching.clone();
         wrong_spawn.spawn = Some("S2".into());
-        assert!(declared_gate_wait_since(std::slice::from_ref(&wrong_spawn), &agent, now).is_none());
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&wrong_spawn), &agent, now).is_none()
+        );
 
         let mut missing_spawn = matching.clone();
         missing_spawn.spawn = None;
@@ -3880,7 +3895,9 @@ mod tests {
 
         let mut wrong_class = matching.clone();
         wrong_class.class = InterventionClass::AdHoc;
-        assert!(declared_gate_wait_since(std::slice::from_ref(&wrong_class), &agent, now).is_none());
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&wrong_class), &agent, now).is_none()
+        );
 
         // A declaration recorded after the sample it would apply to cannot
         // retroactively excuse that earlier sample.
