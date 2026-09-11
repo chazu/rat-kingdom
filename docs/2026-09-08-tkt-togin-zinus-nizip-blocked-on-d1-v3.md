@@ -33,14 +33,14 @@ this dispatch (Crumb-14), independent of the two prior holds below:
 
 This is the **third** recorded hold on this exact ticket:
 1. Gouda-14 (commit `cbfbed2`) reached the same conclusion but that dispatch's
-   branch never landed — `steward-protected-paths` timed out acquiring the
+   branch never landed — `landing-protected-paths` timed out acquiring the
    verification admission queue (WIP limit 1), a landing-pipeline problem, not
    a content one (per Burrow-14's `nofop-decomposition-reverified-2`,
    artifact `01M20RC4D1X9WFSC5ZF66WFHTJ`).
 2. Cinder-14 (commit `a8f5bce`, artifact `held-pending-d1`
    `01M20MVGGB67VPZDPNKK6F8RE6`) reached the same conclusion; that branch also
    never merged into main (also hit a `gate-failure` on
-   `steward-protected-paths`, artifact `01M20NZ2NV0JAA675QVYTJCVZR`, WIP limit
+   `landing-protected-paths`, artifact `01M20NZ2NV0JAA675QVYTJCVZR`, WIP limit
    1 again).
 
 ## Disposition

@@ -99,7 +99,7 @@ async fn diagnostician_is_confined_to_reading() {
         ("agent.steer", json!({"name": name, "text": "go"})),
         ("repo.add", json!({"path": "/tmp"})),
         ("ticket.new", json!({"title": "t"})),
-        ("workflow.run", json!({"name": "steward"})),
+        ("workflow.run", json!({"name": "landing"})),
         (
             "space.out",
             json!({"scope": "r", "category": "artifact", "identity": "finding",

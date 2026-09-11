@@ -182,7 +182,7 @@ The cost ledger under-reports terminal spend by **5.2×** ($3.85 recorded vs
 $20.04 actual) and tier routing + E5's caps + E7's per-day economics all
 read it. A control loop with a 5× sensor error is urgent by definition.
 **The final-rollup fix is a dependency of E5 and of E7's measurements.**
-`rk ticket reopen` (explicit, operator/steward-only) rides along.
+`rk ticket reopen` (explicit, operator/landing-only) rides along.
 
 ## E7. The drain week — falsifiable this time ⟨R⟩
 

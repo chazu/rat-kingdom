@@ -21,7 +21,7 @@ did not create speculative second-level work:
 | TKT-142 | Focused repair plus repo-wide inventory children | Keep repair separate from adding the doc gate. |
 | TKT-152 | Three cross-domain read children | Keep representation, API threading, and compatibility verification separate. |
 | TKT-155 | Unpin retest plus gossip-topic design children | Keep the mechanical check separate from the design decision. |
-| TKT-179 | Diff-scope plus land-result gate children | Keep the two steward gates independently verifiable. |
+| TKT-179 | Diff-scope plus land-result gate children | Keep the two landing gates independently verifiable. |
 
 TKT-85 remains intentionally open even though its direct work is split: it is
 the dependency gate for the P14/P15 tier, not a work item to close casually.

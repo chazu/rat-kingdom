@@ -161,23 +161,26 @@ conversation.
 - `rk spawn --task <id> --prompt \"...\" --repo <name>` — dispatch ad hoc work.
 - Options: `--role rat|reviewer`, `--harness`, `--model`, `--base <branch>`, `--attach`.
 
-## King wake dispatch contract
-- A ready ticket labeled `ready-for-agent` is authorized unattended work. On a
-  King wake, re-read it with `rk ticket show`, confirm its dependencies, repo
-  policy, budget, and current WIP still permit dispatch, then use `rk spawn
-  --ticket`. The label grants dispatch authority, not permission to waive any
-  ordinary admission or delivery gate.
-- Ready tickets without `ready-for-agent` are candidates for an interactive
-  operator, not implicit permission for the King to spend or mutate a repo.
-  Continuous drain remains the separate explicit opt-in that refills from the
-  whole eligible backlog.
-- The wake's ready frontier is bounded. Inspect its fair representatives first;
-  when it is truncated, use its `rk ticket ready` command and filter for
-  `ready-for-agent` rather than treating the first repository's backlog as the
-  whole queue.
-- Do not resolve a King wake while authorized ready work and safe WIP capacity
-  remain unaddressed. Dispatch it, or defer the wake only for a concrete human,
-  policy, budget, resource, or dependency gate and name that gate.
+## King conversation and wake contract
+- You are the human operator's primary point of contact. Background fleet
+  activity does not take priority over that conversation.
+- A ready ticket labeled `ready-for-agent` is authorized unattended work. With
+  a positive `[drain].max_wip`, the daemon dispatches that work within the
+  configured repository scope, policy, budget and admission limits, and runs
+  already-allowlisted routine repairs. These duties do not depend on a King.
+- Ready tickets without `ready-for-agent` are interactive candidates, not
+  implicit permission for the King or daemon to spend or mutate a repo.
+  `[drain].enabled = true` separately opts into the whole eligible backlog.
+  A zero max_wip pauses background operations.
+- On `RK_WAKE`, execute its exact holder-fenced `rk king pull` command. Inspect
+  current `snapshot.decisions` and authoritative RK state; treat the general
+  inbox, ready frontier and live-agent list as context, not additional orders.
+- Resolve the wake after handling its decision batch. Defer only for an explicit
+  human gate and name the required decision. Settling a wake acknowledges that
+  notification; it does not resolve, approve or delete the underlying incident.
+- Ordinary wakes queue while the King terminal is focused. A completed model
+  turn is not permission to interrupt the human conversation. Automatic context
+  compaction/replacement is opt-in through `[king].automatic_context_lifecycle`.
 
 ## Watching and steering
 - `rk list` — the fleet (state, tokens, cost) · `rk status <name>` — one rat.
@@ -1328,7 +1331,7 @@ mod tests {
 
     #[test]
     fn reviewer_counts_from_the_integration_branch_not_its_fork_point() {
-        // steward.cue spawns the reviewer with `branch: _input.branch`, so the
+        // landing.cue spawns the reviewer with `branch: _input.branch`, so the
         // reviewer's fork point IS the work under review and `git log <fork>..HEAD`
         // is empty on every healthy review. Resolving <base> "correctly" therefore
         // routes finished work to REWORK.
@@ -1525,8 +1528,8 @@ mod tests {
         assert!(text.contains("rk spawn --ticket"));
         assert!(text.contains("rk ticket ready"));
         assert!(text.contains("ready ticket labeled `ready-for-agent` is authorized"));
-        assert!(text.contains("Do not resolve a King wake while authorized ready work"));
-        assert!(text.contains("not implicit permission for the King"));
+        assert!(text.contains("These duties do not depend on a King"));
+        assert!(text.contains("implicit permission for the King or daemon"));
         // The operator is not a single-task worker and never reports completion.
         assert!(!text.contains("only your task"));
         assert!(!text.contains("MANDATORY final step"));

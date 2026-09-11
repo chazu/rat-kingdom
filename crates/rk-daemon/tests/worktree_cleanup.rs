@@ -2,7 +2,7 @@
 //! instance terminalization, the orphan-sweep safety checks, and the
 //! disk-pressure spawn guard.
 //!
-//! Root cause of the 2026-08-16 incident: steward/workflow failure paths skip
+//! Root cause of the 2026-08-16 incident: landing/workflow failure paths skip
 //! their own `dismiss` step, so a terminal agent's worktree (and its
 //! multi-GB cargo `target/`) can persist indefinitely — 104 of them, 298 GB,
 //! drove the disk to 97% full and the daemon started failing writes. These

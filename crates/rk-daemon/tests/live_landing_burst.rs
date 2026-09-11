@@ -80,14 +80,14 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
 "#;
 
 /// Installs the daemon-native landing pipeline's real completion feed
-/// (`examples/triggers-landing-pipeline.cue`'s `steward-landing-on-completion`
+/// (`examples/triggers-landing-pipeline.cue`'s `landing-on-completion`
 /// trigger, repo-local) as a repo-registered `.rk/triggers.cue` — the
 /// reactor resolves repo-local trigger files the same way it resolves the
 /// global directory (`Reactor::trigger_files`).
 const LANDING_TRIGGER: &str = r#"
 triggers: [
 	{
-		name:   "steward-landing-on-completion"
+		name:   "landing-on-completion"
 		action: "land"
 		match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
 		maxFires: 20
@@ -112,8 +112,8 @@ async fn many_concurrent_completions_on_one_key_serialize_through_the_live_daemo
     let checks = format!(
         r#"
 checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "test -f \"{marker}\" && echo overlap >> \"{log}\"; touch \"{marker}\"; sleep 0.15; rm -f \"{marker}\"", timeout: "30s"}},
 ]
 "#,

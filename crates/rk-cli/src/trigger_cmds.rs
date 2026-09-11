@@ -10,7 +10,7 @@
 //!
 //! This exists to close a named gap in the daemon-native landing pipeline
 //! cutover (docs/proposals/daemon-native-landing-pipeline.md §6.5): swapping
-//! `steward-on-completion` for `steward-landing-on-completion` was a manual
+//! `legacy-landing-on-completion` for `landing-on-completion` was a manual
 //! file copy with no tooling to confirm the old trigger definition was
 //! actually removed from a deployment afterward. A stale copy left behind
 //! keeps matching the identical `harness_result` predicate the replacement
@@ -188,8 +188,8 @@ pub struct ConflictsReport {
 /// with it. Two triggers matching the same tuple both fire in full on every
 /// match, double-dispatching — the hazard named by
 /// docs/proposals/daemon-native-landing-pipeline.md §6.2 step 3 (e.g. the
-/// retired `steward-on-completion` left deployed alongside its replacement
-/// `steward-landing-on-completion`, both matching the identical
+/// retired `legacy-landing-on-completion` left deployed alongside its replacement
+/// `landing-on-completion`, both matching the identical
 /// `harness_result` predicate).
 ///
 /// Scans the same active set the reactor itself dispatches from
@@ -367,7 +367,11 @@ mod tests {
         let source_dir = repo.path().join("examples");
         fs::create_dir_all(&source_dir).unwrap();
         let source = source_dir.join("triggers.cue");
-        fs::write(&source, "triggers: [{name: \"steward-on-completion\"}]\n").unwrap();
+        fs::write(
+            &source,
+            "triggers: [{name: \"legacy-landing-on-completion\"}]\n",
+        )
+        .unwrap();
         let layout = Layout::at(home.path());
         install(&layout, source.to_str().unwrap(), None).unwrap();
 
@@ -378,7 +382,7 @@ mod tests {
         // global copy is now stale and must be flagged, not silently ignored.
         fs::write(
             &source,
-            "triggers: [{name: \"steward-landing-on-completion\", action: \"land\"}]\n",
+            "triggers: [{name: \"landing-on-completion\", action: \"land\"}]\n",
         )
         .unwrap();
         let drifted = drift(&layout, repo.path().to_str().unwrap(), None).unwrap();
@@ -413,7 +417,7 @@ mod tests {
         let source = source_dir.join("triggers-landing-pipeline.cue");
         fs::write(
             &source,
-            "triggers: [{name: \"steward-landing-on-completion\", action: \"land\"}]\n",
+            "triggers: [{name: \"landing-on-completion\", action: \"land\"}]\n",
         )
         .unwrap();
         let layout = Layout::at(home.path());
@@ -448,8 +452,10 @@ mod tests {
         // A leftover deployed trigger with no corresponding source anymore —
         // exactly the double-dispatch hazard this tool exists to catch.
         fs::write(
-            layout.triggers_dir().join("steward-on-completion.cue"),
-            "triggers: [{name: \"steward-on-completion\"}]\n",
+            layout
+                .triggers_dir()
+                .join("legacy-landing-on-completion.cue"),
+            "triggers: [{name: \"legacy-landing-on-completion\"}]\n",
         )
         .unwrap();
 
@@ -480,14 +486,14 @@ mod tests {
         // left deployed globally alongside its repo-local replacement,
         // both matching the identical harness_result predicate.
         fs::write(
-            layout.triggers_dir().join("steward-on-completion.cue"),
-            "triggers: [{name: \"steward-on-completion\", match: {category: \"event\", identity: \"harness_result\"}, run: \"steward\"}]\n",
+            layout.triggers_dir().join("legacy-landing-on-completion.cue"),
+            "triggers: [{name: \"legacy-landing-on-completion\", match: {category: \"event\", identity: \"harness_result\"}, run: \"landing\"}]\n",
         )
         .unwrap();
         fs::create_dir_all(repo.path().join(".rk")).unwrap();
         fs::write(
             repo.path().join(".rk").join("triggers.cue"),
-            "triggers: [{name: \"steward-landing-on-completion\", match: {category: \"event\", identity: \"harness_result\"}, action: \"land\"}]\n",
+            "triggers: [{name: \"landing-on-completion\", match: {category: \"event\", identity: \"harness_result\"}, action: \"land\"}]\n",
         )
         .unwrap();
 
@@ -500,7 +506,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["steward-landing-on-completion", "steward-on-completion"]
+            vec!["landing-on-completion", "legacy-landing-on-completion"]
         );
     }
 

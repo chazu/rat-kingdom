@@ -5,7 +5,7 @@
 **Companion convention:** `verify-through-the-project-runner`
 **Reconstructs:** Parmesan-2's lost 0008 (see 0010 for why it was lost), re-derived
 independently from the live event feed and re-checked against the tree
-**Status:** proposed (do NOT apply live — an operator/steward lands this; see the
+**Status:** proposed (do NOT apply live — an operator/landing lands this; see the
 completion protocol)
 
 ## The recurring pain
@@ -106,7 +106,7 @@ conclusion explicitly:
 ```
 
 The same bare `cargo` is the default `run` gate in
-`examples/workflows/steward.cue` and `checked-merge.cue`. Those gates fail
+`examples/workflows/landing.cue` and `checked-merge.cue`. Those gates fail
 closed, so a toolchain mismatch there produces a `workflow_failed` naming a red
 suite that never compiled.
 

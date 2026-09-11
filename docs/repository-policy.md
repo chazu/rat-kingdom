@@ -49,10 +49,10 @@ repo: {
 ```
 
 `landing` is the daemon-native landing pipeline's per-repo gate policy (see
-[Steward and trust](#steward-and-trust) below) — versioned and digest-activated
+[Landing and trust](#landing-and-trust) below) — versioned and digest-activated
 exactly like `delivery`, not a separate config surface. The values shown are
 the built-in defaults (same names, same defaults the pre-cutover
-`steward.cue` workflow hardcoded as params), so an activated policy that
+`landing.cue` workflow hardcoded as params), so an activated policy that
 omits `landing` entirely behaves identically to these defaults; only set the
 fields you want to change. `protectedPaths` is an ERE matched against
 `git diff --name-only <target>...HEAD`; a hit holds the branch for a human.
@@ -93,7 +93,7 @@ field, not infer success from `merged` or `pr_opened`. `deleteSource` applies
 after successful `merge`, `merge-push`, or `push-branch`; PR branches are kept
 for forge review.
 
-## Steward and trust
+## Landing and trust
 
 Every completed rat's branch may be triaged by the daemon-native landing
 pipeline when the repository's activated CUE triggers include an

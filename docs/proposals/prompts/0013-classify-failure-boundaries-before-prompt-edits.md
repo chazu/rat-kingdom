@@ -18,10 +18,10 @@ the current prompt-refine task describes only as “recurring pain”:
   `wf-9sxjphm766` stopped for the same missing executable.
 - `wf-qjbxfe68ef` (`nightly-self-improve`, 2026-08-03) failed because three
   workers could not use the configured `gpt-5.6-luna` model.
-- `wf-njpsbmr2jf` (`steward`, 2026-07-28) failed its repository check in
+- `wf-njpsbmr2jf` (`landing`, 2026-07-28) failed its repository check in
   `continuous_drain`; the suite output showed a test failure, not a role-prompt
   omission.
-- Eight steward runs on 2026-07-29 through 2026-08-03 failed before review
+- Eight landing runs on 2026-07-29 through 2026-08-03 failed before review
   because a raw workflow command was refused by the repository's
   `require_named_checks` policy.
 
@@ -94,6 +94,6 @@ the wording, not assume a particular ticket title or workflow implementation.
 ```json
 {
   "rule": "prompt-refinement-evidence-boundary: Before proposing a role-prompt or convention change, classify the failure boundary and record evidence that the relevant tool, model, workflow policy, and repository gate were available. Missing executables, inaccessible models, policy refusals, authorization failures, merge collisions, and red repository checks are tickets for their owning boundary unless the evidence shows a causal prompt omission; do not write speculative prompt patches.",
-  "why": "Recent failures span missing rk in wf-1jmpq62hm4, unavailable gpt-5.6-luna in wf-qjbxfe68ef, a red continuous_drain gate in wf-njpsbmr2jf, and require_named_checks refusals in eight steward runs. The current refine task does not require boundary classification, while wf-fp0gwx21zw demonstrates that a true coordination prompt defect has a distinct causal signature. A durable classification rule prevents infrastructure and gate failures from becoming speculative prompt edits."
+  "why": "Recent failures span missing rk in wf-1jmpq62hm4, unavailable gpt-5.6-luna in wf-qjbxfe68ef, a red continuous_drain gate in wf-njpsbmr2jf, and require_named_checks refusals in eight landing runs. The current refine task does not require boundary classification, while wf-fp0gwx21zw demonstrates that a true coordination prompt defect has a distinct causal signature. A durable classification rule prevents infrastructure and gate failures from becoming speculative prompt edits."
 }
 ```

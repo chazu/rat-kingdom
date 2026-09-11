@@ -714,7 +714,7 @@ enabled = true
 interval_secs = 60
 stuck_after_secs = 600           # silence past this => STUCK (0 = off); keep
                                  # comfortably below any workflow `wait` that
-                                 # blocks on this rat (e.g. steward's
+                                 # blocks on this rat (e.g. landing's
                                  # reviewTimeout, default 15m) or the soft
                                  # steer below never gets a chance to help
 burn_usd_per_min = 4.0           # sustained USD/min => RUNNING AWAY (0 = off;
@@ -826,14 +826,15 @@ worktree; run them from an operator checkout or another non-agent directory.
 
 ### `[drain]` — continuous-drain autoscaler
 
-Turning on `[drain]` hands the dispatch loop to the daemon: it keeps up to
+A positive `[drain].max_wip` enables delegated background operation without a
+King session. The daemon keeps up to
 `max_wip` rats live, spawning the highest-priority ready ticket whenever a slot
 frees. Keys:
 
-- `enabled` — opt in (default `false`). While off, the daemon never
-  auto-spawns; you dispatch by hand.
+- `enabled` — expand dispatch to the whole eligible backlog (default `false`).
+  While false, only tickets explicitly labeled `ready-for-agent` auto-dispatch.
 - `max_wip` — target concurrency (the WIP limit). **`0` is inert even when
-  `enabled = true`** — the loop needs a non-zero cap to spawn anything.
+  `enabled = true`** — zero pauses background dispatch and attention repair.
 - `interval_secs` — fallback refill cadence; a freed slot also wakes a refill
   immediately via the tuple feed, so this is just a backstop.
 - `repo` — restrict draining to one repo scope. Unset drains every registered
@@ -858,9 +859,15 @@ overnight.
 The King is a dedicated LLM session with operator authority, not an ordinary
 supervised rat. RK uses Herdr only as a wake transport: it persists a wake
 first, injects an opaque `KWK-...` id plus a fixed built-in pull instruction,
-and expects the King to pull current state over authenticated RPC. Delivery is
-at least once, so repeated terminal prompts are harmless when the same wake is
-claimed again.
+and expects the King to pull current state over authenticated RPC. Wakes contain
+explicit decisions, not routine inbox or fleet changes. Per-incident receipts
+suppress repeats across restart; unclaimed delivery remains retryable. Normal
+wakes queue while the King pane is focused, even between completed model turns.
+
+With a positive `[drain].max_wip`, the daemon independently dispatches delegated
+work and runs proven delivery repairs and allowlisted bounded conflict correction.
+Stale ownership and failed repairs remain decisions. Workers exchange ordinary
+questions and answers directly through the BBS.
 
 Bootstrap the King from the Rat Kingdom checkout. Install the current binary
 first; an older installed `rk` and daemon do not expose the King lifecycle
@@ -877,6 +884,7 @@ harness, model, or lifecycle timings, edit `~/.rat-kingdom/config.toml` (or
 
 ```toml
 [king]
+automatic_context_lifecycle = false
 harness = "codex"
 permission_mode = "danger-full-access"
 ```
@@ -915,7 +923,8 @@ rk king resolve KWK-... --holder king    # handled
 rk king defer KWK-... --holder king      # explicit human gate
 ```
 
-The pull payload is bounded to current attention items, the first 20 inbox
+The pull payload includes `decisions`, the explicit pending decision batch,
+alongside current attention context, the first 20 inbox
 rows, up to 20 ready-ticket representatives selected fairly across
 repositories, and 50 live agents. `ready_frontier` carries the exact ready
 total, a digest over every ready identity, per-repository counts, truncation,
@@ -924,8 +933,9 @@ enters the injected wake. The lease acquired by `king pull` is still fenced by
 `[policy] orchestrator_lease_ttl_secs`, and `attention.decide` remains bounded
 by the authority allowlist and rate cap.
 
-Idle lifecycle state is durable in `~/.rat-kingdom/king-state.json`. Compaction
-runs only when Herdr reports the exact registered generation quiescent (`idle`
+Idle lifecycle state is durable in `~/.rat-kingdom/king-state.json`. Automatic
+compaction and replacement are disabled by default. Opt in with
+`[king].automatic_context_lifecycle = true`. Compaction then runs only when Herdr reports the exact registered generation quiescent (`idle`
 or a completed `done` turn), unfocused, and with no unsettled wake. RK submits
 `/compact` atomically through `herdr agent prompt`; it never separately types
 text and Enter. A timeout or the hard
@@ -1056,9 +1066,9 @@ workflow: {
   `toolchain` text records the repository-owned runner/toolchain for onboarding
   evidence. A workflow may pass data to that fixed command through an `env`
   map, but only with `RK_CHECK_*` names; attempts to replace `PATH`, loader
-  hooks, or `RK_AGENT` fail closed. The shipped steward uses this mechanism for
+  hooks, or `RK_AGENT` fail closed. The shipped landing uses this mechanism for
   its repo-owned diff guards and escalation actions, so repositories enabling
-  it must register the matching `steward-*` checks shown in
+  it must register the matching `landing-*` checks shown in
   `examples/checks.cue` as well as their `verify` check.
   The same registry is surfaced as optional guidance in spawned worker prompts;
   it does not replace the workflow gate. See `examples/workflows/named-check-merge.cue`.
@@ -1072,7 +1082,7 @@ workflow: {
   instead of only recording that the gate said no. A step may also set
   `retryOnFail: <n>` (default 0) for a check already characterized as flaky
   for reasons outside the code under test — machine load from several
-  fleet-wide builds running at once is the shipped steward's case. A retry
+  fleet-wide builds running at once is the shipped landing's case. A retry
   does not weaken the gate: a genuinely red suite fails every attempt and
   still holds the branch, just a few seconds later, and every attempt is
   recorded (`retries` on the result, or in the gate-failure artifact on the
@@ -1152,8 +1162,8 @@ exclude_instances = []    # authors never reacted to (besides "reactor")
 notify_escalations = true # false = hard kill switch, zero notification sinks, inbox-only
 ```
 
-- **Active escalation push.** When the steward escalates a `STOP`/unknown
-  verdict as a `need` (identity `steward`), a built-in reaction fans it out
+- **Active escalation push.** When the landing escalates a `STOP`/unknown
+  verdict as a `need` (identity `landing`), a built-in reaction fans it out
   through every configured **notification sink**, so the operator is pushed
   at, not only queued in `rk inbox`. Which channels see it is config, not code
   — see [Notification sinks](#notification-sinks) below.
@@ -1183,7 +1193,7 @@ kind = "herdr"                          # desktop push (rk-mux)
 [[notify.sinks]]
 name = "ops-chat"                       # defaults to the kind if unset
 kind = "command"                        # shell out to an operator script
-classes = ["steward-escalation"]        # empty = every class
+classes = ["landing-escalation"]        # empty = every class
 min_severity = "warn"                   # info (default) | warn | critical
 
 [notify.sinks.options]

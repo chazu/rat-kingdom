@@ -3,7 +3,7 @@
 **Author:** rat-114 (task: refine-prompts)
 **Target prompt:** `crates/rk-core/src/prime.rs` → `FRAGMENT_GIT_SAFETY`
 **Companion convention:** `no-workspace-wide-reformatting`
-**Status:** proposed (do NOT apply live — an operator/steward lands this; see the
+**Status:** proposed (do NOT apply live — an operator/landing lands this; see the
 completion protocol)
 
 ## The recurring pain
@@ -42,7 +42,7 @@ crate. Every rat then independently:
 - **It is paid N times.** There is no shared rule, so each rat rediscovers the
   hazard and re-derives the "revert the sweep" remedy from scratch. A one-line
   convention converts N reasoning episodes into zero.
-- **It inflates review.** A reviewer (or the steward's diff-size budget gate)
+- **It inflates review.** A reviewer (or the landing's diff-size budget gate)
   cannot tell task work from reformat noise in a 35-file diff.
 
 ## Root cause

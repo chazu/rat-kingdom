@@ -292,8 +292,8 @@ fn print_tuple_line(t: &Value, display: &CastleDisplay, fact_votes: Option<&Valu
 /// name one — the raw-`rk out` counterpart to the sugar commands' env autofill.
 ///
 /// A durable tuple is otherwise anonymous, so nothing downstream can tell one
-/// author's record from a concurrent peer's. That is TKT-161: a `steward`
-/// reviewer records `artifact/<repo>/review`, and with several stewards in
+/// author's record from a concurrent peer's. That is TKT-161: a `landing`
+/// reviewer records `artifact/<repo>/review`, and with several landings in
 /// flight on one repo (the reactor fires one per rat completion, by design) the
 /// newest `review` in that scope may be the OTHER instance's. A workflow `read`
 /// with `fromAgent: true` keys on this stamp, so putting it here rather than in
@@ -301,7 +301,7 @@ fn print_tuple_line(t: &Value, display: &CastleDisplay, fact_votes: Option<&Valu
 /// verdict.
 ///
 /// An explicit `agent` in the payload is left alone: `rk out need … '{"agent":
-/// "steward", …}'` is naming the *role* that speaks, not the process that ran,
+/// "landing", …}'` is naming the *role* that speaks, not the process that ran,
 /// and overwriting it would rewrite what `rk inbox` shows the operator.
 fn stamp_author(payload: &mut Value, agent: Option<String>) {
     let (Some(agent), Some(obj)) = (agent, payload.as_object_mut()) else {
@@ -836,7 +836,7 @@ mod tests {
     use super::*;
 
     /// `--field` exists so shell callers (workflow checks especially) can
-    /// build valid payloads without jq on PATH — the steward escalation
+    /// build valid payloads without jq on PATH — the landing escalation
     /// checks silently wrote empty payloads when jq was missing from the
     /// daemon's inherited environment. Escaping belongs to serde, not sh.
     #[test]
@@ -845,20 +845,20 @@ mod tests {
         apply_fields(
             &mut payload,
             &[
-                "agent=steward".into(),
+                "agent=landing".into(),
                 "task=TKT-1".into(),
                 r#"text=quote " and \ survive"#.into(),
             ],
         )
         .unwrap();
-        assert_eq!(payload["agent"], "steward");
+        assert_eq!(payload["agent"], "landing");
         assert_eq!(payload["task"], "TKT-1");
         assert_eq!(payload["text"], "quote \" and \\ survive");
     }
 
     #[test]
     fn fields_layer_on_top_of_payload_and_reject_non_objects() {
-        let mut payload = json!({"agent": "steward", "kept": true});
+        let mut payload = json!({"agent": "landing", "kept": true});
         apply_fields(
             &mut payload,
             &["agent=other".into(), "k=v=with=equals".into()],
@@ -961,11 +961,11 @@ mod tests {
 
     #[test]
     fn out_never_overwrites_an_explicit_agent() {
-        // `rk out need … '{"agent":"steward", …}'` names the role that speaks;
+        // `rk out need … '{"agent":"landing", …}'` names the role that speaks;
         // rewriting it would change what `rk inbox` shows the operator.
-        let mut payload = json!({"agent": "steward", "text": "needs a human"});
+        let mut payload = json!({"agent": "landing", "text": "needs a human"});
         stamp_author(&mut payload, Some("Filch-2".into()));
-        assert_eq!(payload["agent"], json!("steward"));
+        assert_eq!(payload["agent"], json!("landing"));
     }
 
     #[test]
@@ -1014,14 +1014,14 @@ mod tests {
         };
         let mut payload = json!({
             "recommendation": "APPROVE",
-            "branch": "rat/fidget-10/steward-review-tkt-1",
+            "branch": "rat/fidget-10/candidate-review-tkt-1",
         });
 
         let error = bind_review_payload(&mut payload, &review).unwrap_err();
         assert_eq!(
             error.to_string(),
             "review artifact binding mismatch for branch: expected \
-             'rat/fidget-10/tkt-1', got \"rat/fidget-10/steward-review-tkt-1\""
+             'rat/fidget-10/tkt-1', got \"rat/fidget-10/candidate-review-tkt-1\""
         );
     }
 }

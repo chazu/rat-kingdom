@@ -237,7 +237,7 @@ note. `⚠` marks a consumer where a name join is currently *correctness-critica
 
 | # | Consumer | File | Joins on | Migration note |
 |---|---|---|---|---|
-| F1 ⚠ | Reactor steward trigger | `reactor.rs:969`–`:1030` | `harness_result` payload; templates `{{tuple.payload.branch}}`, `{{tuple.payload.target}}` | Reads C3's payload. Expose `{{tuple.payload.spawn}}` so a trigger can pin a spawn. Also: `.rk`/`~/.rat-kingdom` trigger `.cue` files are **deployed copies that drift from `examples/`** (TKT-176) — a payload-shape change must be announced, not assumed to propagate. |
+| F1 ⚠ | Reactor landing trigger | `reactor.rs:969`–`:1030` | `harness_result` payload; templates `{{tuple.payload.branch}}`, `{{tuple.payload.target}}` | Reads C3's payload. Expose `{{tuple.payload.spawn}}` so a trigger can pin a spawn. Also: `.rk`/`~/.rat-kingdom` trigger `.cue` files are **deployed copies that drift from `examples/`** (TKT-176) — a payload-shape change must be announced, not assumed to propagate. |
 | F2 ⚠ | Reactor `declared_done` / `is_error` gate | `reactor.rs:1003`–`:1007` | payload fields | No key change, but it acts on whichever `harness_result` matched. Correct only once F1's match is spawn-keyed. |
 | F3 | Landing pipeline enqueue | `landing.rs:61` | fed a `harness_result` | Carry `SpawnId` on the landing request so a queued land is attributable after the rat is archived. |
 | F4 | `factory_analytics` run id | `factory_analytics.rs:183`–`:227` | "name + creation instant" | Replace the hand-built composite with `SpawnId`. Note `:227`'s existing caveat that agent timestamps are a *generation* id, not a workflow-instance id — that distinction survives and gets clearer. |

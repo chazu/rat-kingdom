@@ -58,7 +58,7 @@ pre-migration SHA-256 exactly, exact transcript files increased from 1,165 to
   registry fields, CLI translation, or a fleet-wide merge default;
 - workflow names do not grant landing authority; workflow `land`/`open_pr`
   follows the uniform approval rule and activated target policy;
-- the retired steward mega-workflow and unlinked-subworkflow recovery reader
+- the retired landing mega-workflow and unlinked-subworkflow recovery reader
   are gone; the daemon-native landing pipeline is the one shipped landing path.
 
 Historical event and proposal documents may describe old releases, but no old

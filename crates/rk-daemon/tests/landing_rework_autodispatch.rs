@@ -27,7 +27,7 @@ triggers: [{
 const REVIEW_WORKFLOW: &str = r#"
 package workflow
 workflow: {
-    name: "steward-review"
+    name: "candidate-review"
     params: {
         taskId: {type: "string", required: false, default: "unknown"}
         branch: {type: "string", required: true}
@@ -171,7 +171,7 @@ async fn bounded_rework_lands_intermediately_then_resubmits_parent_exactly_once(
     std::fs::write(layout.triggers_dir().join("landing.cue"), LANDING_TRIGGER).unwrap();
     std::fs::create_dir_all(layout.workflows_dir()).unwrap();
     std::fs::write(
-        layout.workflows_dir().join("steward-review.cue"),
+        layout.workflows_dir().join("candidate-review.cue"),
         REVIEW_WORKFLOW,
     )
     .unwrap();

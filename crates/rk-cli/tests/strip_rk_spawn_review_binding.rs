@@ -13,7 +13,7 @@
 //! reaches the socket (`rk_cli::space_cmds::bind_review_payload`). The outer
 //! reviewer's real `RK_REVIEW_TASK` then mismatches the synthetic task, the
 //! write is rejected, no verdict tuple lands, and the nested suite's `read`
-//! step burns its whole ceiling waiting for one — which is how a steward
+//! step burns its whole ceiling waiting for one — which is how a landing
 //! reviewer turned a green branch red.
 //!
 //! Division of labour with `crates/rk-daemon/tests/workflow_checks.rs`: that
@@ -92,8 +92,8 @@ fn checks(rk_bin: &str, nested_home: &str) -> String {
     format!(
         r#"
 checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "true", timeout: "30s"}},
     {{
         name: "leaked-binding-rejects-review-artifact"
@@ -142,8 +142,8 @@ fn init_repo(repo: &Path) {
     std::fs::write(
         rk_dir.join("checks.cue"),
         r#"checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "true", timeout: "30s"},
 ]
 "#,

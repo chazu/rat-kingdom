@@ -1,7 +1,7 @@
 # Proposal: daemon-native landing pipeline (Phase 3)
 
 **Status:** design proposal — no code changed
-**Ticket:** TKT-01M036PSEHTMD3S5D2JFAG7XVY (Phase 3 of the steward remediation)
+**Ticket:** TKT-01M036PSEHTMD3S5D2JFAG7XVY (Phase 3 of the landing remediation)
 **Depends on:** Phase 1 admission control (TKT-01M036NWE1EW5B1PWSHK0MKX8E, done) and Phase 2
 commit-keyed verdict cache (TKT-01M036NWEG0H019BJ16G59RZVP, done)
 
@@ -9,7 +9,7 @@ commit-keyed verdict cache (TKT-01M036NWEG0H019BJ16G59RZVP, done)
 
 ## 0. Problem restated
 
-The 2026-08-15 steward investigation (`memory/steward-investigation`) found a 35% steward
+The 2026-08-15 landing investigation (`memory/landing-investigation`) found a 35% landing
 machinery failure rate, all mechanical, zero judgment failures, with one load-bearing root
 cause: **a workflow `run` step can only execute inside an already-spawned agent's worktree**
 (`crates/rk-daemon/src/workflow_exec.rs:2559-2582` — `ctx.active_agent` is set only by `spawn`,
@@ -18,7 +18,7 @@ brand-new `git worktree add -b`, harness launch, registry row — just to get *s
 three deterministic checks. Phase 0 (tiering) and Phase 2 (the verdict cache) already cut the
 number of times that spawn needs an LLM behind it, but even a cache **hit** or a **doc-only**
 diff still spawns a "gate-holder" agent whose entire job is to host gates
-(`examples/workflows/steward.cue:34-48`, `:563-566`). The gate itself — and the merge
+(`examples/workflows/landing.cue:34-48`, `:563-566`). The gate itself — and the merge
 serialization after it — are daemon primitives (`MergeQueue`, named-check execution) invoked
 through the longest possible path: CUE workflow → spawn → wait → run.
 
@@ -26,7 +26,7 @@ This document proposes removing that coupling: gates and the merge decision move
 daemon-native `LandingPipeline` component that runs checks in a **persistent, daemon-owned
 worktree** instead of a throwaway agent one, consults the Phase 2 verdict cache **directly**
 (no CUE read step), and only ever spawns an agent for the one thing that genuinely needs an
-LLM — the review judgment itself, when nothing is cached and the diff isn't trivial. `steward.cue`
+LLM — the review judgment itself, when nothing is cached and the diff isn't trivial. `landing.cue`
 shrinks to exactly that one job.
 
 ---
@@ -69,8 +69,8 @@ struct MergeQueue {
   queueing, CAS, branch deletion, and event emission; nothing new is needed here.
 - A merge conflict or a target that moved concurrently is a clean
   `MergeOutcome { merged: false, detail }` (`crates/rk-git/src/lib.rs:428-433`), never an `Err` —
-  the caller gates on the returned JSON's `merged`/`delivered` fields exactly as `steward.cue`
-  does today (`evaluate {expect: {delivered: true}}`, `examples/workflows/steward.cue:424`).
+  the caller gates on the returned JSON's `merged`/`delivered` fields exactly as `landing.cue`
+  does today (`evaluate {expect: {delivered: true}}`, `examples/workflows/landing.cue:424`).
 - Outcomes are restart-durable even though the lock isn't: every `land` emits a `branch_landed`
   event tuple (`supervisor.rs:3135`) into the durable, disk-backed tuplespace
   (`rk_space::Space::open`, not `open_in_memory`), and `inbox.rs:722-739`
@@ -131,7 +131,7 @@ rework (a sha-only key let two branches sharing a tip commit exchange verdicts).
   waiter wake-ups use.
 - The reviewer's verdict artifact: `category: artifact`, `scope: <repo>`, `identity: "review"`,
   payload `{task, recommendation, notes, head_sha, branch}`, written by the reviewer itself via
-  `rk out artifact <repo> review --payload '{...}'` (`examples/workflows/steward.cue:365`).
+  `rk out artifact <repo> review --payload '{...}'` (`examples/workflows/landing.cue:365`).
   `rk out` auto-stamps the writer's agent name into the payload if absent
   (`crates/rk-cli/src/space_cmds.rs:302-308`).
 - **There is no dedicated Rust wrapper function today** — but the primitive it would wrap is
@@ -148,7 +148,7 @@ rework (a sha-only key let two branches sharing a tip commit exchange verdicts).
   non-empty `forBranch` (`workflow_exec.rs:1616-1632`) — that invariant lives only in the CUE
   engine's `ReadStep` handling today, not in `Pattern::for_commit` itself.
 - A cache hit (any of APPROVE/REWORK/STOP) is honored identically to a fresh verdict — no
-  re-review to shop for a better opinion (`examples/workflows/steward.cue:71-72`, proven by
+  re-review to shop for a better opinion (`examples/workflows/landing.cue:71-72`, proven by
   `crates/rk-daemon/tests/workflow_verdict_cache.rs:382-433`). The landing pipeline's routing
   (§2.4) must preserve this: a cached REWORK/STOP takes the same path a fresh one would.
 
@@ -201,9 +201,9 @@ factored out from `ctx.active_agent`-specific code rather than reimplemented:
   `{instance, agent, command, exit, verdict, stdout_tail, stderr_tail, failing_tests, retries}`
   — already `instance: "daemon"`-shaped, i.e. already written as if from daemon code, not an
   agent. Reuse verbatim.
-- `steward-protected-paths` / `steward-diff-scope` are **fully generic** named checks in
+- `landing-protected-paths` / `landing-diff-scope` are **fully generic** named checks in
   `.rk/checks.cue` — plain shell (`.rk/checks.cue:16-25`) parameterized only via `RK_CHECK_*`
-  env. No Rust code is steward-specific; the landing pipeline supplies the same env vars a
+  env. No Rust code is landing-specific; the landing pipeline supplies the same env vars a
   workflow `run` step does today.
 
 **Concretely, this proposal needs one new function on `Repo`** (name illustrative, decided at
@@ -231,7 +231,7 @@ production use by `Reactor` and `Supervisor` — not hypothetical:
   `tickets.create(new).await` directly (`reactor.rs:677`), specifically so ticket-id allocation
   stays serialized through one path (comment, `reactor.rs:671-674`). The landing pipeline's
   REWORK routing should call this directly instead of shelling out `rk ticket new` the way
-  `steward-file-rework-ticket` does today.
+  `landing-file-rework-ticket` does today.
 - **Space writes**: `Space::out(tuple) -> Result<()>` (`crates/rk-space/src/lib.rs:227`) has
   **no auth or category check at all** — the "agents cannot write furniture/convention/task/
   available tuples" restriction lives *only* inside the RPC handler `handle_out`
@@ -276,9 +276,9 @@ production use by `Reactor` and `Supervisor` — not hypothetical:
   `Pattern::for_commit(..., branch, head_sha)`, not a subscription to the reviewer's workflow
   instance's own completion state.
 
-### 1.6 Current `steward.cue` shape (what shrinks)
+### 1.6 Current `landing.cue` shape (what shrinks)
 
-`examples/workflows/steward.cue` (615 lines; the `docs/proposals/steward.cue` copy is stale —
+`examples/workflows/landing.cue` (615 lines; the `docs/proposals/landing.cue` copy is stale —
 it predates review tiering and the verdict cache entirely, so treat the `examples/` copy as
 ground truth) is a single mega-workflow with three CUE-load-time-selected arms
 (`_reducedArm`, `_cachedReviewArm`, `_reviewArm`, selected at `:610-614`), all funneling through
@@ -287,7 +287,7 @@ shared `_gates` (`:203-339`) and `_routeVerdict` (`:407-481`). All three arms sp
 `gateholder` whose task is "run `rk done` immediately" (`:532-551`, `:570-587`) for no reason
 other than that `run` needs a worktree. Post-Phase-3, none of `_gates`, `_routeVerdict`, the
 reduced tier, or the cached-tier gate-holder spawn belong in CUE at all — they move into the
-`LandingPipeline`. What's left of `steward.cue` is exactly `_reviewArm`'s first three steps:
+`LandingPipeline`. What's left of `landing.cue` is exactly `_reviewArm`'s first three steps:
 spawn `reviewer` chained on the branch, wait, and record the verdict artifact. Nothing else.
 
 ---
@@ -341,7 +341,7 @@ beyond what `LandingQueue`'s per-key serialization already provides.
 Gate execution against this path reuses §1.4's downstream machinery (named-check resolution,
 `spawn_check_child`, retry/timeout/truncation, `record_gate_failure`) with the "resolve a
 directory from `ctx.active_agent`" step replaced by "use the fixed gate-worktree path for this
-`(repo, target)`." Concretely: `steward-protected-paths`, `steward-diff-scope`, and the repo's
+`(repo, target)`." Concretely: `landing-protected-paths`, `landing-diff-scope`, and the repo's
 named `verify` check run **exactly as they do today**, with the same `RK_CHECK_*` env
 parameterization — nothing about the checks themselves changes, only where they run.
 
@@ -361,16 +361,16 @@ LLM judgment is needed:
 2. Otherwise, probe the cache **directly**: `Pattern::for_commit(Category::Artifact, "review",
    branch, head_sha).scope(repo)` + `space.scan(...)` (§1.3). A hit (any recommendation) is
    used without spawning a reviewer — never shop for a second opinion.
-3. On a miss, request a review: spawn the shrunk `steward.cue` (§2.5) — or call
+3. On a miss, request a review: spawn the shrunk `landing.cue` (§2.5) — or call
    `Supervisor::spawn_async` directly and skip the workflow engine for this too, another (a)/(b)
    choice like §2.1's, deferred to the same open-questions section — chained onto the candidate
    branch, then **park on the tuple, not the instance**: `space.rd(&pattern, review_timeout)`
    bound to that exact `(repo, branch, head_sha)` (§1.5's `watch_attached_completion` pattern).
    A timeout here is a clean STOP-equivalent hold, not an instance failure — mirroring the
-   fail-closed posture `steward.cue`'s own `reviewTimeout` wait has today.
+   fail-closed posture `landing.cue`'s own `reviewTimeout` wait has today.
 
 **Gate/review ordering**: keep gates-then-verdict, same as today (`_gates` always precedes
-`_routeVerdict` in every arm of the current `steward.cue`) — a red suite should hold the branch
+`_routeVerdict` in every arm of the current `landing.cue`) — a red suite should hold the branch
 regardless of what any reviewer or cache says, and running gates first means a reviewer is never
 spawned for a branch that was going to be held anyway. The one behavior to preserve exactly:
 gates run on **every** landing attempt, cached verdict or not (§1.6's documented Phase 2
@@ -383,21 +383,21 @@ Once gates pass and a verdict (fresh or cached) is in hand:
 - **APPROVE** → `Supervisor::land(repo_root, branch, target, keep_branch)` (§1.1) directly.
 - **REWORK** → `Tickets::create(...)` (§1.5) directly, hold the branch (do nothing further to
   it — no `dismiss` is even needed if no agent worktree was ever spawned for this candidate).
-- **STOP** → `Space::out(Tuple::new(Category::Need, repo, "steward", "daemon", payload))` (§1.5)
+- **STOP** → `Space::out(Tuple::new(Category::Need, repo, "landing", "daemon", payload))` (§1.5)
   directly, hold the branch.
 - **Gate failure / timeout** → `record_gate_failure` (§1.4, unchanged) +
-  `Space::out` a `need` (mirrors `steward-report-gate-failure`/`steward-report-timeout`) directly.
+  `Space::out` a `need` (mirrors `landing-report-gate-failure`/`landing-report-timeout`) directly.
 - **Unrecognized verdict** → same STOP-shaped escalation, treated as a bug per today's
-  `default` arm (`examples/workflows/steward.cue:465-478`).
+  `default` arm (`examples/workflows/landing.cue:465-478`).
 
 None of these five outcomes require a shell subprocess, `rk` on `PATH`, or an agent auth token —
 every one is a direct async Rust call from the `LandingPipeline` component into `Supervisor`,
 `Tickets`, or `Space`.
 
-### 2.5 `steward.cue` shrinks to review-only
+### 2.5 `landing.cue` shrinks to review-only
 
 The only workflow-shaped piece of work left that genuinely needs an agent is the LLM judgment
-call. `steward.cue` (or its replacement, name TBD — `steward-review.cue`) becomes:
+call. `landing.cue` (or its replacement, name TBD — `candidate-review.cue`) becomes:
 
 ```
 spawn reviewer chained onto the candidate branch
@@ -405,11 +405,11 @@ wait (reviewTimeout)
 evaluate {is_error: false}
 ```
 
-— i.e. exactly the first three steps of today's `_reviewArm` (`examples/workflows/steward.cue:
+— i.e. exactly the first three steps of today's `_reviewArm` (`examples/workflows/landing.cue:
 343-371`), nothing else. It is invoked by the `LandingPipeline` on a cache miss (§2.3), not
 fired by the reactor per completion — **the trigger fires the pipeline, not the mega-workflow**,
 per the ticket's item 5. If §2.1 goes with option (a) (reuse the trigger engine), the
-`steward-on-completion` trigger's target changes from `workflow: "steward"` to the
+`legacy-landing-on-completion` trigger's target changes from `workflow: "landing"` to the
 `LandingQueue`-enqueue action; the review-only workflow is instead invoked programmatically by
 the pipeline itself when it decides a review is needed, not reactor-fired at all.
 
@@ -443,7 +443,7 @@ codebase (nothing new to invent):
   reviewer the way an in-memory-only wait would — the reviewer keeps working, writes its verdict
   tuple whenever it finishes, and the restarted pipeline's `space.rd` on the same durable pattern
   picks it up. This is precisely the failure mode the Phase 2 investigation's "motivating
-  specimen" (Templeton-7, `memory/steward-investigation`) hit under the *old* wait-on-instance
+  specimen" (Templeton-7, `memory/landing-investigation`) hit under the *old* wait-on-instance
   design — the new design structurally can't reproduce it.
 
 ---
@@ -484,11 +484,11 @@ on a pass. Integration tests: queue ordering (FIFO within a key, independent acr
 doc-only completion lands with zero agent spawns, a failing gate produces a `gate-failure`
 artifact and holds the branch. *Depends on T1.*
 
-**T3 — Review integration (verdict cache) + direct-call routing + shrunk `steward.cue`.**
+**T3 — Review integration (verdict cache) + direct-call routing + shrunk `landing.cue`.**
 Wire `LandingPipeline` to probe `Pattern::for_commit` directly before requesting a review; on
 miss, invoke the shrunk review-only workflow (§2.5) and park on `Space::rd` for the verdict
 tuple; route APPROVE/REWORK/STOP via direct `Supervisor::land`/`Tickets::create`/`Space::out`
-calls. Ship the shrunk `steward.cue`/`steward-review.cue`. Integration tests: cache hit skips
+calls. Ship the shrunk `landing.cue`/`candidate-review.cue`. Integration tests: cache hit skips
 spawn entirely, cache miss spawns exactly one reviewer, a cached REWORK routes to a ticket
 without spawning, park-and-resume survives the reviewer finishing after a simulated daemon
 restart (space-level, not process-level, restart in test). *Depends on T2.*
@@ -500,7 +500,7 @@ the `work_key = (repo, branch, head_sha)` dedup guarding double-land on a redeli
 completion. Full end-to-end integration tests: a burst of completions queues instead of
 thundering; a daemon restart mid-gate-run resumes correctly; a daemon restart mid-review-wait
 still picks up the verdict once written; escalation (`need`/rework ticket) surfaces in `rk
-inbox` identically to today. Operator cutover runbook: disable the `steward-on-completion`
+inbox` identically to today. Operator cutover runbook: disable the `legacy-landing-on-completion`
 trigger's workflow-spawn behavior (or retire it entirely if (a) was chosen), enable the landing
 pipeline, verify `rk workflow drift`-equivalent parity. *Depends on T2, T3.*
 
@@ -519,9 +519,9 @@ contract.** A review of the first T4 landing caught three gaps, closed as follow
 - Two proofs promised above were missing. `burst_of_completions_on_one_key_never_runs_gates_
   concurrently` enqueues several candidates onto the same `(repo, target)` key before draining
   starts and proves (via a marker file a concurrent run would trip) that they still gate-run one
-  at a time. `escalation_row_matches_the_workflow_driven_steward_shape` proves
+  at a time. `escalation_row_matches_the_workflow_driven_landing_shape` proves
   `LandingPipeline::escalate`'s direct `Space::out` write produces the identical `rk inbox` row
-  `inbox::build` renders from the historical workflow-driven `steward-report-stop`/`-gate-
+  `inbox::build` renders from the historical workflow-driven `landing-report-stop`/`-gate-
   failure`/`-timeout`/`-unknown-verdict` `rk out need` shape.
 - **Cross-key concurrency contract.** `run_cycle` drained every `(repo, target)` key in one
   sequential `for` loop, awaiting each key's full `drain_key` before starting the next. That
@@ -566,7 +566,7 @@ dependency on anything else in this program and could start immediately.
 3. **Bounded-k vs strictly single-consumer** per `(repo, target)`: single-consumer is
    recommended above since the final merge step re-serializes on `MergeQueue` regardless, but if
    gate-run wall-clock (not merge) turns out to be the bottleneck under load, a small k (e.g. 2,
-   matching the current `maxInFlight: 2` steward trigger default) may be worth it from day one
+   matching the current `maxInFlight: 2` landing trigger default) may be worth it from day one
    instead of as a later tuning pass.
 4. **Gate-worktree disk/lifetime management**: one persistent worktree per `(repo, target)`
    accumulates on disk indefinitely (unlike agent worktrees, which get cleaned up on dismiss).
@@ -590,9 +590,9 @@ by `Reactor::fire_land_action` (`crates/rk-daemon/src/reactor.rs`) straight into
 hop — while still reusing the reactor's `(trigger, tuple)` dedup marker, `maxFires` rate cap, and
 cursor-based restart-safety (NOT `maxInFlight`: that admission model is superseded by
 `LandingQueue`'s own single-consumer-per-`(repo,target)` queue downstream). The shipped example
-is `examples/triggers-landing-pipeline.cue` (`steward-landing-on-completion`), a like-for-like
-match-predicate copy of `steward-on-completion` (`examples/triggers.cue`) with
-`action: "land"` instead of `run: "steward"`.
+is `examples/triggers-landing-pipeline.cue` (`landing-on-completion`), a like-for-like
+match-predicate copy of `legacy-landing-on-completion` (`examples/triggers.cue`) with
+`action: "land"` instead of `run: "landing"`.
 
 `work_key = (repo, branch, head_sha)` dedup (§2.6): `LandingPipeline::enqueue` probes a durable
 `landing_processed` marker (written by `LandingPipeline::process_entry` on every terminal
@@ -606,7 +606,7 @@ flight resolves to the SAME workflow instance (`review_instance_id`, a stable id
 work key) rather than spawning a second reviewer.
 
 The cutover itself is **NOT automatic** — this section is a manual runbook. The operator performs
-every step below; nothing in this codebase flips `steward-on-completion` off or the landing
+every step below; nothing in this codebase flips `legacy-landing-on-completion` off or the landing
 pipeline on by itself.
 
 ### 6.1 Preconditions
@@ -615,22 +615,22 @@ pipeline on by itself.
   live in a running fleet until `mise run deploy` or equivalent — same caveat as every other
   daemon-native landing change in this program's history, see `workflow-instance-archive` and
   `dropped-land-inbox-guard` in fleet memory).
-- The target repo has `.rk/checks.cue` registering `steward-protected-paths`, `steward-diff-scope`,
-  and its real `verify` check — identical to what the workflow-driven steward already requires.
-  `examples/workflows/steward-review.cue` (the shrunk review-only workflow, T3) is installed
-  wherever `steward.cue` is today.
+- The target repo has `.rk/checks.cue` registering `landing-protected-paths`, `landing-diff-scope`,
+  and its real `verify` check — identical to what the workflow-driven landing already requires.
+  `examples/workflows/candidate-review.cue` (the shrunk review-only workflow, T3) is installed
+  wherever `landing.cue` is today.
 
 ### 6.2 Swap the trigger (per repo, or globally)
 
-1. Locate the live trigger file installing `steward-on-completion` (global
+1. Locate the live trigger file installing `legacy-landing-on-completion` (global
    `~/.rat-kingdom/triggers/`, or a repo's `.rk/triggers.cue`).
 2. Copy `examples/triggers-landing-pipeline.cue` alongside it under a NEW filename first (do not
-   overwrite yet) — e.g. `steward-landing.cue`.
-3. **Do not run both at once.** `steward-on-completion` and `steward-landing-on-completion` match
+   overwrite yet) — e.g. `landing-pipeline.cue`.
+3. **Do not run both at once.** `legacy-landing-on-completion` and `landing-on-completion` match
    the identical `harness_result` predicate; loading both trigger files into the same triggers
    directory double-dispatches every completion (one full workflow spawn, one `LandingQueue`
    enqueue), racing each other for the same branch. Remove or rename the old trigger file's
-   `steward-on-completion` entry (or the whole file, if it defines nothing else) in the SAME
+   `legacy-landing-on-completion` entry (or the whole file, if it defines nothing else) in the SAME
    change that adds the new one.
 4. Restart the daemon (or wait for the trigger file's mtime-based reparse, `Reactor`'s
    `TriggerCache` — see `edited_trigger_file_is_reparsed_not_stale` for the mechanism) so the new
@@ -650,10 +650,10 @@ There is no automated `rk workflow drift` command as of T4; verify parity by han
    run is invisible, same as today).
 3. Force a REWORK and a STOP verdict (or reuse existing fixtures) and confirm: REWORK files a
    ticket titled `rework: <task>` and leaves the branch unmerged; STOP writes a `need` tuple with
-   identity `steward` and the branch stays unmerged — both should appear in `rk inbox` in the
-   SAME shape a workflow-driven steward's escalation does today (this was a T4 design constraint,
+   identity `landing` and the branch stays unmerged — both should appear in `rk inbox` in the
+   SAME shape a workflow-driven landing's escalation does today (this was a T4 design constraint,
    not just a happy accident: `LandingPipeline::escalate`/`file_rework_ticket` reuse the exact
-   tuple shapes `steward-report-stop`/`steward-file-rework-ticket` wrote).
+   tuple shapes `landing-report-stop`/`landing-file-rework-ticket` wrote).
 4. Force a failing gate (e.g. a branch that fails `verify`) and confirm a `gate-failure` artifact
    is recorded and the branch is held unmerged, matching `record_gate_failure`'s existing shape.
 5. Only once all four are confirmed working on a scratch/low-traffic repo should the swap be
@@ -661,7 +661,7 @@ There is no automated `rk workflow drift` command as of T4; verify parity by han
 
 ### 6.4 Rollback
 
-Reverse §6.2: restore the original `steward-on-completion` trigger file and remove/rename the
+Reverse §6.2: restore the original `legacy-landing-on-completion` trigger file and remove/rename the
 `action: "land"` one. Nothing about the swap is destructive to in-flight state — a candidate
 already fully processed (landed/rework-filed/escalated) has no live queue entry to roll back;
 one still mid-flight when the trigger set is swapped back simply stops being drained by the
@@ -682,8 +682,8 @@ queue-to-workflow migration).
   gate worktree) is retried every poll cycle indefinitely rather than escalating after N attempts.
 - Gate-worktree disk/lifetime management (§5 item 4) is still open, unchanged by T4.
 
-The operator executed this §6 cutover on 2026-08-16: the `steward-landing-on-completion` trigger
-(`action: land`) replaced `steward-on-completion` in the global triggers directory, scope
+The operator executed this §6 cutover on 2026-08-16: the `landing-on-completion` trigger
+(`action: land`) replaced `legacy-landing-on-completion` in the global triggers directory, scope
 `rat-kingdom`.
 
 ---

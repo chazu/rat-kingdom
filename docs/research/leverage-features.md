@@ -69,7 +69,7 @@ Grouped by leverage dimension. ★ = selected for the deep-dive top 10.
 1. **★ Reactive trigger engine** — tuple write → workflow dispatch, zero-token,
    zero-latency. *Leverage: the substrate that turns the whole system from
    operator-pull to self-driving; every other autonomy feature composes on it.*
-2. **★ Steward: autonomous triage & auto-merge** — on completion, a cheap rat runs
+2. **★ Landing: autonomous triage & auto-merge** — on completion, a cheap rat runs
    the repo's checks and auto-merges clean work, escalating only the rest.
    *Leverage: removes the human from the single most-repeated decision — "is this
    branch good to merge?"*
@@ -135,12 +135,12 @@ Grouped by leverage dimension. ★ = selected for the deep-dive top 10.
     the precondition for ever leaving the fleet alone.*
 18. **★ Pre-merge verification `run` step** — run the repo's tests/lint in the
     worktree and fail-closed before merge. *Leverage: the teeth that make
-    auto-merge (steward, dispatcher) trustworthy.*
+    auto-merge (landing, dispatcher) trustworthy.*
 19. **Policy engine (per-repo guardrails)** — protected paths, max cost, required
     review, allowed tools, enforced at spawn/merge. *Leverage: one config makes a
     whole repo safe for broad autonomy.*
 20. **Diff-scope guardrail** — flag/block merges touching sensitive paths or
-    exceeding a size budget (LANDED, TKT-55): the steward now runs a diff-scope
+    exceeding a size budget (LANDED, TKT-55): the landing now runs a diff-scope
     gate (`maxDiffFiles` / `maxDiffLines` per-repo budgets, `0` = off) beside the
     protected-path gate — an over-budget branch fails closed and is held for a
     human in `rk inbox` instead of auto-merging. *Leverage: catches the runaway
@@ -205,7 +205,7 @@ are strong multipliers that depend on or extend the above.
 and, when a written tuple matches a declared `#Trigger` (`{category, identity}` +
 agent/scope excludes), fires a workflow with params templated from the tuple's
 payload — zero tokens, zero model latency, cannot be broken by an agent deviating
-from protocol. E.g. `harness_result → steward`, `task_ready → drain-one`,
+from protocol. E.g. `harness_result → landing`, `task_ready → drain-one`,
 `obstacle:budget_exceeded → notify-operator`.
 
 **Why it's high leverage.** This is the single feature that converts rat-kingdom
@@ -213,7 +213,7 @@ from *operator-pull* (every workflow is `rk workflow run`) to *self-driving*
 (events dispatch the next action). The design doc calls reactive triggers "the
 reliability win" and the predecessor's biggest correct idea (§3, design doc), and
 Phase 5 lists it as the headline REMAINING item (impl-plan `:49`). Features #2, #3,
-#4, #6-steward, and #9 all become trivial once triggers exist; without it each is a
+#4, #6-landing, and #9 all become trivial once triggers exist; without it each is a
 bespoke daemon loop. It is the highest-leverage feature precisely because it is
 *leverage-on-leverage*.
 
@@ -248,9 +248,9 @@ bespoke daemon loop. It is the highest-leverage feature precisely because it is
 
 ---
 
-### 2. Steward: autonomous triage & auto-merge
+### 2. Landing: autonomous triage & auto-merge
 
-**What it does.** On every rat completion, a lightweight steward automatically
+**What it does.** On every rat completion, a lightweight landing automatically
 fetches the branch, runs the repo's checks (via #6), and: merges clean work,
 routes fixable work back to a rework rat, and escalates only genuine judgment calls
 to the operator (via #12/`HerdrMux::notify`). The operator reviews exceptions, not
@@ -259,16 +259,16 @@ every branch.
 **Why it's high leverage.** "Is this branch good to merge?" is the most frequent
 decision the operator makes — once per completed task. Automating the *clean* case
 (the majority) is the biggest single reduction in per-task attention. The
-predecessor's steward pattern is explicitly flagged as a keep (design doc §3,
+predecessor's landing pattern is explicitly flagged as a keep (design doc §3,
 Phase 7), and reviewer-drives-rework already ships the routing primitives — the
-steward is their reactive, unattended application.
+landing is their reactive, unattended application.
 
 **Implementation sketch (grounded).**
 - Register a trigger (#1) on `Event/harness_result` (emitted by
-  `route_completion`, `supervisor.rs:606`) that fires a `steward` workflow scoped to
+  `route_completion`, `supervisor.rs:606`) that fires a `landing` workflow scoped to
   the completed rat's branch (`ctx.active_branch` chains onto it, exactly as
   `code-review.cue` does).
-- The steward workflow: `spawn` a cheap reviewer/axe rat on the branch → `run`
+- The landing workflow: `spawn` a cheap reviewer/axe rat on the branch → `run`
   the repo's test/lint gate (#6) → `read` the reviewer's verdict artifact
   (`read` step already lifts `rk out artifact … review`, `workflow_exec.rs:385`) →
   `when` on verdict: APPROVE → `dismiss` (merge via `merge_branch`,
@@ -279,7 +279,7 @@ steward is their reactive, unattended application.
 **Dependencies / risks.**
 - Depends on **#1 (triggers)** to be reactive, and on **#6 (run gate)** for real
   teeth — an auto-merge behind a weak check is worse than manual review.
-- **False confidence**: pair with **#19 (policy)** so the steward refuses to
+- **False confidence**: pair with **#19 (policy)** so the landing refuses to
   auto-merge diffs touching protected paths, forcing those to the operator.
 - Merge-to-main nuance: a reviewer chained off the work branch merges into its
   *base*, not main directly (documented limitation, high-leverage-workflows.md §5);
@@ -298,7 +298,7 @@ per fleet).
 **Why it's high leverage.** It removes the operator from the dispatch loop
 entirely: instead of one `rk spawn --ticket` per item (or one `backlog-drain` per
 batch), a well-groomed backlog turns itself into a steady stream of parallel work at
-a controlled burn. Combined with #2 (steward closes each item) it's a closed
+a controlled burn. Combined with #2 (landing closes each item) it's a closed
 loop — the operator grooms/prioritizes, the fleet executes.
 
 **Implementation sketch (grounded).**
@@ -405,7 +405,7 @@ merging trustworthy. Today `evaluate` only CUE-unifies against the *harness's ow
 reported output* (`unify_concrete`, `workflow_exec.rs:305`) — it takes the rat's
 word. Nothing runs the repository's own checks deterministically before a merge. A
 `run` gate converts "the rat says it passed" into "the suite is green or it does not
-land." Every auto-merge path (#2 steward, #3 dispatcher, #23 land) is only as safe
+land." Every auto-merge path (#2 landing, #3 dispatcher, #23 land) is only as safe
 as this gate.
 
 **Implementation sketch (grounded).**
@@ -547,7 +547,7 @@ documented in high-leverage-workflows.md §5 ("Merge semantics note"), a reviewe
 chained off the work branch dismisses into its *base*, not main — so today APPROVE
 routes *completion-vs-failure*, and a human still lands the branch. A `land` step
 makes review→rework→**merge-to-main** a fully unattended loop, which is what makes
-#2 (steward) able to actually ship, not just stage.
+#2 (landing) able to actually ship, not just stage.
 
 **Implementation sketch (grounded).**
 - The capability already exists at the git layer: `Repo::merge_branch(branch,
@@ -571,7 +571,7 @@ makes review→rework→**merge-to-main** a fully unattended loop, which is what
 | # | Feature | Dimension | Primary leverage |
 |---|---------|-----------|------------------|
 | 1 | Reactive trigger engine | Autonomy | Substrate: pull → self-driving |
-| 2 | Steward: autonomous triage & merge | Autonomy | Removes the per-task merge decision |
+| 2 | Landing: autonomous triage & merge | Autonomy | Removes the per-task merge decision |
 | 3 | Continuous WIP dispatcher | Scaling | Backlog → self-refilling parallel work |
 | 4 | `rk inbox` attention queue | Observability | Collapses 5 poll surfaces into 1 |
 | 5 | Burn-rate & stuck detection | Safety | Unlocks *trusting* unattended runs |
@@ -584,5 +584,5 @@ makes review→rework→**merge-to-main** a fully unattended loop, which is what
 **Critical path.** #1 (triggers) is the keystone — #2, #3, #9 all ride on it, and
 #5/#6/#27 are the guardrails that make #2/#3 safe to leave running. If only three
 features were built, build **#1 + #5 + #6**: a reactive substrate plus the two
-guardrails that make reactive autonomy trustworthy. The steward (#2) and dispatcher
+guardrails that make reactive autonomy trustworthy. The landing (#2) and dispatcher
 (#3) then follow almost for free from primitives that already exist.

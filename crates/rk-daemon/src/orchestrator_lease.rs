@@ -202,6 +202,27 @@ impl LeaseStore {
     pub fn current(&self, scope: &str) -> rk_core::Result<Option<Lease>> {
         Ok(self.lock()?.leases.get(scope).cloned())
     }
+
+    /// End a bounded background action without making the King wait for TTL.
+    /// A stale holder cannot release a replacement's lease.
+    pub fn release(
+        &self,
+        scope: &str,
+        holder: &str,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> rk_core::Result<()> {
+        let mut data = self.lock()?;
+        let lease = data
+            .leases
+            .get_mut(scope)
+            .ok_or_else(|| rk_core::Error::other(format!("no lease held for {scope}")))?;
+        if lease.holder != holder || lease.generation != generation {
+            return Err(rk_core::Error::other("lease release fencing failed"));
+        }
+        lease.expires_at = now;
+        self.persist(&data)
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +231,23 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc::now()
+    }
+
+    #[test]
+    fn bounded_action_releases_for_king_and_old_holder_cannot_release_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LeaseStore::load(dir.path().join("lease.json")).unwrap();
+        let at = now();
+        let lease = store.acquire("repo", "daemon-operations", 300, at).unwrap();
+        store
+            .release("repo", &lease.holder, lease.generation, at)
+            .unwrap();
+        let king = store.acquire("repo", "king", 300, at).unwrap();
+        assert!(king.generation > lease.generation);
+        assert!(store
+            .release("repo", &lease.holder, lease.generation, at)
+            .is_err());
+        assert!(store.current("repo").unwrap().unwrap().is_live(at));
     }
 
     #[test]

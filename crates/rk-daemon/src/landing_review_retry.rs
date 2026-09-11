@@ -257,7 +257,7 @@ impl ReviewDeathContext {
     /// Evidence-rich human gate: evidence, decision, and the resolving command.
     pub(crate) fn escalation(&self, withheld: &Withheld, death_context: &str) -> String {
         format!(
-            "steward: review of {branch} for {task} died before a verdict and was NOT \
+            "landing: review of {branch} for {task} died before a verdict and was NOT \
              automatically retried ({code}) — branch held unmerged.\n\
              EVIDENCE: exact reviewed head {head_sha}; the reviewer ended without producing a \
              verdict: {death_context}. {detail}\n\

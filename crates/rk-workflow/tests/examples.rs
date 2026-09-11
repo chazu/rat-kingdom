@@ -115,7 +115,7 @@ fn all_shipped_examples_load() {
 }
 
 #[test]
-fn steward_review_carries_the_exact_review_binding_on_its_spawn() {
+fn candidate_review_carries_the_exact_review_binding_on_its_spawn() {
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("TKT-1")),
         ("branch".to_string(), json!("rat/worker/tkt-1")),
@@ -123,8 +123,8 @@ fn steward_review_carries_the_exact_review_binding_on_its_spawn() {
         ("headSha".to_string(), json!("abc123")),
         ("reviewAttempt".to_string(), json!("landing-review-1")),
     ]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward-review.cue"), &inputs)
-        .expect("steward-review loads");
+    let workflow = rk_workflow::load(&examples_dir().join("candidate-review.cue"), &inputs)
+        .expect("candidate-review loads");
     let spawn = workflow
         .steps
         .iter()
@@ -142,7 +142,7 @@ fn steward_review_carries_the_exact_review_binding_on_its_spawn() {
 }
 
 #[test]
-fn steward_review_reuses_the_daemon_gate_proof() {
+fn candidate_review_reuses_the_daemon_gate_proof() {
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("TKT-1")),
         ("branch".to_string(), json!("rat/worker/tkt-1")),
@@ -150,8 +150,8 @@ fn steward_review_reuses_the_daemon_gate_proof() {
         ("headSha".to_string(), json!("abc123")),
         ("reviewAttempt".to_string(), json!("landing-review-1")),
     ]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward-review.cue"), &inputs)
-        .expect("steward-review loads");
+    let workflow = rk_workflow::load(&examples_dir().join("candidate-review.cue"), &inputs)
+        .expect("candidate-review loads");
     let spawn = workflow
         .steps
         .iter()
@@ -234,8 +234,8 @@ fn shipped_example_triggers_load() {
     }
 }
 
-/// The daemon-native landing pipeline's completion feed (steward remediation
-/// Phase 3-T4, post-cutover replacement for the retired `steward-on-completion`
+/// The daemon-native landing pipeline's completion feed (landing remediation
+/// Phase 3-T4, post-cutover replacement for the retired `legacy-landing-on-completion`
 /// workflow trigger): an `action: "land"` trigger needs no `run` (the schema
 /// makes it optional for that action), and it must match every plain-rat
 /// completion the old workflow trigger used to.
@@ -246,7 +246,7 @@ fn landing_pipeline_trigger_loads_with_no_run_and_matches_rat_completions() {
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
     let landing = triggers
         .iter()
-        .find(|t| t.name == "steward-landing-on-completion")
+        .find(|t| t.name == "landing-on-completion")
         .expect("shipped landing-pipeline trigger");
     assert_eq!(landing.action, rk_workflow::TriggerAction::Land);
     assert_eq!(landing.run, "");
@@ -645,18 +645,18 @@ fn land_on_approve_gates_failed_delivery() {
 ///
 /// TKT-161 fixed the two examples that carried the unbound read at the time, and
 /// pinned each one in its own test. That is not a guarantee about the class: the
-/// live fleet also ran a hand-copied `steward-grmpl` with no repo source, which
+/// live fleet also ran a hand-copied `landing-grmpl` with no repo source, which
 /// kept the unbound read for three more days and could auto-merge a branch on a
 /// concurrent instance's verdict. A per-file assertion cannot fail for a file
 /// nobody wrote a test for, so assert the property over the directory — the next
-/// steward variant, or a copy-paste of an existing one, is covered the moment it
+/// landing variant, or a copy-paste of an existing one, is covered the moment it
 /// lands here.
 ///
 /// This guards the SHIPPED set. It cannot reach a repo-scoped workflow living in
-/// some other repo's `.rk/workflows/` (which is where `steward-grmpl` belongs —
-/// TKT-178), so a per-repo steward still has to carry the binding on its own.
+/// some other repo's `.rk/workflows/` (which is where `landing-grmpl` belongs —
+/// TKT-178), so a per-repo landing still has to carry the binding on its own.
 ///
-/// `(artifact, <repo>, review)` is the shared key: a steward is fired PER rat
+/// `(artifact, <repo>, review)` is the shared key: a landing is fired PER rat
 /// completion, so instances run concurrently on one repo by design and all of
 /// them read it. Unbound, "newest match wins" is whichever reviewer finished
 /// last.

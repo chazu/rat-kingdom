@@ -15,7 +15,7 @@ burn detection, stale-instance timeout, ticket reopen, announce sinks).*
   backlog accumulates duplicates faster than anything dedupes them.**
 - Blocked 16 tickets: 3 operator-only, 2 decision tickets (+2 implementations
   gated on those decisions), 4 epic-wip (gate concurrency = Phase-2 E4
-  territory), 4 building on the dead steward CUE path slated for removal,
+  territory), 4 building on the dead landing CUE path slated for removal,
   1 landing-policy (E2 territory).
 - Filed 3 fresh probe tickets: verify/CI profile alignment (high),
   terminal-cost rollup fix (high), `rk ticket reopen` (normal).
@@ -45,10 +45,10 @@ burn detection, stale-instance timeout, ticket reopen, announce sinks).*
 
 ## Scoreboard (T+8h)
 
-- **First substantive autonomous landing**: Sooty-8's dead-steward-CUE
+- **First substantive autonomous landing**: Sooty-8's dead-landing-CUE
   deletion, full loop, zero operator touch (62fa8e0 / f744219).
 - Landing outcomes so far: 3 landed (1 substantive, 2 empty/self-groom),
-  1 rework-filed (steward auto-filed — the phase-1 hand-off working),
+  1 rework-filed (landing auto-filed — the phase-1 hand-off working),
   1 gate-held (O10 rollover collateral), 1 escalated (dead reviewer,
   superseded by re-dispatch).
 - Non-empty landings vs the ≥3/day bar: 1, with several branches still
@@ -137,7 +137,7 @@ evidence), first organic ballot use (quorum unreachable at 2-WIP).
 
 ## Interventions
 
-*(operator/steward actions that autonomous machinery should eventually own —
+*(operator/landing actions that autonomous machinery should eventually own —
 classified as: dispatch / recovery / review / landing / grooming / other)*
 
 | When | Class | What | Should-be-owner |

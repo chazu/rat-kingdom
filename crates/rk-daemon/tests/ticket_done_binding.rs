@@ -267,7 +267,7 @@ async fn merge_mode_ticket_stays_open_when_branch_deleted_without_merging() {
 /// A `TKT-<ULID>` ticket minted before proquint ids is spawned under its
 /// ULID identity, so the lock registry's `record.task` carries that
 /// spelling verbatim. `rk ticket show`/`list` now surface the ticket's
-/// deterministic proquint alias, so the operator (or a steward) naturally
+/// deterministic proquint alias, so the operator (or a landing) naturally
 /// addresses the follow-up `ticket.update --status done` by the alias.
 /// Both name the same ticket, so the guard must reach the same verdict for
 /// both: a raw string compare against `record.task` would find no

@@ -5,7 +5,7 @@
 **Refines:** proposal 0002 (landed as commit `3690a85`)
 **Companion convention:** extends `no-workspace-wide-reformatting` (does not
 replace it)
-**Status:** proposed (do NOT apply live — an operator/steward lands this; see the
+**Status:** proposed (do NOT apply live — an operator/landing lands this; see the
 completion protocol)
 
 ## The recurring pain

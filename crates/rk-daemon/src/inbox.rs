@@ -480,7 +480,7 @@ pub fn build(
     // depended on the workflow DEFINITION carrying an
     // `evaluate {expect: {merged: true}}` after its `land` — and a definition is
     // a file that can be stale, forked per repo, or hand-edited. TKT-147 is what
-    // that costs: a steward completed cleanly on `{merged: false}` and the fix
+    // that costs: a landing completed cleanly on `{merged: false}` and the fix
     // sat off main for two days. Asserting it here instead makes the invariant
     // hold for every workflow, including the ones that forgot the gate.
     //
@@ -1621,7 +1621,7 @@ mod tests {
         // `evaluate` completes as if the work landed. The branch is left
         // outside main with nothing naming it. Assert it here instead.
         let lands = vec![land(
-            "rat/dusty-2/steward-review-tkt-147",
+            "rat/dusty-2/candidate-review-tkt-147",
             false,
             false,
             "merge conflict or failure: CONFLICT (content): Merge conflict in lib.rs",
@@ -1642,15 +1642,15 @@ mod tests {
         assert_eq!(row.kind, "unlanded-branch");
         // Ranked with the failures: dropped reviewed work, not a passive note.
         assert_eq!(row.urgency, urgency::UNLANDED);
-        assert_eq!(row.subject, "rat/dusty-2/steward-review-tkt-147");
+        assert_eq!(row.subject, "rat/dusty-2/candidate-review-tkt-147");
         assert!(row
             .detail
-            .contains("rat/dusty-2/steward-review-tkt-147 → main"));
+            .contains("rat/dusty-2/candidate-review-tkt-147 → main"));
         // The reason git gave must reach the operator, not just "it failed".
         assert!(row.detail.contains("Merge conflict in lib.rs"));
         assert!(row
             .action()
-            .contains("rk land rat/dusty-2/steward-review-tkt-147 --repo repo --target main"));
+            .contains("rk land rat/dusty-2/candidate-review-tkt-147 --repo repo --target main"));
     }
 
     #[test]
@@ -1728,7 +1728,7 @@ mod tests {
             "repo",
             "branch_landed",
             "castle",
-            json!({"branch": "rat/filch/steward-review-tkt-18", "target": "main", "merged": false}),
+            json!({"branch": "rat/filch/candidate-review-tkt-18", "target": "main", "merged": false}),
         );
         let inbox = build(
             &[],

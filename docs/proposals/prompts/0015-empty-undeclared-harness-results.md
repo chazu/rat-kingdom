@@ -10,7 +10,7 @@
 
 ## The recurring pain
 
-Recent nightly and steward failures repeatedly contain a harness result that
+Recent nightly and landing failures repeatedly contain a harness result that
 never declared completion and produced no usable work product. The signature is
 `declared_done: false`, `is_error: true`, usually `tokens: 0`, and an empty
 `result` (or a short interrupted turn):

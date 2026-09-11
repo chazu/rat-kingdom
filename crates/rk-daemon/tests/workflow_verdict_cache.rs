@@ -1,4 +1,4 @@
-//! Phase 2 of the steward remediation (memory/steward-investigation): a
+//! Phase 2 of the landing remediation (memory/landing-investigation): a
 //! commit-keyed verdict cache so a retry against an UNCHANGED branch tip does
 //! not re-pay for a reviewer.
 //!
@@ -10,7 +10,7 @@
 //! cached yet.
 //!
 //! Reduced to the seam under test, the same way `workflow_verdict_binding.rs`
-//! reduces the real steward: a leading cache probe, then a `when` whose `""`
+//! reduces the real landing: a leading cache probe, then a `when` whose `""`
 //! (miss) arm spawns a reviewer exactly as before, and whose `default` (hit)
 //! arm routes on the cached recommendation WITHOUT spawning anything. The
 //! reviewer script counts its own invocations into a file under `$RK_HOME`,
@@ -31,7 +31,7 @@ use support::connect;
 
 /// Every test in this file drives `RK_FAKE_HARNESS_CMD`, a process-global env
 /// var — and unlike the earlier reduced-workflow tests (which all share one
-/// identical fake script), the shipped-steward e2e test below installs a
+/// identical fake script), the shipped-landing e2e test below installs a
 /// DIFFERENT script. Concurrent test threads racing to set it would let one
 /// test's harness content leak into another's run, so every fn in this file
 /// takes this lock first (the convention `automated_landing.rs`/
@@ -72,7 +72,7 @@ rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"reviewed","session_id":"cache-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
-/// The steward's Phase 2 shape, reduced to the seam under test: probe the
+/// The landing's Phase 2 shape, reduced to the seam under test: probe the
 /// verdict cache for `_input.headSha`; a miss (`""`) spawns a reviewer, waits,
 /// and routes on the verdict IT wrote (`fromAgent: true`, unchanged from
 /// before the cache); a hit (`default`) skips straight to routing on the
@@ -221,7 +221,7 @@ fn release_reviewers(home: &Path) {
 }
 
 /// Record a verdict exactly as `rk out artifact <repo> review` would, carrying
-/// `head_sha`+`branch` the way steward.cue's reviewer prompt does
+/// `head_sha`+`branch` the way landing.cue's reviewer prompt does
 /// (TKT-01M036N1RT74H6NPRH5FMM8A6T, and the rework of
 /// TKT-01M036NWEG0H019BJ16G59RZVP that added `branch`).
 async fn plant_verdict(
@@ -322,7 +322,7 @@ async fn same_sha_retry_consumes_cached_approve_without_spawning_a_reviewer() {
 
 /// A retry against a branch tip whose only recorded verdict belongs to a
 /// DIFFERENT commit is a cache miss: it falls through to spawning a fresh
-/// reviewer, exactly as steward did before the cache existed.
+/// reviewer, exactly as landing did before the cache existed.
 #[tokio::test]
 async fn a_different_commit_is_a_cache_miss_and_spawns_a_fresh_reviewer() {
     let _env_guard = HARNESS_ENV_LOCK.lock().await;

@@ -2015,7 +2015,7 @@ mod tests {
         );
         assert_eq!(
             command_tool(
-                r#"text="steward: reviewer returned STOP"; payload=$(jq -nc --arg text "$text" '{text:$text}'); rk out need repo steward --payload "$payload""#
+                r#"text="landing: reviewer returned STOP"; payload=$(jq -nc --arg text "$text" '{text:$text}'); rk out need repo landing --payload "$payload""#
             )
             .as_deref(),
             Some("rk")
@@ -2034,7 +2034,7 @@ mod tests {
             dir.path().join(".rk/checks.cue"),
             r#"checks: [
     {name: "guard", command: "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep x"},
-    {name: "report", command: "text=\"reviewer returned STOP; rk out need repo steward\"; git status --short"},
+    {name: "report", command: "text=\"reviewer returned STOP; rk out need repo landing\"; git status --short"},
 ]"#,
         )
         .unwrap();

@@ -449,7 +449,7 @@ fn is_reporting_boundary(agent: &AgentRecord) -> bool {
         .and_then(|coordination| coordination.reports_to.as_deref())
         == Some("coordinator")
         || (agent.workflow_instance.is_some()
-            && matches!(agent.role.as_str(), "foreman" | "steward"))
+            && matches!(agent.role.as_str(), "foreman" | "landing"))
 }
 
 fn is_descendant(all: &[AgentRecord], agent: &AgentRecord, root: &str) -> bool {

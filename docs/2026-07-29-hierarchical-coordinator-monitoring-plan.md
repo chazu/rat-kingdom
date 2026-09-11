@@ -50,7 +50,7 @@ coordinator session
         |             +-- leaf rats
         |
         +-- owned workflow B
-               +-- steward B (reporting boundary)
+               +-- landing B (reporting boundary)
                       +-- leaf rats
 ```
 
@@ -107,7 +107,7 @@ scope remain authoritative for workflow state.
 ### Middle-rat
 
 A rat that acts as a reporting boundary for a workflow or a subtree: normally a
-foreman or steward, but not necessarily limited to those role strings. The
+foreman or landing, but not necessarily limited to those role strings. The
 boundary is determined by dispatch metadata and structural lineage, with role
 used for presentation and policy defaults.
 
@@ -160,7 +160,7 @@ every agent that happens to share the repo.
 
 ### 2. Make the reporting boundary explicit
 
-The system should not rely on the literal role names `foreman` and `steward` to
+The system should not rely on the literal role names `foreman` and `landing` to
 decide what reaches the coordinator. A workflow dispatch should be able to mark
 an agent as a reporting boundary, for example with a normalized coordination
 metadata value:
@@ -174,7 +174,7 @@ metadata value:
 }
 ```
 
-The initial defaults can treat workflow-owned foremen and stewards as visible,
+The initial defaults can treat workflow-owned foremen and landings as visible,
 while preserving an explicit override for new middle-rat roles. Lineage remains
 the safety boundary; role is only a default policy and display label.
 
@@ -391,8 +391,8 @@ include stable IDs and commands for drill-down, for example:
 [RAT KINGDOM ATTENTION]
 - Foreman-1 completed 4/7 child tickets; 1 child is blocked.
   Inspect: rk status Foreman-1
-- Steward-2 failed during review of TKT-...
-  Inspect: rk log Steward-2 --generation 1
+- Landing-2 failed during review of TKT-...
+  Inspect: rk log Landing-2 --generation 1
 - Workflow wf-01... is awaiting approval.
   Inspect: rk workflow status wf-01...
 [ACTIVE ROLLUP]
@@ -416,7 +416,7 @@ hosts that can support it, not a Rat Kingdom completion requirement.
 
 - Document coordinator session, owned workflow, middle-rat, and leaf-rat
   terminology in the operator prompt and relevant domain docs.
-- Add fixtures for a coordinator-owned workflow with a foreman, steward, and
+- Add fixtures for a coordinator-owned workflow with a foreman, landing, and
   multiple leaf rats.
 - Implement a pure supervision-tree projection that produces middle-rat
   summaries and descendant counts.
@@ -503,7 +503,7 @@ automatic turn-boundary injection, but the core system does not depend on one.
   crash, leaf-rat failure, rapid child completion, and multiple simultaneous
   owned workflows.
 - Verify that unrelated castle activity does not enter the coordinator prompt.
-- Verify that `rk inbox` and existing steward escalation notification behavior
+- Verify that `rk inbox` and existing landing escalation notification behavior
   remain intact.
 - Add operator documentation and changelog entries with cursor/recovery
   examples.

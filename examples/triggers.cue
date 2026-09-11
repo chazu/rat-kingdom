@@ -55,13 +55,13 @@ triggers: [
 		maxFires: 3
 	},
 
-	// THE STEWARD (leverage #2). On every rat completion, reactively triage that
+	// THE LANDING (leverage #2). On every rat completion, reactively triage that
 	// rat's branch: the daemon-native landing pipeline decides auto-merge /
 	// rework-ticket / escalate — so the operator reviews exceptions, not every
-	// branch. This used to be a `run: "steward"` workflow trigger fired from
+	// branch. This used to be a `run: "landing"` workflow trigger fired from
 	// here; that mega-workflow and its trigger entry are retired post-cutover
-	// (steward remediation Phase 4, TKT-01M048ASYM00N37EBK1VM7FH5H) in favor of
-	// `examples/triggers-landing-pipeline.cue`'s `steward-landing-on-completion`
+	// (landing remediation Phase 4, TKT-01M048ASYM00N37EBK1VM7FH5H) in favor of
+	// `examples/triggers-landing-pipeline.cue`'s `landing-on-completion`
 	// (`action: "land"`), which hands the same completions straight to
 	// `crates/rk-daemon/src/landing.rs` instead of spawning a CUE workflow.
 ]

@@ -15,7 +15,7 @@ stigmergically through a Linda-style tuplespace ("BBS").
 
 **Mechanism summary (verified in code):**
 
-- **Roles**: king, worker, reviewer, merge-handler, foreman, steward. King/steward are
+- **Roles**: king, worker, reviewer, merge-handler, foreman, landing. King/landing are
   global singletons (no worktree); everything else gets branch `agent/{name}/{taskID}`
   and a per-agent worktree under the castle root (`internal/agent/agent.go:169`).
 - **Spawn**: create worktree → install anti-main-commit hook → `tmux new-session -e`
@@ -68,7 +68,7 @@ From code inspection and the predecessor's own post-mortem research docs:
    The Phase-1 pre-scan, `seen` maps, and 500ms re-scan loops in `steps/wait.go` are
    mitigation, not cure.
 5. **Payload-blind event routing**: worker `task_done`/`dismiss_request` events route to
-   steward/king unconditionally; the spawning foreman is bypassed because parent/child
+   landing/king unconditionally; the spawning foreman is bypassed because parent/child
    lineage is a hand-copied payload field the sugar command doesn't even emit
    (`.ai/research/2026-04-06-foreman-worker-notification-routing`). Race: king dismisses
    a worker before its foreman integrates the branch.
@@ -97,7 +97,7 @@ database, or (c) discipline encoded in prose instead of structure.
   deviating from protocol. The predecessor's own docs call this the reliability win.
 - **Schema-enforcing sugar commands** (`task-done`, `obstacle`, `escalate`) that
   auto-fill identity from env — "the strongest defense against BBS noise."
-- **Steward pattern**: offload routine triage (fetch branch, test, auto-dismiss or
+- **Landing pattern**: offload routine triage (fetch branch, test, auto-dismiss or
   escalate) from the human-facing coordinator.
 - **Worktree-per-agent, never-touch-main, target-branch-then-merge lifecycle.**
 - **A2A client contract** (agent-card discovery, 4 endpoints) — designed, tested, but the
@@ -142,7 +142,7 @@ machine-parseable supervision surface. Two patterns cover everything:
 TOML-defined agents, `axe run <agent> -p ... --json`, native `--max-tokens` budget caps
 with **exit code 4 on budget exceeded**, token counts in JSON metadata, MCP support,
 `call_agent` delegation. No resume/steer — supervise as a plain subprocess. Easiest to
-integrate; good fit for steward/reviewer-style bounded jobs.
+integrate; good fit for landing/reviewer-style bounded jobs.
 
 **Proposed abstraction** (informed by vibe-kanban's Rust executor trait, the closest
 prior art — see `crates/executors` in BloopAI/vibe-kanban):

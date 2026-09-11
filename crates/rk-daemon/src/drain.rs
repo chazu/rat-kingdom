@@ -6,7 +6,7 @@
 //! fewer than `W` are running and the ready backlog is non-empty it claims the
 //! highest-priority ready ticket and spawns a rat for it. That turns "keep the
 //! fleet busy" from one operator spawn per ticket into a single config dial;
-//! combined with the steward closing each merged item it is a closed loop — the
+//! combined with the landing pipeline closing each merged item it is a closed loop — the
 //! operator grooms and prioritises, the fleet executes.
 //!
 //! # Cadence
@@ -103,6 +103,20 @@ impl Drain {
 
     /// [`run_cycle`](Self::run_cycle) with an injectable "now" for aging tests.
     pub async fn run_cycle_at(&self, now: DateTime<Utc>) -> rk_core::Result<usize> {
+        self.run_cycle_with_authorization(now, false).await
+    }
+
+    /// Refill only work explicitly delegated by its current ticket label.
+    /// Uses the same admission, policy, budget, claim and recovery path as drain.
+    pub async fn run_authorized_cycle(&self) -> rk_core::Result<usize> {
+        self.run_cycle_with_authorization(Utc::now(), true).await
+    }
+
+    async fn run_cycle_with_authorization(
+        &self,
+        now: DateTime<Utc>,
+        authorized_only: bool,
+    ) -> rk_core::Result<usize> {
         let max_wip = self.config.max_wip;
         if max_wip == 0 {
             return Ok(0);
@@ -149,6 +163,13 @@ impl Drain {
         // Dependency-aware ready backlog, optionally pinned to one repo scope,
         // ranked by effective (aged) priority — strongest first.
         let mut ready = self.tickets.ready(ready_scope)?;
+        if authorized_only {
+            ready.retain(|ticket| {
+                string_array(&ticket.payload, "labels")
+                    .iter()
+                    .any(|label| label == "ready-for-agent")
+            });
+        }
         ready.sort_by(|a, b| {
             let (sa, sb) = (self.score(a, now), self.score(b, now));
             // Highest score first; FIFO (oldest ticket) on a tie.
@@ -234,7 +255,12 @@ impl Drain {
             let resolved = self.resolve_tier(ticket)?;
             // Atomic claim before spawn: if a concurrent drain/fan-out already
             // took it we lose the race and skip, so no ticket is double-grabbed.
-            if !self.tickets.claim(&ticket.identity).await? {
+            let claimed = if authorized_only {
+                self.tickets.claim_authorized(ticket).await?
+            } else {
+                self.tickets.claim(&ticket.identity).await?
+            };
+            if !claimed {
                 continue;
             }
 

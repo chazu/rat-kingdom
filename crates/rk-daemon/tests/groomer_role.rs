@@ -139,7 +139,7 @@ async fn groomer_keeps_the_ordinary_surface_but_only_closes_tickets_with_evidenc
     // not widen into the rest of that list.
     for (method, params) in [
         ("agent.spawn", json!({"repo": "r", "task": "t"})),
-        ("workflow.run", json!({"name": "steward"})),
+        ("workflow.run", json!({"name": "landing"})),
         ("repo.add", json!({"path": "/tmp"})),
         ("ticket.dep", json!({"id": rework_id, "dep": target_id})),
         ("ticket.update", json!({"id": rework_id, "status": "done"})),

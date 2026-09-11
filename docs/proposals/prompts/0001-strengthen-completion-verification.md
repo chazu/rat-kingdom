@@ -2,7 +2,7 @@
 
 **Author:** rat-28 (task: refine-prompts)
 **Target prompt:** `crates/rk-core/src/prime.rs` → `FRAGMENT_COMPLETION`
-**Status:** proposed (do NOT apply live — see completion-protocol; an operator/steward lands this)
+**Status:** proposed (do NOT apply live — see completion-protocol; an operator/landing lands this)
 
 ## The recurring pain
 

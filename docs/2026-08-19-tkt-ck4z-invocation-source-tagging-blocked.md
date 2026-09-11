@@ -65,7 +65,7 @@ comparison this ticket was meant to enable. Either:
    piece of instrumentation than the deferred wrapper design, or
 2. The decision in TKT-01M0CJY73NHNXNE3PTAY86033B gets made without this data:
    reason from the structural argument already in that ticket (every rat's
-   own verify and the automated steward gate both hit the same shared target
+   own verify and the automated landing gate both hit the same shared target
    dir, clustered in time; self-driven is very plausibly not rare) rather than
    waiting on telemetry that can't arrive.
 

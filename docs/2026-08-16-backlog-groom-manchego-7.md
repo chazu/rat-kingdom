@@ -22,8 +22,8 @@ Every open or in_progress ticket titled `rework: TKT-...` was checked by
 reading the **live status of its referenced ticket** with `rk ticket show`.
 All 34 point at a target ticket whose current status is **done** — the
 rework was actually completed and reviewed under a later
-`steward-review-<tkt>` branch that merged into main (spot-verified via
-`git log main --grep`, e.g. `df21be4 merge rat/dart-5/steward-review-tkt-01m01nzbwerf4w9qarwg8p632p into main`).
+`candidate-review-<tkt>` branch that merged into main (spot-verified via
+`git log main --grep`, e.g. `df21be4 merge rat/dart-5/candidate-review-tkt-01m01nzbwerf4w9qarwg8p632p into main`).
 Each of these rework tickets is stale and should be closed by the operator,
 noting the done target as the resolution:
 
@@ -128,7 +128,7 @@ items in its own body):
 
 All other large umbrellas (TKT-85/86/87 and their P13b/P14/P15 children,
 TKT-141, TKT-142, TKT-152, TKT-153, TKT-155, TKT-157, TKT-179, the
-operator-config and steward-cutover parents) were already decomposed by
+operator-config and landing-cutover parents) were already decomposed by
 prior grooming passes and were left as-is; TKT-85 remains an intentional
 load-bearing gate. No new duplicates were found beyond §1 and §3. Global
 `grmpl` tickets outside this cluster were reviewed but not otherwise

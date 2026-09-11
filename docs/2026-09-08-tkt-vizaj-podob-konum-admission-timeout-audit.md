@@ -18,7 +18,7 @@ in-progress right now by Thistle-14 for a touching-but-distinct concern
 1. **The WIP limit is fleet-wide, not landing-specific.**
    `~/.rat-kingdom/config.toml` sets `verification_admission_limit = 1` with
    no `rat-kingdom` override in `verification_admission_limit_by_repo`. Every
-   managed check for this repo — a 30-second `steward-protected-paths` grep
+   managed check for this repo — a 30-second `landing-protected-paths` grep
    and a 60-minute `verify-full` — shares one queue slot
    (`crates/rk-daemon/src/managed_verification.rs`
    `VerificationAdmission::acquire`, `VerificationResources`). Under
@@ -29,7 +29,7 @@ in-progress right now by Thistle-14 for a touching-but-distinct concern
    execution timeout — deliberately.** In `ManagedVerification::run`
    (`managed_verification.rs:556-591`), `tokio::time::timeout(timeout, ...)`
    bounds the wait for a permit using the SAME `timeout` the check declared
-   for its own execution in `checks.cue` (`steward-protected-paths` declares
+   for its own execution in `checks.cue` (`landing-protected-paths` declares
    `2m`). The comment immediately above the sibling `test_exec_lock` guard
    (line 509-512) states the reasoning explicitly: *"Bounded by this check's
    own timeout: if the queue is deep enough that a check cannot even START

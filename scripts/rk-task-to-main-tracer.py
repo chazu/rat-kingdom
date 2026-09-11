@@ -52,7 +52,7 @@ from pathlib import Path
 FIXTURE_DIR_DEFAULT = Path(__file__).parent / "fixtures" / "rk-task-to-main-tracer"
 
 # The "verify" lane is the actual full test-suite check (see .rk/checks.cue);
-# steward-protected-paths / steward-diff-scope are cheap scope gates and are
+# landing-protected-paths / landing-diff-scope are cheap scope gates and are
 # never candidates for "duplicate full-suite" — excluding them by lane name
 # avoids over-counting.
 FULL_SUITE_LANE = "verify"

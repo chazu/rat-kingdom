@@ -30,7 +30,7 @@ Gouda-14 (whole ticket), re-confirmed again here — no gap found on any pass:
 At least one prior dispatch on this exact ticket (Gouda-14, branch
 `rat/gouda-14/tkt-nofop-hodap-zufah`, commit `cbfbed2`) reached the same
 "no gap" conclusion and wrote a near-identical status doc, but the landing
-gate's `steward-protected-paths` check timed out acquiring the verification
+gate's `landing-protected-paths` check timed out acquiring the verification
 admission queue (WIP limit 1 reached) and the branch never merged — an
 infrastructure failure, not a finding about the work. Because the doc never
 reached `main`, the next dispatch on this ticket sees no record and redoes

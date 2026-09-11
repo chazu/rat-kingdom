@@ -3,7 +3,7 @@
 **Author:** Burrow-2 (task: refine-prompts)
 **Target prompt:** `crates/rk-core/src/prime.rs` → `FRAGMENT_COMPLETION`
 **Companion convention:** `rk-done-requires-a-commit`
-**Status:** proposed (do NOT apply live — an operator/steward lands this; see the
+**Status:** proposed (do NOT apply live — an operator/landing lands this; see the
 completion protocol)
 
 ## The recurring pain
@@ -11,11 +11,11 @@ completion protocol)
 A rat finishes the work, kicks off the long verification run (`cargo test
 --workspace` takes 10–15 min in these workspaces), ends its turn to wait for it,
 and **only commits afterwards**. In that window the branch is byte-identical to
-`main`. The steward chains a review branch off it, sees an empty diff, and burns
+`main`. The landing chains a review branch off it, sees an empty diff, and burns
 a full reviewer lifetime on nothing.
 
 Measured over the drain feed (`rk scan event`, 289 `harness_result` tuples,
-2026-07-22 → 2026-07-25), **eight** distinct steward reviews opened onto an
+2026-07-22 → 2026-07-25), **eight** distinct landing reviews opened onto an
 empty branch. Two are unambiguously this failure mode:
 
 **TKT-90 (grmpl), 2026-07-24 — reconstructed from the event stream:**
@@ -23,7 +23,7 @@ empty branch. Two are unambiguously this failure mode:
 ```
 13:54:15  agent_spawned    Methuselah  TKT-90
 14:00:30  harness_result   Methuselah  "I'll wait for the monitor to report the test results."
-14:00:30  agent_spawned    Warbeak     steward-review-TKT-90
+14:00:30  agent_spawned    Warbeak     candidate-review-TKT-90
 14:02:30  task_done        Warbeak     "REWORK. Empty delivery — rat/methuselah/tkt-90 created
                                         from main, never committed; branch is byte-identical
                                         to main HEAD, yet ticket was marked done."

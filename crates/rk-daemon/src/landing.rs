@@ -12,8 +12,8 @@
 //! ([`LandingQueue`], modeled on the Phase 1 trigger queue —
 //! `Reactor::enqueue_fire`/`drain_queued_fires`) and the consumer
 //! ([`LandingPipeline`]) that dequeues a candidate, runs the same three
-//! gates `steward.cue`'s `_gates` block runs today (`steward-protected-paths`,
-//! `steward-diff-scope`, the repo's named `verify` check) against T1's warm
+//! gates `landing.cue`'s `_gates` block runs today (`landing-protected-paths`,
+//! `landing-diff-scope`, the repo's named `verify` check) against T1's warm
 //! worktree, and — for a `doc-only`/`trivial` diff, the tier that needs no
 //! LLM judgment — advances the exact tested candidate on a pass. A diff
 //! needing review is handed back as
@@ -362,12 +362,12 @@ pub(crate) fn landing_queue_task_states(space: &Space) -> Vec<LandingQueueTaskSt
 }
 
 /// The two gates that guard every landing attempt regardless of tier —
-/// the retired steward mega-workflow's `_gates` block, POLICY (#19) and
+/// the retired landing mega-workflow's `_gates` block, POLICY (#19) and
 /// DIFF-SCOPE (#20). Named-check registry entries, not raw commands: a repo
 /// must register them in `.rk/checks.cue` exactly as it does for the
-/// workflow-driven steward today.
-const PROTECTED_PATHS_CHECK: &str = "steward-protected-paths";
-const DIFF_SCOPE_CHECK: &str = "steward-diff-scope";
+/// workflow-driven landing today.
+const PROTECTED_PATHS_CHECK: &str = "landing-protected-paths";
+const DIFF_SCOPE_CHECK: &str = "landing-diff-scope";
 
 /// Wall-clock bound for the two cheap policy/scope gates — matches
 /// that retired workflow's own `timeout: "2m"`.
@@ -380,7 +380,7 @@ const DEFAULT_CHECK_TIMEOUT: &str = "10m";
 /// Identity of a landing candidate's verdict artifact — Phase 2's
 /// commit-keyed cache (`Pattern::for_commit`, §1.3 of the design doc),
 /// written by the reviewer itself: `rk out artifact <repo> review --payload
-/// {...}` (`examples/workflows/steward-review.cue`).
+/// {...}` (`examples/workflows/candidate-review.cue`).
 const REVIEW_ARTIFACT_IDENTITY: &str = "review";
 
 /// Durable settlement marker for a review attempt whose landing-pipeline
@@ -414,14 +414,14 @@ const BARRIER_CEILING_PRE_MARKER: &str = "review-ceiling-pre-marker";
 /// caller not yet told. Armed only by `tests/review_ceiling_crash_barrier.rs`.
 const BARRIER_CEILING_POST_MARKER: &str = "review-ceiling-post-marker";
 
-/// Identity of the steward's escalation `need` tuple. Matches
-/// the retired steward workflow's `steward-report-stop`/
-/// `steward-report-unknown-verdict`/`steward-report-timeout` named checks,
-/// which all write `(need, <repo>, steward)` — `rk inbox` already ranks this
+/// Identity of the landing's escalation `need` tuple. Matches
+/// the retired landing workflow's `landing-report-stop`/
+/// `landing-report-unknown-verdict`/`landing-report-timeout` named checks,
+/// which all write `(need, <repo>, landing)` — `rk inbox` already ranks this
 /// identity, so escalating through the identical shape keeps operator-facing
 /// behavior unchanged even though the write is now a direct `Space::out`
 /// call instead of a shelled-out `rk out need` (§1.5).
-const STEWARD_NEED_IDENTITY: &str = "steward";
+const LANDING_NEED_IDENTITY: &str = "landing";
 
 /// Identity of the visibility event emitted when a candidate is about to
 /// land on a target other than `"main"`. Mirrors
@@ -436,10 +436,10 @@ const STEWARD_NEED_IDENTITY: &str = "steward";
 const LANDING_NON_MAIN_TARGET_IDENTITY: &str = "landing_non_main_land_target";
 
 /// Name of the shrunk, review-only workflow definition (design doc §2.5) —
-/// `examples/workflows/steward-review.cue`. [`LandingPipeline::request_review`]
+/// `examples/workflows/candidate-review.cue`. [`LandingPipeline::request_review`]
 /// invokes it programmatically on a verdict-cache miss; it is never
 /// reactor-fired.
-const REVIEW_WORKFLOW: &str = "steward-review";
+const REVIEW_WORKFLOW: &str = "candidate-review";
 
 /// Identity of the durable primary-vs-shadow comparison record written by
 /// [`LandingPipeline::await_shadow_comparison`]. One per review request that
@@ -1222,8 +1222,8 @@ impl LandingEdgeClass {
 }
 
 /// Whether POSIX ERE `pattern` matches any line of `paths` — evaluated
-/// through `grep -E`, the same engine `steward-protected-paths`/
-/// `steward-diff-scope` already use for their own patterns (their command
+/// through `grep -E`, the same engine `landing-protected-paths`/
+/// `landing-diff-scope` already use for their own patterns (their command
 /// text in `.rk/checks.cue`), so a repo's `focusedChecks.paths` pattern
 /// behaves identically to `protectedPaths`. A pattern that fails to even
 /// spawn `grep` is treated as no match — fail-closed toward running FEWER
@@ -1289,7 +1289,7 @@ fn select_focused_checks(
     (selected, reasons)
 }
 
-/// The gate/tier tuning steward.cue exposes as workflow params
+/// The gate/tier tuning landing.cue exposes as workflow params
 /// (formerly its `params` block) — same names, same
 /// defaults, now owned by the daemon-native pipeline instead of CUE.
 #[derive(Debug, Clone)]
@@ -1379,7 +1379,7 @@ pub(crate) enum LandingOutcome {
     /// separate explicit tracker action.
     Empty(Value),
     /// A gate failed or timed out. `run_check_in` already recorded the
-    /// durable `gate-failure` artifact, and a steward `need` row was written
+    /// durable `gate-failure` artifact, and a landing `need` row was written
     /// so the hold is visible in `rk inbox`; the branch is left unmerged.
     GateHeld,
     /// Repository policy cannot resolve the complete named gate list. This
@@ -1549,7 +1549,7 @@ impl LandingPipeline {
     /// Resolve this entry's repo-owned gate/review policy from its activated
     /// `.rk/repo.cue` (`RepositoryPolicy.landing`, digest-activated like
     /// `delivery` — `Supervisor::repository_policy`) — the daemon-native
-    /// replacement for what the retired steward mega-workflow
+    /// replacement for what the retired landing mega-workflow
     /// used to expose as workflow params (`protectedPaths`, `maxDiffFiles`,
     /// `maxDiffLines`, `gateTimeout`, `reviewTimeout`). A repo without an
     /// activated policy fails closed. `check_name` is not
@@ -2118,7 +2118,7 @@ impl LandingPipeline {
         let need = self.escalate(
             entry,
             format!(
-                "steward: NO GATE for {} on {} — branch held unmerged: {error}",
+                "landing: NO GATE for {} on {} — branch held unmerged: {error}",
                 entry.task, entry.branch
             ),
         )?;
@@ -2245,7 +2245,7 @@ impl LandingPipeline {
             git_repo.discard_candidate(&candidate.candidate_ref)?;
             // The durable gate-failure artifact carries the evidence; the
             // need row is what makes the hold VISIBLE in `rk inbox` — parity
-            // with the CUE steward's escalation contract. A hold that
+            // with the CUE landing's escalation contract. A hold that
             // followed an exhausted infra-death retry says so explicitly —
             // "one precise human gate" distinct from an ordinary red check,
             // since the automatic recovery path already ran and lost. Keyed
@@ -2255,12 +2255,12 @@ impl LandingPipeline {
             // later, unrelated ordinary failure as a retry exhaustion.
             let text = if gate_outcome == GateRunOutcome::InfraRetryExhausted {
                 format!(
-                    "steward: run gate FAILED for {} on {} after an automatic infrastructure-death retry was exhausted — branch held unmerged; read the durable gate-failure and landing_gate_infra_retry artifacts for the evidence",
+                    "landing: run gate FAILED for {} on {} after an automatic infrastructure-death retry was exhausted — branch held unmerged; read the durable gate-failure and landing_gate_infra_retry artifacts for the evidence",
                     entry.task, entry.branch
                 )
             } else {
                 format!(
-                    "steward: run gate FAILED for {} on {} — branch held unmerged; read the                      durable gate-failure artifact for the failing tests",
+                    "landing: run gate FAILED for {} on {} — branch held unmerged; read the                      durable gate-failure artifact for the failing tests",
                     entry.task, entry.branch
                 )
             };
@@ -2804,7 +2804,7 @@ impl LandingPipeline {
     }
 
     /// Spawn the shrunk review-only workflow (design doc §2.5,
-    /// `examples/workflows/steward-review.cue`) chained onto the candidate
+    /// `examples/workflows/candidate-review.cue`) chained onto the candidate
     /// branch, then wait on the verdict tuple ITSELF rather than the
     /// workflow instance's own completion (§1.5's `watch_attached_completion`
     /// pattern) — a daemon restart loses nothing: the reviewer keeps working
@@ -3439,7 +3439,7 @@ impl LandingPipeline {
     /// (`ReviewWaitOutcome::CeilingReached`) — or was explicitly cancelled —
     /// with the reviewer still live (module doc, parent incident
     /// 2026-08-21: a Codex reviewer stayed `Running`/reconnecting well after
-    /// its owning steward-review workflow had already timed out). Two
+    /// its owning candidate-review workflow had already timed out). Two
     /// things a live-at-ceiling hold must do that a dead-reviewer hold
     /// (`route_review_death`) does not need to, because there the reviewer
     /// is already gone:
@@ -3865,7 +3865,7 @@ impl LandingPipeline {
         self.escalate(
             entry,
             format!(
-                "steward: review of {} for {} requires a human ({code}) — branch held unmerged.\n\
+                "landing: review of {} for {} requires a human ({code}) — branch held unmerged.\n\
                  EVIDENCE: exact reviewed head {}; {detail}. Reviewer notes: {notes}\n\
                  DECISION NEEDED: {decision}\n\
                  BLAST RADIUS: {} file(s) / {} line(s) on {}, held back from {}. Nothing merged.\n\
@@ -3905,7 +3905,7 @@ impl LandingPipeline {
         self.escalate(
             entry,
             format!(
-                "steward: {} for {} passed gates and review but could not land onto {} \
+                "landing: {} for {} passed gates and review but could not land onto {} \
                  — branch held unmerged, target ref untouched.\n\
                  EVIDENCE: {} is checked out at {worktree_path}, which refused a \
                  fast-forward onto the tested merge {}: {detail}\n\
@@ -4417,7 +4417,7 @@ impl LandingPipeline {
             let _ = self.escalate(
                 entry,
                 format!(
-                    "steward: rework {} landed onto {}, but automatic parent resubmission failed: \
+                    "landing: rework {} landed onto {}, but automatic parent resubmission failed: \
                      {error}. Re-submit with `rk land {} --repo {} --target <original-target> \
                      --task <original-ticket>`",
                     entry.task, entry.target, entry.target, entry.repo_path
@@ -4435,7 +4435,7 @@ impl LandingPipeline {
             let _ = self.escalate(
                 entry,
                 format!(
-                    "steward: conflict correction {} landed onto {}, but automatic parent \
+                    "landing: conflict correction {} landed onto {}, but automatic parent \
                      resubmission failed: {error}. Re-submit with `rk land {} --repo {} --target \
                      <original-target> --task <original-ticket>`",
                     entry.task, entry.target, entry.target, entry.repo_path
@@ -6046,7 +6046,7 @@ impl LandingPipeline {
         }
     }
 
-    /// File the historical steward-shaped follow-up directly and idempotently.
+    /// File the historical landing-shaped follow-up directly and idempotently.
     /// Distinct coalesce namespace from [`Self::file_rework_ticket`] so a
     /// conflict and a review-rework on the same branch/head never collapse
     /// onto the same follow-up ticket.
@@ -6173,13 +6173,13 @@ impl LandingPipeline {
             .map(|t| t.payload))
     }
 
-    /// File the historical steward-shaped follow-up directly and idempotently.
+    /// File the historical landing-shaped follow-up directly and idempotently.
     async fn file_rework_ticket(&self, entry: &LandingQueueEntry) -> rk_core::Result<Tuple> {
         self.tickets
             .create(NewTicket {
                 title: format!("rework: {}", entry.task),
                 body: Some(format!(
-                    "Steward routed REWORK on branch {}. Read the reviewer notes: rk scan \
+                    "Landing routed REWORK on branch {}. Read the reviewer notes: rk scan \
                      artifact {}",
                     entry.branch, entry.repo_name
                 )),
@@ -6207,10 +6207,10 @@ impl LandingPipeline {
         let tuple = Tuple::new(
             Category::Need,
             entry.repo_name.clone(),
-            STEWARD_NEED_IDENTITY,
+            LANDING_NEED_IDENTITY,
             "daemon",
             json!({
-                "agent": "steward", "task": entry.task, "text": text,
+                "agent": "landing", "task": entry.task, "text": text,
                 "landing_incident": crate::current_needs::LandingIncident {
                     branch: entry.branch.clone(), target: entry.target.clone(),
                     head_sha: entry.head_sha.clone(), source_spawn: entry.source_spawn,
@@ -6371,7 +6371,7 @@ impl LandingPipeline {
         self.gate_plan(&checks_file, &entry.target, gates, &changed_paths)
     }
 
-    /// Run the same three gates `steward.cue`'s `_gates` block runs today
+    /// Run the same three gates `landing.cue`'s `_gates` block runs today
     /// (POLICY, DIFF-SCOPE, the repo's named `verify` check) against a
     /// persistent daemon-owned worktree reset to the candidate's tip.
     /// Returns [`GateRunOutcome::Pass`] only if every gate reported
@@ -7235,7 +7235,7 @@ impl LandingPipeline {
         let find = |name: &str| {
             checks
                 .iter()
-                .find(|c| c.name == name)
+                .find(|c| rk_core::landing_names::canonical(&c.name) == name)
                 .cloned()
                 .ok_or_else(|| {
                     rk_core::Error::other(format!(
@@ -7564,16 +7564,16 @@ mod tests {
 
     const ALL_PASS_CHECKS: &str = r#"
 checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "true", timeout: "30s"},
 ]
 "#;
 
     const VERIFY_FAILS_CHECKS: &str = r#"
 checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "exit 3", timeout: "30s"},
 ]
 "#;
@@ -7659,10 +7659,10 @@ checks: [
     }
 
     /// Writes a minimal review-only workflow definition at the well-known
-    /// resolved path (`<home>/workflows/steward-review.cue`) —
+    /// resolved path (`<home>/workflows/candidate-review.cue`) —
     /// [`REVIEW_WORKFLOW`]'s lookup name — using the `fake` harness so
     /// `request_review` can spawn a real (cheap, scripted) reviewer process
-    /// without touching the shipped `examples/workflows/steward-review.cue`,
+    /// without touching the shipped `examples/workflows/candidate-review.cue`,
     /// which pins a real harness/model.
     ///
     /// Deliberately omits the new declarative `review` block: the daemon-owned
@@ -7682,12 +7682,12 @@ checks: [
         let dir = layout.workflows_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("steward-review.cue"),
+            dir.join("candidate-review.cue"),
             r#"
 package workflow
 
 workflow: {
-	name: "steward-review"
+	name: "candidate-review"
 	params: {
 		taskId:        {type: "string", required: false, default: "unknown"}
 		branch:        {type: "string", required: true}
@@ -7730,12 +7730,12 @@ workflow: {
         let dir = layout.workflows_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("steward-review.cue"),
+            dir.join("candidate-review.cue"),
             r#"
 package workflow
 
 workflow: {
-	name: "steward-review"
+	name: "candidate-review"
 	params: {
 		taskId:        {type: "string", required: false, default: "unknown"}
 		branch:        {type: "string", required: true}
@@ -7775,7 +7775,7 @@ workflow: {
         let dir = layout.workflows_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("steward-review.cue"),
+            dir.join("candidate-review.cue"),
             r#"
 package workflow
 
@@ -7785,7 +7785,7 @@ import (
 )
 
 workflow: {
-	name: "steward-review"
+	name: "candidate-review"
 	params: {
 		taskId:        {type: "string", required: false, default: "unknown"}
 		branch:        {type: "string", required: true}
@@ -7823,7 +7823,7 @@ workflow: {
     /// [`write_review_workflow`] predates the P4a live-path wiring and never
     /// declares `priority`/`labels`/`reviewerModel`/`reviewerHarness` on its
     /// spawn step, so it cannot exercise either cost-tier routing or shadow
-    /// review. This mirrors `examples/workflows/steward-review.cue`'s actual
+    /// review. This mirrors `examples/workflows/candidate-review.cue`'s actual
     /// wiring of those four params onto the spawn step: `priority`/`labels`
     /// are the tier-routing predicate; `reviewerModel`/`reviewerHarness` are
     /// empty for the primary reviewer (leaving the tier table / `reviewer`
@@ -7834,12 +7834,12 @@ workflow: {
         let dir = layout.workflows_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("steward-review.cue"),
+            dir.join("candidate-review.cue"),
             r#"
 package workflow
 
 workflow: {
-	name: "steward-review"
+	name: "candidate-review"
 	params: {
 		taskId:          {type: "string", required: false, default: "unknown"}
 		branch:          {type: "string", required: true}
@@ -7895,14 +7895,14 @@ workflow: {
         let dir = layout.workflows_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("steward-review.cue"),
+            dir.join("candidate-review.cue"),
             r#"
 package workflow
 
 import "list"
 
 workflow: {
-	name: "steward-review"
+	name: "candidate-review"
 	params: {
 		taskId:          {type: "string", required: false, default: "unknown"}
 		branch:          {type: "string", required: true}
@@ -9153,7 +9153,7 @@ workflow: {
         let LandingOutcome::Escalated(need) = &outcomes[0] else {
             panic!("expected Escalated, got {:?}", outcomes[0]);
         };
-        assert_eq!(need.payload["agent"], "steward");
+        assert_eq!(need.payload["agent"], "landing");
         let text = need.payload["text"].as_str().unwrap();
         assert!(
             text.contains("could not land"),
@@ -9211,18 +9211,18 @@ workflow: {
         assert_eq!(outcomes.len(), 1);
         assert!(matches!(outcomes[0], LandingOutcome::GateHeld));
 
-        // The hold is VISIBLE where a human looks: a steward-parity need row
-        // (agent/task/text) exists for the repo — the CUE steward's
+        // The hold is VISIBLE where a human looks: a landing-parity need row
+        // (agent/task/text) exists for the repo — the CUE landing's
         // escalation contract, kept by the pipeline (review round 2).
         let needs = space
             .scan(
                 &Pattern::category(Category::Need)
                     .scope("code-repo")
-                    .identity(STEWARD_NEED_IDENTITY),
+                    .identity(LANDING_NEED_IDENTITY),
             )
             .unwrap();
         assert_eq!(needs.len(), 1, "gate hold must write exactly one need row");
-        assert_eq!(needs[0].payload["agent"], "steward");
+        assert_eq!(needs[0].payload["agent"], "landing");
         assert_eq!(needs[0].payload["task"], "add src");
         assert!(needs[0].payload["text"]
             .as_str()
@@ -9252,7 +9252,7 @@ workflow: {
             .scan(
                 &Pattern::category(Category::Need)
                     .scope("code-repo")
-                    .identity(STEWARD_NEED_IDENTITY),
+                    .identity(LANDING_NEED_IDENTITY),
             )
             .unwrap();
         assert_eq!(
@@ -9290,8 +9290,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{log}'; n=$(wc -l < '{log}'); if [ $n -eq 1 ]; then kill -9 $$; else exit 0; fi", timeout: "30s"}},
 ]
 "#,
@@ -9370,8 +9370,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{log}'; kill -9 $$", timeout: "30s"}},
 ]
 "#,
@@ -9431,7 +9431,7 @@ workflow: {
             .scan(
                 &Pattern::category(Category::Need)
                     .scope("code-repo")
-                    .identity(STEWARD_NEED_IDENTITY),
+                    .identity(LANDING_NEED_IDENTITY),
             )
             .unwrap();
         assert_eq!(needs.len(), 1);
@@ -9466,8 +9466,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "echo x >> '{log}'; n=$(wc -l < '{log}'); if [ $n -eq 1 ]; then kill -9 $$; else exit 0; fi", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "echo x >> '{log}'; n=$(wc -l < '{log}'); if [ $n -eq 1 ]; then kill -9 $$; else exit 0; fi", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "exit 1", timeout: "30s"}},
 ]
 "#,
@@ -9501,7 +9501,7 @@ workflow: {
         assert_eq!(outcomes.len(), 1);
         assert!(matches!(outcomes[0], LandingOutcome::GateHeld));
 
-        // The retry on `steward-protected-paths` passed — the evidence for
+        // The retry on `landing-protected-paths` passed — the evidence for
         // it must say so.
         let events = space
             .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
@@ -9513,14 +9513,14 @@ workflow: {
                 .find(|e| e.payload["ordinal"].as_u64() == Some(n))
                 .unwrap_or_else(|| panic!("no event with ordinal {n}: {events:?}"))
         };
-        assert_eq!(by_ordinal(1).payload["check"], "steward-protected-paths");
+        assert_eq!(by_ordinal(1).payload["check"], "landing-protected-paths");
         assert_eq!(by_ordinal(2).payload["disposition"], "retry_passed");
         assert_eq!(by_ordinal(2).payload["verdict"], "pass");
 
         // A gate-failure artifact is also recorded for the transient infra
         // death itself (verdict "infra"); the one that must decide the hold
         // is `verify`'s ordinary failure — not the retried, now-passing
-        // `steward-protected-paths` check.
+        // `landing-protected-paths` check.
         let failures = space
             .scan(
                 &Pattern::category(Category::Artifact)
@@ -9541,7 +9541,7 @@ workflow: {
             .scan(
                 &Pattern::category(Category::Need)
                     .scope("code-repo")
-                    .identity(STEWARD_NEED_IDENTITY),
+                    .identity(LANDING_NEED_IDENTITY),
             )
             .unwrap();
         assert_eq!(needs.len(), 1);
@@ -9569,8 +9569,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{log}'; exit 3", timeout: "30s"}},
 ]
 "#,
@@ -9629,8 +9629,8 @@ workflow: {
                 repo_dir.path(),
                 &format!(
                     r#"checks: [
-    {{name: "steward-protected-paths", command: "echo ran >> '{}'"}},
-    {{name: "steward-diff-scope", command: "true"}},
+    {{name: "landing-protected-paths", command: "echo ran >> '{}'"}},
+    {{name: "landing-diff-scope", command: "true"}},
     {{name: "verify", command: "true"}},
 ]
 "#,
@@ -9762,8 +9762,8 @@ workflow: {
         write_checks(
             repo_dir.path(),
             r#"checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "sleep 5", timeout: "30s"},
 ]
 "#,
@@ -9840,8 +9840,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{log}'; n=$(wc -l < '{log}'); if [ $n -eq 2 ]; then sleep 5; fi; kill -9 $$", timeout: "30s"}},
 ]
 "#,
@@ -9987,8 +9987,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{log}'; n=$(wc -l < '{log}'); if [ $n -eq 2 ]; then sleep 5; fi; kill -9 $$", timeout: "30s"}},
 ]
 "#,
@@ -10173,8 +10173,8 @@ workflow: {
                 repo_dir.path(),
                 &format!(
                     r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{log}'; exit 0", timeout: "30s"}},
 ]
 "#,
@@ -10288,8 +10288,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s"}},
 ]
 "#,
@@ -10350,7 +10350,7 @@ workflow: {
         assert_eq!(pass_events[0].payload["candidate_sha"], head_sha);
         assert_eq!(
             pass_events[0].payload["checks"],
-            json!(["steward-protected-paths", "steward-diff-scope", "verify"])
+            json!(["landing-protected-paths", "landing-diff-scope", "verify"])
         );
         assert!(pass_events[0].payload["duration_ms"].is_u64());
 
@@ -10431,8 +10431,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s"}},
 ]
 "#,
@@ -10502,8 +10502,8 @@ workflow: {
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{log}'; kill -9 $$", timeout: "30s"}},
 ]
 "#,
@@ -10767,7 +10767,7 @@ workflow: {
     }
 
     /// Like `tuples`, but scoped to `code-repo` — for identities (dispatch
-    /// markers, steward needs) that must not be conflated with another
+    /// markers, landing needs) that must not be conflated with another
     /// repo's tuples of the same category+identity.
     fn scoped_tuples(space: &Space, category: Category, identity: &str) -> Vec<Tuple> {
         space
@@ -11141,7 +11141,7 @@ workflow: {
         assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
         no_spawns(&space);
 
-        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        let needs = scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY);
         assert_eq!(needs.len(), 1);
         let text = needs[0].payload["text"].as_str().unwrap();
         for required in [
@@ -11318,7 +11318,7 @@ workflow: {
              {markers:?}"
         );
 
-        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        let needs = scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY);
         assert_eq!(
             needs.len(),
             1,
@@ -11347,7 +11347,7 @@ workflow: {
             "a redelivered decision must not silently dispatch behind the existing human gate"
         );
         assert_eq!(
-            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
+            scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY).len(),
             1,
             "replay must converge on the existing human gate rather than raise a second one"
         );
@@ -11386,7 +11386,7 @@ workflow: {
         assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
         no_spawns(&space);
 
-        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        let needs = scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY);
         assert_eq!(needs.len(), 1);
         let text = needs[0].payload["text"].as_str().unwrap();
         for required in [
@@ -11409,7 +11409,7 @@ workflow: {
             .await
             .unwrap();
         assert_eq!(
-            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
+            scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY).len(),
             1,
             "replay must converge on the existing human gate"
         );
@@ -11759,7 +11759,7 @@ workflow: {
             "replayed routing must not append another marker"
         );
         assert!(
-            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).is_empty(),
+            scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY).is_empty(),
             "a journaled correction agent must not be mistaken for an interrupted dispatch"
         );
 
@@ -12046,7 +12046,7 @@ workflow: {
              {markers:?}"
         );
 
-        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        let needs = scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY);
         assert_eq!(
             needs.len(),
             1,
@@ -12069,7 +12069,7 @@ workflow: {
             "a redelivery must not silently dispatch behind the existing human gate"
         );
         assert_eq!(
-            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
+            scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY).len(),
             1,
             "replay must converge on the existing human gate rather than raise a second one"
         );
@@ -12261,7 +12261,7 @@ workflow: {
         assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
         no_spawns(&space);
 
-        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        let needs = scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY);
         assert_eq!(needs.len(), 1);
         let text = needs[0].payload["text"].as_str().unwrap();
         for required in [
@@ -12293,7 +12293,7 @@ workflow: {
         let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
         pipeline.route_rework(&entry, &repo).await.unwrap();
         assert_eq!(
-            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
+            scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY).len(),
             1,
             "replay must converge on the existing human gate"
         );
@@ -12342,16 +12342,16 @@ workflow: {
     /// `LandingPipeline::escalate` writes its `need` tuple directly
     /// (`Space::out`, §1.5 of the design doc) instead of going through a
     /// shelled-out `rk out need`, but the ROW `rk inbox` renders from it must
-    /// be indistinguishable from the shape a workflow-driven steward's
-    /// `steward-report-stop`/`steward-report-gate-failure`/
-    /// `steward-report-timeout`/`steward-report-unknown-verdict` named checks
-    /// (`.rk/checks.cue`) have always produced: `rk out need <repo> steward
-    /// --field agent=steward --field task=<id> --field text=<text>`. Compares
+    /// be indistinguishable from the shape a workflow-driven landing's
+    /// `landing-report-stop`/`landing-report-gate-failure`/
+    /// `landing-report-timeout`/`landing-report-unknown-verdict` named checks
+    /// (`.rk/checks.cue`) have always produced: `rk out need <repo> landing
+    /// --field agent=landing --field task=<id> --field text=<text>`. Compares
     /// `inbox::build`'s output for a hand-built tuple in that exact
     /// historical shape against the tuple the pipeline actually escalates
     /// with on a STOP verdict.
     #[tokio::test]
-    async fn escalation_row_matches_the_workflow_driven_steward_shape() {
+    async fn escalation_row_matches_the_workflow_driven_landing_shape() {
         let home = tempfile::tempdir().unwrap();
         let (repo_dir, head_sha, main_before) = review_candidate_repo();
 
@@ -12378,12 +12378,12 @@ workflow: {
         let historical = Tuple::new(
             Category::Need,
             "code-repo",
-            STEWARD_NEED_IDENTITY,
+            LANDING_NEED_IDENTITY,
             "daemon",
             json!({
-                "agent": "steward",
+                "agent": "landing",
                 "task": "add src",
-                "text": "steward: reviewer returned STOP for add src on feature — needs a \
+                "text": "landing: reviewer returned STOP for add src on feature — needs a \
                          human merge decision; branch held unmerged",
             }),
         );
@@ -12429,20 +12429,20 @@ workflow: {
     }
 
     /// The REWORK counterpart to `escalation_row_matches_the_workflow_driven_
-    /// steward_shape` above. A REWORK verdict never reaches `rk inbox` — no
+    /// landing_shape` above. A REWORK verdict never reaches `rk inbox` — no
     /// source `build` reads from scans `Category::Task` (tickets), so the
     /// follow-up ticket `file_rework_ticket` files has no row to compare
     /// against another row. What must still match, byte-for-byte, is the
-    /// TICKET SHAPE itself: the pre-cutover `steward-file-rework-ticket`
+    /// TICKET SHAPE itself: the pre-cutover `landing-file-rework-ticket`
     /// named check (removed in `.rk/checks.cue`/`examples/checks.cue`, Phase
     /// 4) ran exactly `rk ticket new "rework: $RK_CHECK_TASK_ID" --repo
-    /// "$RK_CHECK_REPO" --body "Steward routed REWORK on branch
+    /// "$RK_CHECK_REPO" --body "Landing routed REWORK on branch
     /// $RK_CHECK_BRANCH. Read the reviewer notes: rk scan artifact
     /// $RK_CHECK_REPO"` — title, scope, and body are asserted against that
     /// exact historical template here, not just that *some* ticket got
     /// filed.
     #[tokio::test]
-    async fn rework_ticket_matches_the_workflow_driven_steward_shape() {
+    async fn rework_ticket_matches_the_workflow_driven_landing_shape() {
         let home = tempfile::tempdir().unwrap();
         let (repo_dir, head_sha, main_before) = review_candidate_repo();
 
@@ -12465,7 +12465,7 @@ workflow: {
 
         let historical_title = "rework: add src";
         let historical_body =
-            "Steward routed REWORK on branch feature. Read the reviewer notes: rk scan \
+            "Landing routed REWORK on branch feature. Read the reviewer notes: rk scan \
              artifact code-repo";
         assert_eq!(produced.payload["title"], historical_title);
         assert_eq!(produced.payload["body"], historical_body);
@@ -13242,8 +13242,8 @@ workflow: {
             repo_dir.path(),
             r#"
 checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "sleep 0.4 && true", timeout: "30s"},
 ]
 "#,
@@ -13361,8 +13361,8 @@ checks: [
         let checks = format!(
             r#"
 checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo gate >> \"{gates}\"; test -f \"{marker}\" && echo overlap >> \"{log}\"; touch \"{marker}\"; sleep 0.1; rm -f \"{marker}\"", timeout: "30s"}},
 ]
 "#,
@@ -13444,8 +13444,8 @@ checks: [
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo gate >> '{log}'; test ! -f docs/bad.md", timeout: "30s"}},
 ]
 "#,
@@ -13522,8 +13522,8 @@ checks: [
         init_repo(repo_dir.path());
         let checks = format!(
             r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "git -C '{repo}' update-ref refs/heads/main refs/heads/moving-target", timeout: "30s"}},
 ]
 "#,
@@ -14105,8 +14105,8 @@ checks: [
         let checks = format!(
             r#"
 checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "touch \"{barrier}/reached-$$\"; while [ ! -f \"{release}\" ]; do sleep 0.02; done", timeout: "30s"}},
 ]
 "#,
@@ -14281,7 +14281,7 @@ checks: [
         assert_ne!(main_before, main_after, "branch must have landed");
         assert!(
             space
-                .scan(&Pattern::category(Category::Need).identity(STEWARD_NEED_IDENTITY))
+                .scan(&Pattern::category(Category::Need).identity(LANDING_NEED_IDENTITY))
                 .unwrap()
                 .is_empty(),
             "a live reviewer that produced a verdict before the ceiling must not escalate"
@@ -14557,7 +14557,7 @@ checks: [
         assert_ne!(main_before, main_after, "branch must have landed");
         assert!(
             space
-                .scan(&Pattern::category(Category::Need).identity(STEWARD_NEED_IDENTITY))
+                .scan(&Pattern::category(Category::Need).identity(LANDING_NEED_IDENTITY))
                 .unwrap()
                 .is_empty(),
             "a retry that produces a verdict before its own ceiling must not escalate"
@@ -14602,7 +14602,7 @@ checks: [
             tuples(&space, Category::Event, "agent_spawned").is_empty(),
             "the attempt budget was already spent by the seeded marker; replay must not dispatch"
         );
-        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        let needs = scoped_tuples(&space, Category::Need, LANDING_NEED_IDENTITY);
         assert_eq!(needs.len(), 1, "replay must converge on one visible gate");
         assert!(needs[0].payload["text"]
             .as_str()
@@ -16141,8 +16141,8 @@ checks: [
         let verify_marker = marker_dir.path().join("verify-ran");
         let checks = format!(
             r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "lint-check", command: "echo x >> '{lint}'", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{verify}'", timeout: "30s"}},
 ]
@@ -16204,8 +16204,8 @@ checks: [
         assert_eq!(
             plans[0].payload["selected_checks"],
             json!([
-                "steward-protected-paths",
-                "steward-diff-scope",
+                "landing-protected-paths",
+                "landing-diff-scope",
                 "lint-check"
             ])
         );
@@ -16289,7 +16289,7 @@ checks: [
         assert_eq!(plans[0].payload["full_check_required"], true);
         assert_eq!(
             plans[0].payload["selected_checks"],
-            json!(["steward-protected-paths", "steward-diff-scope", "verify"])
+            json!(["landing-protected-paths", "landing-diff-scope", "verify"])
         );
         assert!(!plans[0].payload["proof_key"].is_null());
 
@@ -16313,7 +16313,7 @@ checks: [
         assert_eq!(
             verification_spans.len(),
             3,
-            "one span per check (steward-protected-paths, steward-diff-scope, verify), not one \
+            "one span per check (landing-protected-paths, landing-diff-scope, verify), not one \
              aggregate span for the whole gate run: {verification_spans:?}"
         );
         let lanes: std::collections::BTreeSet<&str> = verification_spans
@@ -16323,8 +16323,8 @@ checks: [
         assert_eq!(
             lanes,
             std::collections::BTreeSet::from([
-                "steward-protected-paths",
-                "steward-diff-scope",
+                "landing-protected-paths",
+                "landing-diff-scope",
                 "verify"
             ])
         );
@@ -16351,8 +16351,8 @@ checks: [
         let repo_dir = tempfile::tempdir().unwrap();
         init_repo(repo_dir.path());
         let checks = r#"checks: [
-    {name: "steward-protected-paths", command: "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep -qE \"$RK_CHECK_PROTECTED_PATHS\"", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep -qE \"$RK_CHECK_PROTECTED_PATHS\"", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "lint-check", command: "true", timeout: "30s"},
     {name: "verify", command: "true", timeout: "30s"},
 ]
@@ -16422,8 +16422,8 @@ checks: [
         let verify_marker = marker_dir.path().join("verify-ran");
         let checks = format!(
             r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "lint-check", command: "exit 1", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{verify}'", timeout: "30s"}},
 ]
@@ -16477,8 +16477,8 @@ checks: [
         assert_eq!(
             plans[0].payload["selected_checks"],
             json!([
-                "steward-protected-paths",
-                "steward-diff-scope",
+                "landing-protected-paths",
+                "landing-diff-scope",
                 "lint-check"
             ])
         );
@@ -16491,8 +16491,8 @@ checks: [
         init_repo(repo_dir.path());
         let checks = format!(
             r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "git -C '{repo}' update-ref refs/heads/main refs/heads/moving-target", timeout: "30s"}},
 ]
 "#,
@@ -16568,8 +16568,8 @@ checks: [
         let counter_file = marker_dir.path().join("verify-runs");
         let checks = format!(
             r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo x >> '{counter}'", timeout: "30s"}},
 ]
 "#,
@@ -16657,8 +16657,8 @@ checks: [
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s"}},
 ]
 "#,
@@ -16753,7 +16753,7 @@ checks: [
         assert_eq!(pass_events.len(), 1);
         assert_eq!(
             pass_events[0].payload["checks"],
-            json!(["steward-protected-paths", "steward-diff-scope", "verify"])
+            json!(["landing-protected-paths", "landing-diff-scope", "verify"])
         );
     }
 
@@ -16774,8 +16774,8 @@ checks: [
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s"}},
 ]
 "#,
@@ -16880,8 +16880,8 @@ checks: [
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s"}},
 ]
 "#,
@@ -16923,8 +16923,8 @@ checks: [
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s"}},
 ]
 "#,
@@ -16988,8 +16988,8 @@ checks: [
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s"}},
 ]
 "#,
@@ -17093,8 +17093,8 @@ checks: [
             repo_dir.path(),
             &format!(
                 r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s"}},
 ]
 "#,
@@ -17269,8 +17269,8 @@ checks: [
     fn checks_cue_with_verify(cmd: &str, toolchain: &str, env_policy: &str) -> String {
         format!(
             r#"checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "{cmd}", timeout: "30s", toolchain: "{toolchain}", environmentPolicy: "{env_policy}"}},
 ]
 "#

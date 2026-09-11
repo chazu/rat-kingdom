@@ -302,7 +302,7 @@ impl ConflictContext {
     /// Evidence-rich human gate: evidence, decision, blast radius, and command.
     pub(crate) fn escalation(&self, withheld: &Withheld) -> String {
         format!(
-            "steward: merge CONFLICT on {branch} for {task} was NOT auto-dispatched ({code}) — \
+            "landing: merge CONFLICT on {branch} for {task} was NOT auto-dispatched ({code}) — \
              branch held unmerged.\n\
              EVIDENCE: {branch} (source, head {head_sha}, fork point {fork_point}) failed to \
              merge into {target} (head {target_head}); {detail}. Git's conflict report: \

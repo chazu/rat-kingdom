@@ -11,15 +11,15 @@
 TKT-147 was implemented, reviewed, given an APPROVE artifact — and never merged.
 It sat off main for two days until it was re-landed by cherry-pick, costing a
 rebase over two intervening tickets plus re-verification. The ticket asked:
-*does the steward's land/merge step fail closed and report, or can an approve be
+*does the landing's land/merge step fail closed and report, or can an approve be
 recorded while the merge silently no-ops?*
 
 ## What actually happened
 
-The steward instance is still on disk. `wf-dn6das9gb9`:
+The landing instance is still on disk. `wf-dn6das9gb9`:
 
 ```json
-{ "workflow": "steward", "status": "completed",
+{ "workflow": "landing", "status": "completed",
   "current_step": 9, "total_steps": 9, "error": null,
   "params": { "taskId": "TKT-147", "branch": "rat/nezumi-2/tkt-147" } }
 ```
@@ -28,7 +28,7 @@ with a context holding `vars: {"verdict": "APPROVE"}` and:
 
 ```json
 "previous_result": {
-  "branch": "rat/dusty-2/steward-review-tkt-147", "merged": false,
+  "branch": "rat/dusty-2/candidate-review-tkt-147", "merged": false,
   "pr_opened": false, "branch_deleted": false,
   "detail": "merge conflict or failure: git merge --no-ff -m merge … failed: " }
 ```
@@ -40,7 +40,7 @@ said the approved work had not landed.
 That is not a bug in `land`. `land` reported its outcome accurately —
 `{merged: false}` is a deliberate clean result rather than an error, so a
 workflow can gate on it and retry. The gate is the caller's job, and the shipped
-`steward.cue` has carried one since TKT-44:
+`landing.cue` has carried one since TKT-44:
 
 ```cue
 {type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
@@ -50,8 +50,8 @@ workflow can gate on it and retry. The gate is the caller's job, and the shipped
 The instance that dropped TKT-147 ran **9 top-level steps**. The definition
 carrying that gate had 11 by then (TKT-55 added the diff-scope gate on
 2026-07-23); 9 is the pre-TKT-55 shape. The deployed copy at
-`~/.rat-kingdom/workflows/steward.cue` was stale — it is a hand-copied file, one
-per castle and one per repo variant (`steward-grmpl.cue`), and nothing ties its
+`~/.rat-kingdom/workflows/landing.cue` was stale — it is a hand-copied file, one
+per castle and one per repo variant (`landing-grmpl.cue`), and nothing ties its
 version to the repo's.
 
 **So the answer to the ticket's question is: both.** The land step fails closed
@@ -67,11 +67,11 @@ store — **108 lands, 5 dropped** (`merged: false` and `pr_opened: false`):
 
 | branch | ticket | recovered |
 | --- | --- | --- |
-| `rat/filch/steward-review-tkt-18` | TKT-18 | by hand |
-| `rat/rat-11/steward-review-tkt-28` | TKT-28 | by hand |
-| `rat/rat-9/steward-review-tkt-30` | TKT-30 | by hand |
-| `rat/rat-44/steward-review-tkt-46` | TKT-46 | by hand |
-| `rat/dusty-2/steward-review-tkt-147` | TKT-147 | by cherry-pick, 2 days later |
+| `rat/filch/candidate-review-tkt-18` | TKT-18 | by hand |
+| `rat/rat-11/candidate-review-tkt-28` | TKT-28 | by hand |
+| `rat/rat-9/candidate-review-tkt-30` | TKT-30 | by hand |
+| `rat/rat-44/candidate-review-tkt-46` | TKT-46 | by hand |
+| `rat/dusty-2/candidate-review-tkt-147` | TKT-147 | by cherry-pick, 2 days later |
 
 TKT-171 described this as the second recorded instance. It is the fifth
 occurrence, ~4.6% of all lands. TKT-28 and TKT-30 were never recorded as
@@ -131,7 +131,7 @@ It makes one **impossible to lose**: the row appears the moment the land drops
 the branch and stays until the branch actually reaches its target.
 
 Adding the missing `evaporate`-style guard to each workflow definition is still
-worth doing, and the shipped `steward.cue` already has it. The point is that the
+worth doing, and the shipped `landing.cue` already has it. The point is that the
 invariant no longer *depends* on that.
 
 ## Related

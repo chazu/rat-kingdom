@@ -63,8 +63,8 @@ pub fn install_passing_landing_checks(repo: &std::path::Path) {
     std::fs::write(
         rk_dir.join("checks.cue"),
         r#"checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "true", timeout: "30s"},
 ]
 "#,

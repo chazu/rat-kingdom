@@ -5,7 +5,7 @@ into an event bus: registered `#Trigger` reactions fire a workflow whenever a
 matching tuple lands. Dispatch is zero-token and zero-model — a pure predicate
 match followed by a `workflow.run`. It is the foundational enabler both research
 reports single out (`docs/research/stigmergy.md` P4,
-`docs/research/leverage-features.md` #1): steward loops, continuous drain,
+`docs/research/leverage-features.md` #1): landing loops, continuous drain,
 obstacle coalescence, and quorum promotion all ride on it instead of each
 growing its own bespoke feed consumer.
 
@@ -53,7 +53,7 @@ reactor hands the matched tuple straight to the daemon-native `LandingPipeline`
 payload — so `run` is not read for this action and need not be set, and `params`
 templating does not apply either. This is what the shipped landing pipeline
 example (`examples/triggers-landing-pipeline.cue`) uses; see
-[Shipped reaction: the steward and the landing pipeline](#shipped-reaction-the-steward-and-the-landing-pipeline)
+[Shipped reaction: the landing and the landing pipeline](#shipped-reaction-the-landing-and-the-landing-pipeline)
 below.
 
 ### Param templating
@@ -247,9 +247,9 @@ forever. Three guards, defence-in-depth:
    `reactor_rate_capped` obstacle and skips, so a storm is bounded and visible.
 4. **Match scoping.** A trigger can narrow its `match` (a `search` substring, an
    `identity`, a `scope`) so the tuples its own workflow emits fall outside the
-   predicate entirely. The steward does exactly this — it matches only
+   predicate entirely. The landing does exactly this — it matches only
    `"role":"rat"` completions, so the `"reviewer"` completions it spawns never
-   match (see the steward section below).
+   match (see the landing section below).
 
 ## Per-cycle cost
 
@@ -286,14 +286,14 @@ newest existing tuple, so it does **not** react to the entire pre-existing
 backlog at startup. Only tuples that arrive after boot are dispatched. A restart
 resumes from the persisted cursor.
 
-## Shipped reaction: the steward and the landing pipeline
+## Shipped reaction: the landing and the landing pipeline
 
-The **steward** is the reactor's flagship autonomy loop and the biggest single
+The **landing** is the reactor's flagship autonomy loop and the biggest single
 reduction in per-task operator attention: it automates the most-repeated
 operator decision, *"is this branch good to merge?"*, reactively triaging
 every rat completion (`Event/harness_result`, emitted by `route_completion`).
 It ships as an **`action: "land"` CUE trigger**. The repository's activated
-trigger (an example is `steward-landing-on-completion` in
+trigger (an example is `landing-on-completion` in
 `examples/triggers-landing-pipeline.cue`) hands each matching completion
 straight to `LandingPipeline` (`crates/rk-daemon/src/landing.rs`) without a
 workflow instance. The retired workflow-driven mega-workflow is no longer a
@@ -306,7 +306,7 @@ per-repo CUE; the deterministic gates run without an agent.
 
 ### The daemon-native landing pipeline
 
-`steward-landing-on-completion` matches the identical `harness_result`
+`landing-on-completion` matches the identical `harness_result`
 predicate the old trigger did (`"role":"rat"`, fail-closed on `is_error`/
 `declared_done`, §1.5 of the design doc), but its `action: "land"` reads
 `branch`/`head_sha`/`target`/`diff_class`/`task` directly off the tuple
@@ -318,10 +318,10 @@ parallel; within one key, candidates still gate-run one at a time).
 
 For each dequeued candidate, in order:
 
-1. **Policy gate** (`steward-protected-paths` named check) — refuses to
+1. **Policy gate** (`landing-protected-paths` named check) — refuses to
    auto-merge a diff touching protected paths
    (`git diff --name-only <target>...HEAD` matched against an ERE).
-2. **Diff-scope gate** (`steward-diff-scope` named check) — refuses to
+2. **Diff-scope gate** (`landing-diff-scope` named check) — refuses to
    auto-merge a diff over a per-repo size budget (`maxDiffFiles` /
    `maxDiffLines`, `0` = off), so a runaway rat that dodges protected paths
    but rewrites half the repo is held for a human rather than auto-merged.
@@ -345,7 +345,7 @@ it from process logs.
    `(repo, branch, head_sha)`) runs first, directly against the tuplespace —
    no CUE read step. A **hit** (any prior `APPROVE`/`REWORK`/`STOP` for this
    exact branch tip) is reused without spawning a second opinion. A **miss**
-   spawns the shrunk `examples/workflows/steward-review.cue` — a reviewer
+   spawns the shrunk `examples/workflows/candidate-review.cue` — a reviewer
    chained onto the candidate branch, its *only* job — and parks on the
    verdict tuple itself (`space.rd`, not the workflow instance's completion
    state), which is what makes review survive a daemon restart mid-wait (see
@@ -408,7 +408,7 @@ to `main` as a whole once complete.
 repo-scoped `reactor_non_main_land_target` event whenever a workflow-firing
 trigger's interpolated `params.target` was not `"main"`, and `rk workflow
 list` appended `target=<branch>` to that instance — both ways an operator
-could see a completed steward had landed somewhere other than `main`.
+could see a completed landing had landed somewhere other than `main`.
 `fire_land_action` never called `note_non_main_land_target` (that call site
 is specific to the workflow-firing path), and the zero-agent-spawn fast paths
 (step 4 above) never had a workflow instance for `rk workflow list` to
@@ -430,17 +430,17 @@ copy (pin it to `"main"` or the repo's configured delivery target) rather than
 editing the shared global one — that changes the tradeoff for every
 chained/rework rat in the repo, including the ones the ergonomics exists for.
 
-**Re-entrancy — match scoping.** The steward is the worked example of the fourth
+**Re-entrancy — match scoping.** The landing is the worked example of the fourth
 re-entrancy technique: its trigger's `match.search` is `"role":"rat"`, so it
-fires only on plain-rat completions. The reviewer `steward-review.cue` spawns
+fires only on plain-rat completions. The reviewer `candidate-review.cue` spawns
 completes as a `"reviewer"` (a field carried on every `harness_result`), whose
 payload the search does not contain — so the pipeline never re-triggers itself
 on the branch it just reviewed. A reworked ticket, once drained, completes as
 a `"rat"` and re-enters the pipeline: a closed loop, not a runaway.
 
-> Installing either steward trigger makes **all** matching rat completions
-> auto-merge on a clean verdict. Do not run both `steward-on-completion` and
-> `steward-landing-on-completion` in the same triggers directory at once —
+> Installing either landing trigger makes **all** matching rat completions
+> auto-merge on a clean verdict. Do not run both `legacy-landing-on-completion` and
+> `landing-on-completion` in the same triggers directory at once —
 > they match the identical predicate and would double-dispatch every
 > completion — and do not also run an approval-gated workflow
 > (`land-on-approve`) over the same completions, or they race for the branch.
@@ -487,7 +487,7 @@ for the surrounding merge/delivery/inbox behavior.
 ### Activation and acceptance
 
 1. **Activate policy and checks** — commit `.rk/repo.cue`, register
-   `steward-protected-paths`, `steward-diff-scope`, and the repository's real
+   `landing-protected-paths`, `landing-diff-scope`, and the repository's real
    `verify` check in `.rk/checks.cue`, then activate the exact digest through
    repository onboarding.
 2. **Activate the trigger** — install the repository's `action: "land"`
@@ -631,14 +631,14 @@ converged-on wall into durable, closable work.
 
 ## Built-in reaction: escalation notification
 
-The third built-in turns a steward escalation into an **active** operator push.
-The steward already surfaces a `STOP`/unknown verdict as a `need` (identity
-`steward`) that `rk inbox` ranks — a *passive* queue the operator polls. This
+The third built-in turns a landing escalation into an **active** operator push.
+The landing already surfaces a `STOP`/unknown verdict as a `need` (identity
+`landing`) that `rk inbox` ranks — a *passive* queue the operator polls. This
 built-in builds a channel-agnostic `EscalationNotice` the moment such a `need`
 lands and fans it out through the [`SinkRegistry`](#notification-sinks), so a
 human is pushed at instead of only finding it on their next inbox check.
 
-- The discriminator is `category = need` **and** `identity = "steward"`. A rat's
+- The discriminator is `category = need` **and** `identity = "landing"`. A rat's
   own `rk need` keys on its agent name, so an ordinary help request is left on
   the inbox queue and never pops a notification.
 - Delivery is per `(need tuple, sink)`, each guarded by its own durable
@@ -675,7 +675,7 @@ kind = "herdr"                          # desktop push (rk-mux, the historical d
 [[notify.sinks]]
 name = "ops-chat"                       # dedup/registry key; defaults to kind if unset
 kind = "command"                        # shell out to an operator program
-classes = ["steward-escalation"]        # notice classes this sink accepts; empty = all
+classes = ["landing-escalation"]        # notice classes this sink accepts; empty = all
 min_severity = "warn"                   # info (default) | warn | critical
 
 [notify.sinks.options]
@@ -853,7 +853,7 @@ per-channel table that decides *which* channels a `true` here actually reaches.
 - Tests: `crates/rk-daemon/tests/reactor.rs` (live-daemon fire, idempotency under
   feed loss + cursor reset, re-entrancy/exclusion, rate cap, quorum promotion,
   obstacle coalescence — quorum, per-scope/topic separation, idempotent
-  re-filing; steward escalation notify — fires once, steward-only, disable
+  re-filing; landing escalation notify — fires once, landing-only, disable
   switch; and resolution backlinks — retire-and-lay-trail plus
   steer-and-reinforce with replay idempotency) plus unit tests in the reactor and
   workflow modules.

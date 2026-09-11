@@ -29,13 +29,13 @@ use support::connect;
 mod fixture;
 
 /// The daemon-native landing pipeline's completion feed
-/// (`examples/triggers-landing-pipeline.cue`'s `steward-landing-on-completion`,
+/// (`examples/triggers-landing-pipeline.cue`'s `landing-on-completion`,
 /// reproduced here rather than read from that file so this test does not
 /// depend on the example's path or content staying byte-identical).
 const LANDING_TRIGGER: &str = r#"
 triggers: [
     {
-        name:   "landing-on-completion"
+        name:   "legacy-landing-on-completion"
         action: "land"
         match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
         maxFires: 20
@@ -49,8 +49,8 @@ triggers: [
 /// `landing.rs`'s own `restart_mid_gate_run_resumes_and_lands`.
 const CHECKS: &str = r#"
 checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "sleep 0.6 && true", timeout: "30s"},
 ]
 "#;

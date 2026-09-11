@@ -469,7 +469,7 @@ async fn automatic_reactor_landing_can_be_reverted() {
     std::fs::create_dir_all(layout.triggers_dir()).unwrap();
     std::fs::write(
         layout.triggers_dir().join("landing.cue"),
-        r#"triggers: [{name: "landing-on-completion", action: "land",
+        r#"triggers: [{name: "legacy-landing-on-completion", action: "land",
             match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""},
             maxFires: 20}]"#,
     )

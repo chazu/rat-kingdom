@@ -63,8 +63,8 @@ Command: `rk --json status TKT-01M0P974FGSEFSX2KCS93QFPTF`.
 | verification | 10000 | verify | 823 | ad-hoc | false | fail |
 | verification | 10001 | verify | 756 | ad-hoc | false | fail |
 | verification | 10002 | verify | **413842** | ad-hoc | false | pass |
-| verification | 1 | steward-protected-paths | 12 | full-final | — | — |
-| verification | 2 | steward-diff-scope | 17 | full-final | — | — |
+| verification | 1 | landing-protected-paths | 12 | full-final | — | — |
+| verification | 2 | landing-diff-scope | 17 | full-final | — | — |
 | verification | 3 | verify | **407564** | full-final | — | — |
 
 `proof_reuse: {"reused": 0, "total": 7}`. The managed, developer-triggered
@@ -85,8 +85,8 @@ the proof-reuse fix was live). Command:
 |---|---|---|---|---|---|---|
 | verification | 10000 | verify | 119823 | ad-hoc | false | caller_disconnect |
 | verification | 10001 | verify | **274855** | ad-hoc | false | pass |
-| verification | 1 | steward-protected-paths | 465 | full-final | false | — |
-| verification | 2 | steward-diff-scope | 260 | full-final | false | — |
+| verification | 1 | landing-protected-paths | 465 | full-final | false | — |
+| verification | 2 | landing-diff-scope | 260 | full-final | false | — |
 | verification | 3 | verify | **null** | full-final | **true** | — |
 
 `proof_reuse: {"reused": 1, "total": 6}`. The landing gate's `full-final`

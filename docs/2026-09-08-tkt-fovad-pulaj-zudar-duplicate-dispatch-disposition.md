@@ -49,7 +49,7 @@ branch and no commit (`git branch -a` in the `glossolalia` checkout has no
 `mise run verify`, and its branch merged as `e4bd8bd7...` at `20:27:48Z`.
 `TKT-rusur-fihar-tubog` is `closed`, assignee `Parmesan-13`. The prior
 attempt on this ticket, `Provolone-13`, had already failed the
-`steward-diff-scope` gate at `19:58:35Z` and was left as a stalled
+`landing-diff-scope` gate at `19:58:35Z` and was left as a stalled
 escalation (`branch held unmerged`) — the ticket's dependency
 (`TKT-fufav-sisuk-lavop`) then landed at `20:22:00Z`, its containing
 landing-review workflow finished cleanup at `20:22:27Z`, and the ticket

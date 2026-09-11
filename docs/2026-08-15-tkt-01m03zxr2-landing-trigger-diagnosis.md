@@ -1,9 +1,9 @@
-# TKT-01M03ZXR2X84H9JZH505W6H97Z: steward-on-completion "inconsistent fires" — diagnosis
+# TKT-01M03ZXR2X84H9JZH505W6H97Z: landing-on-completion "inconsistent fires" — diagnosis
 
 ## The report
 
 Across six base-chained rework completions on 2026-08-15, the reporting rat
-observed the `steward-on-completion` trigger firing an auto-steward review for
+observed the `landing-on-completion` trigger firing an auto-landing review for
 three (Gadget-5, Noodle-5, Whisker-7) and not for the other three (Wriggle-5,
 Peanut-5, Django-6), despite all six being repo-scoped `rat-kingdom` rats with
 role `"rat"` and real branches — a set that should uniformly match the
@@ -15,7 +15,7 @@ trigger's predicate (`category: event, identity: harness_result, search:
 For each of the six named agents, `rk scan event rat-kingdom --search
 "\"agent\":\"<name>\""` returns exactly one `harness_result` tuple, and for
 each of those six tuple ids there is exactly one `reactor_fired` marker
-(`system` scope, `key: steward-on-completion@<tuple id>`) carrying a real
+(`system` scope, `key: landing-on-completion@<tuple id>`) carrying a real
 workflow instance id — never the `"queued"` placeholder `enqueue_fire` writes,
 so every one of these six fired via the **direct, immediate** dispatch path
 in `try_fire`, not via the `maxInFlight` queue. Decoding the ULID timestamps
@@ -34,14 +34,14 @@ under 200ms):
 
 None of the six left a `reactor_fire_attempt` record (no retries were
 needed) and none left a `reactor_fire_gave_up` obstacle. Each of the six
-spawned `steward` workflow instances ran all 12 steps to `status: completed`:
+spawned `landing` workflow instances ran all 12 steps to `status: completed`:
 
 - All six → gate passed
 - Gadget-5, Whisker-7, Wriggle-5, Peanut-5 → verdict `APPROVE`, merged `true`
   (Wriggle-5 and Peanut-5, two of the three reported "missed", show real
   merge commits: `9e2c9ee4...` and `a3d4d643...`)
 - Noodle-5, Django-6 → verdict `REWORK`, `merged: false` (branch correctly
-  held unmerged, not a miss — that is the steward doing its job)
+  held unmerged, not a miss — that is the landing doing its job)
 
 So per the live tuplespace, **all six triggers fired, exactly once, via the
 direct dispatch path, within 15 seconds of the
@@ -76,11 +76,11 @@ got routed to REWORK.
 
 ## Most likely explanation for the original report
 
-The steward pipeline (reviewer spawn → gates → verdict → land) takes roughly
+The landing pipeline (reviewer spawn → gates → verdict → land) takes roughly
 12–15 minutes end to end for all six of these completions — there is no
 timing difference between the "fired" and "not fired" reported sets. The most
 parsimonious read is that the original characterization checked for evidence
-(`rk inbox`, `git log`, or a merged branch) before each rework's steward
+(`rk inbox`, `git log`, or a merged branch) before each rework's landing
 pipeline had finished, not that the trigger failed to fire. This is
 consistent with the report's own framing ("took three days to characterize")
 describing an investigation across many completions in the fleet, not

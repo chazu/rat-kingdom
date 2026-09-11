@@ -362,7 +362,7 @@ impl Repo {
     }
 
     /// File list and total changed-line count for the `base...head` symmetric
-    /// (merge-base) diff — the same range shape the `steward-diff-scope` check
+    /// (merge-base) diff — the same range shape the `landing-diff-scope` check
     /// computes by hand in `.rk/checks.cue`. A binary file reports `-`/`-` in
     /// `--numstat`; those count as 0 lines, matching that check's `awk` script.
     pub fn diff_stat(&self, base: &str, head: &str) -> rk_core::Result<DiffStat> {

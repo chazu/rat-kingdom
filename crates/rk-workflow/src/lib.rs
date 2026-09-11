@@ -81,20 +81,20 @@ impl Default for DeliveryPolicy {
 
 /// Per-repository landing-pipeline gate policy: the protected-path and
 /// diff-scope guardrails plus the review-tier wall-clock budgets that
-/// the retired steward mega-workflow used to expose as
+/// the retired landing mega-workflow used to expose as
 /// workflow params (`protectedPaths`, `maxDiffFiles`, `maxDiffLines`,
-/// `gateTimeout`, `reviewTimeout`) before Phase 4 of the steward remediation
+/// `gateTimeout`, `reviewTimeout`) before Phase 4 of the landing remediation
 /// moved gate execution into the daemon-native `LandingPipeline`
 /// (`crates/rk-daemon/src/landing.rs`). Same names, same defaults — now
 /// versioned and digest-activated like [`DeliveryPolicy`] instead of hardcoded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandingPolicy {
     /// POLICY GUARDRAIL: an ERE matched against changed file paths, run
-    /// through the repo's `steward-protected-paths` named check.
+    /// through the repo's `landing-protected-paths` named check.
     #[serde(default = "default_protected_paths", rename = "protectedPaths")]
     pub protected_paths: String,
     /// DIFF-SCOPE GUARDRAIL: 0 disables the budget. Run through the repo's
-    /// `steward-diff-scope` named check.
+    /// `landing-diff-scope` named check.
     #[serde(default = "default_max_diff_files", rename = "maxDiffFiles")]
     pub max_diff_files: u64,
     #[serde(default = "default_max_diff_lines", rename = "maxDiffLines")]
@@ -926,7 +926,7 @@ pub struct ReadStep {
     ///
     /// `(category, scope, identity)` alone is not an identity: two instances of
     /// the same workflow running on one repo — which is the *designed* steady
-    /// state, since the reactor fires `steward` per rat completion — have their
+    /// state, since the reactor fires `landing` per rat completion — have their
     /// reviewers writing `artifact/<repo>/review` concurrently. "Newest wins"
     /// then hands one instance the other's verdict, and the `when` behind it
     /// routes a land on a stranger's review. Setting this narrows the match to
@@ -960,7 +960,7 @@ pub struct ReadStep {
     #[serde(default, rename = "fromInstance")]
     pub from_instance: bool,
     /// Bind the read to the tuple whose payload names this exact commit
-    /// (`"head_sha":"<sha>"`) — the steward's commit-keyed verdict cache
+    /// (`"head_sha":"<sha>"`) — the landing's commit-keyed verdict cache
     /// (Phase 2). Unlike [`ReadStep::from_agent`]/[`ReadStep::from_instance`],
     /// this is deliberately unscoped by author or run: it lifts ANY prior
     /// verdict for this exact branch tip, so a retry on an unchanged commit
@@ -971,7 +971,7 @@ pub struct ReadStep {
     /// [`ReadStep::from_instance`], which own the same single predicate slot.
     /// The sha itself must be non-empty — set only when a real commit is known
     /// to key on (guard at CUE load time when it may be absent, the same way
-    /// `steward.cue` gates review tiering on `diffClass`).
+    /// `landing.cue` gates review tiering on `diffClass`).
     ///
     /// Must be paired with [`ReadStep::for_branch`] (rework of
     /// TKT-01M036NWEG0H019BJ16G59RZVP): a sha alone is not exclusive to one
@@ -1643,6 +1643,7 @@ pub fn load_str(source: &str, inputs: &HashMap<String, Value>) -> rk_core::Resul
     let json = cue_export(&dir, "workflow")?;
     let mut workflow: Workflow = serde_json::from_str(&json)
         .map_err(|e| rk_core::Error::other(format!("workflow JSON did not match schema: {e}")))?;
+    workflow.name = rk_core::landing_names::canonical(&workflow.name).to_string();
     workflow.steps = expand_aspects(workflow.steps, &workflow.aspects);
     std::fs::remove_dir_all(&dir).ok();
     Ok(workflow)

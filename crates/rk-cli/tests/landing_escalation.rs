@@ -1,4 +1,4 @@
-//! End-to-end proof of the steward escalation path: a failed run gate must
+//! End-to-end proof of the landing escalation path: a failed run gate must
 //! produce a VISIBLE need row, and a failing escalation must not mask the
 //! gate's own result (TKT-01M00WPWEFZVPW3YBNX3825MBG).
 //!
@@ -57,7 +57,7 @@ git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
     )
 }
 
-/// A steward-shaped workflow: spawn -> wait -> failing gate -> escalation.
+/// A landing-shaped workflow: spawn -> wait -> failing gate -> escalation.
 /// The escalation command is the real shape from `.rk/checks.cue`: shell back
 /// into `rk out need … --field …` from inside the agent's worktree.
 fn escalation_workflow(escalation_command: &str, rk_bin: &str) -> String {
@@ -136,7 +136,7 @@ async fn fixture(
     client
         .call(
             "repo.add",
-            json!({"name": "steward-escalation", "path": repo_dir.path()}),
+            json!({"name": "landing-escalation", "path": repo_dir.path()}),
         )
         .await
         .unwrap();
@@ -176,24 +176,24 @@ async fn run_to_terminal(client: &mut Client, repo: &Path, task_id: &str) -> Val
 /// real `rk` binary from inside the agent's worktree -> the row is visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_gate_produces_a_visible_need_row() {
-    let escalation = r#""$RK_CHECK_RK" out need "$RK_CHECK_REPO" steward --field agent=steward --field "task=$RK_CHECK_TASK_ID" --field "text=steward: run gate FAILED for $RK_CHECK_TASK_ID — branch held unmerged""#;
+    let escalation = r#""$RK_CHECK_RK" out need "$RK_CHECK_REPO" landing --field agent=landing --field "task=$RK_CHECK_TASK_ID" --field "text=landing: run gate FAILED for $RK_CHECK_TASK_ID — branch held unmerged""#;
     let wf = escalation_workflow(&format!("{escalation:?}"), env!("CARGO_BIN_EXE_rk"));
     let (home, repo, mut client, _handle) = fixture(&wf).await;
 
     let status = run_to_terminal(&mut client, repo.path(), "esc-e2e-1").await;
     assert_eq!(status["status"], "completed", "status: {status}");
 
-    // The need tuple exists, attributed to the steward role, carrying the task.
+    // The need tuple exists, attributed to the landing role, carrying the task.
     let scanned = client
         .call(
             "space.scan",
-            json!({"category": "need", "scope": "fixture", "identity": "steward"}),
+            json!({"category": "need", "scope": "fixture", "identity": "landing"}),
         )
         .await
         .unwrap();
     let tuples = scanned["tuples"].as_array().unwrap();
     assert_eq!(tuples.len(), 1, "scanned: {scanned}");
-    assert_eq!(tuples[0]["payload"]["agent"], "steward");
+    assert_eq!(tuples[0]["payload"]["agent"], "landing");
     assert_eq!(tuples[0]["payload"]["task"], "esc-e2e-1");
 
     // And it is VISIBLE where a human looks: the inbox carries the need text.

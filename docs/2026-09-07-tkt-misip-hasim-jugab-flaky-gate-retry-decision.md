@@ -28,7 +28,7 @@ code changes ship with it.
    keyed by verdict kind).
 2. **Diff-scope-gated generic retry**: any ordinary fail verdict whose
    failing check's working directory is provably excluded by the
-   candidate's diff scope (`steward-diff-scope`'s own file-set check) gets
+   candidate's diff scope (`landing-diff-scope`'s own file-set check) gets
    one bounded retry, no signature curation required.
 3. **Status quo**: ordinary fail verdicts stay immediately blocking; rely on
    `preexisting-failure-is-a-ticket-not-an-inline-fix` (TKT-43) plus a human
@@ -64,7 +64,7 @@ and they answer it very differently:
   it, and turning a heuristic into an automatic retry-and-proceed changes
   what "the gate said no" means for every repo using the named
   `verify`/`verify-full` checks — not just the specific flakes someone has
-  already diagnosed. It also couples two checks (`steward-diff-scope` and
+  already diagnosed. It also couples two checks (`landing-diff-scope` and
   the verify gate) that are currently independent, which is exactly the
   kind of cross-cutting semantics change the hot-scan doc deferred rather
   than land unilaterally.
@@ -93,7 +93,7 @@ approved:
   discipline to `gate_infra_retry_used`/`gate_infra_retry_check` —
   `run_gates_at`'s infra-retry branch is the direct template.
   `GateRunOutcome` gains an `OrdinaryRetryExhausted` case mirroring
-  `InfraRetryExhausted`, and the steward-hold message names it explicitly
+  `InfraRetryExhausted`, and the landing-hold message names it explicitly
   so an operator reading a hold artifact can tell "retried and still
   failed" from "never eligible to retry."
 - Maintain the signature list next to

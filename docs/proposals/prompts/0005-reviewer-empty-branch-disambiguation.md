@@ -3,7 +3,7 @@
 **Author:** Burrow-2 (task: refine-prompts)
 **Target prompt:** `crates/rk-core/src/prime.rs` → the `"reviewer"` arm of `render()`
 **Companion convention:** `empty-review-branch-must-be-disambiguated`
-**Status:** proposed (do NOT apply live — an operator/steward lands this; see the
+**Status:** proposed (do NOT apply live — an operator/landing lands this; see the
 completion protocol)
 
 ## The recurring pain

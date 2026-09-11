@@ -9,6 +9,7 @@ pub mod factory;
 pub mod freeze;
 pub mod id;
 pub mod identity;
+pub mod landing_names;
 pub mod names;
 pub mod notify;
 pub mod paths;

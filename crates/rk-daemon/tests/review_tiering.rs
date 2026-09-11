@@ -1,8 +1,8 @@
-//! Review tiering (TKT-01M036N1RT74H6NPRH5FMM8A6T): the steward skips its
+//! Review tiering (TKT-01M036N1RT74H6NPRH5FMM8A6T): the landing skips its
 //! reviewer spawn for a diff classified "doc-only"/"trivial", replacing it
 //! with a near-zero gate-holder — same deterministic gates, unconditional
-//! land, no LLM verdict. `TIERED_STEWARD` mirrors the shape of
-//! the retired steward mega-workflow's tiering (a `list.Concat`/`if` selection
+//! land, no LLM verdict. `TIERED_LANDING` mirrors the shape of
+//! the retired landing mega-workflow's tiering (a `list.Concat`/`if` selection
 //! over `_input.diffClass` at CUE load time, a shared `_gate`, distinct
 //! `reviewer`/`gateholder` agent profiles), trimmed to a fast fake-harness
 //! run rather than the real named checks.
@@ -23,8 +23,8 @@ static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 
 const WORKING_FAKE: &str = r#"
 read -r _prompt
-echo "tiered work" > steward.txt
-git add steward.txt >/dev/null 2>&1
+echo "tiered work" > landing.txt
+git add landing.txt >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"tier-fake"}'
 rk_done "work done"
@@ -35,11 +35,11 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
 // fake-harness test needs: the deterministic `_gate` and the land tail are
 // shared between both tiers via `list.Concat`; only the spawned agent profile
 // (and, in the real file, the verdict routing) differs.
-const TIERED_STEWARD: &str = r#"
+const TIERED_LANDING: &str = r#"
 import "list"
 
 workflow: {
-    name: "steward"
+    name: "landing"
     params: {
         diffClass: {type: "string", required: false, default: "large"}
     }
@@ -117,7 +117,7 @@ async fn run_and_wait(
     let started = client
         .call(
             "workflow.run",
-            json!({"name": "steward", "repo": repo.to_string_lossy(), "params": params}),
+            json!({"name": "landing", "repo": repo.to_string_lossy(), "params": params}),
         )
         .await
         .unwrap();
@@ -165,7 +165,7 @@ async fn doc_only_diff_class_skips_reviewer_but_still_gates_and_lands() {
     init_repo(repo.path());
     let layout = Layout::at(home.path());
     std::fs::create_dir_all(layout.workflows_dir()).unwrap();
-    std::fs::write(layout.workflows_dir().join("steward.cue"), TIERED_STEWARD).unwrap();
+    std::fs::write(layout.workflows_dir().join("landing.cue"), TIERED_LANDING).unwrap();
     let daemon = Daemon::new_in_memory(layout.clone(), "tiered".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -198,7 +198,7 @@ async fn doc_only_diff_class_skips_reviewer_but_still_gates_and_lands() {
     // deterministic gate (a gate failure would have failed the instance above
     // instead of reaching `land`).
     assert!(
-        git(repo.path(), &["show", "main:steward.txt"]).contains("tiered work"),
+        git(repo.path(), &["show", "main:landing.txt"]).contains("tiered work"),
         "reduced-tier work must still land on main after the gate passes"
     );
 
@@ -219,7 +219,7 @@ async fn missing_diff_class_defaults_to_the_review_tier() {
     init_repo(repo.path());
     let layout = Layout::at(home.path());
     std::fs::create_dir_all(layout.workflows_dir()).unwrap();
-    std::fs::write(layout.workflows_dir().join("steward.cue"), TIERED_STEWARD).unwrap();
+    std::fs::write(layout.workflows_dir().join("landing.cue"), TIERED_LANDING).unwrap();
     let daemon = Daemon::new_in_memory(layout.clone(), "tiered-default".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;

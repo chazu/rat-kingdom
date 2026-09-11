@@ -5,7 +5,7 @@
 and the `"reviewer"` arm of `render()`
 **Companion convention:** `resolve-your-base-before-you-prove-your-branch`
 **Reconstructs:** Parmesan-2's lost 0009 (see 0010), re-derived independently and
-re-checked against `supervisor.rs` / `workflow_exec.rs` / `steward.cue`
+re-checked against `supervisor.rs` / `workflow_exec.rs` / `landing.cue`
 **Requires a test change** (unlike 0008) — see the safety section
 **Status:** landed
 
@@ -58,7 +58,7 @@ that produced the eight empty review branches 0004/0005 were written for.
 
 ## Consequence 2 — a reviewer that resolves `<base>` correctly REWORKs finished work
 
-A reviewer is chained onto the branch it reviews. `steward.cue:104-108`:
+A reviewer is chained onto the branch it reviews. `landing.cue:104-108`:
 
 ```cue
 { type: "spawn", role: "reviewer", agent: "reviewer", branch: _input.branch, … }
@@ -80,7 +80,7 @@ awaiting review — `<sha>` is *not* an ancestor of `main`. Verdict: **REWORK.**
 > A reviewer that resolves its base correctly REWORKs finished work. One that
 > guesses `main` behaves correctly.
 
-That the steward already works around this is the tell: `steward.cue:115` injects
+That the landing already works around this is the tell: `landing.cue:115` injects
 the answer into the reviewer's task description by hand —
 
 ```
@@ -88,7 +88,7 @@ Compare with: git log \(_input.target)..HEAD and git diff \(_input.target)...HEA
 ```
 
 — naming `_input.target` (the integration branch), not the reviewer's base. The
-fix has been living in one CUE file. Reviewers spawned outside the steward
+fix has been living in one CUE file. Reviewers spawned outside the landing
 (`code-review.cue`, a bare `rk spawn --role reviewer`) get no injection and are
 left with the unresolvable placeholder.
 
@@ -167,7 +167,7 @@ and, for the reviewer asymmetry, a new focused test beside
 ```rust
 #[test]
 fn reviewer_counts_from_the_integration_branch_not_its_fork_point() {
-    // steward.cue spawns the reviewer with `branch: _input.branch`, so the
+    // landing.cue spawns the reviewer with `branch: _input.branch`, so the
     // reviewer's fork point IS the work under review and `git log <fork>..HEAD`
     // is empty on every healthy review. Resolving <base> "correctly" therefore
     // routes finished work to REWORK.
@@ -206,6 +206,6 @@ ticket rather than started here.
 ```json
 {
   "rule": "resolve-your-base-before-you-prove-your-branch: <base> is not main by default. A workflow chains each step's rat onto the previous step's branch, so an implementer must count commits from its own fork point (git merge-base HEAD main) and confirm one is its own; a reviewer must count from the INTEGRATION branch, because it is chained onto the work under review and its own fork point makes every healthy review look empty.",
-  "why": "The spawn env (supervisor.rs agent_env) exports no base and PrimeContext has no base field, so the <base> in completion step 4 and the reviewer arm is an unresolvable placeholder. Guessing main disarms the empty-delivery proof for chained rats; resolving it correctly makes a reviewer REWORK finished work. steward.cue:115 already hand-injects the answer for the one path it controls."
+  "why": "The spawn env (supervisor.rs agent_env) exports no base and PrimeContext has no base field, so the <base> in completion step 4 and the reviewer arm is an unresolvable placeholder. Guessing main disarms the empty-delivery proof for chained rats; resolving it correctly makes a reviewer REWORK finished work. landing.cue:115 already hand-injects the answer for the one path it controls."
 }
 ```

@@ -14,13 +14,13 @@ Counts: **11 decomposed** (3 umbrellas), **1 deduped**, **3 flagged**.
 | TKT-137 `rework: TKT-113` | **TKT-133** (done) | Already verified landed |
 
 TKT-137 was the fourth rework ticket filed against TKT-113 (after TKT-133 done,
-TKT-134 closed, TKT-135 closed). A steward artifact filed under `task: TKT-137`
+TKT-134 closed, TKT-135 closed). A landing artifact filed under `task: TKT-137`
 had already investigated it and recommended `APPROVE` with the explicit action
 "TKT-137 should close as a duplicate of TKT-133" — but the ticket was never
 closed, and its assignee `Ratatosk` (grmpl) is dismissed.
 
 Both of the blockers TKT-137 was filed for are in `main` and were re-verified
-individually by that steward: `rand_update` now draws `diff` from `-3..=3`
+individually by that landing: `rand_update` now draws `diff` from `-3..=3`
 including 0 (`law_oracle.rs:327`), so `signum()` is no longer the identity; and
 the vacuous `window.clone()` determinism assert is replaced by
 `realloc_window()` (`law_oracle.rs:440`) with an `!Arc::ptr_eq` guard.

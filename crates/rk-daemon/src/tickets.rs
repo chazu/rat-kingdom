@@ -327,7 +327,7 @@ impl Tickets {
         // Explicit scope wins. Otherwise a sub-ticket inherits its parent's
         // scope, so decomposing a repo-scoped ticket doesn't silently drop the
         // sub-tickets into "system" (which breaks `rk spawn --ticket` and the
-        // steward-on-completion trigger match).
+        // legacy-landing-on-completion trigger match).
         let scope = match &t.scope {
             Some(s) => s.clone(),
             None => parent_tuple.map(|p| p.scope).unwrap_or_else(system_scope),
@@ -787,7 +787,40 @@ impl Tickets {
     /// take-and-replace, so of two concurrent drains racing for one ticket
     /// exactly one wins and the loser leaves the ticket untouched.
     pub async fn claim(&self, id: &str) -> rk_core::Result<bool> {
+        self.claim_if_current(id, None).await
+    }
+
+    /// Fence delegated dispatch against label, prompt, tier or dependency edits
+    /// made since the scheduler read its candidate. Losing the fence is a no-op.
+    pub async fn claim_authorized(&self, ticket: &Tuple) -> rk_core::Result<bool> {
+        self.claim_if_current(&ticket.identity, Some(ticket)).await
+    }
+
+    async fn claim_if_current(&self, id: &str, expected: Option<&Tuple>) -> rk_core::Result<bool> {
         let _guard = self.lock.lock().await;
+        if let Some(expected) = expected {
+            let by_id = self.all_by_id()?;
+            let Some(current) = by_id.get(id) else {
+                return Ok(false);
+            };
+            let labels = current.payload["labels"].as_array();
+            if current.payload != expected.payload
+                || current.scope != expected.scope
+                || !labels
+                    .is_some_and(|labels| labels.iter().any(|label| label == "ready-for-agent"))
+                || rk_core::freeze::blocks_automated_dispatch(
+                    &labels
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                )
+                || is_blocked(current, &by_id)
+            {
+                return Ok(false);
+            }
+        }
         let Some(existing) = self.take_ticket(id).await? else {
             return Ok(false);
         };
@@ -860,7 +893,7 @@ impl Tickets {
     }
 
     /// Reopen a `done` or `closed` ticket as an explicit recovery action
-    /// (used by `rk revert` and the operator/steward-only `rk ticket
+    /// (used by `rk revert` and the operator/landing-only `rk ticket
     /// reopen`). Ordinary updates cannot move a ticket backwards out of
     /// either terminal state — [`valid_transition`] only allows `done` ->
     /// `closed` — so this is the sole path back to the backlog once a
@@ -1930,6 +1963,56 @@ mod tests {
         assert!(t.add_dep(&a.identity, &c.identity).await.is_err());
         // Self-dependency is rejected too.
         assert!(t.add_dep(&a.identity, &a.identity).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn authorized_claim_rechecks_delegation_and_dependencies_under_the_mutation_lock() {
+        let t = tickets();
+        let mut spec = new("delegated", "r", None);
+        spec.labels = vec!["ready-for-agent".into()];
+        let candidate = t.create(spec).await.unwrap();
+        t.update(
+            &candidate.identity,
+            TicketChanges {
+                remove_labels: vec!["ready-for-agent".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !t.claim_authorized(&candidate).await.unwrap(),
+            "revoked delegation"
+        );
+        let refreshed = t
+            .update(
+                &candidate.identity,
+                TicketChanges {
+                    add_labels: vec!["ready-for-agent".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let dependency = t.create(new("dependency", "r", None)).await.unwrap();
+        t.add_dep(&candidate.identity, &dependency.identity)
+            .await
+            .unwrap();
+        assert!(
+            !t.claim_authorized(&refreshed).await.unwrap(),
+            "new dependency"
+        );
+        let blocked = t.get(&candidate.identity).unwrap().unwrap();
+        assert!(
+            !t.claim_authorized(&blocked).await.unwrap(),
+            "current blocked candidate"
+        );
+        t.remove_dep(&candidate.identity, &dependency.identity)
+            .await
+            .unwrap();
+        let ready = t.get(&candidate.identity).unwrap().unwrap();
+        assert!(t.claim_authorized(&ready).await.unwrap());
+        assert!(!t.claim_authorized(&ready).await.unwrap());
     }
 
     #[tokio::test]

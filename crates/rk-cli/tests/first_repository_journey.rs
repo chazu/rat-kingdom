@@ -47,8 +47,8 @@ fn first_repository_gates_enforce_line_budget_and_protected_paths() {
         git(repo.path(), &["add", path]);
         git(repo.path(), &["commit", "-m", "candidate"]);
         for (name, expected) in [
-            ("steward-diff-scope", scope_pass),
-            ("steward-protected-paths", protected_pass),
+            ("landing-diff-scope", scope_pass),
+            ("landing-protected-paths", protected_pass),
         ] {
             let check = checks.iter().find(|check| check.name == name).unwrap();
             let output = std::process::Command::new("sh")
@@ -363,7 +363,7 @@ async fn first_repository_reaches_gated_delivery_and_retained_cleanup_evidence()
         .find(|proof| proof["payload"]["candidate_sha"] == *delivered_sha)
         .expect("the delivered commit must have its own gate-pass evidence");
     let checks = proof["payload"]["checks"].as_array().unwrap();
-    for check in ["verify", "steward-protected-paths", "steward-diff-scope"] {
+    for check in ["verify", "landing-protected-paths", "landing-diff-scope"] {
         assert!(checks.iter().any(|name| name == check), "{proof}");
     }
     assert!(std::fs::read_to_string(repo.path().join("README.md"))

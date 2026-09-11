@@ -34,7 +34,7 @@ Reviewer-ceiling fencing (distinct machinery, `rk_workflow::LandingPolicy` in
 
 | Field | Default | Governs |
 |---|---|---|
-| `review_timeout` (workflow ceiling) | `STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS` = `900s` (15m) | Wall-clock ceiling a reviewer workflow instance may run before it is fenced (terminated/parked) regardless of transport health. |
+| `review_timeout` (workflow ceiling) | `LANDING_DEFAULT_REVIEW_TIMEOUT_SECS` = `900s` (15m) | Wall-clock ceiling a reviewer workflow instance may run before it is fenced (terminated/parked) regardless of transport health. |
 | `max_review_death_attempts` | `1` | How many fresh review attempts a review-death retry (including a transport-fenced one) may spend before it stops and escalates, via `landing_review_retry::ReviewDeathBackoffPolicy`. |
 
 `SupervisorConfig::stuck_after_secs` (default `600s`) is asserted at a unit

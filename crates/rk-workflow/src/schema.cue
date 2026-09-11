@@ -124,7 +124,7 @@ workflow: #Workflow
 	type: "spawn"
 	role: string | *"rat"
 	// Optional reporting-boundary metadata. Workflow-owned foremen and
-	// stewards are also treated as boundaries by the daemon for compatibility.
+	// landings are also treated as boundaries by the daemon for compatibility.
 	coordination?: #Coordination
 	// Named agent profile from `agents` (or global config).
 	agent?: string
@@ -249,13 +249,13 @@ workflow: #Workflow
 	// Match ANY tuple whose payload names this exact commit — a
 	// `"head_sha":"<sha>"` substring — regardless of which agent or instance
 	// wrote it. This is the commit-keyed verdict cache lookup: a review
-	// artifact recorded for a branch tip is reusable by any later steward run
+	// artifact recorded for a branch tip is reusable by any later landing run
 	// against that same unchanged tip. Unlike `fromAgent`/`fromInstance`, it
 	// is deliberately NOT scoped to this run — the whole point is to find a
 	// PRIOR run's verdict. Mutually exclusive with
 	// `search`/`fromAgent`/`fromInstance`. The sha must be non-empty; guard
 	// the step at CUE load time (an `if` over the param, not a runtime `when`)
-	// when it may be absent, the same way `steward.cue` gates review tiering
+	// when it may be absent, the same way `landing.cue` gates review tiering
 	// on `diffClass`. Must be paired with `forBranch` — a sha alone is not
 	// exclusive to one branch (two branches cut from the same point, before
 	// either gains a new commit, share a tip).

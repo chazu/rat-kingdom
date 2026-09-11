@@ -21,7 +21,7 @@ repo: #RepositoryPolicy
 }
 
 #DeliveryPolicy: {
-	// `agent-base` carries the completed worker's actual base through steward;
+	// `agent-base` carries the completed worker's actual base through landing;
 	// any other value is a fixed branch name such as `main` or `develop`.
 	target: string | *"agent-base"
 	mode: "merge" | "merge-push" | "push-branch" | "pr" | *"merge"
@@ -31,17 +31,17 @@ repo: #RepositoryPolicy
 	deleteSource: bool | *true
 }
 
-// Landing-pipeline gate policy (Phase 4 of the steward remediation): the
+// Landing-pipeline gate policy (Phase 4 of the landing remediation): the
 // same protectedPaths/maxDiffFiles/maxDiffLines/gateTimeout/reviewTimeout
-// knobs the retired steward mega-workflow used to expose as workflow params,
+// knobs the retired landing mega-workflow used to expose as workflow params,
 // now versioned and digest-activated here in per-repo CUE and mechanically
 // executed by the daemon-native LandingPipeline (crates/rk-daemon/src/landing.rs).
 #LandingPolicy: {
 	// POLICY GUARDRAIL (#19): an ERE matched against changed file paths, run
-	// through the repo's `steward-protected-paths` named check.
+	// through the repo's `landing-protected-paths` named check.
 	protectedPaths: string | *"(^|/)(\\.github|\\.rk|migrations)/"
 	// DIFF-SCOPE GUARDRAIL (#20): 0 disables the budget. Run through the
-	// repo's `steward-diff-scope` named check.
+	// repo's `landing-diff-scope` named check.
 	maxDiffFiles: int | *50
 	maxDiffLines: int | *2000
 	// Wall-clock bound for the repo's real `verify` check.

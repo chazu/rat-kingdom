@@ -442,7 +442,7 @@ pub struct WorkflowEngine {
     /// Fleet-wide concurrent-agent ceiling shared with the continuous-drain
     /// autoscaler (`[drain] max_wip`): a `spawn` step waits for a free slot
     /// under the same cap a drain refill respects, so workflow-spawned agents
-    /// (e.g. steward reviewers) cannot unboundedly outrun it. Zero (the
+    /// (e.g. landing reviewers) cannot unboundedly outrun it. Zero (the
     /// default, and drain's own "disabled" value) means no ceiling — matches
     /// pre-admission-control behaviour.
     fleet_wip_cap: usize,
@@ -509,6 +509,30 @@ impl WorkflowEngine {
     /// wins over `~/.rat-kingdom/workflows/<name>.cue`. Direct `.cue` paths are
     /// accepted only when they stay inside one of those two roots.
     pub fn find_definition(&self, name: &str, repo: &str) -> rk_core::Result<PathBuf> {
+        let name = rk_core::landing_names::canonical(name);
+        if name == "candidate-review" {
+            // Preserve repository-local customization across the rename. New
+            // installs use the canonical file; existing installs keep working
+            // until their definitions are migrated, including after restart.
+            for root in [
+                PathBuf::from(repo).join(".rk/workflows"),
+                self.layout.workflows_dir(),
+            ] {
+                for candidate_name in [name, rk_core::landing_names::LEGACY_REVIEW_WORKFLOW] {
+                    let candidate = root.join(format!("{candidate_name}.cue"));
+                    if candidate.exists() {
+                        return definition_inside_roots(
+                            &candidate,
+                            repo,
+                            &self.layout.workflows_dir(),
+                        )
+                        .ok_or_else(|| {
+                            rk_core::Error::other("review definition is outside workflow roots")
+                        });
+                    }
+                }
+            }
+        }
         let as_path = PathBuf::from(name);
         if as_path.extension().map(|e| e == "cue").unwrap_or(false) && as_path.exists() {
             return definition_inside_roots(&as_path, repo, &self.layout.workflows_dir())
@@ -838,7 +862,7 @@ impl WorkflowEngine {
     /// STILL `Running`/`Paused`/`Spawning` when its owning instance goes
     /// terminal, e.g. a reviewer stuck reconnecting through a transport
     /// outage (the 2026-08-21 incident this closes: a Codex reviewer stayed
-    /// `Running` and reconnecting well after its owning steward-review
+    /// `Running` and reconnecting well after its owning candidate-review
     /// workflow had already timed out, holding fleet capacity
     /// indefinitely). [`Supervisor::dismiss_live_instance_agents`] is the
     /// live-state counterpart; running both here means a workflow's own
@@ -1503,10 +1527,10 @@ impl WorkflowEngine {
                     // by which key the wanted tuple actually carries:
                     //
                     // - `fromAgent` (TKT-161) — what an agent THIS instance
-                    //   spawned wrote. The reactor fires `steward` per rat
+                    //   spawned wrote. The reactor fires `landing` per rat
                     //   completion, so concurrent reviewers write
                     //   `artifact/<repo>/review` at the same time and an unbound
-                    //   read can hand a steward the OTHER steward's verdict to
+                    //   read can hand a landing the OTHER landing's verdict to
                     //   land on. Cured by the rat generation's exact spawn id.
                     // - `fromInstance` (TKT-172) — what was written FOR this
                     //   run. The `workflow_approval` event behind an approval
@@ -1516,7 +1540,7 @@ impl WorkflowEngine {
                     //   instance id (`for_workflow_instance`) — the same
                     //   predicate the gate itself waits on, so gate and read
                     //   cannot disagree about whose decision this is.
-                    // - `forCommit` (steward Phase 2 verdict cache) — what was
+                    // - `forCommit` (landing Phase 2 verdict cache) — what was
                     //   written for a specific branch tip, regardless of who
                     //   wrote it or which run it belongs to. Deliberately the
                     //   OPPOSITE scoping of the other two: it exists to find a
@@ -1592,7 +1616,7 @@ impl WorkflowEngine {
                             .await
                             .map_err(|e| rk_core::Error::other(format!("read failed: {e}")))?,
                     };
-                    // `onTimeout: "continue"` (steward Phase 2 verdict cache) lets
+                    // `onTimeout: "continue"` (landing Phase 2 verdict cache) lets
                     // a bounded, non-blocking probe come back empty without
                     // ending the run — the following `when` routes on "nothing
                     // cached yet" instead. Every read before the cache used the
@@ -2143,7 +2167,7 @@ impl WorkflowEngine {
     /// started. That is fixed on the producer side (a generation now publishes
     /// exactly one `harness_result`, the one it finished on — see
     /// `Supervisor::claim_completion`), because `wait` is not the only reader:
-    /// the reactor's steward trigger and the ticket auto-close read the same
+    /// the reactor's landing trigger and the ticket auto-close read the same
     /// event. Do not reintroduce a per-turn `harness_result`.
     ///
     fn result_pattern(
@@ -4019,7 +4043,7 @@ mod tests {
         );
     }
 
-    /// The steward escalation checks (`rk out need`, `rk ticket new`) run in
+    /// The landing escalation checks (`rk out need`, `rk ticket new`) run in
     /// the daemon's inherited environment, which may not contain the rk binary
     /// directory at all — the daemon is auto-started by whatever client first
     /// connects. The child PATH must therefore always lead with the daemon's
@@ -4082,7 +4106,7 @@ mod tests {
 
     /// A failing check's error must carry the check's own words — an exit code
     /// alone masked `jq: command not found` behind "exited 1, expected 0" for
-    /// every steward escalation failure.
+    /// every landing escalation failure.
     #[test]
     fn check_failure_detail_surfaces_bounded_output() {
         let detail = check_failure_detail("payload rejected", "sh: jq: command not found\n");
@@ -4277,14 +4301,14 @@ test a::flaky ... FAILED
     /// left to the inbox tests that consume it.
     #[test]
     fn work_key_identifies_the_work_not_the_run() {
-        let base = work_key("/dev/repo", "steward", &params(&[("ticket", "TKT-1")]));
+        let base = work_key("/dev/repo", "landing", &params(&[("ticket", "TKT-1")]));
 
         // A retry is a different RUN of the same WORK: nothing about the run —
         // its id, its start time, its outcome — is an input here, so re-deriving
         // from the same three fields must land on the same key.
         assert_eq!(
             base,
-            work_key("/dev/repo", "steward", &params(&[("ticket", "TKT-1")]))
+            work_key("/dev/repo", "landing", &params(&[("ticket", "TKT-1")]))
         );
 
         // Param insertion order is a HashMap accident, not a difference in work.
@@ -4295,14 +4319,14 @@ test a::flaky ... FAILED
         forward.insert("a".to_string(), json!("1"));
         forward.insert("b".to_string(), json!("2"));
         assert_eq!(
-            work_key("/dev/repo", "steward", &forward),
-            work_key("/dev/repo", "steward", &reordered)
+            work_key("/dev/repo", "landing", &forward),
+            work_key("/dev/repo", "landing", &reordered)
         );
 
         // Each of the three inputs genuinely separates work.
         assert_ne!(
             base,
-            work_key("/dev/other", "steward", &params(&[("ticket", "TKT-1")]))
+            work_key("/dev/other", "landing", &params(&[("ticket", "TKT-1")]))
         );
         assert_ne!(
             base,
@@ -4310,9 +4334,9 @@ test a::flaky ... FAILED
         );
         assert_ne!(
             base,
-            work_key("/dev/repo", "steward", &params(&[("ticket", "TKT-2")]))
+            work_key("/dev/repo", "landing", &params(&[("ticket", "TKT-2")]))
         );
-        assert_ne!(base, work_key("/dev/repo", "steward", &HashMap::new()));
+        assert_ne!(base, work_key("/dev/repo", "landing", &HashMap::new()));
     }
 
     /// The length prefixes are load-bearing, not cosmetic: without them a repo
@@ -4322,8 +4346,8 @@ test a::flaky ... FAILED
     #[test]
     fn work_key_cannot_be_re_cut_across_its_fields() {
         assert_ne!(
-            work_key("/dev/repo|x", "steward", &HashMap::new()),
-            work_key("/dev/repo", "x|steward", &HashMap::new())
+            work_key("/dev/repo|x", "landing", &HashMap::new()),
+            work_key("/dev/repo", "x|landing", &HashMap::new())
         );
         assert_ne!(
             work_key("a", "bc", &HashMap::new()),
@@ -4339,7 +4363,7 @@ test a::flaky ... FAILED
     fn work_key_ignores_the_definition_digest() {
         let mut before = Instance {
             id: "wf-a".into(),
-            workflow: "steward".into(),
+            workflow: "landing".into(),
             repo: "/dev/repo".into(),
             coordinator: None,
             schedule: None,
@@ -4351,7 +4375,7 @@ test a::flaky ... FAILED
             error: None,
             awaiting: None,
             instance_max_usd: None,
-            definition: "steward".into(),
+            definition: "landing".into(),
             definition_digest: "aaaa".into(),
             params: params(&[("ticket", "TKT-1")]),
             depth: 0,
@@ -5136,6 +5160,47 @@ test a::flaky ... FAILED
         );
     }
 
+    #[test]
+    fn review_rename_preserves_local_customization_and_old_resume_names() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let global = home.path().join("workflows");
+        let local = repo.path().join(".rk/workflows");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(
+            global.join("candidate-review.cue"),
+            "workflow: {name: \"candidate-review\", steps: []}",
+        )
+        .unwrap();
+        let legacy_name = rk_core::landing_names::LEGACY_REVIEW_WORKFLOW;
+        let legacy = local.join(format!("{legacy_name}.cue"));
+        let source = include_str!("../../../examples/workflows/candidate-review.cue")
+            .replace("candidate-review", legacy_name)
+            .replace("review-only: spawn", "local customization: spawn");
+        std::fs::write(&legacy, source).unwrap();
+        let selected = engine
+            .find_definition("candidate-review", repo.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(selected, legacy.canonicalize().unwrap());
+        let inputs = HashMap::from([
+            ("branch".into(), json!("candidate")),
+            ("reviewAttempt".into(), json!("review-test")),
+        ]);
+        let definition = rk_workflow::load(&selected, &inputs).unwrap();
+        assert_eq!(definition.name, "candidate-review");
+        assert!(definition.description.starts_with("local customization"));
+        let migrated = local.join("candidate-review.cue");
+        std::fs::rename(&legacy, &migrated).unwrap();
+        assert_eq!(
+            engine
+                .find_definition(legacy_name, repo.path().to_str().unwrap())
+                .unwrap(),
+            migrated.canonicalize().unwrap()
+        );
+    }
+
     /// A minimal engine with an in-memory space/registry, enough to exercise
     /// [`crate::managed_verification::ManagedVerification::run`] directly without a live daemon or a
     /// spawned agent (mirrors `supervisor::respawn_tests::supervisor`).
@@ -5287,7 +5352,7 @@ test a::flaky ... FAILED
 
     /// Root-cause regression for the parent transport-outage incident
     /// (2026-08-21, TKT-01M0HDFZNVPHE0JV382VSBCQD0): a Codex reviewer stayed
-    /// `Running` and reconnecting well after its owning steward-review
+    /// `Running` and reconnecting well after its owning candidate-review
     /// workflow had already timed out, holding fleet capacity indefinitely.
     /// Before [`WorkflowEngine::sweep_instance_agents`] existed, the
     /// finalize-time/stale-timeout cleanup sweep called ONLY
@@ -5868,7 +5933,7 @@ test a::flaky ... FAILED
     fn wedged_instance(id: &str, started_at: DateTime<Utc>) -> Instance {
         Instance {
             id: id.into(),
-            workflow: "steward".into(),
+            workflow: "landing".into(),
             repo: "/repo".into(),
             coordinator: None,
             schedule: None,
@@ -5880,7 +5945,7 @@ test a::flaky ... FAILED
             error: None,
             awaiting: None,
             instance_max_usd: None,
-            definition: "steward".into(),
+            definition: "landing".into(),
             definition_digest: String::new(),
             params: HashMap::new(),
             depth: 0,
@@ -6040,7 +6105,7 @@ test a::flaky ... FAILED
         // The "still-running" execute() future the sweep declared wedged
         // finishes anyway and its spawn_execution task calls finalize.
         engine
-            .finalize("wf-race", "/repo", "steward", Ok(()))
+            .finalize("wf-race", "/repo", "landing", Ok(()))
             .await
             .unwrap();
 

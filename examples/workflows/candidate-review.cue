@@ -1,4 +1,4 @@
-// steward-review: the review-only remainder of the steward after the
+// candidate-review: code review launched by the landing pipeline after the
 // daemon-native landing pipeline (Phase 3, TKT-01M036PSEHTMD3S5D2JFAG7XVY)
 // took over gates, the commit-keyed verdict-cache probe, and
 // APPROVE/REWORK/STOP routing. See
@@ -14,34 +14,17 @@
 // daemon restart even though this instance's own bookkeeping does not
 // (design doc §2.6).
 //
-// Invoked PROGRAMMATICALLY by `LandingPipeline::request_review` on a
-// verdict-cache miss — never reactor-fired, and never run by hand. Exactly
-// the first three steps of the old mega-workflow's `_reviewArm`
-// (`examples/workflows/steward.cue:343-371`), nothing else: no gates, no
-// verdict read, no routing — all three now live in the daemon-native
-// pipeline instead of CUE.
+// Invoked programmatically by LandingPipeline on a verdict-cache miss.
+// Gates, verdict routing, delivery and recovery belong to the native pipeline.
+// This is a bounded code review workflow, not a standing operations agent.
 //
-// CUTOVER STATUS (Phase 4, TKT-01M036PSF2WV7NHZE00G2EFCVK): the operator
-// executed the §6 runbook on 2026-08-16 — the live
-// `steward-landing-on-completion` trigger (action: land) replaced
-// `steward-on-completion` in the global triggers directory, so THIS
-// workflow (spawned programmatically by `LandingPipeline::request_review`)
-// is now the one genuinely live review path. `examples/workflows/steward.cue`
-// is no longer fired by anything; it remains in the tree only as the
-// pre-cutover reference implementation, plus its dedicated schema/routing
-// tests in `crates/rk-workflow/tests/examples.rs` and
-// `crates/rk-daemon/tests/workflow_verdict_cache.rs`. Deleting it and that
-// test coverage together (~450 lines) is tracked separately:
-// TKT-01M048ASYM00N37EBK1VM7FH5H, "Remove obsolete steward CUE gate
-// definitions after pipeline cutover".
-//
-// Install with `rk workflow install examples/workflows/steward-review.cue`
+// Install with `rk workflow install examples/workflows/candidate-review.cue`
 // (global) or into `<repo>/.rk/workflows/` (repo-local) — same install/drift
 // story as every other shipped workflow.
 package workflow
 
 workflow: {
-	name:        "steward-review"
+	name:        "candidate-review"
 	description: "review-only: spawn a reviewer chained onto a landing candidate's branch and wait for its verdict"
 
 	params: {
@@ -68,7 +51,7 @@ workflow: {
 		// it from the complete review context and the runtime binds verdicts to it.
 		reviewAttempt: {type: "string", required: true}
 		// Same invariant as the old mega-workflow's `reviewTimeout`
-		// (`examples/workflows/steward.cue`): must stay comfortably ABOVE the
+		// (`examples/workflows/landing.cue`): must stay comfortably ABOVE the
 		// daemon's `supervisor.stuck_after_secs`, or the wait here hard-fails
 		// before the sweep's soft steer gets a chance to nudge a slow reviewer
 		// back to a clean `rk done`.
@@ -123,9 +106,9 @@ workflow: {
 				attempt: _input.reviewAttempt
 			}
 			task: {
-				title: "steward-review-" + _input.taskId
+				title: "candidate-review-" + _input.taskId
 				description: """
-					You are the steward's reviewer on branch {{ctx.activeBranch}}
+					You are the landing's reviewer on branch {{ctx.activeBranch}}
 					(head \(_input.headSha)), chained off a rat's completed work for:
 					\(_input.taskId)
 

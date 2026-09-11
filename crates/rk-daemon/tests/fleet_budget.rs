@@ -265,7 +265,7 @@ async fn dismissed_agent_drops_off_fleet_tally() {
 }
 
 /// TKT-40: a COMPLETED agent's spend must also drop off the fleet tally. The
-/// steward lands a rat via a separate reviewer branch and never dismisses the
+/// landing lands a rat via a separate reviewer branch and never dismisses the
 /// original ticket-rat, so it lingers as `Completed` — under the old rule (skip
 /// only `Dismissed`) its spend kept accumulating and could silently block every
 /// spawn. Now that only live agents count, a spender that records cost then

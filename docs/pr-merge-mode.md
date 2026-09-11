@@ -174,7 +174,7 @@ panics, and the branch is left intact for you to retry.
 ## 5. End-to-end review path
 
 Direct mode and PR mode differ only in **what "proceed" does** — every gate that
-decides *whether* to proceed (approval gates, the steward's reviewer + run-gate)
+decides *whether* to proceed (approval gates, the landing's reviewer + run-gate)
 is unchanged.
 
 **Direct mode (default):**

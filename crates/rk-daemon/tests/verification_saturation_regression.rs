@@ -714,7 +714,7 @@ mod fixture;
 const RESTART_LANDING_TRIGGER: &str = r#"
 triggers: [
     {
-        name:   "landing-on-completion"
+        name:   "legacy-landing-on-completion"
         action: "land"
         match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
         maxFires: 20
@@ -731,8 +731,8 @@ triggers: [
 /// bypassed check.
 const RESTART_CHECKS: &str = r#"
 checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "sleep 0.6 && true", timeout: "30s", sharedCargoTarget: true},
 ]
 "#;

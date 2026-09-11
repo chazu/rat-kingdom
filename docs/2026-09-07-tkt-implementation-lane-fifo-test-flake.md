@@ -4,7 +4,7 @@
 
 While landing the doc-only branch
 `rat/cornflower-13/research-maki-agent-harness-chatgpt`, the protected-main
-steward gate ran `mise run verify-full` and failed only on
+landing gate ran `mise run verify-full` and failed only on
 `supervisor::respawn_tests::implementation_lane_admits_the_longest_waiting_request_first`.
 The candidate had no Rust changes and `verify-changed` had already passed;
 the branch was held unmerged until a human forced an audited bypass.
@@ -104,7 +104,7 @@ daemon-native landing gate (`crates/rk-daemon/src/landing.rs`) or its
 retry logic was needed here. The existing fleet convention
 (`preexisting-failure-is-a-ticket-not-an-inline-fix`, TKT-43) already
 covers the *reporting* half correctly. What it does not yet cover is the
-steward gate's own behavior when a `verify`/`verify-full` check hold fires
+landing gate's own behavior when a `verify`/`verify-full` check hold fires
 for a failure with **no plausible relationship to the candidate's diff**
 (here: a doc-only branch, `verify-changed` green, failure confined to an
 unrelated pre-existing test): today that still requires an operator's

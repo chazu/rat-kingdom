@@ -2,9 +2,9 @@
 //! reviewer wrote, never a concurrent instance's.
 //!
 //! The failure this pins down: `(category, scope, identity)` is not an identity.
-//! `steward.cue` lifts its merge decision with
+//! `landing.cue` lifts its merge decision with
 //! `{type: "read", category: "artifact", identity: "review", …}`, and the
-//! reactor fires a steward per rat completion — so two stewards on ONE repo is
+//! reactor fires a landing per rat completion — so two landings on ONE repo is
 //! the designed steady state, not an edge case. Both reads match the same
 //! pattern, "newest match wins" hands both of them whichever reviewer finished
 //! last, and the `when` behind it routes an APPROVE — a land onto main — on a
@@ -77,7 +77,7 @@ rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"reviewed","session_id":"verdict-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
-/// The steward's shape, reduced to the seam under test: spawn a reviewer, wait,
+/// The landing's shape, reduced to the seam under test: spawn a reviewer, wait,
 /// lift its verdict, route. APPROVE completes the run (the stand-in for `land`,
 /// which needs no real merge to make the routing observable); REWORK stops it
 /// with a reason naming the arm, so the arm each instance took is legible from
@@ -256,7 +256,7 @@ async fn concurrent_instances_each_route_on_their_own_reviewers_verdict() {
     let mut client = connect(&layout).await;
     support::register_repo(&mut client, repo_dir.path()).await;
 
-    // Both stewards in flight at once, exactly as the reactor produces them.
+    // Both landings in flight at once, exactly as the reactor produces them.
     let first = run_workflow(&mut client, repo_dir.path()).await;
     let second = run_workflow(&mut client, repo_dir.path()).await;
     let first_reviewer = await_reviewer(&mut client, &first).await;
@@ -280,7 +280,7 @@ async fn concurrent_instances_each_route_on_their_own_reviewers_verdict() {
 
     // The heart of it: the first instance lifted its own reviewer's APPROVE.
     // Under the bug it lifted the peer's REWORK and failed on the rework arm —
-    // and in the real steward it is the mirror case that bites, an instance
+    // and in the real landing it is the mirror case that bites, an instance
     // landing a branch on main because a stranger's reviewer said APPROVE.
     assert_eq!(
         first_done["context"]["vars"]["verdict"],
@@ -350,7 +350,7 @@ async fn an_unbound_read_still_takes_the_newest_strangers_verdict() {
     // The defect, reproduced: this instance's reviewer said APPROVE and the
     // instance routed REWORK, because the newest `review` in the repo belonged
     // to somebody else. Swap the plant order and it would route the other way —
-    // which in `steward.cue` is a merge to main on an unread branch.
+    // which in `landing.cue` is a merge to main on an unread branch.
     assert_eq!(
         first_done["context"]["vars"]["verdict"],
         json!("REWORK"),

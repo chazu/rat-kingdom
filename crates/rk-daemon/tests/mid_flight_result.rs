@@ -9,13 +9,13 @@
 //! than one `harness_result` this way. Because a `LIMIT 1` read returns the
 //! OLDEST match, every reader keyed on the agent name got the MID-FLIGHT turn:
 //! a workflow `wait` unblocked on "the full cargo test pass is still running",
-//! the `evaluate` behind it judged that text, and three steward reviewers whose
+//! the `evaluate` behind it judged that text, and three landing reviewers whose
 //! APPROVE/REWORK landed in a later turn were read as having no verdict at all.
 //! Exact spawn identity does not help — these are turns WITHIN one
 //! generation, milliseconds apart.
 //!
 //! The gate is in the supervisor rather than in the workflow `wait`, because
-//! `wait` is not the only reader: the reactor's steward trigger and the ticket
+//! `wait` is not the only reader: the reactor's landing trigger and the ticket
 //! auto-close consume the same event. Three proofs let a turn through: the rat
 //! ran `rk done`; the process exited; or the turn failed.
 //!

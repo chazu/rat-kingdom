@@ -24,7 +24,7 @@ Zero uses in 801 lifetime spawns. Remove crate/module, config surface, and docs 
 A scheduled (weekly) workflow that drives `action_approval.rs` through propose → digest → approve → daemon-execute with CAS, against a no-op action, and escalates on failure. This is the freeze's only "keep exercised" obligation; an unexercised security gate is the TKT-171 pattern.
 *AC: workflow exists, runs green on schedule, red path produces an escalation notice.*
 
-*(Dead steward CUE deletion: already ticketed as TKT-01M048 — referenced, not duplicated.)*
+*(Dead landing CUE deletion: already ticketed as TKT-01M048 — referenced, not duplicated.)*
 
 ---
 
@@ -32,7 +32,7 @@ A scheduled (weekly) workflow that drives `action_approval.rs` through propose �
 
 **B1. NotificationSink extraction (R5 core)** — *medium, no deps, gates B2*
 Extract the hardwired path (`reactor.rs` `notify_escalation` → `rk_mux::HerdrMux::notify`) into: `EscalationNotice` (tuple_id, class, severity, scope, subject, text, suggested action, structured refs), `NotificationSink` trait, config-driven `[[notify.sinks]]` registry with class/severity filters, and ONE fan-out function used by all escalation sources. Herdr sink reproduces current behavior exactly; existing `notify_escalations` bool maps onto it for back-compat. Sinks are best-effort: a deliver failure logs and never blocks escalation recording. Per-(tuple, sink) durable dedup reusing the `already_fired` marker pattern.
-*AC: existing steward-escalation notification behavior unchanged under default config; second sink can be registered in config without code changes to callers; dead sink degrades to passive inbox.*
+*AC: existing landing-escalation notification behavior unchanged under default config; second sink can be registered in config without code changes to callers; dead sink degrades to passive inbox.*
 
 **B2. Recovery announce helper + ack + re-notify sweep** — *medium, deps: B1*
 (a) Shared helper for recovery actions: emit event tuple + inbox row + fan-out through B1, with per-action rate-cap and ±10% jitter support. (b) `rk inbox ack <id>` writes a durable tuplespace ack marker. (c) Re-notify sweep: escalation with no ack → re-notify at 4h, then every 24h, max 3, then a standing inbox row with no further pushes. Ack is sink-agnostic — a future rat-king sink acks through the same CLI path.
@@ -88,7 +88,7 @@ Migrate the enumerated consumers to join on the generation key; name-only matchi
 
 **C3. Bind ticket-done to delivery (S5, minus pr-mode)** — *medium, no deps*
 `merge`/`merge-push`: done requires `merged == true`. `push-branch`: done requires the `remote_branch_merged_or_gone` ancestor-of-target check. pr-mode explicitly deferred until a forge-webhook ingest source exists (post-C4). Closes the TKT-18/46/147 "approved but never merged" class structurally.
-*AC: `rk done` (or steward mark-done) on an unmerged merge-mode ticket is refused with a pointed error; merged path unaffected.*
+*AC: `rk done` (or landing mark-done) on an unmerged merge-mode ticket is refused with a pointed error; merged path unaffected.*
 
 **C4. Minimal ingest bridge (R1): GitHub Actions CI poller** — *medium, no deps*
 Source: rat-kingdom's own CI (`ci.yml` on github.com/chazu/rat-kingdom — the only registered repo with a remote). First form is a **poller, not a webhook listener**: laptop-hosted daemon has no public endpoint, so a launchd shim polls the Actions API (~2min cadence) for recent run conclusions and translates them into `rk ingest` (`ci_failed`/`ci_recovered`), using a per-source derived rk token and a read-only fine-grained GitHub token over plain HTTPS (no `gh` CLI, consistent with the use-git-directly decision). `delivery_id = run_id + attempt` for dedup; transition detection suppresses unchanged-state refreshes. Read-only; exercises auth, dedup receipts, and transition detection against reality. Listener/webhook form is a later swap if ingest ever moves to a server castle (rk-sync is the kept path for that).

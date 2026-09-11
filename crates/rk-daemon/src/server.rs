@@ -389,13 +389,132 @@ mod current_need_tests {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
+    #[tokio::test]
+    async fn worker_cannot_grant_unattended_dispatch_through_ticket_rpcs() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(Layout::at(temp.path()), &Default::default()).unwrap();
+        for method in ["ticket.new", "ticket.update"] {
+            let req = Request {
+                id: "test".into(),
+                method: method.into(),
+                caller: "worker".into(),
+                auth: String::new(),
+                client_version: None,
+                params: json!({"id": "TKT-1", "title": "unauthorized",
+                    "labels": ["ready-for-agent"], "add_labels": ["ready-for-agent"]}),
+            };
+            let response = if method == "ticket.new" {
+                daemon.handle_ticket_new(req).await
+            } else {
+                daemon.handle_ticket_update(req).await
+            };
+            assert_eq!(response.error.unwrap().code, codes::FORBIDDEN);
+        }
+        assert!(daemon.tickets.list(None, None, None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_repairs_proven_delivery_once_and_preserves_human_decisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.test"]);
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+        std::fs::write(repo.join("README.md"), "delivered\n").unwrap();
+        git(&repo, &["commit", "-am", "delivered"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-b", "undelivered"]);
+        std::fs::write(repo.join("README.md"), "unlanded\n").unwrap();
+        git(&repo, &["commit", "-am", "unlanded"]);
+        let unlanded = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "main"]);
+        let mut daemon =
+            Daemon::new(Layout::at(temp.path().join("home")), &Default::default()).unwrap();
+        daemon.set_drain_config(rk_core::config::DrainConfig {
+            max_wip: 1,
+            ..Default::default()
+        });
+        daemon
+            .repos
+            .lock()
+            .unwrap()
+            .add(crate::repos::RepoRecord {
+                name: "tenant".into(),
+                path: repo.canonicalize().unwrap(),
+                host: None,
+                created_at: Utc::now(),
+                activated_policy: None,
+            })
+            .unwrap();
+        for (id, commit) in [("TKT-delivered", &base), ("TKT-contradiction", &unlanded)] {
+            daemon
+                .space
+                .out(Tuple::new(
+                    Category::Task,
+                    "tenant",
+                    id,
+                    "daemon",
+                    json!({
+                        "title": id, "status": "in_progress", "delivery": {"merge_commit": commit,
+                            "branch": "undelivered", "target": "main", "landed_at": Utc::now()}
+                    }),
+                ))
+                .unwrap();
+        }
+        daemon.routine_attention_cycle().await.unwrap();
+        assert_eq!(
+            daemon
+                .tickets
+                .get("TKT-delivered")
+                .unwrap()
+                .unwrap()
+                .payload["status"],
+            "closed"
+        );
+        assert_eq!(
+            daemon
+                .tickets
+                .get("TKT-contradiction")
+                .unwrap()
+                .unwrap()
+                .payload["status"],
+            "in_progress"
+        );
+        let pattern =
+            Pattern::category(Category::Event).identity(crate::attention::DECISION_IDENTITY);
+        let before = daemon.space.scan(&pattern).unwrap().len();
+        daemon.routine_attention_cycle().await.unwrap();
+        assert_eq!(
+            daemon.space.scan(&pattern).unwrap().len(),
+            before,
+            "no repeated repair"
+        );
+        let (snapshot, _, has_work) = daemon.king_authoritative_snapshot().await.unwrap();
+        assert!(has_work);
+        assert!(snapshot["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["kind"] == crate::reconcile::kind::TRACKER_CONTRADICTS_GIT));
+        assert!(!snapshot["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["subject"] == "TKT-delivered"));
+        assert!(daemon.king.snapshot().unwrap().registration.is_none());
+    }
+
     fn need(task: &str, at: chrono::DateTime<Utc>, incident: Option<Value>) -> Tuple {
         let mut row = Tuple::new(
             Category::Need,
             "tenant",
-            "steward",
+            "landing",
             "daemon",
-            json!({"agent": "steward", "task": task, "text": "historical incident"}),
+            json!({"agent": "landing", "task": task, "text": "historical incident"}),
         );
         row.created_at = at;
         if let Some(incident) = incident {
@@ -646,7 +765,10 @@ async fn king_snapshot_exposes_a_ready_ticket_behind_another_repositories_backlo
 
     let (snapshot, summary, has_work) = daemon.king_authoritative_snapshot().await.unwrap();
 
-    assert!(has_work);
+    assert!(
+        !has_work,
+        "unlabeled backlog must stay visible without waking the King"
+    );
     assert!(summary.contains("26 ready"), "{summary}");
     assert_eq!(snapshot["ready_frontier"]["total"], 26);
     assert_eq!(snapshot["ready_frontier"]["truncated"], true);
@@ -1918,14 +2040,11 @@ impl Daemon {
             });
         }
 
-        // Continuous-drain loop: a WIP-limited fleet autoscaler. While fewer than
-        // `max_wip` rats are live and the ready backlog is non-empty, claim the
-        // highest-priority ready ticket and spawn a rat — the always-on refill
-        // counterpart to a one-shot backlog-drain workflow. Off unless explicitly
-        // enabled *and* given a positive cap (handing the dispatch loop to the
-        // daemon is opt-in). Wakes on the tuple feed (a completion frees a slot)
-        // with the interval as a fallback, mirroring the reactor.
-        if daemon.drain_config.enabled && daemon.drain_config.max_wip > 0 {
+        // One background operations loop shares the existing drain executor.
+        // A positive cap enables explicitly delegated work; `enabled` expands
+        // that scope to the whole eligible backlog. Feed events refill slots,
+        // and timer ticks also run prescribed attention repairs.
+        if daemon.drain_config.max_wip > 0 {
             let drain = Arc::new(crate::drain::Drain::new(
                 Arc::clone(&daemon.supervisor),
                 daemon.tickets.clone(),
@@ -1938,23 +2057,37 @@ impl Daemon {
             let mut feed = daemon.space.subscribe();
             let mut drain_shutdown = daemon.shutdown_tx.subscribe();
             let interval = Duration::from_secs(daemon.drain_config.interval_secs.max(1));
+            let operations_daemon = Arc::clone(&daemon);
+            let whole_backlog = daemon.drain_config.enabled;
             // Unlike the reactor/scheduler, a drain cycle shells out to nothing
             // (it claims tickets and spawns) so it runs directly in this async
             // task — the same context the RPC spawn path already uses.
             background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 loop {
-                    tokio::select! {
-                        _ = tick.tick() => {}
+                    let periodic = tokio::select! {
+                        _ = tick.tick() => true,
                         recv = feed.recv() => match recv {
                             // Coalesce a burst so one refill covers the batch.
-                            Ok(_) => while feed.try_recv().is_ok() {},
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Ok(_) => { while feed.try_recv().is_ok() {} false },
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => false,
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         },
                         _ = drain_shutdown.changed() => break,
+                    };
+                    // Repairs publish audit events themselves. Only the timer
+                    // drives recovery, so those events cannot create a loop.
+                    if periodic {
+                        if let Err(error) = operations_daemon.routine_attention_cycle().await {
+                            warn!(%error, "background attention cycle failed");
+                        }
                     }
-                    match drain.run_cycle().await {
+                    let result = if whole_backlog {
+                        drain.run_cycle().await
+                    } else {
+                        drain.run_authorized_cycle().await
+                    };
+                    match result {
                         Ok(0) => {}
                         Ok(n) => debug!(spawned = n, "drain cycle refilled fleet"),
                         Err(e) => warn!(error = %e, "drain cycle failed"),
@@ -3887,6 +4020,18 @@ impl Daemon {
             &landing_queue_summary,
             self.landing_queue_config.stale_after_secs,
         ));
+        let mut king_decisions = crate::king::inbox_decisions(&items, &needs, &obstacles, &agents);
+        for decision in &mut king_decisions {
+            bound_json(decision, 1_000, 20);
+        }
+        let signatures = crate::king::decision_signatures(&json!({"decisions": king_decisions}));
+        let acknowledged = self.king.snapshot()?.acknowledged_decisions;
+        king_decisions.retain(|decision| {
+            decision["id"]
+                .as_str()
+                .is_some_and(|id| signatures.get(id) != acknowledged.get(id))
+        });
+        king_decisions.truncate(100);
         items.sort_by_key(|b| std::cmp::Reverse(b.urgency));
         let mut response_truncated = source_truncated || items.len() > MAX_INBOX_ITEMS;
         items.truncate(MAX_INBOX_ITEMS);
@@ -3895,6 +4040,7 @@ impl Daemon {
         // the NDJSON frame. Drop lowest-priority tail rows until it does.
         while serde_json::to_vec(&json!({
             "items": &items,
+            "king_decisions": &king_decisions,
             "truncated": response_truncated,
         }))
         .map(|bytes| bytes.len() > MAX_FRAME_BYTES)
@@ -3905,7 +4051,9 @@ impl Daemon {
             }
             response_truncated = true;
         }
-        Ok(json!({"items": items, "truncated": response_truncated}))
+        Ok(
+            json!({"items": items, "truncated": response_truncated, "king_decisions": king_decisions}),
+        )
     }
 
     /// Assemble the cross-ledger convergence report (`crate::reconcile`) for
@@ -4905,10 +5053,12 @@ impl Daemon {
             Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
         };
         let mut leases = Vec::new();
+        let mut lease_conflicts = Vec::new();
         for repo in snapshot["attention"]
             .as_array()
             .into_iter()
             .flatten()
+            .filter(|item| item["item"]["effective_authority"] == "orchestrator")
             .filter_map(|item| item["repo"].as_str())
         {
             match self.orchestrator_lease.acquire(
@@ -4919,13 +5069,16 @@ impl Daemon {
             ) {
                 Ok(lease) => leases.push(lease),
                 Err(error) => {
-                    return Response::err(req.id, codes::FORBIDDEN, error.to_string());
+                    // Reading a decision must remain possible while another
+                    // fenced owner finishes its action. Mutation still needs
+                    // a successfully acquired lease.
+                    lease_conflicts.push(json!({"repo": repo, "reason": error.to_string()}));
                 }
             }
         }
         Response::ok(
             req.id,
-            json!({"wake": wake, "leases": leases, "snapshot": snapshot}),
+            json!({"wake": wake, "leases": leases, "lease_conflicts": lease_conflicts, "snapshot": snapshot}),
         )
     }
 
@@ -4989,9 +5142,147 @@ impl Daemon {
         )
     }
 
-    /// Build the bounded pull payload. It deliberately contains current
-    /// derived state rather than trusting the snapshot captured when terminal
-    /// delivery happened.
+    /// The existing drain scope and WIP dial also bound background operations.
+    /// A zero cap pauses them; broad backlog drain remains separately opt-in.
+    fn background_repo_enabled(&self, repo: &str) -> bool {
+        self.drain_config.max_wip > 0
+            && if self.drain_config.repos.is_empty() {
+                self.drain_config
+                    .repo
+                    .as_deref()
+                    .is_none_or(|name| name == repo)
+            } else {
+                self.drain_config
+                    .repos
+                    .get(repo)
+                    .is_some_and(|config| config.enabled)
+            }
+    }
+
+    fn background_repair_allowed(
+        &self,
+        repo: &str,
+        violation: &crate::reconcile::Violation,
+    ) -> bool {
+        use crate::reconcile::Authority;
+        self.background_repo_enabled(repo)
+            && match self.authority_policy.effective_authority(violation) {
+                Authority::Mechanical => {
+                    crate::attention::mechanical_action_for(violation).is_some()
+                }
+                Authority::Orchestrator => {
+                    // Stale ownership can hide finished or salvageable work.
+                    // Keep that judgment with the King; conflict correction
+                    // already owns a durable bounded recovery chain.
+                    violation.kind == crate::reconcile::kind::CONFLICT_HELD_LANDING
+                        && self.authority_policy.orchestrator_may_act(&violation.kind)
+                        && crate::attention::orchestrator_action_for(violation).is_some()
+                }
+                Authority::Human => false,
+            }
+    }
+
+    /// Failed execution stays visible for judgment. Timers retry rate holds and
+    /// crash intents, but never repeatedly execute a recorded failure.
+    fn latest_attention_failure(&self, repo: &str, id: &str) -> rk_core::Result<Option<Value>> {
+        let rows = self.space.scan(
+            &Pattern::category(Category::Event)
+                .identity(crate::attention::DECISION_IDENTITY)
+                .scope(repo),
+        )?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.payload["violation_id"].as_str() == Some(id))
+            .max_by_key(|row| row.id)
+            .map(|row| row.payload)
+            .filter(|value| {
+                value["outcome"]
+                    .as_str()
+                    .is_some_and(|outcome| outcome.starts_with("error:"))
+            }))
+    }
+
+    async fn routine_attention_cycle(&self) -> rk_core::Result<()> {
+        let repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?
+            .list();
+        for repo in repos {
+            if !self.background_repo_enabled(&repo.name) {
+                continue;
+            }
+            let report = self.reconcile_report(repo.name.clone()).await?;
+            for violation in &report.violations {
+                // A delivery record is not proof when the same report says
+                // Git contradicts it. Preserve the stronger authority gate.
+                if report.violations.iter().any(|other| {
+                    other.subject == violation.subject
+                        && self.authority_policy.effective_authority(other)
+                            == crate::reconcile::Authority::Human
+                }) {
+                    continue;
+                }
+                if !self.background_repair_allowed(&report.scope, violation)
+                    || self.find_decision(&report.scope, &violation.id)?.is_some()
+                    || self
+                        .latest_attention_failure(&report.scope, &violation.id)?
+                        .is_some()
+                {
+                    continue;
+                }
+                let (holder, generation) = if self.authority_policy.effective_authority(violation)
+                    == crate::reconcile::Authority::Orchestrator
+                {
+                    let Ok(lease) = self.orchestrator_lease.acquire(
+                        &report.scope,
+                        "daemon-operations",
+                        self.authority_policy.lease_ttl_secs,
+                        (self.request_clock)(),
+                    ) else {
+                        // Respect an interactive operator's live lease.
+                        break;
+                    };
+                    (Some(lease.holder), Some(lease.generation))
+                } else {
+                    (None, None)
+                };
+                let result = self
+                    .attention_decide(AttentionDecideParams {
+                        repo: report.scope.clone(),
+                        item: violation.id.clone(),
+                        holder: holder.clone(),
+                        generation,
+                        budget_usd: None,
+                        budget_tokens: None,
+                        disposition: None,
+                        reason: None,
+                        requested_decision: None,
+                        blast_radius: None,
+                        resolving_action: None,
+                    })
+                    .await;
+                if let (Some(holder), Some(generation)) = (holder, generation) {
+                    self.orchestrator_lease.release(
+                        &report.scope,
+                        &holder,
+                        generation,
+                        (self.request_clock)(),
+                    )?;
+                }
+                if let Err(error) = result {
+                    warn!(repo = %report.scope, item = %violation.id, ?error,
+                        "background repair needs operator attention");
+                }
+                // One repair per repo per timer pass; every execution re-reads
+                // authoritative state inside attention_decide and journals it.
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build current decision and context views for a bounded authoritative pull.
     async fn king_authoritative_snapshot(&self) -> rk_core::Result<(Value, String, bool)> {
         let repos = self
             .repos
@@ -4999,19 +5290,41 @@ impl Daemon {
             .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?
             .list();
         let mut attention = Vec::new();
+        let mut decisions = Vec::new();
         for repo in &repos {
             let report = self.reconcile_report(repo.name.clone()).await?;
-            let cursor = self
-                .orchestrator_lease
-                .current(&report.scope)?
-                .and_then(|lease| lease.cursor);
-            if let Some(item) =
-                crate::attention::next_attention(&report, &self.authority_policy, cursor.as_deref())
-            {
+            for violation in &report.violations {
+                if let Some(record) = self.find_decision(&report.scope, &violation.id)? {
+                    if record["gated"] != true {
+                        continue;
+                    }
+                    decisions.push(json!({"id": violation.id, "repo": report.scope,
+                        "kind": "human-gate", "subject": violation.subject,
+                        "detail": record["requested_decision"], "reason": record["reason"],
+                        "action": record["resolving_action"]}));
+                    continue;
+                }
+                let failure = self.latest_attention_failure(&report.scope, &violation.id)?;
+                if self.background_repair_allowed(&report.scope, violation) && failure.is_none() {
+                    continue;
+                }
+                let item = crate::attention::AttentionItem {
+                    violation: violation.clone(),
+                    effective_authority: self.authority_policy.effective_authority(violation),
+                };
+                decisions.push(json!({"id": violation.id, "repo": report.scope,
+                    "kind": violation.kind, "subject": violation.subject,
+                    "authority": item.effective_authority, "detail": violation.detail,
+                    "failure": failure.as_ref().map(|record| &record["outcome"]),
+                    "action": format!("rk attention next {}", report.scope)}));
                 attention.push(json!({"repo": report.scope, "item": item}));
             }
         }
         let mut inbox = self.inbox_value(None).await?;
+        if let Some(items) = inbox["king_decisions"].as_array() {
+            decisions.extend(items.iter().cloned());
+        }
+        inbox.as_object_mut().unwrap().remove("king_decisions");
         if let Some(items) = inbox["items"].as_array_mut() {
             items.truncate(20);
         }
@@ -5051,11 +5364,10 @@ impl Daemon {
                 })
             })
             .collect::<Vec<_>>();
-        let has_work = !attention.is_empty()
-            || inbox["items"]
-                .as_array()
-                .is_some_and(|items| !items.is_empty())
-            || ready_frontier.total > 0;
+        for decision in &mut decisions {
+            bound_json(decision, 1_000, 20);
+        }
+        let has_work = !decisions.is_empty();
         let summary = format!(
             "{} attention, {} inbox, {} ready, {} live",
             attention.len(),
@@ -5065,6 +5377,7 @@ impl Daemon {
         );
         let mut snapshot = json!({
             "generated_at": (self.request_clock)(),
+            "decisions": decisions,
             "attention": attention,
             "inbox": inbox,
             "ready_tickets": ready,
@@ -5078,9 +5391,20 @@ impl Daemon {
             "live_agents": live_agents,
             "drain": {
                 "enabled": self.drain_config.enabled,
+                "mode": if self.drain_config.max_wip == 0 { "paused" }
+                    else if self.drain_config.enabled { "whole-backlog" } else { "authorized-only" },
                 "max_wip": self.drain_config.max_wip,
             },
         });
+        let acknowledged = self.king.snapshot()?.acknowledged_decisions;
+        let signatures = crate::king::decision_signatures(&snapshot);
+        if let Some(items) = snapshot["decisions"].as_array_mut() {
+            items.retain(|item| {
+                item["id"]
+                    .as_str()
+                    .is_some_and(|id| signatures.get(id) != acknowledged.get(id))
+            });
+        }
         bound_json(&mut snapshot, 2_000, 100);
         Ok((snapshot, summary, has_work))
     }
@@ -5113,8 +5437,6 @@ impl Daemon {
     }
 
     async fn king_cycle(&self) -> rk_core::Result<Value> {
-        use sha2::Digest as _;
-
         let _cycle = self.king_cycle_lock.lock().await;
         let state = self.king.snapshot()?;
         let Some(registration) = state.registration else {
@@ -5151,7 +5473,7 @@ impl Daemon {
         };
 
         let now = (self.request_clock)();
-        if crate::king::is_quiescent(&herdr_state.status) {
+        if crate::king::may_deliver(&herdr_state.status, herdr_state.focused) {
             if let Some(checkpoint) = self
                 .king
                 .pending_restore_due(self.king_config.wake_retry_secs, now)?
@@ -5174,26 +5496,12 @@ impl Daemon {
             }
         }
 
-        let (snapshot, summary, has_work) = self.king_authoritative_snapshot().await?;
-        // Observation time is useful to the King but is not work identity: if
-        // it entered the digest, an unchanged settled queue would wake again
-        // on every poll solely because the clock moved.
-        let mut digest_value = snapshot.clone();
-        if let Some(object) = digest_value.as_object_mut() {
-            object.remove("generated_at");
-        }
-        let bytes = serde_json::to_vec(&digest_value)?;
-        let digest = hex::encode(sha2::Sha256::digest(bytes));
-        let wake = self.king.observe(
-            digest,
-            summary,
-            snapshot,
-            has_work,
-            self.king_config.wake_retry_secs,
-            now,
-        )?;
+        let (snapshot, _, _) = self.king_authoritative_snapshot().await?;
+        let wake = self
+            .king
+            .observe_decisions(snapshot, self.king_config.wake_retry_secs, now)?;
         if let Some(wake) = wake {
-            if crate::king::is_quiescent(&herdr_state.status) {
+            if crate::king::may_deliver(&herdr_state.status, herdr_state.focused) {
                 let target = registration.identity.terminal_id.clone();
                 let text = format!(
                     "RK_WAKE {id}. Run `rk --json king pull {id} --holder {holder}`; after handling it run `rk king resolve {id} --holder {holder}`, or `rk king defer {id} --holder {holder}` only for an explicit human gate.",
@@ -8267,6 +8575,16 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
+        if req.caller != "operator"
+            && !req.caller.is_empty()
+            && params.labels.iter().any(|label| label == "ready-for-agent")
+        {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "only an operator may grant ready-for-agent dispatch authority",
+            );
+        }
         // Filing follow-up work is agent-safe, but the author identity is not a
         // caller-controlled field. Otherwise an agent could create a ticket
         // that presents itself as the operator or another castle.
@@ -8336,8 +8654,22 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
+        if req.caller != "operator"
+            && !req.caller.is_empty()
+            && params
+                .changes
+                .add_labels
+                .iter()
+                .any(|label| label == "ready-for-agent")
+        {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "only an operator may grant ready-for-agent dispatch authority",
+            );
+        }
         // Bind `done` to delivery (TKT-01M08HB566GFBZVMDKZ8DT1ES0 / strategic-
-        // review C3): a steward or operator marking a merge-mode/push-branch
+        // review C3): a landing or operator marking a merge-mode/push-branch
         // ticket done before its branch actually landed is exactly the
         // TKT-18/46/147 "approved but never merged" class — refuse it here,
         // with a pointed error, instead of letting the ticket claim done.
@@ -11298,6 +11630,7 @@ struct AttentionInvalidateParams {
 /// e.g. human-gated or lease fencing) is a materially different failure than
 /// a malformed request or an internal error, and a caller (especially an
 /// automated orchestrator loop) needs to tell them apart.
+#[derive(Debug)]
 enum AttentionDecideError {
     Refused(String),
     BadParams(String),
@@ -11757,7 +12090,7 @@ mod retain_matching_violation_tests {
 
 /// Does `commit`'s own diff (against its first parent) touch a path matched
 /// by `protected_paths` (an ERE)? The same question `.rk/checks.cue`'s
-/// `steward-protected-paths` check answers by hand for a landing candidate's
+/// `landing-protected-paths` check answers by hand for a landing candidate's
 /// diff-scope range; this asks it about one already-landed commit instead,
 /// via the exact same `grep -qE` semantics. `None` means the question could
 /// not be answered (no parent commit, git or grep unavailable) — the caller
@@ -12976,7 +13309,7 @@ mod review_artifact_binding_tests {
                 "identity": "review",
                 "payload": {
                     "recommendation": "APPROVE",
-                    "branch": "rat/fidget-10/steward-review-tkt-1",
+                    "branch": "rat/fidget-10/candidate-review-tkt-1",
                     "head_sha": "0640835",
                     "target": "release",
                     "task": "TKT-1",
@@ -12990,7 +13323,7 @@ mod review_artifact_binding_tests {
         assert_eq!(
             error.message,
             "review artifact binding mismatch for branch: expected \
-             'rat/fidget-10/tkt-1', got \"rat/fidget-10/steward-review-tkt-1\""
+             'rat/fidget-10/tkt-1', got \"rat/fidget-10/candidate-review-tkt-1\""
         );
         assert!(
             daemon

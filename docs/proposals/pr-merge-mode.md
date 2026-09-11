@@ -59,8 +59,8 @@ a reviewed branch straight onto `main`.
     vs `dismiss noMerge` (hold). The approval-gate primitive is TKT-2/TKT-5.
   - `land-on-approve.cue` — rat implements → cheap reviewer records a verdict →
     **approval gate** → APPROVE `land`s the branch onto `main`; REJECT holds it.
-  - `steward.cue` — reactor-fired on every rat completion. Cheap reviewer +
-    **policy gate** (protected-path ERE, `steward.cue` step 2) + **run gate**
+  - `landing.cue` — reactor-fired on every rat completion. Cheap reviewer +
+    **policy gate** (protected-path ERE, `landing.cue` step 2) + **run gate**
     (repo's real test suite) + verdict artifact → `APPROVE` lands, `REWORK` files
     a ticket + holds, `STOP` emits a `need` + holds. Both gates fail closed.
 
@@ -131,10 +131,10 @@ opens a PR/MR instead of calling `merge_branch`, then **holds** the branch
   fallback** — the same layering the daemon already uses everywhere.
 - **Pro:** one switch flips a repo from auto-merge to PR without touching any
   workflow; every existing merge path (`dismiss`, `land`, `dismiss_all`,
-  steward, land-on-approve) inherits it for free.
+  landing, land-on-approve) inherits it for free.
 - **Con:** "merge requested but held as PR" changes the meaning of the
   `merged: true/false` result; callers/gates that assert `merged: true` (e.g.
-  steward's `evaluate {expect: {merged: true}}`) must learn a third outcome
+  landing's `evaluate {expect: {merged: true}}`) must learn a third outcome
   (`pr_opened`).
 
 ### Option B — A `--pr` flag on `dismiss` / a `pr: true` field on `land`
@@ -156,9 +156,9 @@ workflow (a fork of `land-on-approve.cue` that opens a PR instead of landing).
 
 - **Pro:** zero change to `dismiss` semantics; the PR path is opt-in per
   workflow and reads explicitly in the `.cue`; composes with the existing
-  approval/steward gates (gate → `open_pr` instead of gate → `land`).
+  approval/landing gates (gate → `open_pr` instead of gate → `land`).
 - **Con:** doesn't cover the plain `rk dismiss` CLI path or the reactor-fired
-  steward unless those workflows are also forked; policy lives in N workflow
+  landing unless those workflows are also forked; policy lives in N workflow
   files instead of one repo record.
 
 ### Option D — Post-merge push mirror (explicitly rejected)
@@ -200,7 +200,7 @@ step (Option C) for workflows that want it explicitly.** Concretely:
    new `pull_request_opened` event alongside the existing `agent_dismissed` /
    `branch_landed` events.
 
-4. **Teach the gates the third outcome.** Where steward/land-on-approve today do
+4. **Teach the gates the third outcome.** Where landing/land-on-approve today do
    `evaluate {expect: {merged: true}}` after a `land`, PR mode should instead
    assert `pr_opened: true`. Add an `open_pr` workflow step (thin wrapper over
    the new supervisor method) and a `pr-on-approve.cue` example so a workflow can
@@ -213,7 +213,7 @@ step (Option C) for workflows that want it explicitly.** Concretely:
 **Why this shape:** it reuses the one existing merge seam (no new merge paths to
 keep in sync), keeps today's behavior as the default (`Direct`), makes the
 review-vs-merge choice a single per-repo fact "for projects that warrant it,"
-and layers cleanly onto the approval/steward gates that already decide *whether*
+and layers cleanly onto the approval/landing gates that already decide *whether*
 to proceed — PR mode only changes *what "proceed" does*.
 
 ---
@@ -237,7 +237,7 @@ operator to confirm scope first.
 - **T4 — `open_pr` workflow step + `pr-on-approve.cue`.** New `Step::OpenPr` in
   `rk-workflow` + exec in `workflow_exec.rs`; example workflow forking
   `land-on-approve.cue`. *(depends on T1, T3)*
-- **T5 — Gate outcome + inbox.** Make steward / land-on-approve assert
+- **T5 — Gate outcome + inbox.** Make landing / land-on-approve assert
   `pr_opened` when the repo is PR-mode; add an "awaiting-review" inbox source for
   open PRs. *(depends on T3, T4)*
 - **T6 — Docs.** Operator guide: auth prerequisites (`gh auth login` /
@@ -260,7 +260,7 @@ Natural sequencing: **T1 + T2 in parallel → T3 → T4 → T5 → T6.**
    to the PR's own CI + human reviewer), or should the reactor watch PR
    status/checks and re-fire a rat on failing CI (a much larger feature — a PR
    status trigger)? Recommend v1 = open-and-hand-off; watch-CI is a follow-up.
-4. **Interaction with the steward's own review.** In PR mode, does the steward's
+4. **Interaction with the landing's own review.** In PR mode, does the landing's
    cheap-reviewer + run-gate still run *before* opening the PR (belt and
    suspenders — a green local suite in the PR body), or do we skip it and let the
    PR's CI be the sole gate? Recommend keeping the run-gate: its output makes a

@@ -883,7 +883,7 @@ impl<'a> ManagedVerification<'a> {
         // workflow-author-owned shell, and existing workflows rely on `sh`'s
         // default (last-stage-wins) pipe semantics for assertion idioms like
         // `... | grep -q '<expected text>'` (examples/checks.cue's
-        // steward-protected-paths does exactly this). Forcing `pipefail` over
+        // landing-protected-paths does exactly this). Forcing `pipefail` over
         // those INVERTS them: `grep -q` exits as soon as it matches, so a
         // producer large enough to still be writing takes SIGPIPE (141), and
         // under `pipefail` the negated pipeline reports success precisely when
@@ -978,7 +978,7 @@ impl<'a> ManagedVerification<'a> {
     /// Persist a bounded, durable `(artifact, <repo>, gate-failure)` tuple for
     /// a failed (or timed-out) `run` step. Without this, the only trace of a
     /// gate's own verdict is `ctx.previous_result`, which the very next `run`
-    /// step (an escalation check, a `steward-report-gate-failure`) overwrites
+    /// step (an escalation check, a `landing-report-gate-failure`) overwrites
     /// — so once the workflow routes past this step, everything but a
     /// composed one-line instance error is gone (TKT-01M02AMKD24WZVVMARJPXKYKSW).
     /// Called unconditionally for a non-"pass" verdict, independent of whether

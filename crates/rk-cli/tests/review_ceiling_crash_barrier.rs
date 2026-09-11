@@ -84,7 +84,7 @@ const REVIEW_WORKFLOW: &str = r#"
 package workflow
 
 workflow: {
-	name: "steward-review"
+	name: "candidate-review"
 	params: {
 		taskId:        {type: "string", required: false, default: "unknown"}
 		branch:        {type: "string", required: true}
@@ -123,7 +123,7 @@ fn review_workflow_real_adapter(harness: &str) -> String {
 package workflow
 
 workflow: {{
-	name: "steward-review"
+	name: "candidate-review"
 	params: {{
 		taskId:        {{type: "string", required: false, default: "unknown"}}
 		branch:        {{type: "string", required: true}}
@@ -283,7 +283,7 @@ fn daemon_home(workflow_cue: &str, supervisor_interval_secs: Option<u64>) -> tem
     std::fs::write(home.path().join("config.toml"), config).unwrap();
     let workflows = home.path().join("workflows");
     std::fs::create_dir_all(&workflows).unwrap();
-    std::fs::write(workflows.join("steward-review.cue"), workflow_cue).unwrap();
+    std::fs::write(workflows.join("candidate-review.cue"), workflow_cue).unwrap();
     home
 }
 
@@ -307,8 +307,8 @@ fn candidate_repo(repo_policy_cue: Option<&str>) -> (tempfile::TempDir, String) 
     std::fs::create_dir_all(dir.path().join(".rk")).unwrap();
     std::fs::write(
         dir.path().join(".rk/checks.cue"),
-        "checks: [\n    {name: \"steward-protected-paths\", command: \"true\", timeout: \"30s\"},\n    \
-         {name: \"steward-diff-scope\", command: \"true\", timeout: \"30s\"},\n    \
+        "checks: [\n    {name: \"landing-protected-paths\", command: \"true\", timeout: \"30s\"},\n    \
+         {name: \"landing-diff-scope\", command: \"true\", timeout: \"30s\"},\n    \
          {name: \"verify\", command: \"true\", timeout: \"30s\"},\n]\n",
     )
     .unwrap();
@@ -1137,9 +1137,9 @@ fn assert_transport_outage_is_typed_and_fenced(harness: &str, bin_env: &str, bin
     // with unattended review-death retry disabled by policy, it converges to
     // exactly ONE bounded human escalation.
     let need = until(
-        "the review-death escalation to land as a steward need",
+        "the review-death escalation to land as a landing need",
         || {
-            tuples(&home_path, &repo_name, "need", "steward")
+            tuples(&home_path, &repo_name, "need", "landing")
                 .into_iter()
                 .find(|t| {
                     t["payload"]["text"]

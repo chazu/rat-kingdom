@@ -957,14 +957,14 @@ async fn per_trigger_rate_cap_bounds_a_storm() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
-/// The steward's re-entrancy break (TKT-19): its trigger scopes to
+/// The landing's re-entrancy break (TKT-19): its trigger scopes to
 /// `harness_result` completions carrying `"role":"rat"` via the match `search`.
-/// A rat completion fires it; a reviewer completion (the very agent the steward
-/// spawns) does NOT — so the steward never re-triggers itself on the branch it
+/// A rat completion fires it; a reviewer completion (the very agent the landing
+/// spawns) does NOT — so the landing never re-triggers itself on the branch it
 /// just reviewed. This pins the `search`-substring scoping the whole design
 /// rests on, without needing the reviewer's verdict artifact.
 #[tokio::test]
-async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
+async fn landing_trigger_fires_on_rat_completion_not_reviewer() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -973,21 +973,21 @@ async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
     register_repo(&layout, "myrepo", repo.path());
     std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
 
-    // A minimal steward stand-in: same match predicate the shipped trigger uses
+    // A minimal landing stand-in: same match predicate the shipped trigger uses
     // (harness_result + `"role":"rat"` payload search), firing the count-only
-    // react-work workflow instead of the real steward.
+    // react-work workflow instead of the real landing.
     let dir = layout.triggers_dir();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("steward.cue"),
-        r#"triggers: [{name: "steward-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", repo: "myrepo"}]"#,
+        dir.join("landing.cue"),
+        r#"triggers: [{name: "legacy-landing-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", repo: "myrepo"}]"#,
     )
     .unwrap();
 
     let space = rk_space::Space::open_in_memory().unwrap();
     let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
 
-    // The reviewer the steward would spawn completes first: role "reviewer".
+    // The reviewer the landing would spawn completes first: role "reviewer".
     // serde_json serializes map keys in insertion order, so the payload renders
     // `"role":"reviewer"` — which the `"role":"rat"` search does NOT contain.
     space
@@ -1002,10 +1002,10 @@ async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
     assert_eq!(
         reactor.run_cycle().unwrap(),
         0,
-        "a reviewer completion must NOT fire the steward (re-entrancy break)"
+        "a reviewer completion must NOT fire the landing (re-entrancy break)"
     );
 
-    // A plain rat completion: role "rat" — the search matches, steward fires.
+    // A plain rat completion: role "rat" — the search matches, landing fires.
     space
         .out(Tuple::new(
             Category::Event,
@@ -1018,7 +1018,7 @@ async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
     assert_eq!(
         reactor.run_cycle().unwrap(),
         1,
-        "a rat completion fires the steward exactly once"
+        "a rat completion fires the landing exactly once"
     );
     assert_eq!(reactor.engine_instance_count(), 1);
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
@@ -1032,7 +1032,7 @@ async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
 /// scope field. So the shipped trigger's `repo: "{{tuple.scope}}"`
 /// interpolation must resolve to that real repo, not "system".
 #[tokio::test]
-async fn steward_trigger_resolves_real_repo_for_system_scoped_ticket_completion() {
+async fn landing_trigger_resolves_real_repo_for_system_scoped_ticket_completion() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -1041,14 +1041,14 @@ async fn steward_trigger_resolves_real_repo_for_system_scoped_ticket_completion(
     register_repo(&layout, "myrepo", repo.path());
     std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
 
-    // The shipped trigger shape (examples/triggers.cue steward-on-completion):
+    // The shipped trigger shape (examples/triggers.cue legacy-landing-on-completion):
     // no top-level `repo:` override, so try_fire's fallback chain resolves the
     // target repo straight from the matched tuple's own scope.
     let dir = layout.triggers_dir();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("steward.cue"),
-        r#"triggers: [{name: "steward-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", params: {repo: "{{tuple.scope}}"}}]"#,
+        dir.join("landing.cue"),
+        r#"triggers: [{name: "legacy-landing-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", params: {repo: "{{tuple.scope}}"}}]"#,
     )
     .unwrap();
 
@@ -1070,13 +1070,13 @@ async fn steward_trigger_resolves_real_repo_for_system_scoped_ticket_completion(
     assert_eq!(
         reactor.run_cycle().unwrap(),
         1,
-        "steward must fire for the rat's real repo even though its ticket was system-scoped"
+        "landing must fire for the rat's real repo even though its ticket was system-scoped"
     );
     assert_eq!(reactor.engine_instance_count(), 1);
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
-/// A completion tuple carrying a non-`main` `target` (the shipped steward
+/// A completion tuple carrying a non-`main` `target` (the shipped landing
 /// trigger pins `target: "{{tuple.payload.target}}"`, so a rework/chained rat's
 /// own `--base` flows straight through) must produce a visible
 /// `reactor_non_main_land_target` event — the land target is otherwise
@@ -1092,13 +1092,13 @@ async fn non_main_land_target_is_reported_main_is_not() {
     register_repo(&layout, "myrepo", repo.path());
     std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
 
-    // Same shape as the shipped steward trigger: `target` is pinned straight
+    // Same shape as the shipped landing trigger: `target` is pinned straight
     // from the completion tuple's payload, not the workflow's own default.
     let dir = layout.triggers_dir();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("steward.cue"),
-        r#"triggers: [{name: "steward-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", repo: "myrepo", params: {target: "{{tuple.payload.target}}", branch: "{{tuple.payload.branch}}"}}]"#,
+        dir.join("landing.cue"),
+        r#"triggers: [{name: "legacy-landing-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", repo: "myrepo", params: {target: "{{tuple.payload.target}}", branch: "{{tuple.payload.branch}}"}}]"#,
     )
     .unwrap();
 
@@ -1127,7 +1127,7 @@ async fn non_main_land_target_is_reported_main_is_not() {
     assert_eq!(reactor.run_cycle().unwrap(), 1);
 
     // The launched instance itself must RECORD the inherited target — the
-    // visibility event alone is not the recorded steward state. This is what
+    // visibility event alone is not the recorded landing state. This is what
     // `rk workflow status`/`list` read (list renders " target=<branch>" from
     // exactly this params field; see rk-cli workflow_target_suffix tests).
     let instances = engine.list();
@@ -1160,10 +1160,10 @@ async fn non_main_land_target_is_reported_main_is_not() {
     assert_eq!(events[0].instance, "reactor");
     assert_eq!(events[0].payload["target"], "rat/camembert-4/tkt-9");
     assert_eq!(events[0].payload["branch"], "rat/basil-4/rework");
-    assert_eq!(events[0].payload["trigger"], "steward-on-completion");
+    assert_eq!(events[0].payload["trigger"], "legacy-landing-on-completion");
     assert_eq!(
         events[0].payload["text"],
-        "steward-on-completion workflow react-work will land rat/basil-4/rework on non-main target rat/camembert-4/tkt-9"
+        "legacy-landing-on-completion workflow react-work will land rat/basil-4/rework on non-main target rat/camembert-4/tkt-9"
     );
 
     // An ordinary completion landing on "main" must NOT produce the event.
@@ -1668,15 +1668,15 @@ async fn zero_quorum_disables_coalescence() {
     );
 }
 
-/// A steward escalation `need`: identity "steward", as `rk out need <repo>
-/// steward` writes it (instance = castle, not the escalating agent).
-fn steward_need(scope: &str, task: &str, text: &str) -> Tuple {
+/// A landing escalation `need`: identity "landing", as `rk out need <repo>
+/// landing` writes it (instance = castle, not the escalating agent).
+fn landing_need(scope: &str, task: &str, text: &str) -> Tuple {
     let mut t = Tuple::new(
         Category::Need,
         scope,
-        "steward",
+        "landing",
         "test-castle",
-        json!({"agent": "steward", "task": task, "text": text}),
+        json!({"agent": "landing", "task": task, "text": text}),
     )
     .with_lifecycle(rk_core::tuple::Lifecycle::Ephemeral);
     t.strength = Some(1.0);
@@ -1747,7 +1747,7 @@ async fn a_second_sink_registers_and_a_dead_sink_degrades() {
     sinks.register(
         SinkConfig {
             name: Some("live-channel".into()),
-            classes: vec!["steward-escalation".into()],
+            classes: vec!["landing-escalation".into()],
             ..SinkConfig::of_kind("probe")
         },
         Box::new(Probe {
@@ -1758,13 +1758,13 @@ async fn a_second_sink_registers_and_a_dead_sink_degrades() {
     let reactor = build_reactor_with_sinks(&layout, ReactorConfig::default(), space.clone(), sinks);
 
     space
-        .out(steward_need("myrepo", "TKT-42", "steward: STOP for TKT-42"))
+        .out(landing_need("myrepo", "TKT-42", "landing: STOP for TKT-42"))
         .unwrap();
     reactor.run_cycle().unwrap();
 
     assert_eq!(
         *live.lock().unwrap(),
-        ["steward escalation — TKT-42"],
+        ["landing escalation — TKT-42"],
         "the second sink got the notice with no change at the escalation source"
     );
     assert_eq!(
@@ -1776,7 +1776,7 @@ async fn a_second_sink_registers_and_a_dead_sink_degrades() {
     // the escalation itself is still on the passive queue.
     assert_eq!(
         space
-            .scan(&rk_core::tuple::Pattern::category(Category::Need).identity("steward"))
+            .scan(&rk_core::tuple::Pattern::category(Category::Need).identity("landing"))
             .unwrap()
             .len(),
         1,
@@ -1830,7 +1830,7 @@ async fn a_second_sink_registers_from_notify_config_alone() {
 [[notify.sinks]]
 name = "ops-script"
 kind = "command"
-classes = ["steward-escalation"]
+classes = ["landing-escalation"]
 
 [notify.sinks.options]
 command = "{}"
@@ -1856,17 +1856,17 @@ kind = "carrier-pigeon"
     );
 
     space
-        .out(steward_need(
+        .out(landing_need(
             "myrepo",
             "TKT-77",
-            "steward: STOP for TKT-77 — needs a human merge decision",
+            "landing: STOP for TKT-77 — needs a human merge decision",
         ))
         .unwrap();
     reactor.run_cycle().unwrap();
 
     assert_eq!(
         std::fs::read_to_string(&delivered).unwrap(),
-        "critical|steward escalation — TKT-77|steward\n",
+        "critical|landing escalation — TKT-77|landing\n",
         "a kind named only in [[notify.sinks]] delivered the notice, \
          with its severity and refs intact and no change at the escalation source"
     );
@@ -1887,12 +1887,12 @@ kind = "carrier-pigeon"
     );
 }
 
-/// A steward escalation gets an active push exactly once, and only the steward:
+/// A landing escalation gets an active push exactly once, and only the landing:
 /// an ordinary rat's `rk need` (identity = agent name) is left on the passive
 /// inbox queue. The push degrades to a no-op with no herdr server, so we assert
 /// on the durable de-dup marker it leaves behind rather than the popup itself.
 #[tokio::test]
-async fn steward_escalation_notifies_once_ordinary_need_does_not() {
+async fn landing_escalation_notifies_once_ordinary_need_does_not() {
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::at(home.path());
     layout.ensure().unwrap();
@@ -1900,15 +1900,15 @@ async fn steward_escalation_notifies_once_ordinary_need_does_not() {
     let space = rk_space::Space::open_in_memory().unwrap();
     let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
 
-    // A steward STOP escalation and an ordinary rat help request land together.
+    // A landing STOP escalation and an ordinary rat help request land together.
     space
-        .out(steward_need(
+        .out(landing_need(
             "myrepo",
             "TKT-99",
-            "steward: reviewer returned STOP for TKT-99 — needs a human merge decision",
+            "landing: reviewer returned STOP for TKT-99 — needs a human merge decision",
         ))
         .unwrap();
-    let mut rat_need = steward_need("myrepo", "TKT-1", "cannot find the socket");
+    let mut rat_need = landing_need("myrepo", "TKT-1", "cannot find the socket");
     rat_need.identity = "Whisker".into(); // an ordinary rat need keys on its agent
     space.out(rat_need).unwrap();
 
@@ -1916,7 +1916,7 @@ async fn steward_escalation_notifies_once_ordinary_need_does_not() {
     assert_eq!(
         escalation_markers(&space),
         1,
-        "only the steward escalation is pushed; a rat's own need is not"
+        "only the landing escalation is pushed; a rat's own need is not"
     );
 
     // Idempotent under at-least-once redelivery: wipe the cursor so both needs
@@ -1946,10 +1946,10 @@ async fn escalation_notify_can_be_disabled() {
     let reactor = build_reactor_with_space(&layout, config, space.clone());
 
     space
-        .out(steward_need(
+        .out(landing_need(
             "myrepo",
             "TKT-7",
-            "steward: STOP, needs a human",
+            "landing: STOP, needs a human",
         ))
         .unwrap();
     reactor.run_cycle().unwrap();

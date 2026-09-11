@@ -63,8 +63,8 @@ fn write_checks(repo: &Path, src: &str) {
 
 const FAST_CHECKS: &str = r#"
 checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "true", timeout: "30s"},
 ]
 "#;
@@ -93,7 +93,7 @@ fn repo_name_of(repo: &Path) -> String {
 const LANDING_TRIGGER: &str = r#"
 triggers: [
     {
-        name:   "landing-on-completion"
+        name:   "legacy-landing-on-completion"
         action: "land"
         match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
         maxFires: 20
@@ -423,8 +423,8 @@ async fn retry_while_running_gates_converges_without_a_second_gate_run() {
     let checks = format!(
         r#"
 checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo run >> \"{log}\"; sleep 0.6 && true", timeout: "30s"}},
 ]
 "#,
@@ -658,8 +658,8 @@ async fn restart_mid_gate_kill_does_not_race_a_second_landing_processed_marker()
     let checks = format!(
         r#"
 checks: [
-    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
-    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
     {{name: "verify", command: "echo run >> \"{log}\"; sleep 0.8 && true", timeout: "30s"}},
 ]
 "#,

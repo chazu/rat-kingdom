@@ -123,6 +123,6 @@ proposal already made.
   regardless of whether the prompt half ever does; the two are complementary,
   not alternatives.
 - **Nothing pushes.** The row is passive, like the rest of `rk inbox` — it is
-  seen when the operator polls. The steward escalation push (herdr) is the
+  seen when the operator polls. The landing escalation push (herdr) is the
   precedent for making a row active, and no ballot is urgent enough to warrant
   it.

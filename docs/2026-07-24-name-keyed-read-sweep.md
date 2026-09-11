@@ -151,10 +151,10 @@ the safe one.
   24 duplicated names interleaves two unrelated rats' transcripts. Same class,
   durable store, no bound — but it is a file path rather than a tuple query and
   is already assigned to **TKT-158**. Confirmed still unfixed; not touched here.
-- **The steward's verdict read is unbounded across instances.** `steward.cue`
+- **The landing's verdict read is unbounded across instances.** `landing.cue`
   step 4 reads `category: artifact, identity: "review"` scoped to the repo with
   no per-instance discriminator. Newest-wins mitigates staleness but does not
-  make it correct: with two stewards in flight, the newest `review` artifact in
+  make it correct: with two landings in flight, the newest `review` artifact in
   the repo may belong to the other one's reviewer, and the verdict routes a
   merge. Not agent-name-keyed, so outside this ticket's class — filed as
   **TKT-161**. `reviewer-drives-rework.cue:91` has the identical read.

@@ -49,9 +49,9 @@ case "$1 $2" in
         if [ -n "${RK_TEST_HERDR_DELAY_SESSION:-}" ]; then
           printf '%s' "$((delayed + 1))" > "$RK_TEST_HERDR_DELAY_SESSION"
         fi
-        printf '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[{"name":"king","label":"king","terminal_id":"term_king","pane_id":"pane_king","revision":%s,"agent":"claude","cwd":"%s","agent_status":"idle","interactive_ready":true,"focused":false}]}}}\n' "$session" "$cwd"
+        printf '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[{"name":"king","label":"king","terminal_id":"term_king","pane_id":"pane_king","revision":%s,"agent":"claude","cwd":"%s","agent_status":"idle","interactive_ready":true,"focused":%s}]}}}\n' "$session" "$cwd" "${RK_TEST_HERDR_FOCUSED:-false}"
       else
-        printf '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[{"name":"king","label":"king","terminal_id":"term_king","pane_id":"pane_king","revision":%s,"agent_session":{"value":"session_%s"},"agent":"codex","cwd":"%s","agent_status":"idle","focused":false}]}}}\n' "$session" "$session" "$cwd"
+        printf '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[{"name":"king","label":"king","terminal_id":"term_king","pane_id":"pane_king","revision":%s,"agent_session":{"value":"session_%s"},"agent":"codex","cwd":"%s","agent_status":"idle","focused":%s}]}}}\n' "$session" "$session" "$cwd" "${RK_TEST_HERDR_FOCUSED:-false}"
       fi
     elif [ -f "$RK_TEST_HERDR_WORKSPACE" ]; then
       printf '%s\n' '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[]}}}'
@@ -171,6 +171,52 @@ async fn run_lifecycle(report_session: bool) -> (String, String) {
         .as_str()
         .expect("spawn registered a generation fence")
         .to_string();
+
+    std::env::set_var("RK_TEST_HERDR_FOCUSED", "true");
+    client
+        .call(
+            "space.out",
+            json!({"category": "obstacle", "scope": "system",
+        "identity": "fleet", "payload": {"type": "budget_exceeded", "cost_usd": 12}}),
+        )
+        .await
+        .unwrap();
+    let queued = client.call("king.tick", json!({})).await.unwrap();
+    assert_eq!(
+        queued["action"], "wake_pending",
+        "focused conversation must retain its turn"
+    );
+    assert!(!std::fs::read_to_string(&log)
+        .unwrap()
+        .contains("RK_WAKE KWK-"));
+    std::env::set_var("RK_TEST_HERDR_FOCUSED", "false");
+    let delivered = client.call("king.tick", json!({})).await.unwrap();
+    assert_eq!(delivered["action"], "wake");
+    let wake = delivered["wake"].as_str().unwrap();
+    let pulled = client
+        .call("king.pull", json!({"wake": wake, "holder": "king"}))
+        .await
+        .unwrap();
+    assert_eq!(pulled["snapshot"]["decisions"].as_array().unwrap().len(), 1);
+    client
+        .call(
+            "king.settle",
+            json!({"wake": wake, "holder": "king", "disposition": "deferred"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client.call("king.tick", json!({})).await.unwrap()["action"],
+        "none"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("RK_WAKE KWK-")
+            .count(),
+        1
+    );
+    std::env::remove_var("RK_TEST_HERDR_FOCUSED");
 
     let restarted = client.call("king.restart", json!({})).await.unwrap();
     assert_eq!(restarted["restarted"], true);

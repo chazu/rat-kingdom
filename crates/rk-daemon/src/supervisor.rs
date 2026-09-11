@@ -118,8 +118,8 @@ fn duplicate_task_refused(task: &str, owner: &str) -> String {
     }
 }
 
-// Review-tiering diff_class thresholds (Phase 0 of the steward remediation).
-// The steward trigger reads `diff_class` off the completion payload to decide
+// Review-tiering diff_class thresholds (Phase 0 of the landing remediation).
+// The landing trigger reads `diff_class` off the completion payload to decide
 // whether a diff is worth an LLM reviewer's judgment at all; these bounds are
 // deliberately conservative — a diff outside them defaults toward "large",
 // never away from it, so a threshold bug can only ADD a review, never skip
@@ -159,7 +159,7 @@ const BARRIER_TASK_DONE_POST_ROUTE: &str = "task-done-post-route";
 /// orphaned harness falls back to the `rk done` summary after the grace.
 const TASK_DONE_HARNESS_GRACE: chrono::Duration = chrono::Duration::seconds(1);
 
-/// The completion-payload fields a reactive steward tiers its review on: the
+/// The completion-payload fields a reactive landing tiers its review on: the
 /// branch tip this generation produced, its size vs. the recorded target, and
 /// a precomputed bucket. See [`Supervisor::diff_summary`].
 struct DiffSummary {
@@ -378,7 +378,7 @@ fn is_reporting_boundary(record: &AgentRecord) -> bool {
         .and_then(|coordination| coordination.reports_to.as_deref())
         == Some("coordinator")
         || (record.workflow_instance.is_some()
-            && matches!(record.role.as_str(), "foreman" | "steward"))
+            && matches!(record.role.as_str(), "foreman" | "landing"))
 }
 
 struct SpawnJournal<'a> {
@@ -738,7 +738,7 @@ pub struct Supervisor {
 /// monitor, a background test suite finishing, or a task notification all end a
 /// turn and produce a `Completed` event while the rat is still mid-task. Every
 /// one of those used to be published as a durable `harness_result`, and every
-/// reader of that event — the workflow `wait`, the reactor's steward trigger,
+/// reader of that event — the workflow `wait`, the reactor's landing trigger,
 /// the ticket auto-close — takes the OLDEST match, i.e. the mid-flight one.
 /// This is the bookkeeping that reduces a generation's turns to the single turn
 /// it finished on. See [`Supervisor::claim_completion`].
@@ -3341,8 +3341,8 @@ impl Supervisor {
     /// keeps `fleet_max_usd`/`repo_max_usd` standing guardrails on the *current
     /// live/concurrent* fleet, not cumulative lifetime ceilings that would
     /// refuse all spawns once lifetime spend crossed the cap. TKT-39 dropped
-    /// only `Dismissed`, but steward-landed rats linger as `Completed` (the
-    /// steward lands via a separate reviewer branch and never dismisses the
+    /// only `Dismissed`, but landing-landed rats linger as `Completed` (the
+    /// landing lands via a separate reviewer branch and never dismisses the
     /// original ticket-rat), so their spend still accumulated and could
     /// silently block continuous-drain and every other spawn (TKT-40).
     ///
@@ -4899,7 +4899,7 @@ impl Supervisor {
     /// `harness_result`, and because a `LIMIT 1` read returns the OLDEST match,
     /// every reader keyed on the agent name gets a MID-FLIGHT turn: a workflow
     /// `wait` unblocks on "the full cargo test pass is still running", the
-    /// `evaluate` behind it judges that text, and a steward reviewer whose
+    /// `evaluate` behind it judges that text, and a landing reviewer whose
     /// APPROVE lands in a later turn is read as having no verdict at all.
     ///
     /// Three things prove a turn is the last one, and this is where the first
@@ -5265,7 +5265,7 @@ impl Supervisor {
     /// Called on a deliberate teardown (`dismiss`), where the held-back turn
     /// result must NOT surface as a late completion — nothing is waiting on it,
     /// and a stray `harness_result` carrying `"role":"rat"` would re-fire the
-    /// reactor's steward on a branch that was just merged. Also called on
+    /// reactor's landing on a branch that was just merged. Also called on
     /// `respawn`, which continues the SAME generation in a fresh process: the
     /// crashed run's withheld turn is stale, and its `routed` flag would
     /// otherwise gag the resumed run.
@@ -5364,14 +5364,14 @@ impl Supervisor {
                 // generation's id, so a spawn-keyed reader cannot match it.
                 "spawn": record.spawn_id().to_string(),
                 // The completed agent's role ("rat", "reviewer", ...). Carried so
-                // a reactor trigger can scope reactively — e.g. the steward fires
+                // a reactor trigger can scope reactively — e.g. the landing fires
                 // on `"role":"rat"` completions only, which also breaks its own
                 // re-entrancy: the reviewer it spawns completes as "reviewer" and
-                // never re-triggers the steward on the branch it just reviewed.
+                // never re-triggers the landing on the branch it just reviewed.
                 "role": record.role,
                 "task": record.task,
                 "branch": record.branch,
-                // The actual base this agent was forked from. Steward carries
+                // The actual base this agent was forked from. Landing carries
                 // this daemon-authored value through as its delivery target so
                 // feature-branch work does not silently reroute to `main`.
                 "target": record.target_branch,
@@ -6290,7 +6290,7 @@ impl Supervisor {
     /// spawned that itself already reached a terminal agent state
     /// (`Completed`/`Failed`) without ever going through `dismiss` — e.g.
     /// because the workflow's own step sequence errored out before reaching
-    /// its `dismiss`/`dismiss_all` step, the exact steward/workflow failure
+    /// its `dismiss`/`dismiss_all` step, the exact landing/workflow failure
     /// path that leaked 104 worktrees over the 2026-08-16 incident — and
     /// dismiss each one now, so its worktree is reclaimed even when the
     /// per-arm CUE steps that were supposed to do it never ran.
@@ -6348,7 +6348,7 @@ impl Supervisor {
     /// (`AgentState::is_live`) — e.g. a reviewer stuck reconnecting through a
     /// transport outage (the 2026-08-21 incident: Codex reviewer Scurry-11
     /// stayed `Running` and reconnecting well after its owning
-    /// steward-review workflow had already timed out). Leaving it running
+    /// candidate-review workflow had already timed out). Leaving it running
     /// holds fleet capacity indefinitely for a wait nothing is listening to
     /// any more, so this tears the process down the same way an explicit
     /// `dismiss` would (`dismiss_inner` with `park_if_dirty: true`, same
@@ -6755,7 +6755,7 @@ impl Supervisor {
             "detail": outcome.detail,
         });
         // Surface an opened PR as its own event, exactly as `land`/`dismiss` do,
-        // so the inbox / steward can pick up the hand-off.
+        // so the inbox / landing can pick up the hand-off.
         if outcome.opened {
             self.emit_event(
                 &repo_name,

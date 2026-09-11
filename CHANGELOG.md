@@ -1,19 +1,31 @@
 # Changelog
 
+## 2026-09-11 — King conversation first slice
+
+- Rename review to `candidate-review` and the former component's gates,
+  notifications and triggers to landing terminology; retain read compatibility.
+- Dispatch `ready-for-agent` work in the daemon with a positive drain WIP cap,
+  preserving whole-backlog drain as a separate opt-in.
+- Run proven delivery repair and allowlisted bounded conflict correction in the
+  background; retain failures and stale ownership as explicit decisions.
+- Wake the King only for new/revised decisions, retain receipts across restart,
+  queue while focused, and make automatic conversation replacement opt-in.
+
+
 All notable changes to rat-kingdom are documented here.
 
 ## [Unreleased] — 2026-07-23 · The Self-Driving Fleet
 
 A single release that turns rat-kingdom from an **operator-pull** system (every
 action is an `rk` command you type) into a **self-driving** one: a daemon reactor
-watches the tuplespace and dispatches work, a steward reviews and merges
+watches the tuplespace and dispatches work, a landing reviews and merges
 completed branches unattended, and an autoscaler keeps the backlog draining
 itself — all behind guardrails that make leaving the fleet running safe.
 
 Derived from two research reports (`docs/research/stigmergy.md`,
 `docs/research/leverage-features.md`), both of which independently identified the
 daemon **reactor** as the keystone. Most of the work below was delivered by the
-fleet reviewing and merging *itself* through the steward loop (see _How this was
+fleet reviewing and merging *itself* through the landing loop (see _How this was
 built_).
 
 ### Collaboration reliability (2026-09-10)
@@ -106,7 +118,7 @@ built_).
   `rk status`; Claude bypasses permission prompts and Codex bypasses both
   approvals and the sandbox for ordinary unattended workers.
 
-- **Steward** — on every rat completion the reactor fires a workflow that spawns
+- **Landing** — on every rat completion the reactor fires a workflow that spawns
   a cheap reviewer on the branch, runs a protected-path **policy gate** and the
   repo's real **test gate** (both fail-closed), then routes on the verdict:
   `APPROVE` → land to main, `REWORK` → file a follow-up ticket + hold the branch,
@@ -184,7 +196,7 @@ built_).
   and restorable. A running instance is never archived.
 - **`rk log`** — a bounded per-agent transcript (assistant text, tool calls,
   retries) with `--follow`; the events the supervisor previously dropped.
-- **Escalation push** — a steward escalation fires a desktop notification via
+- **Escalation push** — a landing escalation fires a desktop notification via
   herdr, so a branch that needs a human decision pings you instead of waiting to
   be noticed.
 - **`rk top`** — live ratatui fleet dashboard: agents (state/task/cost),
@@ -226,10 +238,10 @@ Two operator switches are now set in `~/.rat-kingdom/config.toml`:
 
 ### How this was built
 
-The reactor + steward loop delivered most of this release itself: a rat finishes
-a ticket → the reactor fires the steward → a cheap reviewer runs the policy +
+The reactor + landing loop delivered most of this release itself: a rat finishes
+a ticket → the reactor fires the landing → a cheap reviewer runs the policy +
 test gates → clean work auto-lands, real defects are routed to REWORK. The
-steward caught genuine issues on its own (a flaky test, a refactor that would
+landing caught genuine issues on its own (a flaky test, a refactor that would
 have reverted another ticket, several stale-base build breaks) and never merged a
 red branch. The operator's role was reduced to grooming the backlog, resolving a
 handful of stale-base merge conflicts, and salvaging three post-completion token

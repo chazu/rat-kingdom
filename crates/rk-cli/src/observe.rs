@@ -1302,7 +1302,7 @@ mod tests {
             json!({"text": "stuck"}),
         )];
         let instances = vec![json!({
-            "id": "wf-abc", "workflow": "steward", "status": "running",
+            "id": "wf-abc", "workflow": "landing", "status": "running",
             "current_step": 2, "total_steps": 5, "awaiting": "approval gate",
         })];
         let rollup = json!({"fleet": {"spent_usd": 1.25, "max_usd": 10.0}});

@@ -47,5 +47,5 @@ prompt instruction.
 `git commit`; its worktree was reaped on dismissal and both files were lost
 uncommitted. The versions here are independent re-derivations checked against the
 live event feed (which Parmesan-2 could not read) and against
-`supervisor.rs`/`workflow_exec.rs`/`steward.cue`. **0010 is that loss written up
+`supervisor.rs`/`workflow_exec.rs`/`landing.cue`. **0010 is that loss written up
 as its own proposal.**

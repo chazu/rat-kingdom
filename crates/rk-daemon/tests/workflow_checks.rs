@@ -46,8 +46,8 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did the wo
 /// exists in the worktree and carries its own inline `expectExit: 0` gate.
 const CHECKS: &str = r#"
 checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "true", timeout: "30s"},
     {name: "worktree-has-work", command: "test -f work-{{ctx.activeAgent}}.txt", expectExit: 0, timeout: "30s"},
     {name: "check-inputs-arrive", command: "test \"$RK_CHECK_TASK\" = env-1 && test -n \"$RK_CHECK_AGENT\"", expectExit: 0, timeout: "30s"},
@@ -342,7 +342,7 @@ async fn raw_command_runs_when_policy_off() {
 /// synthetic reviewer that writes an artifact for its own synthetic task)
 /// inherited an outer reviewer's real `RK_REVIEW_TASK`/etc, which then
 /// mismatched its own synthetic identity and got rejected — exactly what
-/// happened live when steward reviewer Pumpernickel-10 ran the repository's
+/// happened live when landing reviewer Pumpernickel-10 ran the repository's
 /// `verify` check for Widget-10 (TKT-01M0GDHKYSKEGVZR7QY9FP1VKK).
 ///
 /// This pins the environment SURFACE — exactly which names a stripped child
@@ -354,8 +354,8 @@ async fn raw_command_runs_when_policy_off() {
 /// `rk` binary through `CARGO_BIN_EXE_rk`.
 const REVIEW_BINDING_CHECKS: &str = r#"
 checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "true", timeout: "30s"},
     {name: "leaks-without-strip", command: "test \"$RK_REVIEW_TASK\" = outer-task", expectExit: 0, timeout: "30s"},
     {
@@ -404,7 +404,7 @@ async fn strip_rk_spawn_removes_review_binding_but_inherit_still_sees_it() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
     // Simulate the daemon's own process carrying an outer reviewer's
-    // exact-review binding — as it does when a steward reviewer runs the
+    // exact-review binding — as it does when a landing reviewer runs the
     // repository's declared `verify` check from within its own worktree.
     std::env::set_var("RK_REVIEW_BRANCH", "rat/outer-reviewer/tkt-outer");
     std::env::set_var("RK_REVIEW_HEAD", "deadbeef");

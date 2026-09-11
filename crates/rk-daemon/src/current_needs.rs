@@ -50,7 +50,7 @@ pub(crate) fn resolution_candidates(
     let mut candidates = Vec::new();
     for need in needs {
         if need.category != Category::Need
-            || need.identity != "steward"
+            || !rk_core::landing_names::is_landing_need(&need.identity)
             || need.instance != "daemon"
         {
             continue;

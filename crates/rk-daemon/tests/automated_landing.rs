@@ -18,17 +18,17 @@ static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 
 const WORKING_FAKE: &str = r#"
 read -r _prompt
-echo "trusted workflow landed" > steward.txt
-git add steward.txt >/dev/null 2>&1
+echo "trusted workflow landed" > landing.txt
+git add landing.txt >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"auto-land-fake"}'
 rk_done "work done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"auto-land-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
-const STEWARD: &str = r#"
+const LANDING: &str = r#"
 workflow: {
-    name: "steward"
+    name: "landing"
     agents: {default: {harness: "fake"}}
     steps: [
         {type: "spawn", role: "reviewer", task: {title: "reviewed-work"}},
@@ -41,9 +41,9 @@ workflow: {
 }
 "#;
 
-const FEATURE_STEWARD: &str = r#"
+const FEATURE_LANDING: &str = r#"
 workflow: {
-    name: "steward"
+    name: "landing"
     agents: {default: {harness: "fake"}}
     steps: [
         {type: "spawn", role: "reviewer", task: {title: "reviewed-feature-work"}},
@@ -91,7 +91,7 @@ async fn run_and_wait(client: &mut Client, repo: &Path) -> serde_json::Value {
     let started = client
         .call(
             "workflow.run",
-            json!({"name": "steward", "repo": repo.to_string_lossy(), "params": {}}),
+            json!({"name": "landing", "repo": repo.to_string_lossy(), "params": {}}),
         )
         .await
         .unwrap();
@@ -110,7 +110,7 @@ async fn run_and_wait(client: &mut Client, repo: &Path) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn neither_global_nor_repo_local_steward_bypasses_the_human_gate() {
+async fn neither_global_nor_repo_local_landing_bypasses_the_human_gate() {
     let _env_guard = HARNESS_ENV_LOCK.lock().await;
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
 
@@ -120,7 +120,7 @@ async fn neither_global_nor_repo_local_steward_bypasses_the_human_gate() {
     init_repo(trusted_repo.path());
     let trusted_layout = Layout::at(trusted_home.path());
     std::fs::create_dir_all(trusted_layout.workflows_dir()).unwrap();
-    std::fs::write(trusted_layout.workflows_dir().join("steward.cue"), STEWARD).unwrap();
+    std::fs::write(trusted_layout.workflows_dir().join("landing.cue"), LANDING).unwrap();
     let trusted_daemon = Daemon::new_in_memory(trusted_layout.clone(), "trusted".into()).unwrap();
     let trusted_handle = tokio::spawn(trusted_daemon.run());
     let mut trusted_client = connect(&trusted_layout).await;
@@ -138,7 +138,7 @@ async fn neither_global_nor_repo_local_steward_bypasses_the_human_gate() {
         "land step requires a prior approved human gate"
     );
     assert!(
-        !trusted_repo.path().join("steward.txt").exists(),
+        !trusted_repo.path().join("landing.txt").exists(),
         "managed workflow work must not land without approval"
     );
     trusted_handle.abort();
@@ -149,7 +149,7 @@ async fn neither_global_nor_repo_local_steward_bypasses_the_human_gate() {
     init_repo(local_repo.path());
     let local_dir = local_repo.path().join(".rk/workflows");
     std::fs::create_dir_all(&local_dir).unwrap();
-    std::fs::write(local_dir.join("steward.cue"), STEWARD).unwrap();
+    std::fs::write(local_dir.join("landing.cue"), LANDING).unwrap();
     let local_layout = Layout::at(local_home.path());
     let local_daemon = Daemon::new_in_memory(local_layout.clone(), "local".into()).unwrap();
     let local_handle = tokio::spawn(local_daemon.run());
@@ -168,7 +168,7 @@ async fn neither_global_nor_repo_local_steward_bypasses_the_human_gate() {
         "land step requires a prior approved human gate"
     );
     assert!(
-        !local_repo.path().join("steward.txt").exists(),
+        !local_repo.path().join("landing.txt").exists(),
         "repo-local name shadowing must not land work"
     );
     local_handle.abort();
@@ -191,7 +191,7 @@ async fn activated_agent_base_policy_does_not_replace_human_approval() {
 
     let layout = Layout::at(home.path());
     std::fs::create_dir_all(layout.workflows_dir()).unwrap();
-    std::fs::write(layout.workflows_dir().join("steward.cue"), FEATURE_STEWARD).unwrap();
+    std::fs::write(layout.workflows_dir().join("landing.cue"), FEATURE_LANDING).unwrap();
     let daemon = Daemon::new_in_memory(layout.clone(), "feature-policy".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -213,7 +213,7 @@ async fn activated_agent_base_policy_does_not_replace_human_approval() {
         !Command::new("git")
             .arg("-C")
             .arg(repo.path())
-            .args(["show", "feature/integration:steward.txt"])
+            .args(["show", "feature/integration:landing.txt"])
             .output()
             .unwrap()
             .status
@@ -224,7 +224,7 @@ async fn activated_agent_base_policy_does_not_replace_human_approval() {
         !Command::new("git")
             .arg("-C")
             .arg(repo.path())
-            .args(["show", "main:steward.txt"])
+            .args(["show", "main:landing.txt"])
             .output()
             .unwrap()
             .status

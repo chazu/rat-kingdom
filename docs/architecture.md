@@ -1,5 +1,11 @@
 # Current architecture and acceptance map
 
+King conversation and delegated background operations are separated in
+[the first conversation slice](2026-09-11-king-conversation-first-slice.md).
+The King receives explicit decisions; daemon loops own authorized dispatch and
+prescribed recovery. Code review is the bounded `candidate-review` workflow.
+
+
 This is the source navigation map as of 2026-09-05. The native tracker owns
 current ticket state; [ROADMAP.md](ROADMAP.md) owns release scope and milestone
 exit criteria. Dated reviews and `superpowers/plans/` preserve design history.

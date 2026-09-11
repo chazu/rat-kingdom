@@ -6,7 +6,7 @@
 merged to main) serializes the shared-`CARGO_TARGET_DIR` test-execution phase for
 every check that routes through `WorkflowEngine::run_check_in` — workflow `run`
 steps and the daemon-native landing-pipeline gate (`landing.rs`), including
-steward's automated verify gate that fires on every completed rat. It does not,
+landing's automated verify gate that fires on every completed rat. It does not,
 and structurally cannot, cover a rat's own direct `mise run verify` invocation in
 its bash tool session (completion protocol step 3): that process is a
 grandchild of the harness process the daemon spawned, with no daemon

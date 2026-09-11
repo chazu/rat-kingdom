@@ -11,7 +11,7 @@ process the daemon spawned, with no daemon subprocess-level hook into it.
 
 The ticket's own recommendation was to decide whether that gap matters in
 practice — is the self-driven case the dominant contention source, or is the
-now-covered automated steward gate sufficient — before investing in a
+now-covered automated landing gate sufficient — before investing in a
 fleet-wide harness-launch wrapper (PATH-routing `cargo`/`mise` through an
 IPC- or flock-mediated acquire/release the daemon would inject at spawn
 time, same as it injects `CARGO_TARGET_DIR` today).

@@ -129,9 +129,9 @@ completion. Verbatim first-results:
 Three of the nine are **reviewer** agents whose actual verdict lands in a *later*
 tuple, so a `wait` would hand `evaluate` a result containing no verdict at all:
 
-- `Remy`/steward-review-TKT-116 — first: *"holding for the full-workspace `cargo test`"*; **APPROVE** is in the second
-- `Bristle-2`/steward-review-TKT-113 — first: *"Interim state while I wait"*; **REWORK** is in the second
-- `Twitch-2`/steward-review-TKT-113 — first: *"Suite still running."*; **REWORK** is in the second
+- `Remy`/candidate-review-TKT-116 — first: *"holding for the full-workspace `cargo test`"*; **APPROVE** is in the second
+- `Bristle-2`/candidate-review-TKT-113 — first: *"Interim state while I wait"*; **REWORK** is in the second
+- `Twitch-2`/candidate-review-TKT-113 — first: *"Suite still running."*; **REWORK** is in the second
 
 This is the TKT-146 failure signature — `wait` satisfied by the wrong tuple,
 `evaluate` judging the wrong text, `dismiss` firing behind it — surviving
@@ -142,7 +142,7 @@ one generation.
 **Scope of the claim.** This is demonstrated in the stored data — the tuple
 `result_pattern` selects is a non-verdict interim message in these cases — but I
 did not find a workflow instance that provably mis-evaluated because of it. The
-one steward instance waiting on `Remy` (`wf-x1q9ypp7zp`) failed earlier at step 5
+one landing instance waiting on `Remy` (`wf-x1q9ypp7zp`) failed earlier at step 5
 on an unrelated 30-minute `cargo test` timeout, before reaching the wait. So:
 demonstrated selection hazard, not a reproduced production failure.
 

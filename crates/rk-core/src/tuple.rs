@@ -368,13 +368,13 @@ impl Pattern {
 
     /// The one predicate for "the tuple that names commit `<sha>` ON BRANCH
     /// `<branch>` in its payload" — the exact-tip discriminator behind the
-    /// steward's commit-keyed verdict cache (Phase 2 of the steward
+    /// landing's commit-keyed verdict cache (Phase 2 of the landing
     /// remediation).
     ///
     /// Unlike [`Pattern::for_spawn`]/[`Pattern::for_workflow_instance`],
     /// this is deliberately unscoped by author or run: ANY prior verdict
     /// artifact for this exact branch tip is a valid cache hit, regardless of
-    /// which reviewer or steward instance produced it. A new commit changes
+    /// which reviewer or landing instance produced it. A new commit changes
     /// `sha`, which invalidates the cache naturally — there is no separate
     /// eviction to get wrong.
     ///

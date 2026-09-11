@@ -4,7 +4,7 @@
 **Target prompt:** `crates/rk-core/src/prime.rs` → `FRAGMENT_SPACE`
 **Companion convention:** *(none — this proposal is the precondition for any
 convention ever existing)*
-**Status:** proposed (do NOT apply live — an operator/steward lands this; see the
+**Status:** proposed (do NOT apply live — an operator/landing lands this; see the
 completion protocol)
 
 ## The recurring pain

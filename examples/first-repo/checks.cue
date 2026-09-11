@@ -9,12 +9,12 @@ checks: [
         toolchain: "POSIX shell and Git"
     },
     {
-        name: "steward-protected-paths"
+        name: "landing-protected-paths"
         command: "files=$(git diff --name-only \"$RK_CHECK_TARGET\"...HEAD) || exit 1; if printf '%s\\n' \"$files\" | grep -qE \"$RK_CHECK_PROTECTED_PATHS\"; then exit 1; fi"
         timeout: "30s"
     },
     {
-        name: "steward-diff-scope"
+        name: "landing-diff-scope"
         command: """
             files=$(git diff --name-only "$RK_CHECK_TARGET"...HEAD) || exit 1
             test "$files" = README.md || exit 1

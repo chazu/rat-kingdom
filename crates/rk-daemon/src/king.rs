@@ -11,7 +11,7 @@ use rk_core::id::RecordId;
 use rk_mux::AgentIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -107,6 +107,9 @@ pub struct KingState {
     pub wakes: VecDeque<KingWake>,
     pub last_snapshot: Value,
     pub last_resolved_digest: Option<String>,
+    /// Delivery acknowledgements, separate from resolution of the source item.
+    /// Incident identity and semantic revision survive history trimming/restart.
+    pub acknowledged_decisions: BTreeMap<String, String>,
     pub context: ContextLifecycle,
     pub idle_since: Option<DateTime<Utc>>,
     pub last_activity_at: Option<DateTime<Utc>>,
@@ -126,6 +129,7 @@ impl Default for KingState {
             wakes: VecDeque::new(),
             last_snapshot: Value::Null,
             last_resolved_digest: None,
+            acknowledged_decisions: BTreeMap::new(),
             context: ContextLifecycle::Clean,
             idle_since: None,
             last_activity_at: None,
@@ -151,12 +155,113 @@ pub(crate) fn is_quiescent(status: &str) -> bool {
     matches!(status, "idle" | "done")
 }
 
+pub(crate) fn may_deliver(status: &str, focused: bool) -> bool {
+    is_quiescent(status) && !focused
+}
+
+pub(crate) fn decision_signatures(snapshot: &Value) -> BTreeMap<String, String> {
+    use sha2::Digest;
+    snapshot["decisions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|decision| {
+            let id = decision["id"].as_str()?.to_string();
+            let bytes = serde_json::to_vec(decision).ok()?;
+            Some((id, hex::encode(sha2::Sha256::digest(bytes))))
+        })
+        .collect()
+}
+
+/// Explicit decision sources only. Peer questions, ordinary recovery receipts,
+/// failures still owned by a recovery loop, and old dashboard rows stay passive.
+pub(crate) fn inbox_decisions(
+    items: &[crate::inbox::InboxItem],
+    needs: &[rk_core::tuple::Tuple],
+    obstacles: &[rk_core::tuple::Tuple],
+    agents: &[crate::agents::AgentRecord],
+) -> Vec<Value> {
+    use crate::inbox::InboxDisposition;
+    use serde_json::json;
+    let mut decisions = Vec::new();
+    for item in items {
+        if let InboxDisposition::DecisionRequired { commands } = &item.disposition {
+            decisions.push(json!({
+                "id": format!("{}:{}:{}", item.scope, item.kind, item.subject),
+                "repo": item.scope, "kind": item.kind, "subject": item.subject,
+                "detail": item.detail, "commands": commands,
+            }));
+        }
+    }
+    for agent in agents {
+        if let Some(outage) = agent
+            .transport_outage
+            .as_ref()
+            .filter(|outage| outage.ceiling_hit)
+        {
+            decisions.push(
+                json!({"id": format!("transport:{}:{}", agent.spawn_id(), outage.last_failure_at),
+                "repo": agent.repo_name, "kind": "transport-exhausted", "subject": agent.name,
+                "detail": outage.evidence, "provider": outage.provider, "class": outage.class,
+                "action": format!("rk status {}", agent.name)}),
+            );
+        }
+    }
+    for need in needs {
+        let landing =
+            need.instance == "daemon" && rk_core::landing_names::is_landing_need(&need.identity);
+        // A current generation supersedes its old notice after recovery. A
+        // missing/archived generation retains the durable escalation as evidence.
+        let exhausted_without_record = need.payload["type"] == "transport_outage_exhausted"
+            && !agents
+                .iter()
+                .any(|agent| agent.name == need.identity && agent.repo_name == need.scope);
+        if !landing && !exhausted_without_record {
+            continue;
+        }
+        decisions.push(json!({"id": format!("need:{}", need.id),
+            "repo": need.scope, "kind": "operational-exception",
+            "subject": need.payload["task"], "detail": need.payload["text"],
+            "action": format!("rk bbs show {}", need.id)}));
+    }
+    for obstacle in obstacles {
+        if obstacle.payload["type"] != "budget_exceeded" {
+            continue;
+        }
+        // Cost counters may keep changing after a breach. The decision remains
+        // whether to change this budget; its live values are available in rk cost.
+        decisions.push(json!({"id": format!("budget:{}", obstacle.id),
+            "repo": obstacle.scope, "kind": "budget-exceeded", "subject": obstacle.identity,
+            "detail": "Decide whether to change the exhausted budget or keep work paused",
+            "action": "rk cost"}));
+    }
+    decisions
+}
+
 pub struct KingStore {
     path: PathBuf,
     state: Mutex<KingState>,
 }
 
 impl KingStore {
+    /// Only new or materially revised decisions participate in wake identity.
+    /// Dashboard churn and the disappearance of another item are silent.
+    pub fn observe_decisions(
+        &self,
+        snapshot: Value,
+        retry_secs: i64,
+        now: DateTime<Utc>,
+    ) -> rk_core::Result<Option<KingWake>> {
+        self.observe(
+            String::new(),
+            String::new(),
+            snapshot,
+            false,
+            retry_secs,
+            now,
+        )
+    }
+
     pub fn load(path: impl AsRef<Path>) -> rk_core::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let state = if path.exists() {
@@ -293,20 +398,46 @@ impl KingStore {
     }
 
     /// Observe a fresh authoritative snapshot and return a wake that should be
-    /// injected now. One active wake coalesces all changes until it is settled.
+    /// injected now. Changes coalesce until claim; claimed receipts stay fixed.
     pub fn observe(
         &self,
-        digest: String,
-        summary: String,
-        snapshot: Value,
-        has_work: bool,
+        mut digest: String,
+        mut summary: String,
+        mut snapshot: Value,
+        mut has_work: bool,
         retry_secs: i64,
         now: DateTime<Utc>,
     ) -> rk_core::Result<Option<KingWake>> {
         let mut state = self.lock()?;
+        // Selection and receipt checks share the settlement mutex: a concurrent
+        // resolve cannot race this observation into delivering the same item twice.
+        if snapshot["decisions"].is_array() {
+            use sha2::Digest;
+            let signatures = decision_signatures(&snapshot);
+            let decisions = snapshot["decisions"].as_array_mut().unwrap();
+            decisions.retain(|decision| {
+                decision["id"]
+                    .as_str()
+                    .is_some_and(|id| signatures.get(id) != state.acknowledged_decisions.get(id))
+            });
+            decisions.truncate(100);
+            let pending = decision_signatures(&snapshot);
+            digest = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&pending)?));
+            summary = format!("{} decisions", pending.len());
+            has_work = !pending.is_empty();
+        }
         state.last_snapshot = snapshot.clone();
 
         let active = state.wakes.iter_mut().rev().find(|wake| wake.active());
+        // A claimed batch is the exact receipt the King is handling. New
+        // arrivals stay unacknowledged and get their own batch after settlement.
+        if active
+            .as_ref()
+            .is_some_and(|wake| wake.state == WakeState::Claimed)
+        {
+            self.persist(&state)?;
+            return Ok(None);
+        }
         if !has_work {
             if let Some(wake) = active {
                 wake.state = WakeState::Resolved;
@@ -364,7 +495,11 @@ impl KingStore {
         let mut state = self.lock()?;
         let wake = find_wake_mut(&mut state, id)?;
         if wake.active() {
-            wake.state = WakeState::Injected;
+            // The harness may pull before the send completion reaches us.
+            // A late transport receipt must never undo that durable claim.
+            if wake.state != WakeState::Claimed {
+                wake.state = WakeState::Injected;
+            }
             wake.injection_attempts = wake.injection_attempts.saturating_add(1);
             wake.last_injected_at = Some(now);
             wake.updated_at = now;
@@ -427,6 +562,9 @@ impl KingStore {
             wake.clone()
         };
         state.last_resolved_digest = Some(out.digest.clone());
+        state
+            .acknowledged_decisions
+            .extend(decision_signatures(&out.snapshot));
         self.persist(&state)?;
         Ok(out)
     }
@@ -438,6 +576,9 @@ impl KingStore {
         cfg: &KingConfig,
         now: DateTime<Utc>,
     ) -> rk_core::Result<Option<ContextAction>> {
+        if !cfg.automatic_context_lifecycle {
+            return Ok(None);
+        }
         let mut state = self.lock()?;
         if state.context == ContextLifecycle::Compacting
             && state.compact_started_at.is_some_and(|started| {
@@ -730,6 +871,135 @@ mod tests {
         );
     }
 
+    fn decision_snapshot(ids: &[&str]) -> Value {
+        serde_json::json!({"decisions": ids.iter().map(|id| serde_json::json!({
+            "id": id, "kind": "human-gate", "detail": "choose the target"
+        })).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn peer_needs_stay_passive_but_castle_authored_exhausted_transport_is_a_decision() {
+        use rk_core::tuple::{Category, Tuple};
+        let peer = Tuple::new(
+            Category::Need,
+            "repo",
+            "peer",
+            "peer",
+            serde_json::json!({"text": "Who knows this API?"}),
+        );
+        let exhausted = Tuple::new(
+            Category::Need,
+            "repo",
+            "rat-1",
+            "test-castle",
+            serde_json::json!({
+                "type": "transport_outage_exhausted", "text": "credential rejected", "task": "TKT-1"
+            }),
+        );
+        let decisions = inbox_decisions(&[], &[peer, exhausted.clone()], &[], &[]);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["id"], format!("need:{}", exhausted.id));
+    }
+
+    #[test]
+    fn routine_activity_is_quiet_and_conversation_lifecycle_is_opt_in() {
+        let (_dir, store) = store();
+        let now = Utc::now();
+        for minute in 0..120 {
+            let snapshot = serde_json::json!({"decisions": [], "generated_at": minute,
+                "live_agents": [{"updated_at": minute}], "ready_frontier": {"total": 53},
+                "inbox": {"items": [{"kind": "recovery-action", "detail": minute}]}});
+            assert!(store
+                .observe_decisions(snapshot, 60, now + Duration::minutes(minute))
+                .unwrap()
+                .is_none());
+        }
+        assert!(store.snapshot().unwrap().wakes.is_empty());
+        assert!(!may_deliver("done", true));
+        assert!(!may_deliver("working", false));
+        assert!(may_deliver("done", false));
+        assert!(store
+            .context_action("idle", false, &KingConfig::default(), now)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .context_action(
+                "idle",
+                false,
+                &KingConfig::default(),
+                now + Duration::days(1)
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn decisions_acknowledge_individually_survive_restart_and_preserve_arrivals_during_claim() {
+        let (dir, store) = store();
+        let now = Utc::now();
+        let first = store
+            .observe_decisions(decision_snapshot(&["a"]), 60, now)
+            .unwrap()
+            .unwrap();
+        store.claim(&first.id, "king-a", now).unwrap();
+        assert!(store
+            .observe_decisions(decision_snapshot(&["a", "b"]), 60, now)
+            .unwrap()
+            .is_none());
+        store.settle(&first.id, "king-a", true, now).unwrap();
+        drop(store);
+        let store = KingStore::load(dir.path().join("king.json")).unwrap();
+        let second = store
+            .observe_decisions(decision_snapshot(&["a", "b"]), 60, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.snapshot["decisions"],
+            decision_snapshot(&["b"])["decisions"]
+        );
+        store.claim(&second.id, "king-a", now).unwrap();
+        store.settle(&second.id, "king-a", false, now).unwrap();
+        // Clearing b cannot re-notify the still-unresolved a.
+        assert!(store
+            .observe_decisions(decision_snapshot(&["a"]), 60, now)
+            .unwrap()
+            .is_none());
+        let mut changed = decision_snapshot(&["a"]);
+        changed["decisions"][0]["detail"] = serde_json::json!("the target has changed");
+        assert!(store.observe_decisions(changed, 60, now).unwrap().is_some());
+    }
+
+    #[test]
+    fn unclaimed_decision_retries_one_wake_and_clear_during_claim_remains_settleable() {
+        let (_dir, store) = store();
+        let now = Utc::now();
+        let wake = store
+            .observe_decisions(decision_snapshot(&["a"]), 60, now)
+            .unwrap()
+            .unwrap();
+        store.mark_injected(&wake.id, now).unwrap();
+        assert!(store
+            .observe_decisions(decision_snapshot(&["a"]), 60, now + Duration::seconds(59))
+            .unwrap()
+            .is_none());
+        let retry = store
+            .observe_decisions(decision_snapshot(&["a"]), 60, now + Duration::seconds(60))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.id, wake.id);
+        store.claim(&wake.id, "king-a", now).unwrap();
+        store.mark_injected(&wake.id, now).unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().wakes.back().unwrap().state,
+            WakeState::Claimed
+        );
+        assert!(store
+            .observe_decisions(decision_snapshot(&[]), 60, now)
+            .unwrap()
+            .is_none());
+        store.settle(&wake.id, "king-a", false, now).unwrap();
+    }
+
     #[test]
     fn settled_digest_does_not_repeat_until_authoritative_state_changes() {
         let (_dir, store) = store();
@@ -755,6 +1025,7 @@ mod tests {
         let (_dir, store) = store();
         let now = Utc::now();
         let cfg = KingConfig {
+            automatic_context_lifecycle: true,
             compact_after_idle_secs: 5,
             compact_min_wake_batches: 1,
             ..KingConfig::default()
@@ -791,6 +1062,7 @@ mod tests {
         let (_dir, store) = store();
         let now = Utc::now();
         let cfg = KingConfig {
+            automatic_context_lifecycle: true,
             compact_timeout_secs: 10,
             ..KingConfig::default()
         };

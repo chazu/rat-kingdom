@@ -607,7 +607,7 @@ async fn run_step_red_check_fails_closed_and_holds_branch() {
 // spawn → wait → run (a REPOSITORY-OWNED named check that fails behind a
 // successful output consumer) → dismiss (never reached). The check is
 // referenced by name, not inlined, so this exercises the same `.rk/checks.cue`
-// path a real steward gate uses.
+// path a real landing gate uses.
 const RUN_MASKED_CHECK_WORKFLOW: &str = r#"
 workflow: {
     name: "run-masked-check"
@@ -665,8 +665,8 @@ async fn run_step_fails_closed_on_a_failing_check_piped_to_a_successful_consumer
     std::fs::write(
         rk_dir.join("checks.cue"),
         r#"checks: [
-    {name: "steward-protected-paths", command: "true", timeout: "30s"},
-    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "landing-protected-paths", command: "true", timeout: "30s"},
+    {name: "landing-diff-scope", command: "true", timeout: "30s"},
     {name: "verify", command: "bash -c 'set -o pipefail; { seq 1 60000; exit 3; } | cat'", timeout: "60s"},
 ]
 "#,

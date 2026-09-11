@@ -76,7 +76,7 @@
   `herdr agent attach`. Degrades cleanly when herdr is absent.
   REMAINING: live interactive validation, herdr agent-status as secondary
   liveness signal, notifications on blocked state.
-- **P7 NOT STARTED** — steward workflow, rk top, suggestion/endorsement
+- **P7 NOT STARTED** — landing workflow, rk top, suggestion/endorsement
   promotion, rk doctor, packaging.
 
 Known polish items: codex Completed.result sometimes empty (last agent_message
@@ -211,7 +211,7 @@ killed daemon restart re-attaches to the registry without losing agents.
    **turn/steer**, turn/interrupt, approval routing) for supervised sessions.
    Generate serde types from `codex app-server generate-json-schema` in CI.
 2. axe adapter: TOML agent defs, subprocess + `--json` result, `--max-tokens`
-   pass-through, exit-code-4 → BudgetExceeded event. Map to steward/reviewer-
+   pass-through, exit-code-4 → BudgetExceeded event. Map to landing/reviewer-
    style bounded jobs.
 3. Capability negotiation: `HarnessCaps` drives orchestrator behavior (no steer →
    respawn-with-context; no resume → fresh session + tuplespace catch-up).
@@ -346,7 +346,7 @@ partition, and a human on machine B sees machine A's obstacles in `rk watch`.
 ## Phase 7 — Fleet quality-of-life
 
 **Top-line features**
-- Steward: reactive triage workflow — fetch completed branch, run checks,
+- Landing: reactive triage workflow — fetch completed branch, run checks,
   auto-dismiss clean work, escalate the rest (trigger-driven, not a polling
   agent).
 - `rk top` — ratatui fleet dashboard: agents, states, burn rates, budgets,
@@ -357,7 +357,7 @@ partition, and a human on machine B sees machine A's obstacles in `rk watch`.
   crash-loop backoff on respawn, docs site.
 
 **Steps**
-1. Steward as a Phase-5 trigger + workflow (no bespoke role machinery) with an
+1. Landing as a Phase-5 trigger + workflow (no bespoke role machinery) with an
    axe- or Claude-backed check step; escalation via need tuples + herdr
    notifications.
 2. `rk top` over the daemon's event feed + ledger queries.
@@ -370,7 +370,7 @@ partition, and a human on machine B sees machine A's obstacles in `rk watch`.
    staleness), packaging, install docs.
 
 **Exit criteria**: a week of real use on rat-kingdom's own development with the
-steward dismissing clean work unattended; onboarding a second repo takes one
+landing dismissing clean work unattended; onboarding a second repo takes one
 command.
 
 ---

@@ -2,7 +2,7 @@
 
 **Author:** rat-114 (task: refine-prompts)
 **Target prompt:** `crates/rk-core/src/prime.rs` → `reviewer` arm of `render`
-**Status:** proposed (do NOT apply live — an operator/steward lands this)
+**Status:** proposed (do NOT apply live — an operator/landing lands this)
 **Confidence:** medium (structural prompt gap + one live escalation; see caveat)
 
 ## The gap
@@ -10,7 +10,7 @@
 Two prompts tell a reviewer how to decide a verdict, and they disagree in
 richness:
 
-**`steward.cue` review step (lines 96–99)** — the path most reviews take —
+**`landing.cue` review step (lines 96–99)** — the path most reviews take —
 gives real criteria:
 
 ```
@@ -19,7 +19,7 @@ remain), or STOP (fundamentally wrong / needs a human call).
 ```
 
 **The generic `reviewer` role in `prime.rs` (lines 204–210)** — what a reviewer
-spawned outside the steward workflow gets — is much thinner:
+spawned outside the landing workflow gets — is much thinner:
 
 ```
 Review the changes on your branch against the task requirements. Produce a
@@ -28,7 +28,7 @@ problems). ...
 ```
 
 "STOP (serious problems)" tells the reviewer nothing about what STOP *does*.
-In the steward workflow the routing is asymmetric and expensive:
+In the landing workflow the routing is asymmetric and expensive:
 
 - **APPROVE** → auto-lands on main (no human).
 - **REWORK** → files a follow-up ticket, holds the branch — a *free, durable
@@ -45,18 +45,18 @@ including fixable things REWORK was built to absorb without a human.
 There is a live instance in the feed:
 
 ```
-need [rat-kingdom]: steward: reviewer returned STOP for groom-backlog on
-  rat/rat-108/steward-review-groom-backlog — needs a human merge decision;
+need [rat-kingdom]: landing: reviewer returned STOP for groom-backlog on
+  rat/rat-108/candidate-review-groom-backlog — needs a human merge decision;
   branch held unmerged
 ```
 
-**Caveat:** that particular reviewer went through the *steward* step (the richer
+**Caveat:** that particular reviewer went through the *landing* step (the richer
 prompt), and a grooming decision may legitimately need a human — so this one
 STOP was plausibly correct. This proposal is therefore not "the generic prompt
 caused that failure." It is: the generic reviewer prompt is measurably weaker
-than the one steward.cue proved out, and the weakness (no verdict cost) is
+than the one landing.cue proved out, and the weakness (no verdict cost) is
 exactly the kind that turns into avoidable human-in-the-loop toil the moment a
-reviewer is spawned off the steward path. Aligning the two is low-risk and
+reviewer is spawned off the landing path. Aligning the two is low-risk and
 closes the gap before it bites.
 
 ## Proposed change (unified diff)
@@ -92,7 +92,7 @@ closes the gap before it bites.
 - No test asserts on the reviewer blurb's wording (the tests check fragment
   inclusion and the "APPROVE/REWORK/STOP" vocabulary is preserved), so the
   suite stays green.
-- It mirrors criteria already validated in production by `steward.cue`; it does
+- It mirrors criteria already validated in production by `landing.cue`; it does
   not invent new policy, it propagates the working one to the generic path.
 
 ## Companion convention proposal
@@ -106,6 +106,6 @@ Filed as a `convention-proposal` artifact this run:
 
 ## Related
 
-- `examples/workflows/steward.cue` (source of the proven criteria + the routing
+- `examples/workflows/landing.cue` (source of the proven criteria + the routing
   that gives each verdict its cost).
 - TKT-1 (reviewer-drives-rework: the read/when routing this rides on).

@@ -15,7 +15,7 @@
 // merge request regardless of the repo's registered merge mode. So a repo whose
 // default policy is Direct-merge can still opt a specific run into review-by-PR:
 // the choice lives in the workflow, not the repo. The branch is pushed and left
-// standing; a human (or a downstream CI/steward) does the final merge on the
+// standing; a human (or a downstream CI/landing) does the final merge on the
 // forge.
 //
 // While parked, read the review and inspect the branch, then decide:

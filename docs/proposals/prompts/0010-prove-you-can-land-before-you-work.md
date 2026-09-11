@@ -76,8 +76,8 @@ or `git commit` is a stop condition rather than an inconvenience to route around
 
 The same shape of loss shows up in the reviewer lane: three reviewers in the
 corpus terminated with `is_error: true` and an empty `result` (Brie
-`steward-review-probe-spawn-health`, Sable `steward-review-TKT-146`,
-Pumpernickel-2 `steward-review-TKT-175` — the last of which is one of only three
+`candidate-review-probe-spawn-health`, Sable `candidate-review-TKT-146`,
+Pumpernickel-2 `candidate-review-TKT-175` — the last of which is one of only three
 `workflow_failed` events in the window). An entry-time smoke check is the only
 thing that distinguishes "died with nothing" from "was never able to produce
 anything".
@@ -179,5 +179,5 @@ fn completion_protocol_checks_the_tools_before_the_work() {
    timeout: "25m"}`. Prior rats on this exact task ran $1.58 / $2.87 / $5.27 /
    $4.72 — a mine-the-whole-feed-then-write-proposals task does not fit in 25
    minutes, and the timeout is what converted Parmesan-2's slow run into a
-   `workflow_failed`. The steward has the same shape of problem in `TKT-169`
+   `workflow_failed`. The landing has the same shape of problem in `TKT-169`
    (a 30m `cargo test` gate).

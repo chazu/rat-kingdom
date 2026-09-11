@@ -19,7 +19,7 @@ export -e workflow` path `rk_workflow::load` uses).
    no operator signal. `schema.cue` #LandStep explicitly prescribes gating with a
    following `evaluate {expect: {merged: true}}`. Both proposals add it (fail
    closed → surfaces the stuck auto-merge in `rk inbox`).
-   **Landed:** `examples/workflows/land-on-approve.cue`. The old steward
+   **Landed:** `examples/workflows/land-on-approve.cue`. The old landing
    mega-workflow and its proposal copy were removed when the daemon-native
    landing pipeline became the sole shipped landing path.
    → `docs/proposals/land-on-approve.cue`

@@ -64,12 +64,12 @@ impl std::fmt::Display for Severity {
 ///
 /// `class` is the routing key config filters on (`classes = [...]`) and doubles
 /// as the human label: a kebab-case class renders as spaced words, so
-/// `steward-escalation` titles as "steward escalation — <subject>".
+/// `landing-escalation` titles as "landing escalation — <subject>".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscalationNotice {
     /// The tuple that caused this, as a string id. Also the dedup key.
     pub tuple_id: String,
-    /// Routing key + label, kebab-case (e.g. `steward-escalation`).
+    /// Routing key + label, kebab-case (e.g. `landing-escalation`).
     pub class: String,
     pub severity: Severity,
     /// Tuple scope the escalation belongs to (repo name, or `system`).
@@ -452,7 +452,7 @@ mod tests {
     fn notice() -> EscalationNotice {
         EscalationNotice::new(
             "01AAA",
-            "steward-escalation",
+            "landing-escalation",
             Severity::Critical,
             "myrepo",
             "TKT-7",
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn title_and_body_render_the_class_as_words() {
         let n = notice();
-        assert_eq!(n.title(), "steward escalation — TKT-7");
+        assert_eq!(n.title(), "landing escalation — TKT-7");
         assert_eq!(n.body(), "needs a human merge decision");
         assert_eq!(
             n.with_action("rk land myrepo").body(),
@@ -496,7 +496,7 @@ mod tests {
         registry.register(
             SinkConfig {
                 name: Some("matching".into()),
-                classes: vec!["steward-escalation".into()],
+                classes: vec!["landing-escalation".into()],
                 ..SinkConfig::of_kind("recorder")
             },
             Box::new(Recorder::default()),

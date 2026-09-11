@@ -153,7 +153,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let source_dir = repo.path().join("examples/workflows");
         fs::create_dir_all(&source_dir).unwrap();
-        let source = source_dir.join("steward.cue");
+        let source = source_dir.join("landing.cue");
         fs::write(&source, "workflow: {}\n").unwrap();
         let layout = Layout::at(home.path());
         install(&layout, source.to_str().unwrap(), None).unwrap();
@@ -164,7 +164,7 @@ mod tests {
         assert!(!clean.rows.iter().any(|row| row.status == "missing"));
 
         fs::write(
-            layout.workflows_dir().join("steward.cue"),
+            layout.workflows_dir().join("landing.cue"),
             "workflow: changed\n",
         )
         .unwrap();

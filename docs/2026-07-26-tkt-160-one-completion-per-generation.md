@@ -30,8 +30,8 @@ message:
 - Squeak-2 / TKT-113 — "Tests still compiling/running"
 
 Worst case, 3 of those 9 are **reviewers whose verdict lands in a later tuple**
-— Remy/steward-review-TKT-116 (APPROVE in tuple 2), Bristle-2 and
-Twitch-2/steward-review-TKT-113 (REWORK in tuple 2) — so a `wait` handed
+— Remy/candidate-review-TKT-116 (APPROVE in tuple 2), Bristle-2 and
+Twitch-2/candidate-review-TKT-113 (REWORK in tuple 2) — so a `wait` handed
 `evaluate` a result with no verdict in it at all.
 
 This is the TKT-146 signature (wait satisfied by the wrong tuple → evaluate
@@ -44,7 +44,7 @@ are milliseconds apart.
 
 `wait` is not the only consumer of `harness_result`. The same event drives:
 
-- the reactor's `steward-on-completion` trigger (`"role":"rat"`), which would
+- the reactor's `legacy-landing-on-completion` trigger (`"role":"rat"`), which would
   spawn a reviewer and run the auto-merge gates against a branch whose rat is
   still writing to it;
 - `route_completion`'s ticket auto-close, which marked a ticket `done` on a
@@ -83,7 +83,7 @@ Bookkeeping lives in `Supervisor::completions` (`CompletionState`: generation,
 `routed`, `withheld`). `claim_completion` applies proofs 1 and 3 at
 `Completed`; `flush_withheld_completion` applies proof 2 at `Exited`;
 `forget_completion` drops the state on `dismiss` (a deliberate teardown must not
-emit a late completion that re-fires the steward on a just-merged branch) and on
+emit a late completion that re-fires the landing on a just-merged branch) and on
 `respawn` (which continues the *same* generation in a fresh process, so the
 crashed run's `routed` flag would otherwise gag the resumed run).
 
@@ -100,7 +100,7 @@ workflow waiting on that agent until its step timeout.
   timeout is a loud failure in `rk inbox`; the old behaviour was a silent wrong
   answer. TKT-147 (unmerged at time of writing, `64de183`) fails such a wait
   faster when the rat is crashed or abandoned.
-- The steward now fires once per rat, on its real completion, instead of once
+- The landing now fires once per rat, on its real completion, instead of once
   per turn.
 - A ticket is marked `done` on the finishing turn, not on the first turn that
   happened to end mid-work.

@@ -1,6 +1,11 @@
 # King control loop and idle context lifecycle
 
-Status: implemented; explicit King registration is the opt-in boundary.
+Status: original design, superseded in part by
+[the conversation first slice](2026-09-11-king-conversation-first-slice.md).
+Registration now opts into decision notifications only. Background dispatch and
+prescribed repair are daemon responsibilities; broad snapshot changes do not
+wake the King. Focus blocks delivery and automatic context lifecycle is opt-in.
+The original protocol below is retained as design history.
 
 ## Intent
 

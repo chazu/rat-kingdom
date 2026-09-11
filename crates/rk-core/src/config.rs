@@ -58,6 +58,8 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct KingConfig {
+    /// Opt in to automatic compaction/replacement of the human conversation.
+    pub automatic_context_lifecycle: bool,
     /// Durable-state scan cadence.
     pub poll_secs: u64,
     /// Re-inject an unclaimed at-least-once wake after this interval.
@@ -80,6 +82,7 @@ pub struct KingConfig {
 impl Default for KingConfig {
     fn default() -> Self {
         Self {
+            automatic_context_lifecycle: false,
             poll_secs: 15,
             wake_retry_secs: 60,
             compact_after_idle_secs: 5 * 60,
@@ -152,7 +155,7 @@ pub struct SinkConfig {
     pub kind: String,
     /// Set false to keep a sink configured but silent.
     pub enabled: bool,
-    /// Notice classes this sink accepts (e.g. `steward-escalation`). Empty
+    /// Notice classes this sink accepts (e.g. `landing-escalation`). Empty
     /// accepts every class — the common case for a single desktop channel.
     pub classes: Vec<String>,
     /// Severity floor. `info` (the default) accepts everything.
@@ -207,7 +210,11 @@ impl SinkConfig {
     /// list is empty), severity at or above the floor.
     pub fn accepts(&self, notice: &crate::notify::EscalationNotice) -> bool {
         self.enabled
-            && (self.classes.is_empty() || self.classes.iter().any(|c| c == &notice.class))
+            && (self.classes.is_empty()
+                || self.classes.iter().any(|c| {
+                    crate::landing_names::canonical(c)
+                        == crate::landing_names::canonical(&notice.class)
+                }))
             && notice.severity >= self.min_severity
     }
 }
@@ -352,8 +359,8 @@ pub struct ReactorConfig {
     /// topic at scan time, so a hot wall that many rats hit files exactly one
     /// backlog item. Zero disables obstacle coalescence entirely.
     pub coalesce_quorum: u32,
-    /// Active operator push: when the steward escalates a STOP/unknown verdict
-    /// via a `need` (identity `steward`), fire a desktop notification through
+    /// Active operator push: when the landing escalates a STOP/unknown verdict
+    /// via a `need` (identity `landing`), fire a desktop notification through
     /// herdr so the operator is pushed at, not only queued in `rk inbox`. A
     /// no-op when no herdr server is running, so it never blocks a headless
     /// castle. Set false to keep escalations purely on the passive inbox queue.
@@ -595,7 +602,7 @@ impl Default for TicketReopenSweepConfig {
 /// automated half of `rk prune --reap-git`, run on a timer instead of waiting
 /// for an operator to remember it. Root-caused by the 2026-08-16 incident: 104
 /// agent worktrees (298 GB, mostly `target/` dirs) leaked over ~3 weeks
-/// because steward/workflow failure paths skip their own `dismiss` step, and
+/// because landing/workflow failure paths skip their own `dismiss` step, and
 /// nothing ever swept the residue until the disk hit 97% full and daemon
 /// writes started failing with "terminal state persistence failed: io".
 ///
@@ -636,7 +643,7 @@ pub struct WorktreeSweepConfig {
     /// workspace do extra synchronous git reclaim work at finalize time,
     /// adding enough load under `cargo test --workspace`'s full parallel run
     /// to tip unrelated tests' fixed polling timeouts over the edge
-    /// (rework of TKT-01M04N6W4X47KMXDA6MH0WPH8H: two different steward gate
+    /// (rework of TKT-01M04N6W4X47KMXDA6MH0WPH8H: two different landing gate
     /// failures, each passing standalone). Tests that specifically cover
     /// this guarantee opt back in explicitly via `set_worktree_sweep_config`.
     pub finalize_cleanup_enabled: bool,
@@ -706,7 +713,7 @@ impl Default for WorktreeSweepConfig {
 /// least-recently-used (a target unused for `max_age_days` is stale) and a
 /// per-repo cap (`max_per_repo`, keeping only the N most recently used
 /// targets). Both are `0`-disables, matching this codebase's existing
-/// `steward-diff-scope`/`DiskConfig` convention for an off switch. A
+/// `landing-diff-scope`/`DiskConfig` convention for an off switch. A
 /// worktree is NEVER reclaimed while its `(repo, target)` key has a live
 /// `rk-daemon` `LandingQueue` entry — the same fail-closed posture
 /// `Supervisor::reap_git` applies to agent worktrees, so this sweep can run
@@ -875,14 +882,14 @@ pub struct SupervisorConfig {
     ///
     /// INVARIANT (order-your-timers-below-workflow-waits): must stay
     /// comfortably below any workflow's `wait` timeout that blocks on this
-    /// rat's completion — e.g. the review-only steward's `reviewTimeout`
-    /// (examples/workflows/steward-review.cue, default 15m — same default the
+    /// rat's completion — e.g. the review-only landing's `reviewTimeout`
+    /// (examples/workflows/candidate-review.cue, default 15m — same default the
     /// daemon-native landing pipeline's `GateConfig`/`RepositoryPolicy.landing`
     /// use, crates/rk-daemon/src/landing.rs). If this value is >= that
     /// timeout, the workflow gives up and hard-fails the wait before the sweep
     /// has even flagged the rat as stuck, so the soft steer below never gets a
     /// chance to nudge it back to a clean `rk done`. See
-    /// [`STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS`] and
+    /// [`LANDING_DEFAULT_REVIEW_TIMEOUT_SECS`] and
     /// `SupervisorConfig::review_timeout_warning`, which checks this
     /// invariant at daemon startup.
     pub stuck_after_secs: u64,
@@ -966,7 +973,7 @@ impl Default for SupervisorConfig {
         Self {
             enabled: true,
             interval_secs: 60,
-            // 10m: comfortably below STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS (15m) —
+            // 10m: comfortably below LANDING_DEFAULT_REVIEW_TIMEOUT_SECS (15m) —
             // see the invariant on `stuck_after_secs` above.
             stuck_after_secs: 600,
             burn_usd_per_min: 4.0,
@@ -985,37 +992,37 @@ impl Default for SupervisorConfig {
     }
 }
 
-/// The review-only steward's shipped default `reviewTimeout`
-/// (examples/workflows/steward-review.cue: `reviewTimeout: {..., default: "15m"}`
+/// The review-only landing's shipped default `reviewTimeout`
+/// (examples/workflows/candidate-review.cue: `reviewTimeout: {..., default: "15m"}`
 /// — the same default `rk_workflow::LandingPolicy::review_timeout` and
 /// `crates/rk-daemon/src/landing.rs`'s `GateConfig` use for the daemon-native
 /// landing pipeline). Duplicated here (rather than parsed from the `.cue`
 /// source) because rk-core does not depend on rk-workflow/CUE — kept in sync
 /// by hand, cross-referenced from both sides. See the invariant on
 /// [`SupervisorConfig::stuck_after_secs`] and `SupervisorConfig::review_timeout_warning`.
-pub const STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 15 * 60;
+pub const LANDING_DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 15 * 60;
 
 impl SupervisorConfig {
     /// Structural check for the order-your-timers-below-workflow-waits
     /// invariant: a stuck rat must be flagged (and soft-steered) well before
     /// a workflow's `wait` on that rat's completion gives up, or the steer
     /// never gets a chance to work. Returns a warning message when
-    /// `stuck_after_secs` is not safely below the steward's shipped
+    /// `stuck_after_secs` is not safely below the landing's shipped
     /// `reviewTimeout` default; `None` when stuck detection is off (0) or the
     /// ordering is safe.
     pub fn review_timeout_warning(&self) -> Option<String> {
         if self.stuck_after_secs == 0 {
             return None;
         }
-        if self.stuck_after_secs >= STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS {
+        if self.stuck_after_secs >= LANDING_DEFAULT_REVIEW_TIMEOUT_SECS {
             return Some(format!(
-                "supervisor.stuck_after_secs ({}s) >= the steward workflow's shipped \
-                 reviewTimeout default ({}s): a waiting steward review will hard-fail \
+                "supervisor.stuck_after_secs ({}s) >= the landing workflow's shipped \
+                 reviewTimeout default ({}s): a waiting landing review will hard-fail \
                  before the stuck sweep ever flags the rat, so its soft steer never gets \
                  a chance to help. Lower supervisor.stuck_after_secs or raise the \
-                 deployed steward's reviewTimeout so the sweep gets a real intervention \
+                 deployed landing's reviewTimeout so the sweep gets a real intervention \
                  window.",
-                self.stuck_after_secs, STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS
+                self.stuck_after_secs, LANDING_DEFAULT_REVIEW_TIMEOUT_SECS
             ));
         }
         None
@@ -1027,7 +1034,7 @@ impl SupervisorConfig {
 /// highest-priority ready ticket and spawning a rat whenever the fleet has a
 /// free slot — the always-on refill counterpart to a one-shot backlog-drain
 /// workflow, turning "keep the fleet busy" from one operator spawn per ticket
-/// into a single config dial. Combined with the steward closing each merged
+/// into a single config dial. Combined with the landing pipeline closing each merged
 /// item it is a closed loop: the operator grooms/prioritises, the fleet
 /// executes. Off by default: the per-spawn fleet/repo budget cap (the wallet
 /// kill-switch) and the liveness sweep (which reaps stuck rats, freeing slots)
@@ -1042,8 +1049,8 @@ impl SupervisorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DrainConfig {
-    /// Master switch. Off by default — turning it on makes the fleet
-    /// self-dispatch from the ready backlog with no operator in the loop.
+    /// Expand dispatch to the whole eligible backlog. When false, a positive
+    /// max_wip enables only explicitly labeled ready-for-agent work.
     pub enabled: bool,
     /// Target concurrency W: the controller keeps up to this many rats live,
     /// spawning the highest-priority ready ticket whenever a slot frees. Zero
@@ -1468,14 +1475,14 @@ delivered-but-open = "human"
     fn default_stuck_after_secs_stays_below_shipped_review_timeout() {
         // The coincidence this guards: both timers defaulted to 900s (15m),
         // so a stuck reviewer's soft steer never got a window to run before
-        // the steward's own wait gave up.
+        // the landing's own wait gave up.
         let cfg = SupervisorConfig::default();
         assert!(
-            cfg.stuck_after_secs < STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS,
-            "stuck_after_secs ({}) must stay below the steward's shipped \
+            cfg.stuck_after_secs < LANDING_DEFAULT_REVIEW_TIMEOUT_SECS,
+            "stuck_after_secs ({}) must stay below the landing's shipped \
              reviewTimeout ({}) so the sweep gets an intervention window",
             cfg.stuck_after_secs,
-            STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS
+            LANDING_DEFAULT_REVIEW_TIMEOUT_SECS
         );
         assert!(cfg.review_timeout_warning().is_none());
     }
@@ -1483,12 +1490,12 @@ delivered-but-open = "human"
     #[test]
     fn review_timeout_warning_fires_when_stuck_after_secs_catches_up() {
         let mut cfg = SupervisorConfig {
-            stuck_after_secs: STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS,
+            stuck_after_secs: LANDING_DEFAULT_REVIEW_TIMEOUT_SECS,
             ..SupervisorConfig::default()
         };
         assert!(cfg.review_timeout_warning().is_some());
 
-        cfg.stuck_after_secs = STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS + 1;
+        cfg.stuck_after_secs = LANDING_DEFAULT_REVIEW_TIMEOUT_SECS + 1;
         assert!(cfg.review_timeout_warning().is_some());
     }
 
@@ -1571,7 +1578,7 @@ kind = "herdr"
 [[notify.sinks]]
 name = "ops-chat"
 kind = "command"
-classes = ["steward-escalation"]
+classes = ["landing-escalation"]
 min_severity = "warn"
 
 [notify.sinks.options]
@@ -1590,7 +1597,7 @@ timeout_secs = "30"
         let chat = &sinks[1];
         assert_eq!(chat.name(), "ops-chat");
         assert_eq!(chat.kind, "command");
-        assert_eq!(chat.classes, ["steward-escalation"]);
+        assert_eq!(chat.classes, ["landing-escalation"]);
         assert_eq!(chat.min_severity, crate::notify::Severity::Warn);
         assert_eq!(
             chat.option("command"),

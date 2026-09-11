@@ -446,3 +446,103 @@ async fn ticket_status_count(client: &mut Client, scope: &str, status: &str) -> 
         .filter(|t| t["payload"]["status"] == status)
         .count()
 }
+
+#[tokio::test]
+async fn delegated_work_runs_without_a_king_while_unlabeled_and_blocked_work_stays_open() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(SLOW_FAKE));
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget::default(),
+        Space::open_in_memory().unwrap(),
+    )
+    .unwrap();
+    daemon.set_drain_config(DrainConfig {
+        enabled: false,
+        max_wip: 1,
+        interval_secs: 1,
+        repo: Some("delegated".into()),
+        ..Default::default()
+    });
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    client
+        .call(
+            "repo.add",
+            json!({"name": "delegated", "path": repo_dir.path()}),
+        )
+        .await
+        .unwrap();
+    let unapproved = client
+        .call(
+            "ticket.new",
+            json!({"title": "needs discussion", "scope": "delegated"}),
+        )
+        .await
+        .unwrap();
+    let dependency = unapproved["ticket"]["identity"].as_str().unwrap();
+    client
+        .call(
+            "ticket.new",
+            json!({"title": "blocked", "scope": "delegated",
+        "labels": ["ready-for-agent"], "depends_on": [dependency]}),
+        )
+        .await
+        .unwrap();
+    for i in 0..2 {
+        client
+            .call(
+                "ticket.new",
+                json!({"title": format!("approved {i}"), "scope": "delegated",
+            "labels": ["ready-for-agent"]}),
+            )
+            .await
+            .unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+    loop {
+        let agents = client.call("agent.list", json!({})).await.unwrap();
+        let agents = agents["agents"].as_array().unwrap();
+        let live = agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    agent["state"].as_str(),
+                    Some("spawning" | "running" | "paused")
+                )
+            })
+            .count();
+        assert!(live <= 1, "delegated mode shares the WIP ceiling");
+        assert!(agents.len() <= 2, "unapproved or blocked work dispatched");
+        if agents.len() == 2 && live == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "authorized work did not refill without a King"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let king = client.call("king.status", json!({})).await.unwrap();
+    assert!(king["state"]["registration"].is_null());
+    assert!(king["state"]["wakes"].as_array().unwrap().is_empty());
+    let open = client
+        .call(
+            "ticket.list",
+            json!({"scope": "delegated", "status": "open"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        open["tickets"].as_array().unwrap().len(),
+        2,
+        "unapproved and dependency-blocked tickets remain open"
+    );
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}

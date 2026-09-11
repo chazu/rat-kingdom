@@ -204,7 +204,7 @@ mod tests {
     fn notice() -> EscalationNotice {
         EscalationNotice::new(
             "01AAA",
-            "steward-escalation",
+            "landing-escalation",
             Severity::Critical,
             "myrepo",
             "TKT-7",
@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn env_carries_every_notice_field_including_refs() {
         let env = CommandSink::env(&notice());
-        assert_eq!(env["RK_NOTICE_TITLE"], "steward escalation — TKT-7");
+        assert_eq!(env["RK_NOTICE_TITLE"], "landing escalation — TKT-7");
         assert_eq!(
             env["RK_NOTICE_BODY"],
             "needs a human merge decision\n→ rk land myrepo"
@@ -289,7 +289,7 @@ mod tests {
         sink.deliver(&notice()).unwrap();
 
         let got = std::fs::read_to_string(&out).unwrap();
-        assert!(got.contains("argv1=steward escalation — TKT-7"), "{got}");
+        assert!(got.contains("argv1=landing escalation — TKT-7"), "{got}");
         assert!(got.contains("env=critical/rat/x/y"), "{got}");
         assert!(
             got.contains(r#"stdin={"tuple_id":"01AAA""#),

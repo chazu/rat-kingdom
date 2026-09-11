@@ -52,11 +52,6 @@ use tracing::{debug, info, warn};
 pub const REACTOR_INSTANCE: &str = "reactor";
 /// Identity of the durable idempotency marker tuples (system scope).
 const MARKER_IDENTITY: &str = "reactor_fired";
-/// Identity of a steward escalation `need` (steward.cue writes `rk out need
-/// <repo> steward`): the discriminator for the built-in desktop-push reaction.
-/// A rat's own `rk need` carries identity = its agent name, so this never
-/// collides with an ordinary help request.
-const STEWARD_ESCALATION_IDENTITY: &str = "steward";
 /// Identity of the durable "this topic was already coalesced into a ticket"
 /// marker (system scope). Bridges the window between filing and the ticket
 /// landing so a feed-woken re-scan cannot file the same topic twice.
@@ -244,25 +239,25 @@ impl SinkDedup for EscalationDedup<'_> {
     }
 }
 
-/// Describe a steward escalation `need` as a channel-agnostic notice.
+/// Describe a landing escalation `need` as a channel-agnostic notice.
 ///
-/// The class is `steward-escalation`, which is both the config routing key
-/// (`classes = ["steward-escalation"]`) and — rendered as spaced words by
-/// [`EscalationNotice::title`] — the historical popup title "steward escalation
+/// The class is `landing-escalation`, which is both the config routing key
+/// (`classes = ["landing-escalation"]`) and — rendered as spaced words by
+/// [`EscalationNotice::title`] — the historical popup title "landing escalation
 /// — <task>". Severity is `critical`: this is the case where a branch is
 /// finished and blocked on a human.
 ///
 /// Every *other* string field of the need rides along as a structured ref, so a
 /// richer channel than a desktop popup (a chat card, a rat-king reading the
 /// notice) gets the branch/instance/verdict context without this function
-/// needing to know which keys the steward will add next.
-fn steward_escalation_notice(tuple: &Tuple) -> EscalationNotice {
+/// needing to know which keys the landing will add next.
+fn landing_escalation_notice(tuple: &Tuple) -> EscalationNotice {
     const PROMOTED: [&str; 3] = ["task", "text", "action"];
     let field = |key: &str| tuple.payload.get(key).and_then(Value::as_str);
 
     let mut notice = EscalationNotice::new(
         tuple.id.to_string(),
-        "steward-escalation",
+        "landing-escalation",
         Severity::Critical,
         &tuple.scope,
         field("task").unwrap_or("unknown"),
@@ -403,7 +398,7 @@ impl Reactor {
             if tuple.instance == REACTOR_INSTANCE {
                 continue;
             }
-            // Built-in active push: a steward escalation gets a desktop
+            // Built-in active push: a landing escalation gets a desktop
             // notification on top of its `rk inbox` row. Runs before the
             // configured triggers (it is orthogonal to them) and never aborts
             // the cycle — a herdr hiccup must not stall dispatch.
@@ -1595,12 +1590,12 @@ impl Reactor {
 
     /// A fired trigger whose interpolated params carry a `target` other than
     /// `"main"` is about to land wherever that value points instead of the
-    /// conventional default — most commonly a steward chained onto a
+    /// conventional default — most commonly a landing chained onto a
     /// rework/workflow rat's own `--base`, inherited via
     /// `{{tuple.payload.target}}` (see docs/reactor.md, "Land target
     /// inheritance"). That is sometimes exactly the intended rework-chain
     /// ergonomics, but it is otherwise invisible: an operator scanning
-    /// `rk workflow list`/`rk inbox` has no way to tell a completed steward
+    /// `rk workflow list`/`rk inbox` has no way to tell a completed landing
     /// landed on main from one that landed on a feature branch. Emit a
     /// repo-scoped event so it surfaces instead of hiding behind a green run.
     fn note_non_main_land_target(
@@ -1652,7 +1647,7 @@ impl Reactor {
         ));
     }
 
-    /// Built-in reaction: push the operator when the steward escalates. TKT-19
+    /// Built-in reaction: push the operator when the landing escalates. TKT-19
     /// surfaces STOP/unknown verdicts as a `need` that `rk inbox` ranks — a
     /// passive queue. This adds the active push the leverage doc calls for, so
     /// a human is pinged the moment a branch needs a merge decision instead of
@@ -1676,10 +1671,12 @@ impl Reactor {
         if self.sinks.is_empty() {
             return Ok(false);
         }
-        if tuple.category != Category::Need || tuple.identity != STEWARD_ESCALATION_IDENTITY {
+        if tuple.category != Category::Need
+            || !rk_core::landing_names::is_landing_need(&tuple.identity)
+        {
             return Ok(false);
         }
-        let notice = steward_escalation_notice(tuple);
+        let notice = landing_escalation_notice(tuple);
         let deliveries = self.sinks.fan_out(&notice, &EscalationDedup(self));
         let attempted = deliveries
             .iter()
@@ -1691,7 +1688,7 @@ impl Reactor {
                 task = %notice.subject,
                 sinks = attempted,
                 delivered = deliveries.iter().filter(|d| d.outcome.delivered()).count(),
-                "reactor pushed steward escalation notification"
+                "reactor pushed landing escalation notification"
             );
         }
         Ok(attempted > 0)
@@ -2669,7 +2666,7 @@ fn file_stamps(files: &[TriggerFile]) -> Vec<FileStamp> {
 /// | `agent_dismissed`   | `Event` / `agent_dismissed`                                |
 /// | `branch_landed`     | `Event` / `branch_landed`                                  |
 /// | `gate_failed`       | `Artifact` / `gate-failure`                                |
-/// | `escalation_raised` | `Need` / `steward` (the built-in escalation identity)      |
+/// | `escalation_raised` | `Need` / `landing` (the built-in escalation identity)      |
 fn hook_event_for_tuple(tuple: &Tuple) -> Option<&'static str> {
     match (tuple.category, tuple.identity.as_str()) {
         (Category::Event, "agent_spawned") => Some("agent_spawned"),
@@ -2688,7 +2685,7 @@ fn hook_event_for_tuple(tuple: &Tuple) -> Option<&'static str> {
         (Category::Event, "agent_dismissed") => Some("agent_dismissed"),
         (Category::Event, "branch_landed") => Some("branch_landed"),
         (Category::Artifact, "gate-failure") => Some("gate_failed"),
-        (Category::Need, identity) if identity == STEWARD_ESCALATION_IDENTITY => {
+        (Category::Need, identity) if rk_core::landing_names::is_landing_need(identity) => {
             Some("escalation_raised")
         }
         _ => None,

@@ -276,7 +276,7 @@ impl ReworkContext {
     /// Evidence-rich human gate: evidence, decision, blast radius, and command.
     pub(crate) fn escalation(&self, withheld: &Withheld) -> String {
         format!(
-            "steward: REWORK on {branch} for {task} was NOT auto-dispatched ({code}) — branch \
+            "landing: REWORK on {branch} for {task} was NOT auto-dispatched ({code}) — branch \
              held unmerged.\n\
              EVIDENCE: reviewer verdict REWORK at {head_sha}; {detail}. Reviewer notes: {notes}\n\
              DECISION NEEDED: {decision}\n\
