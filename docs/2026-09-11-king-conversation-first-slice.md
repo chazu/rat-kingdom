@@ -18,7 +18,9 @@ dependencies under the ticket mutation lock. Worker RPCs cannot grant that label
 
 The same background loop runs proven delivery repairs and explicitly allowlisted
 conflict correction through `attention.decide`, preserving its journal, lease,
-rate limit and bounded conflict chain. Failed execution is handed to the King;
+rate limit and bounded conflict chain. Held conflicts also recheck current parent
+and correction tickets, then atomically claim the correction. Closed or delivered
+work cannot be restarted by an old hold. Failed execution is handed to the King;
 the timer does not repeatedly execute a recorded failure. Stale ticket ownership
 remains a decision: reopening finished or salvageable work could otherwise
 create an unbounded redispatch cycle. Existing lifecycle sweeps remain owners
@@ -79,3 +81,11 @@ and current-need regressions passed; workspace Clippy with warnings denied and
 format checking passed. Migration was exercised with customized definitions,
 backups, repeated application and a conflicting destination. The human ticket
 trial remains the next acceptance step.
+
+Activation exposed a stale conflict hold for an already delivered ticket. The
+duplicate correction agent was dismissed without landing, and the daemon was
+stopped while the current-ticket guard was added. Regression coverage now checks
+closed and delivered parent/correction tickets; existing correction dispatch,
+lease fencing and replay tests retain their normal open-ticket path.
+The guard passed 22 focused conflict tests and 26 lease/attention integration
+tests, followed by workspace Clippy and format checking.

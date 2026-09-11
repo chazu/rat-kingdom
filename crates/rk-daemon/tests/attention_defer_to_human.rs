@@ -152,6 +152,19 @@ async fn bounded_held_conflict(
 ) {
     let chain_key =
         format!("{repo}\0{branch}\0{head_sha}\0{target}\0conflict-task\0{rework_ticket}");
+    // Production files the correction ticket before it persists this hold.
+    client
+        .call(
+            "space.out",
+            json!({
+                "category": "task",
+                "scope": repo,
+                "identity": rework_ticket,
+                "payload": {"title": "correct the held conflict", "status": "open"},
+            }),
+        )
+        .await
+        .unwrap();
     client
         .call(
             "space.out",

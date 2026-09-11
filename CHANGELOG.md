@@ -7,7 +7,8 @@
 - Dispatch `ready-for-agent` work in the daemon with a positive drain WIP cap,
   preserving whole-backlog drain as a separate opt-in.
 - Run proven delivery repair and allowlisted bounded conflict correction in the
-  background; retain failures and stale ownership as explicit decisions.
+  background; refuse stale closed/delivered correction work, and retain failures
+  and stale ownership as explicit decisions.
 - Wake the King only for new/revised decisions, retain receipts across restart,
   queue while focused, and make automatic conversation replacement opt-in.
 
@@ -18,7 +19,7 @@ All notable changes to rat-kingdom are documented here.
 
 A single release that turns rat-kingdom from an **operator-pull** system (every
 action is an `rk` command you type) into a **self-driving** one: a daemon reactor
-watches the tuplespace and dispatches work, a landing reviews and merges
+watches the tuplespace and dispatches work, the landing pipeline reviews and merges
 completed branches unattended, and an autoscaler keeps the backlog draining
 itself — all behind guardrails that make leaving the fleet running safe.
 

@@ -287,6 +287,19 @@ async fn hold_conflict_marker_only(
     target: &str,
     rework_ticket: &str,
 ) {
+    // Production files the correction ticket before it persists this hold.
+    client
+        .call(
+            "space.out",
+            json!({
+                "category": "task",
+                "scope": repo,
+                "identity": rework_ticket,
+                "payload": {"title": "correct the held conflict", "status": "open"},
+            }),
+        )
+        .await
+        .unwrap();
     client
         .call(
             "space.out",

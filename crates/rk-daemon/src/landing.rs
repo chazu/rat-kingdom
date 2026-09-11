@@ -5889,6 +5889,26 @@ impl LandingPipeline {
             }
         }
 
+        // A held marker is historical evidence, not a current dispatch grant.
+        // The operator may have delivered or abandoned the work through a
+        // different branch while this marker remained awaiting a decision.
+        for task in [&ctx.task, &ctx.rework_ticket] {
+            if let Some(ticket) = self.tickets.get(task)? {
+                if ticket.scope != ctx.repo {
+                    return Err(rk_core::Error::other("conflict ticket changed repository"));
+                }
+                if ticket.payload["status"] == "closed"
+                    || crate::tickets::delivery_of(&ticket).is_some()
+                {
+                    return Ok(format!("conflict-correction chain for {repo}/{branch} no longer needs correction: ticket {task} is delivered or closed"));
+                }
+            } else if task == &ctx.rework_ticket {
+                return Err(rk_core::Error::other(
+                    "conflict correction ticket no longer exists",
+                ));
+            }
+        }
+
         let git_repo = {
             let repo_path = PathBuf::from(&ctx.repo_path);
             blocking(move || rk_git::Repo::discover(&repo_path)).await?
@@ -5914,6 +5934,15 @@ impl LandingPipeline {
             };
             self.withhold_conflict(&entry, &ctx, attempt, round, &withheld)?;
             return Err(rk_core::Error::other(withheld.detail));
+        }
+
+        // Atomically refuse a closed or concurrently claimed correction even
+        // if it changed after the context and branch checks above.
+        if !self.tickets.claim(&ctx.rework_ticket).await? {
+            return Err(rk_core::Error::other(format!(
+                "conflict correction ticket {} is no longer open for dispatch",
+                ctx.rework_ticket
+            )));
         }
 
         // Marker first: replay gates an interrupted spawn instead of duplicating it.
@@ -10894,6 +10923,74 @@ workflow: {
             diff_class: "large".into(),
             task: "add src".into(),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_recovery_never_redispatches_a_closed_or_delivered_ticket() {
+        for (close_parent, delivered) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let home = tempfile::tempdir().unwrap();
+            let (repo_dir, head_sha, main_before) = conflicting_repo();
+            let space = Space::open_in_memory().unwrap();
+            let pipeline = test_pipeline(home.path(), space.clone());
+            let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
+            pipeline.enqueue(entry.clone()).unwrap();
+            let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+            let LandingOutcome::ReworkFiled(ticket) = &outcomes[0] else {
+                panic!("expected a held correction");
+            };
+            if close_parent {
+                space
+                    .out(Tuple::new(
+                        Category::Task,
+                        "code-repo",
+                        &entry.task,
+                        "operator",
+                        json!({"title": "delivered elsewhere", "status": "closed"}),
+                    ))
+                    .unwrap();
+            } else {
+                pipeline
+                    .tickets
+                    .set_status(&ticket.identity, "closed")
+                    .await
+                    .unwrap();
+            }
+            if delivered {
+                let id = if close_parent {
+                    &entry.task
+                } else {
+                    &ticket.identity
+                };
+                pipeline
+                    .tickets
+                    .record_delivery(
+                        id,
+                        &crate::tickets::DeliveryRecord {
+                            merge_commit: main_before.clone(),
+                            branch: "delivered-elsewhere".into(),
+                            target: "main".into(),
+                            landed_at: String::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                // Delivery evidence also wins over a stale open status.
+                pipeline.tickets.reopen(id, "open").await.unwrap();
+            }
+            let chain_key = only_conflict_chain_key(&space);
+            for _ in 0..2 {
+                let result = pipeline
+                    .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
+                    .await
+                    .unwrap();
+                assert!(result.contains("no longer needs correction"), "{result}");
+            }
+            assert!(tuples(&space, Category::Event, "agent_spawned").is_empty());
+            assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+            assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
         }
     }
 
