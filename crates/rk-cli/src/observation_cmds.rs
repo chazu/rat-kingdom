@@ -20,12 +20,13 @@ mod store;
 use store::ObservationLog;
 
 const SCHEMA_VERSION: u32 = 1;
+const PROGRESS_EVALUATOR_VERSION: u32 = 2;
 const MANIFEST: &str = "manifest.json";
 const SAMPLES: &str = "samples.jsonl";
 const INTERVENTIONS: &str = "interventions";
 const REPORT: &str = "report.json";
 const CONTRACT_SCHEMA_VERSION: u32 = 1;
-const QUALIFICATION_EVALUATOR_VERSION: u32 = 1;
+const QUALIFICATION_EVALUATOR_VERSION: u32 = 2;
 const CONTRACT: &str = "contract.json";
 const EXERCISES: &str = "exercises";
 const QUALIFICATION: &str = "qualification.json";
@@ -34,7 +35,7 @@ const DEFAULT_MIN_CONTINUATION_SAMPLES: u64 = 1;
 #[derive(Subcommand)]
 pub enum ObservationCommand {
     /// Create a run, sample until its duration elapses or Ctrl-C, then report.
-    Start(StartArgs),
+    Start(Box<StartArgs>),
     /// Append one read-only sample to an existing run.
     Sample(RunPathArgs),
     /// Resume collection using the original immutable scope and thresholds.
@@ -82,6 +83,16 @@ pub struct StartArgs {
     max_landing_age: String,
     #[arg(long, default_value = "15m")]
     max_ready_age: String,
+    /// Bound on a live generation's progress signature staying unchanged
+    /// before it is independently counted as stalled, regardless of what the
+    /// daemon's own supervisor sweep reports (D1).
+    #[arg(long, default_value = "15m")]
+    progress_stall_after: String,
+    /// Grace period for a bounded wait (a self-declared verification/queue/
+    /// gate phase) before it too counts as stalled. An expired wait cannot
+    /// keep the run healthy.
+    #[arg(long, default_value = "30m")]
+    max_wait: String,
     #[arg(long)]
     max_cost_usd: Option<f64>,
     #[arg(long, default_value_t = 0)]
@@ -201,6 +212,21 @@ struct Thresholds {
     max_duplicate_dispatches: u64,
     max_duplicate_landings: u64,
     max_unclassified_holds: u64,
+    /// See [`StartArgs::progress_stall_after`]. Historical manifests predate
+    /// this field; they fall back to the same 15m default the CLI freezes for
+    /// a new run rather than failing to load.
+    #[serde(default = "default_progress_stall_after_secs")]
+    progress_stall_after_secs: u64,
+    /// See [`StartArgs::max_wait`].
+    #[serde(default = "default_max_wait_secs")]
+    max_wait_secs: u64,
+}
+
+fn default_progress_stall_after_secs() -> u64 {
+    15 * 60
+}
+fn default_max_wait_secs() -> u64 {
+    30 * 60
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -220,6 +246,24 @@ struct SampleMetrics {
     stalled: u64,
     unclassified_holds: u64,
     duplicate_dispatches: u64,
+    /// Tickets with a live (spawning/running) generation whose independently
+    /// derived progress signature (D1) has not changed within the configured
+    /// bound, and whose bounded-wait allowance (if any) has expired. Computed
+    /// from raw per-generation evidence, never from the daemon's own stuck
+    /// sweep or `stalled` bucket above — a failed supervisor sweep must not
+    /// make this read healthy.
+    #[serde(default)]
+    progress_stalled_tickets: u64,
+    /// Tickets with a live generation whose progress evidence is missing or
+    /// ambiguous (e.g. no generation identity), so a reading cannot be made
+    /// either way. Insufficient evidence is a visible coverage gap, not a
+    /// silent pass.
+    #[serde(default)]
+    progress_unresolved_tickets: u64,
+    /// Cumulative distinct stall episodes across all observed attempts,
+    /// including tickets no longer live. Repair never erases an incident.
+    #[serde(default)]
+    progress_stall_episodes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +358,22 @@ struct Report {
     duplicate_landings: u64,
     max_stale_tickets: u64,
     max_unclassified_holds: u64,
+    /// D1's independently derived stall count: live generations whose own
+    /// progress evidence (not the daemon's stuck sweep) has not changed
+    /// within the configured bound. Retained by maximum, so a stall that
+    /// later resolves still fails the run (D1 point 4).
+    #[serde(default)]
+    max_progress_stalled_tickets: u64,
+    /// Live generations whose progress evidence was missing or ambiguous in
+    /// at least one sample — an explicit coverage gap, never folded into a
+    /// passing result by omission.
+    #[serde(default)]
+    max_progress_unresolved_tickets: u64,
+    /// Cumulative distinct progress-stall episodes observed for the cohort,
+    /// including recurrence on the same ticket after an earlier resolution.
+    #[serde(default)]
+    progress_stall_episodes: u64,
+    progress_episodes: Vec<ProgressEpisode>,
     interventions: BTreeMap<String, u64>,
     checks: BTreeMap<String, Check>,
     passed: bool,
@@ -357,10 +417,10 @@ struct DurationRequirement {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LivenessRequirement {
-    /// Consumes D1's stall/hold evidence once landed; until then this bounds
-    /// the interim proxy signals the collector already retains.
     max_stale_tickets: u64,
     max_unclassified_holds: u64,
+    /// Bounds `progress_stalled_tickets` onsets — D1's independently derived
+    /// stall evidence, never the daemon's own stuck-sweep classification.
     max_stall_incidents: u64,
 }
 
@@ -452,7 +512,7 @@ struct QualificationResult {
 
 pub async fn run(layout: &Layout, command: ObservationCommand, as_json: bool) -> Result<()> {
     match command {
-        ObservationCommand::Start(args) => start(layout, args, as_json).await,
+        ObservationCommand::Start(args) => start(layout, *args, as_json).await,
         ObservationCommand::Sample(args) => {
             let sample = append_sample(layout, &args.run).await?;
             print_value(&serde_json::to_value(sample)?, as_json)
@@ -508,6 +568,12 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
             max_duplicate_dispatches: 0,
             max_duplicate_landings: 0,
             max_unclassified_holds: 0,
+            progress_stall_after_secs: positive_duration(
+                &args.progress_stall_after,
+                "--progress-stall-after",
+            )?
+            .as_secs(),
+            max_wait_secs: positive_duration(&args.max_wait, "--max-wait")?.as_secs(),
         },
         observer_build: rk_core::version::BUILD_VERSION.to_string(),
     };
@@ -809,9 +875,12 @@ async fn collect_sample(
             .events
             .sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     }
-    sample.metrics = derive_metrics_with_ready_age(&sample, manifest, |ticket| {
-        log.ready_age(ticket, sample.observed_at)
-    });
+    sample.metrics = derive_metrics_with_ready_age(
+        &sample,
+        manifest,
+        |ticket| log.ready_age(ticket, sample.observed_at),
+        log.progress_metrics(&sample),
+    );
     sample.sampling.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     sample.sampling.rpc_timeouts = client.timeouts;
     sample.sampling.deadline_exceeded = client.deadline_exceeded;
@@ -899,10 +968,339 @@ async fn call(
     }
 }
 
+/// Independent, deterministic outcome of comparing one live generation's
+/// progress evidence against its own prior sample (D1). Never derived from
+/// the daemon's own stuck sweep or `work.current` `stalled` bucket — those
+/// are the alarm this evaluator must keep working without.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressReading {
+    /// The signature changed, or this is a fresh generation with no clock to
+    /// compare against yet.
+    Progressing,
+    /// A self-declared bounded wait (see [`progress_is_waiting`]) still
+    /// within its allowance.
+    Waiting,
+    /// Unchanged signature past the configured bound, including an expired
+    /// bounded-wait allowance. Independent of `AgentState`/`work.current`.
+    Stalled,
+    /// The generation is live but carries no usable generation identity, so
+    /// no reading can be made. Insufficient evidence is a visible coverage
+    /// gap, never a silent pass.
+    Unresolved,
+}
+
+/// Per-attempt progress clocks are disposable cache state reconstructed from
+/// immutable samples. Distinct concurrent generations never share a clock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProgressState {
+    ticket: String,
+    spawn: Option<String>,
+    session: Option<String>,
+    attempt: Option<String>,
+    signature: String,
+    changed_at: DateTime<Utc>,
+    last_observed: DateTime<Utc>,
+    wait_started_at: Option<DateTime<Utc>>,
+    stalled_since: Option<DateTime<Utc>>,
+    episodes: u64,
+    history: Vec<ProgressEpisode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProgressEpisode {
+    ticket: String,
+    spawn: Option<String>,
+    session: Option<String>,
+    attempt: Option<String>,
+    started_at: DateTime<Utc>,
+    resolved_at: Option<DateTime<Utc>>,
+    resolution: Option<String>,
+}
+
+#[derive(Default)]
+struct ProgressMetrics {
+    stalled: u64,
+    unresolved: u64,
+    episodes: u64,
+}
+
+fn progress_key(agent: &Value) -> String {
+    json!([
+        agent["task"],
+        agent["spawn"],
+        agent["session_id"],
+        agent["liveness"]["session"]
+    ])
+    .to_string()
+}
+
+/// The content of a checkpoint, not a repeated `rk progress` call's revision,
+/// is evidence. Generic timestamps and retry counters never advance the clock.
+fn progress_signature(agent: &Value) -> Option<String> {
+    if agent["spawn"].as_str()?.is_empty() {
+        return None;
+    }
+    if agent["state"] == "running"
+        && agent["liveness"]["output_fingerprint"].as_u64().is_none()
+        && agent["progress"]["summary"].as_str().is_none()
+    {
+        return None;
+    }
+    Some(
+        json!([
+            agent["progress"]["summary"],
+            agent["progress"]["next"],
+            agent["progress"]["status"],
+            agent["liveness"]["output_fingerprint"],
+            agent["state"],
+            agent["result"],
+        ])
+        .to_string(),
+    )
+}
+
+fn progress_is_waiting(agent: &Value) -> bool {
+    agent["progress"]["status"].as_str().is_some_and(|status| {
+        matches!(
+            status.to_ascii_lowercase().split([':', ' ']).next(),
+            Some("verifying" | "queued" | "awaiting-review" | "human-gate" | "recovery-backoff")
+        )
+    })
+}
+
+fn resolve_progress_episode(state: &mut ProgressState, now: DateTime<Utc>, reason: &str) {
+    if state.stalled_since.take().is_some() {
+        if let Some(episode) = state.history.last_mut() {
+            episode.resolved_at = Some(now);
+            episode.resolution = Some(reason.into());
+        }
+    }
+}
+
+fn advance_progress_state(
+    previous: Option<&ProgressState>,
+    agent: &Value,
+    now: DateTime<Utc>,
+    thresholds: &Thresholds,
+    queued_since: Option<DateTime<Utc>>,
+) -> (ProgressReading, ProgressState) {
+    let spawn = agent["spawn"].as_str().map(str::to_string);
+    let session = agent["session_id"].as_str().map(str::to_string);
+    let attempt = agent["liveness"]["session"].as_str().map(str::to_string);
+    let signature = progress_signature(agent).or_else(|| {
+        // A queue row bound to this generation supplies evidence even if the
+        // worker itself has never emitted a checkpoint or output fingerprint.
+        queued_since
+            .filter(|_| agent["spawn"].as_str().is_some_and(|s| !s.is_empty()))
+            .map(|_| json!([agent["spawn"], agent["state"]]).to_string())
+    });
+    let replaced =
+        previous.is_none_or(|s| s.spawn != spawn || s.session != session || s.attempt != attempt);
+    let mut state = if replaced {
+        ProgressState {
+            ticket: agent["task"].as_str().unwrap_or("").into(),
+            spawn,
+            session,
+            attempt,
+            signature: signature.clone().unwrap_or_default(),
+            changed_at: now,
+            last_observed: now,
+            wait_started_at: None,
+            stalled_since: None,
+            episodes: 0,
+            history: Vec::new(),
+        }
+    } else {
+        previous.expect("same attempt has a prior state").clone()
+    };
+    // Clock reversal and missing evidence cannot erase a prior silence clock.
+    if now < state.last_observed || signature.is_none() {
+        return (ProgressReading::Unresolved, state);
+    }
+    state.last_observed = now;
+    let signature = signature.unwrap();
+    let reconnecting = agent["liveness"]["reconnect_events"].as_u64().unwrap_or(0) > 0;
+    if !reconnecting && state.signature != signature {
+        state.signature = signature;
+        state.changed_at = now;
+    }
+    let waiting = queued_since.is_some() || progress_is_waiting(agent);
+    if waiting {
+        let since = queued_since.unwrap_or(now);
+        let previous = state.wait_started_at.get_or_insert(since);
+        *previous = (*previous).min(since);
+    } else {
+        state.wait_started_at = None;
+    }
+    // A continuing wait has its own fixed deadline; repeated status/checkpoint
+    // updates cannot renew it. A missing sample never resets either clock.
+    let (since, bound_secs) = if let Some(since) = state.wait_started_at {
+        (since, thresholds.max_wait_secs)
+    } else {
+        (state.changed_at, thresholds.progress_stall_after_secs)
+    };
+    let silence = now
+        .signed_duration_since(since)
+        .to_std()
+        .unwrap_or_default();
+    let expired = silence > Duration::from_secs(bound_secs);
+    if !expired {
+        resolve_progress_episode(&mut state, now, "progress");
+    }
+    let reading = if expired {
+        if state.stalled_since.is_none() {
+            state.stalled_since = Some(now);
+            state.episodes = state.episodes.saturating_add(1);
+            state.history.push(ProgressEpisode {
+                ticket: state.ticket.clone(),
+                spawn: state.spawn.clone(),
+                session: state.session.clone(),
+                attempt: state.attempt.clone(),
+                started_at: now,
+                resolved_at: None,
+                resolution: None,
+            });
+        }
+        ProgressReading::Stalled
+    } else if waiting {
+        ProgressReading::Waiting
+    } else {
+        ProgressReading::Progressing
+    };
+    (reading, state)
+}
+
+/// Join only this repository's queued task. A recorded source generation is
+/// a fence; for older unbound entries, do not excuse a worker created after the
+/// queue phase began. Use the durable phase age, including time before this run.
+fn landing_wait_since(sample: &Sample, agent: &Value) -> Option<DateTime<Utc>> {
+    let rows = sample.status.as_ref()?["landing_queue_tasks"].as_array()?;
+    rows.iter()
+        .filter_map(|row| {
+            if row["status"] != "queued" || row["repo"].as_str()? != agent["repo_name"].as_str()? {
+                return None;
+            }
+            let raw_task = row["task"].as_str()?;
+            let task = sample
+                .tickets
+                .iter()
+                .find(|ticket| ticket["alias"].as_str() == Some(raw_task))
+                .and_then(|ticket| ticket["identity"].as_str())
+                .unwrap_or(raw_task);
+            if Some(task) != agent["task"].as_str() {
+                return None;
+            }
+            let age = row["phase_age_secs"].as_u64()?;
+            let since = sample
+                .observed_at
+                .checked_sub_signed(chrono::Duration::try_seconds(i64::try_from(age).ok()?)?)?;
+            if let Some(spawn) = row["source_spawn"].as_str() {
+                if Some(spawn) != agent["spawn"].as_str() {
+                    return None;
+                }
+            } else if parse_time(&agent["created_at"]).is_none_or(|created| created > since) {
+                return None;
+            }
+            Some(since)
+        })
+        .min()
+}
+
+/// Shared by live collection, checkpoint reconstruction and report replay.
+/// Cumulative episodes include delivered/replaced generations, not only the
+/// agents that happen to remain live in this sample.
+fn advance_sample_progress(
+    states: &mut BTreeMap<String, ProgressState>,
+    sample: &Sample,
+    thresholds: &Thresholds,
+) -> ProgressMetrics {
+    let mut stalled = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut live_by_ticket: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for raw_agent in &sample.agents {
+        let mut agent = raw_agent.clone();
+        if let Some(ticket) = sample
+            .tickets
+            .iter()
+            .find(|t| t["alias"].is_string() && t["alias"] == agent["task"])
+        {
+            agent["task"] = ticket["identity"].clone();
+        }
+        let key = progress_key(&agent);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let live = matches!(agent["state"].as_str(), Some("spawning" | "running"));
+        if !live {
+            if let Some(state) = states.get_mut(&key) {
+                resolve_progress_episode(state, sample.observed_at, "left-live-state");
+            }
+            continue;
+        }
+        let Some(ticket) = agent["task"].as_str().filter(|t| !t.is_empty()) else {
+            unresolved.insert(key);
+            continue;
+        };
+        live_by_ticket
+            .entry(ticket.into())
+            .or_default()
+            .insert(key.clone());
+        let (reading, state) = advance_progress_state(
+            states.get(&key),
+            &agent,
+            sample.observed_at,
+            thresholds,
+            landing_wait_since(sample, &agent),
+        );
+        match reading {
+            ProgressReading::Stalled => {
+                stalled.insert(ticket.to_string());
+            }
+            ProgressReading::Unresolved => {
+                unresolved.insert(ticket.to_string());
+            }
+            _ => {}
+        }
+        states.insert(key, state);
+    }
+    for (key, state) in states.iter_mut() {
+        if live_by_ticket
+            .get(&state.ticket)
+            .is_some_and(|keys| !keys.contains(key))
+        {
+            resolve_progress_episode(state, sample.observed_at, "replaced");
+        }
+    }
+    ProgressMetrics {
+        stalled: stalled.len() as u64,
+        unresolved: unresolved.len() as u64,
+        episodes: states.values().map(|s| s.episodes).sum(),
+    }
+}
+
+fn replay_progress(samples: &mut [Sample], thresholds: &Thresholds) -> Vec<ProgressEpisode> {
+    let mut states = BTreeMap::new();
+    for sample in samples {
+        let progress = advance_sample_progress(&mut states, sample, thresholds);
+        sample.metrics.progress_stalled_tickets = progress.stalled;
+        sample.metrics.progress_unresolved_tickets = progress.unresolved;
+        sample.metrics.progress_stall_episodes = progress.episodes;
+    }
+    let mut episodes: Vec<_> = states.into_values().flat_map(|s| s.history).collect();
+    episodes.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then(a.ticket.cmp(&b.ticket))
+    });
+    episodes
+}
+
 fn derive_metrics_with_ready_age(
     sample: &Sample,
     manifest: &Manifest,
     ready_age: impl Fn(&str) -> u64,
+    progress: ProgressMetrics,
 ) -> SampleMetrics {
     let mut live_tasks: BTreeSet<String> = sample
         .agents
@@ -1012,6 +1410,9 @@ fn derive_metrics_with_ready_age(
         }
     }
     metrics.duplicate_dispatches = live_by_task.values().filter(|&&count| count > 1).count() as u64;
+    metrics.progress_stalled_tickets = progress.stalled;
+    metrics.progress_unresolved_tickets = progress.unresolved;
+    metrics.progress_stall_episodes = progress.episodes;
     metrics
 }
 
@@ -1028,9 +1429,17 @@ fn ready_ticket_ids(sample: &Sample) -> BTreeSet<String> {
 
 #[cfg(test)]
 fn derive_sample_metrics(sample: &Sample, manifest: &Manifest, prior: &[Sample]) -> SampleMetrics {
-    derive_metrics_with_ready_age(sample, manifest, |ticket| {
-        continuous_ready_age_secs(sample, prior, ticket)
-    })
+    let mut states = BTreeMap::new();
+    for previous in prior {
+        advance_sample_progress(&mut states, previous, &manifest.thresholds);
+    }
+    let progress = advance_sample_progress(&mut states, sample, &manifest.thresholds);
+    derive_metrics_with_ready_age(
+        sample,
+        manifest,
+        |ticket| continuous_ready_age_secs(sample, prior, ticket),
+        progress,
+    )
 }
 
 #[cfg(test)]
@@ -1147,7 +1556,8 @@ fn qualify(args: QualifyArgs, as_json: bool) -> Result<()> {
 
 fn derive_report(run_dir: &Path) -> Result<Report> {
     let manifest = load_manifest(run_dir)?;
-    let samples = load_samples(run_dir)?;
+    let mut samples = load_samples(run_dir)?;
+    let progress_episodes = replay_progress(&mut samples, &manifest.thresholds);
     if samples.is_empty() {
         bail!("{} contains no samples", run_dir.display());
     }
@@ -1196,6 +1606,13 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
     let max_reconcile_violations = max_metric(&samples, |m| m.reconcile_violations);
     let max_stale_tickets = max_metric(&samples, |m| m.stale_tickets);
     let max_unclassified_holds = max_metric(&samples, |m| m.unclassified_holds);
+    let max_progress_stalled_tickets = max_metric(&samples, |m| m.progress_stalled_tickets);
+    let max_progress_unresolved_tickets = max_metric(&samples, |m| m.progress_unresolved_tickets);
+    // Retained by maximum, not the final sample: a ticket that stalled and
+    // was later delivered drops out of the live cohort a later sample can
+    // even see, but the episode it recorded while live must not disappear
+    // from the run's evidence (D1 point 4).
+    let progress_stall_episodes = max_metric(&samples, |m| m.progress_stall_episodes);
     let duplicate_dispatches = max_metric(&samples, |m| m.duplicate_dispatches)
         .max(overlapping_dispatches(&samples, ended_at));
     let events = unique_events(&samples);
@@ -1296,6 +1713,20 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         max_unclassified_holds,
         manifest.thresholds.max_unclassified_holds,
     );
+    // Independent of the two checks above: a live generation the daemon
+    // still calls "running" can still fail here (D1's counterexample).
+    check(
+        &mut checks,
+        "progress-stalled-tickets",
+        max_progress_stalled_tickets,
+        0,
+    );
+    check(
+        &mut checks,
+        "progress-evidence-gaps",
+        max_progress_unresolved_tickets,
+        0,
+    );
     if let Some(limit) = manifest.thresholds.max_cost_usd {
         checks.insert(
             "attributed-cost-usd".into(),
@@ -1354,6 +1785,10 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         duplicate_landings,
         max_stale_tickets,
         max_unclassified_holds,
+        max_progress_stalled_tickets,
+        max_progress_unresolved_tickets,
+        progress_stall_episodes,
+        progress_episodes,
         interventions: intervention_counts,
         checks,
         passed,
@@ -1386,7 +1821,8 @@ fn derive_qualification(run_dir: &Path) -> Result<QualificationResult> {
     })?;
     let contract = &frozen.contract;
     let manifest = load_manifest(run_dir)?;
-    let samples = load_samples(run_dir)?;
+    let mut samples = load_samples(run_dir)?;
+    replay_progress(&mut samples, &manifest.thresholds);
     let report = derive_report(run_dir)?;
     let interventions = load_interventions(run_dir)?;
     let exercises = load_exercises(run_dir)?;
@@ -1454,17 +1890,26 @@ fn derive_qualification(run_dir: &Path) -> Result<QualificationResult> {
             report.max_unclassified_holds, contract.liveness.max_unclassified_holds
         ),
     );
-    let stall_incidents = transitions(
-        samples
-            .iter()
-            .map(|sample| sample.metrics.unclassified_holds > 0),
-    );
+    // D1's typed, independent stall evidence: a live generation's own
+    // progress signature, never the daemon's `work.current` `stalled`
+    // bucket — see `progress_signature`/`advance_progress_state`. A failed
+    // supervisor sweep leaves `unclassified_holds` at zero but cannot hide a
+    // stall from this.
+    let stall_incidents = report.progress_stall_episodes;
     require(
         "liveness/stall-incidents",
         stall_incidents <= contract.liveness.max_stall_incidents,
         format!(
-            "{stall_incidents} stall onset(s) against a limit of {} (interim proxy pending D1's typed stall evidence)",
+            "{stall_incidents} independently-derived stall onset(s) against a limit of {}",
             contract.liveness.max_stall_incidents
+        ),
+    );
+    require(
+        "liveness/progress-evidence-gaps",
+        report.max_progress_unresolved_tickets == 0,
+        format!(
+            "{} live generation(s) had progress evidence too ambiguous to judge; insufficient evidence cannot qualify by omission",
+            report.max_progress_unresolved_tickets
         ),
     );
 
@@ -2056,10 +2501,12 @@ fn ticket_is_nonterminal(ticket: &Value) -> bool {
 fn compact_agent(agent: Value) -> Value {
     json!({
         "spawn": agent["spawn"],
+        "session_id": agent["session_id"],
         "name": agent["name"],
         "repo_name": agent["repo_name"],
         "task": agent["task"],
         "state": agent["state"],
+        "result": agent["result"],
         "created_at": agent["created_at"],
         "updated_at": agent["updated_at"],
         "archived_at": agent["archived_at"],
@@ -2068,6 +2515,9 @@ fn compact_agent(agent: Value) -> Value {
         "model": agent["model"],
         "harness": agent["harness"],
         "liveness": agent["liveness"],
+        // Retain structured checkpoint content. A revision or timestamp
+        // changing by itself does not advance the independent progress clock.
+        "progress": agent["progress"],
         "workflow_instance": agent["workflow_instance"],
     })
 }
@@ -2089,6 +2539,8 @@ fn load_manifest(run_dir: &Path) -> Result<Manifest> {
     if manifest.interval_secs == 0
         || manifest.rpc_timeout_secs == 0
         || manifest.sample_timeout_secs == 0
+        || manifest.thresholds.progress_stall_after_secs == 0
+        || manifest.thresholds.max_wait_secs == 0
     {
         bail!("observation interval and deadlines must be greater than zero");
     }
@@ -2654,6 +3106,8 @@ mod tests {
                 max_duplicate_dispatches: 0,
                 max_duplicate_landings: 0,
                 max_unclassified_holds: 0,
+                progress_stall_after_secs: 900,
+                max_wait_secs: 1800,
             },
             observer_build: "test".into(),
         };
@@ -2860,6 +3314,424 @@ mod tests {
         assert_eq!(
             derive_sample_metrics(&value, &manifest, &[]).stale_tickets,
             0
+        );
+    }
+
+    /// The exact counterexample recorded against TKT-humih-nusok-lozus / D1:
+    /// a fixture with a stale running agent (1h-old progress evidence, 1s
+    /// stall bound) produced zero stale tickets and would have passed a
+    /// derived report even with an ad-hoc intervention recorded, because a
+    /// failed supervisor sweep left the daemon calling the generation
+    /// `running` with nothing to independently contradict it.
+    fn stalled_agent_fixture() -> Value {
+        json!({
+            "spawn": "S1",
+            "session_id": "SESSION-1",
+            "task": "TKT-1",
+            "state": "running",
+            "progress": {"revision": 3, "status": "implementing", "next": null, "updated_at": "2026-09-02T00:00:00Z"},
+            "liveness": {"output_fingerprint": 42},
+        })
+    }
+
+    #[test]
+    fn queued_admission_uses_durable_age_and_survives_progress_replay() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 60;
+        let mut first = sample(1, "2026-09-02T00:01:00Z");
+        let mut agent = stalled_agent_fixture();
+        agent["repo_name"] = json!("repo");
+        agent["created_at"] = json!("2026-09-02T00:00:00Z");
+        first.agents = vec![agent];
+        first.tickets = vec![json!({"identity":"TKT-1","alias":"TKT-alias"})];
+        first.status = Some(json!({"landing_queue_tasks":[{
+            "repo":"repo", "task":"TKT-alias", "source_spawn":"S1",
+            "status":"queued", "phase_age_secs":30
+        }]}));
+        let mut states = BTreeMap::new();
+        assert_eq!(
+            advance_sample_progress(&mut states, &first, &manifest.thresholds).stalled,
+            0
+        );
+        let mut second = first.clone();
+        second.observed_at += chrono::Duration::seconds(31);
+        second.status.as_mut().unwrap()["landing_queue_tasks"][0]["phase_age_secs"] = json!(61);
+        // Content chatter cannot extend an authoritative queue phase.
+        second.agents[0]["progress"]["summary"] = json!("still queued");
+        assert_eq!(
+            advance_sample_progress(&mut states, &second, &manifest.thresholds).stalled,
+            1
+        );
+        let mut samples = vec![first.clone(), second.clone()];
+        assert_eq!(replay_progress(&mut samples, &manifest.thresholds).len(), 1);
+        assert_eq!(samples[1].metrics.progress_stalled_tickets, 1);
+        // Starting observation after the wait expired is already a stall.
+        assert_eq!(
+            advance_sample_progress(&mut BTreeMap::new(), &second, &manifest.thresholds).stalled,
+            1
+        );
+        let mut missing = first;
+        missing.agents[0]["progress"] = Value::Null;
+        missing.agents[0]["liveness"] = Value::Null;
+        let metrics = advance_sample_progress(&mut BTreeMap::new(), &missing, &manifest.thresholds);
+        assert_eq!(
+            metrics.unresolved, 0,
+            "bound queue identity supplies evidence"
+        );
+    }
+
+    #[test]
+    fn queued_admission_never_excuses_another_repo_generation_or_completed_phase() {
+        let mut sample = sample(1, "2026-09-02T00:01:00Z");
+        let mut agent = stalled_agent_fixture();
+        agent["repo_name"] = json!("repo");
+        agent["created_at"] = json!("2026-09-02T00:00:00Z");
+        let good = json!({"repo":"repo", "task":"TKT-1", "source_spawn":"S1",
+            "status":"queued", "phase_age_secs":30});
+        sample.status = Some(json!({"landing_queue_tasks":[good.clone()]}));
+        assert!(landing_wait_since(&sample, &agent).is_some());
+        for (field, value) in [
+            ("repo", json!("other")),
+            ("task", json!("TKT-2")),
+            ("source_spawn", json!("old-generation")),
+            ("status", json!("running_gates")),
+            ("phase_age_secs", json!(-1)),
+            ("phase_age_secs", json!(u64::MAX)),
+        ] {
+            let mut row = good.clone();
+            row[field] = value;
+            sample.status = Some(json!({"landing_queue_tasks":[row]}));
+            assert!(landing_wait_since(&sample, &agent).is_none(), "bad {field}");
+        }
+        let mut legacy = good;
+        legacy["source_spawn"] = Value::Null;
+        sample.status = Some(json!({"landing_queue_tasks":[legacy]}));
+        assert!(landing_wait_since(&sample, &agent).is_some());
+        agent["created_at"] = json!("2026-09-02T00:00:59Z");
+        assert!(landing_wait_since(&sample, &agent).is_none());
+    }
+
+    #[test]
+    fn stale_running_agent_is_independently_flagged_even_though_the_daemon_calls_it_live() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        let agent = stalled_agent_fixture();
+        let ticket = json!({
+            "identity": "TKT-1",
+            "created_at": "2026-09-01T00:00:00Z",
+            "payload": {
+                "status": "in_progress",
+                "updated_at": "2026-09-02T00:00:00Z",
+                "delivery": null,
+            },
+        });
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        first.agents = vec![agent.clone()];
+        first.tickets = vec![ticket.clone()];
+        let metrics_first = derive_sample_metrics(&first, &manifest, &[]);
+        assert_eq!(
+            metrics_first.progress_stalled_tickets, 0,
+            "a fresh generation must not inherit an immediate stall"
+        );
+
+        let mut second = sample(2, "2026-09-02T01:00:00Z");
+        second.agents = vec![agent];
+        second.tickets = vec![ticket];
+
+        // The daemon's own classification still calls this healthy: a live
+        // agent excludes the ticket from ownerless staleness exactly as in
+        // `ownerless_active_status_uses_last_ticket_update_for_staleness`.
+        let metrics_second =
+            derive_sample_metrics(&second, &manifest, std::slice::from_ref(&first));
+        assert_eq!(metrics_second.stale_tickets, 0);
+        // But an hour of byte-identical progress evidence against a
+        // 1-second bound is independently a stall.
+        assert_eq!(metrics_second.progress_stalled_tickets, 1);
+        assert_eq!(metrics_second.progress_unresolved_tickets, 0);
+        assert_eq!(metrics_second.progress_stall_episodes, 1);
+    }
+
+    #[test]
+    fn a_replacement_generation_does_not_inherit_a_predecessors_stall() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        let mut stalled = stalled_agent_fixture();
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        first.agents = vec![stalled.clone()];
+        let mut second = sample(2, "2026-09-02T01:00:00Z");
+        second.agents = vec![stalled.clone()];
+        assert_eq!(
+            derive_sample_metrics(&second, &manifest, std::slice::from_ref(&first))
+                .progress_stalled_tickets,
+            1
+        );
+
+        // A resume/replacement mints a new generation identity. It must
+        // start clean, not inherit the predecessor's silence clock.
+        stalled["spawn"] = json!("S2");
+        stalled["progress"]["revision"] = json!(0);
+        let mut third = sample(3, "2026-09-02T01:00:01Z");
+        third.agents = vec![stalled];
+        let metrics_third =
+            derive_sample_metrics(&third, &manifest, &[first.clone(), second.clone()]);
+        assert_eq!(
+            metrics_third.progress_stalled_tickets, 0,
+            "a replacement generation must not inherit a predecessor's proof of progress"
+        );
+    }
+
+    #[test]
+    fn a_declared_verification_wait_is_exempt_until_its_own_deadline_expires() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 3600;
+        let mut waiting = stalled_agent_fixture();
+        waiting["progress"]["status"] = json!("verifying: cargo test --workspace");
+        let first = {
+            let mut sample = sample(1, "2026-09-02T00:00:00Z");
+            sample.agents = vec![waiting.clone()];
+            sample
+        };
+        let mut second = sample(2, "2026-09-02T00:30:00Z");
+        second.agents = vec![waiting.clone()];
+        let metrics_second =
+            derive_sample_metrics(&second, &manifest, std::slice::from_ref(&first));
+        assert_eq!(
+            metrics_second.progress_stalled_tickets, 0,
+            "a declared verification wait must stay exempt within its allowance"
+        );
+
+        // Past its own deadline, the same unchanged wait cannot keep the run
+        // healthy.
+        let mut third = sample(3, "2026-09-02T02:00:00Z");
+        third.agents = vec![waiting];
+        let metrics_third = derive_sample_metrics(&third, &manifest, &[first, second]);
+        assert_eq!(
+            metrics_third.progress_stalled_tickets, 1,
+            "an expired bounded-wait exemption must not keep the run healthy"
+        );
+    }
+
+    #[test]
+    fn progress_attempt_binding_and_repeated_chatter_do_not_reset_clocks() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        let now: DateTime<Utc> = "2026-09-02T00:00:00Z".parse().unwrap();
+        let mut agent = stalled_agent_fixture();
+        agent["liveness"]["session"] = json!("attempt-one");
+        agent["progress"]["summary"] = json!("same checkpoint");
+        let (_, first) = advance_progress_state(None, &agent, now, &manifest.thresholds, None);
+        agent["progress"]["revision"] = json!(999);
+        agent["updated_at"] = json!(now + chrono::Duration::seconds(10));
+        let (reading, second) = advance_progress_state(
+            Some(&first),
+            &agent,
+            now + chrono::Duration::seconds(10),
+            &manifest.thresholds,
+            None,
+        );
+        assert_eq!(
+            reading,
+            ProgressReading::Stalled,
+            "repeated checkpoint is not progress"
+        );
+        agent["liveness"]["reconnect_events"] = json!(2);
+        agent["liveness"]["output_fingerprint"] = json!(12345);
+        let (reading, _) = advance_progress_state(
+            Some(&second),
+            &agent,
+            now + chrono::Duration::seconds(11),
+            &manifest.thresholds,
+            None,
+        );
+        assert_eq!(
+            reading,
+            ProgressReading::Stalled,
+            "transport noise is not progress"
+        );
+        agent["liveness"]["session"] = json!("attempt-two");
+        let (reading, _) = advance_progress_state(
+            Some(&second),
+            &agent,
+            now + chrono::Duration::seconds(12),
+            &manifest.thresholds,
+            None,
+        );
+        assert_eq!(
+            reading,
+            ProgressReading::Progressing,
+            "same provider session can host a fresh RK execution attempt"
+        );
+        let mut same_attempt = stalled_agent_fixture();
+        same_attempt["liveness"]["session"] = json!("attempt-one");
+        let (reading, backwards) = advance_progress_state(
+            Some(&second),
+            &same_attempt,
+            now - chrono::Duration::seconds(1),
+            &manifest.thresholds,
+            None,
+        );
+        assert_eq!(reading, ProgressReading::Unresolved);
+        assert_eq!(backwards.changed_at, second.changed_at);
+    }
+
+    #[test]
+    fn wait_deadlines_and_cumulative_episodes_survive_churn_and_retirement() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 2;
+        let mut states = BTreeMap::new();
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        let mut agent = stalled_agent_fixture();
+        agent["progress"]["status"] = json!("verifying: unit tests");
+        first.agents = vec![agent.clone()];
+        assert_eq!(
+            advance_sample_progress(&mut states, &first, &manifest.thresholds).episodes,
+            0
+        );
+        let mut second = sample(2, "2026-09-02T00:00:03Z");
+        agent["progress"]["summary"] = json!("still verifying");
+        second.agents = vec![agent.clone()];
+        assert_eq!(
+            advance_sample_progress(&mut states, &second, &manifest.thresholds).stalled,
+            1
+        );
+        agent["progress"]["summary"] = json!("still waiting again");
+        let mut third = sample(3, "2026-09-02T00:00:04Z");
+        third.agents = vec![agent.clone()];
+        assert_eq!(
+            advance_sample_progress(&mut states, &third, &manifest.thresholds).episodes,
+            1,
+            "status chatter cannot renew a wait or create another stall onset"
+        );
+        agent["state"] = json!("completed");
+        let mut fourth = sample(4, "2026-09-02T00:00:05Z");
+        fourth.agents = vec![agent];
+        let metrics = advance_sample_progress(&mut states, &fourth, &manifest.thresholds);
+        assert_eq!(metrics.stalled, 0);
+        assert_eq!(metrics.episodes, 1);
+        assert_eq!(
+            states.values().next().unwrap().history[0].resolved_at,
+            Some(fourth.observed_at)
+        );
+        let mut another = stalled_agent_fixture();
+        another["task"] = json!("TKT-2");
+        fourth.agents = vec![another];
+        advance_sample_progress(&mut states, &fourth, &manifest.thresholds);
+        let mut fifth = sample(5, "2026-09-02T00:00:08Z");
+        fifth.agents = fourth.agents;
+        assert_eq!(
+            advance_sample_progress(&mut states, &fifth, &manifest.thresholds).episodes,
+            2,
+            "a retired ticket's incident must not disappear when a different ticket stalls"
+        );
+    }
+
+    #[test]
+    fn progress_report_replays_raw_evidence_and_rebuilds_checkpoint_identically() {
+        let (dir, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        write_json_atomic(&dir.path().join(MANIFEST), &manifest).unwrap();
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        first.agents = vec![stalled_agent_fixture()];
+        let mut second = sample(2, "2026-09-02T00:00:05Z");
+        second.agents = first.agents.clone();
+        // Deliberately persist zero cached metrics; report must derive truth
+        // from raw evidence instead of trusting an earlier evaluator's cache.
+        append_json_line(&dir.path().join(SAMPLES), &first).unwrap();
+        append_json_line(&dir.path().join(SAMPLES), &second).unwrap();
+        let log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        let mut third = sample(3, "2026-09-02T00:00:06Z");
+        third.agents = first.agents;
+        let live = log.progress_metrics(&third);
+        assert_eq!(live.stalled, 1);
+        drop(log);
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(report.progress_stall_episodes, 1);
+        assert_eq!(report.progress_episodes.len(), 1);
+        assert!(!report.checks["progress-stalled-tickets"].passed);
+        fs::remove_file(dir.path().join("collector.json")).unwrap();
+        let rebuilt = ObservationLog::open(dir.path(), &manifest).unwrap();
+        assert_eq!(rebuilt.progress_metrics(&third).stalled, live.stalled);
+        assert_eq!(rebuilt.progress_metrics(&third).episodes, live.episodes);
+    }
+
+    #[test]
+    fn missing_generation_identity_is_a_visible_evidence_gap_not_a_silent_pass() {
+        let (_, manifest) = fixture();
+        let mut value = sample(1, "2026-09-02T00:00:00Z");
+        value.agents = vec![json!({"task": "TKT-1", "state": "running"})];
+        let metrics = derive_sample_metrics(&value, &manifest, &[]);
+        assert_eq!(metrics.progress_stalled_tickets, 0);
+        assert_eq!(metrics.progress_unresolved_tickets, 1);
+    }
+
+    #[test]
+    fn stale_running_agent_report_fails_even_with_an_ad_hoc_intervention_recorded() {
+        let (dir, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        write_json_atomic(&dir.path().join(MANIFEST), &manifest).unwrap();
+
+        let agent = stalled_agent_fixture();
+        let ticket = json!({
+            "identity": "TKT-1",
+            "created_at": "2026-09-01T00:00:00Z",
+            "payload": {
+                "status": "in_progress",
+                "updated_at": "2026-09-02T00:00:00Z",
+                "delivery": null,
+            },
+        });
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        first.agents = vec![agent.clone()];
+        first.tickets = vec![ticket.clone()];
+        let mut second = sample(2, "2026-09-02T01:00:00Z");
+        second.agents = vec![agent];
+        second.tickets = vec![ticket];
+
+        // Drive both samples through the real collector path (not a hand-set
+        // metrics field): `ObservationLog` must independently persist and
+        // read back the same stall across the checkpoint boundary a live
+        // `rk observe sample` would use.
+        let mut log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        for mut value in [first, second] {
+            value.metrics = derive_metrics_with_ready_age(
+                &value,
+                &manifest,
+                |t| log.ready_age(t, value.observed_at),
+                log.progress_metrics(&value),
+            );
+            log.append(&value).unwrap();
+        }
+        drop(log);
+
+        let intervention = Intervention {
+            schema_version: SCHEMA_VERSION,
+            id: "int-1".into(),
+            observed_at: "2026-09-02T01:00:00Z".parse().unwrap(),
+            class: InterventionClass::AdHoc,
+            summary: "an ad-hoc rescue that must not paper over the stall".into(),
+            ticket: Some("TKT-1".into()),
+            actor: "operator".into(),
+            evidence: vec![],
+        };
+        write_new_json(
+            &dir.path().join(INTERVENTIONS).join("int-1.json"),
+            &intervention,
+        )
+        .unwrap();
+
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(
+            report.max_stale_tickets, 0,
+            "the daemon still calls this generation live"
+        );
+        assert!(!report.checks["progress-stalled-tickets"].passed);
+        assert!(
+            !report.passed,
+            "an independently stalled generation must fail the run even with an \
+             ad-hoc intervention recorded and zero daemon-reported stale tickets"
         );
     }
 

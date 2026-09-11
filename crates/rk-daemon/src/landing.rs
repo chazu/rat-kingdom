@@ -334,6 +334,33 @@ pub(crate) fn landing_queue_summary(space: &Space) -> Vec<LandingQueueSummary> {
     summary
 }
 
+/// Read-only wait evidence, scoped to a repository and (where recorded) the
+/// source generation. Ticket identity alone must not grant an unrelated or
+/// replacement worker another attempt's waiting allowance.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LandingQueueTaskState {
+    pub(crate) repo: String,
+    pub(crate) source_spawn: Option<rk_core::id::SpawnId>,
+    pub(crate) task: String,
+    pub(crate) status: LandingEntryStatus,
+    /// Seconds since this entry entered its current phase — see
+    /// [`LandingQueueSnapshotEntry::phase_age_secs`].
+    pub(crate) phase_age_secs: i64,
+}
+
+pub(crate) fn landing_queue_task_states(space: &Space) -> Vec<LandingQueueTaskState> {
+    landing_queue_snapshot(space)
+        .into_iter()
+        .map(|entry| LandingQueueTaskState {
+            repo: entry.repo,
+            source_spawn: entry.source_spawn,
+            task: entry.task,
+            status: entry.status,
+            phase_age_secs: entry.phase_age_secs,
+        })
+        .collect()
+}
+
 /// The two gates that guard every landing attempt regardless of tier —
 /// the retired steward mega-workflow's `_gates` block, POLICY (#19) and
 /// DIFF-SCOPE (#20). Named-check registry entries, not raw commands: a repo
@@ -3440,6 +3467,10 @@ impl LandingPipeline {
         if let Some(existing) = self.review_ceiling_settlement(entry, attempt)? {
             return Ok(existing);
         }
+        let supervisor = Arc::clone(&self.supervisor);
+        let repo = entry.repo_name.clone();
+        let fenced_attempt = attempt.to_string();
+        blocking(move || supervisor.fence_review_attempt(&repo, &fenced_attempt)).await?;
         let dismissed = self.supervisor.dismiss_live_instance_agents(attempt).await;
         // The one genuinely non-atomic window in this function: the reviewer
         // is already dismissed (irreversible — its OS process is gone) but
@@ -4742,10 +4773,11 @@ impl LandingPipeline {
 
     /// Spawn's durable journal proves this exact dispatch crossed its commit point.
     ///
-    /// `record.task` is stored verbatim from `SpawnParams.task` and is never
-    /// canonicalized, so it carries whichever spelling of `ctx.rework_ticket`
-    /// the dispatch happened to use. Match against every spelling
-    /// ([`crate::tickets::Tickets::id_spellings`]) rather than the raw string.
+    /// `Supervisor::spawn` canonicalizes a well-formed ticket reference before
+    /// it reaches `record.task`, but a record written before that landed can still carry whichever spelling of
+    /// `ctx.rework_ticket` the dispatch happened to use. Match against every
+    /// spelling ([`crate::tickets::Tickets::id_spellings`]) rather than the
+    /// raw string.
     fn rework_agent_was_journaled(&self, ctx: &ReworkContext) -> rk_core::Result<bool> {
         let spellings = self.tickets.id_spellings(&ctx.rework_ticket)?;
         Ok(self.supervisor.list_all().into_iter().any(|record| {
@@ -5355,10 +5387,11 @@ impl LandingPipeline {
 
     /// Spawn's durable journal proves this exact dispatch crossed its commit point.
     ///
-    /// `record.task` is stored verbatim from `SpawnParams.task` and is never
-    /// canonicalized, so it carries whichever spelling of `ctx.rework_ticket`
-    /// the dispatch happened to use. Match against every spelling
-    /// ([`crate::tickets::Tickets::id_spellings`]) rather than the raw string.
+    /// `Supervisor::spawn` canonicalizes a well-formed ticket reference before
+    /// it reaches `record.task`, but a record written before that landed can still carry whichever spelling of
+    /// `ctx.rework_ticket` the dispatch happened to use. Match against every
+    /// spelling ([`crate::tickets::Tickets::id_spellings`]) rather than the
+    /// raw string.
     fn conflict_agent_was_journaled(&self, ctx: &ConflictContext) -> rk_core::Result<bool> {
         let spellings = self.tickets.id_spellings(&ctx.rework_ticket)?;
         Ok(self.supervisor.list_all().into_iter().any(|record| {
@@ -6622,8 +6655,8 @@ impl LandingPipeline {
                 .await;
             match outcome {
                 Ok(result) if result.get("verdict").and_then(Value::as_str) == Some("pass") => {}
-                // An infra death (the child never reported its own exit code
-                // — killed by a signal, or any other runner-loss shape) is
+                // An infrastructure fault (admission expired before launch,
+                // or the child never reported its own exit code) is
                 // not a verdict on the branch, so it earns exactly one
                 // automatic retry of this SAME check against this SAME
                 // prepared candidate, bounded by the durable per-entry
@@ -6636,7 +6669,7 @@ impl LandingPipeline {
                 {
                     warn!(
                         check = %check.name, branch = %entry.branch,
-                        "landing pipeline: gate check died to an infrastructure fault, retrying once"
+                        "landing pipeline: gate check hit an infrastructure fault, retrying once"
                     );
                     // Spend the budget AND durably mark THIS check in-flight
                     // BEFORE anything else — including the ordinal-1 evidence
@@ -8057,6 +8090,57 @@ workflow: {
 
         // Every key drained to empty; nothing left queued anywhere.
         assert!(queue.pending_keys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_states_projects_task_status_and_phase_age_by_ticket() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let space = Space::open_in_memory().unwrap();
+        let queue = LandingQueue::new(space.clone(), &layout);
+
+        let ten_min_ago = Utc::now() - chrono::Duration::minutes(10);
+        queue
+            .enqueue(LandingQueueEntry {
+                repo_name: "alpha".into(),
+                repo_path: "/repos/alpha".into(),
+                branch: "b1".into(),
+                target: "main".into(),
+                head_sha: "sha1".into(),
+                diff_class: "trivial".into(),
+                task: "TKT-1".into(),
+                enqueued_at: Some(ten_min_ago),
+                phase_entered_at: Some(ten_min_ago),
+                ..Default::default()
+            })
+            .unwrap();
+        queue
+            .enqueue(LandingQueueEntry {
+                repo_name: "alpha".into(),
+                repo_path: "/repos/alpha".into(),
+                branch: "b2".into(),
+                target: "main".into(),
+                head_sha: "sha2".into(),
+                diff_class: "trivial".into(),
+                task: "TKT-2".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Keep scope and source identity alongside the per-ticket age.
+        let mut states = landing_queue_task_states(&space);
+        states.sort_by(|a, b| a.task.cmp(&b.task));
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].repo, "alpha");
+        assert_eq!(states[0].task, "TKT-1");
+        assert_eq!(states[0].status, LandingEntryStatus::Queued);
+        assert!(
+            states[0].phase_age_secs >= 10 * 60 - 5,
+            "got {}",
+            states[0].phase_age_secs
+        );
+        assert_eq!(states[1].task, "TKT-2");
+        assert_eq!(states[1].status, LandingEntryStatus::Queued);
     }
 
     #[test]
@@ -9529,6 +9613,137 @@ workflow: {
             .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
             .unwrap();
         assert!(events.is_empty(), "events: {events:?}");
+    }
+
+    /// Admission expiry never ran the check, so it spends the same durable
+    /// one-retry budget as an infrastructure death. Congestion that persists
+    /// through the retry still holds; neither case manufactures a passing proof.
+    #[tokio::test]
+    async fn admission_timeout_retries_once_then_passes_or_holds() {
+        for release_on_retry in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let repo_dir = tempfile::tempdir().unwrap();
+            init_repo(repo_dir.path());
+            let executed = home.path().join("check-executed");
+            write_checks(
+                repo_dir.path(),
+                &format!(
+                    r#"checks: [
+    {{name: "steward-protected-paths", command: "echo ran >> '{}'"}},
+    {{name: "steward-diff-scope", command: "true"}},
+    {{name: "verify", command: "true"}},
+]
+"#,
+                    executed.display()
+                ),
+            );
+            git(repo_dir.path(), &["checkout", "-b", "feature"]);
+            std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+            let head_sha = rev_parse(repo_dir.path(), "feature");
+            git(repo_dir.path(), &["checkout", "main"]);
+            let main_before = rev_parse(repo_dir.path(), "main");
+            let space = Space::open_in_memory().unwrap();
+            let pipeline = test_pipeline(home.path(), space.clone());
+            pipeline
+                .supervisor
+                .set_verification_admission_limits(1, HashMap::new());
+            let mut permit = pipeline
+                .supervisor
+                .acquire_verification_admission("code-repo", 1)
+                .await;
+            let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+            let mut entry = LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha: head_sha.clone(),
+                diff_class: "doc-only".into(),
+                task: "add src".into(),
+                ..Default::default()
+            };
+            let mut plan = pipeline
+                .resolve_gate_plan_at(&entry, &git_repo, &GateConfig::default(), &head_sha)
+                .await
+                .unwrap();
+            // Shorten the policy check's admission/execution allowance only
+            // in this fixture; release is synchronized on durable retry evidence.
+            plan.checks[0].2 = Duration::from_secs(1);
+            let release = async {
+                if release_on_retry {
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        loop {
+                            if !space
+                                .scan(
+                                    &Pattern::category(Category::Event)
+                                        .identity(GATE_INFRA_RETRY_IDENTITY),
+                                )
+                                .unwrap()
+                                .is_empty()
+                            {
+                                assert!(!executed.exists(), "first attempt must not execute");
+                                drop(permit.take());
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("admission expiry must grant one retry");
+                }
+            };
+            let (outcome, ()) = tokio::join!(
+                pipeline.execute_gate_plan_at(&mut entry, &git_repo, plan, &head_sha),
+                release
+            );
+            assert_eq!(
+                outcome.unwrap(),
+                if release_on_retry {
+                    GateRunOutcome::Pass
+                } else {
+                    GateRunOutcome::InfraRetryExhausted
+                }
+            );
+            assert!(entry.gate_infra_retry_used);
+            assert_eq!(executed.exists(), release_on_retry);
+            if release_on_retry {
+                assert_eq!(
+                    std::fs::read_to_string(&executed).unwrap().lines().count(),
+                    1
+                );
+            }
+            let events = space
+                .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+                .unwrap();
+            assert_eq!(events.len(), 2, "one attempt plus exactly one retry");
+            let first = events.iter().find(|e| e.payload["ordinal"] == 1).unwrap();
+            let second = events.iter().find(|e| e.payload["ordinal"] == 2).unwrap();
+            assert_eq!(first.payload["verdict"], "infra");
+            assert_eq!(
+                first.payload["exit"],
+                crate::managed_verification::LOCK_TIMEOUT_EXIT
+            );
+            assert_eq!(
+                second.payload["verdict"],
+                if release_on_retry { "pass" } else { "infra" }
+            );
+            assert_eq!(
+                first.payload["candidate_sha"],
+                second.payload["candidate_sha"]
+            );
+            let admissions = space
+                .scan(
+                    &Pattern::category(Category::Event)
+                        .identity(crate::managed_verification::VERIFICATION_ADMISSION_IDENTITY),
+                )
+                .unwrap();
+            assert!(admissions.iter().any(|e| e.payload["verdict"] == "infra"
+                && e.payload["duration_ms"] == 0
+                && e.payload["queue_wait_ms"].as_u64().unwrap() >= 1000));
+            assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        }
     }
 
     /// A genuine timeout (`onTimeout: fail`, the default) must never be

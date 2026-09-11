@@ -138,7 +138,8 @@ async fn wip4_admission_saturation_stays_bounded_starves_nothing_and_keeps_exact
     write_saturation_checks(repo_dir.path(), shared.path(), N_CHECKS, false);
 
     let layout = Layout::at(home.path());
-    let space = Space::open_in_memory().unwrap();
+    layout.ensure().unwrap();
+    let space = Space::open(&layout.db_path()).unwrap();
     let daemon = Daemon::with_space_for_tests(
         layout.clone(),
         "test-castle".into(),
@@ -232,6 +233,36 @@ async fn wip4_admission_saturation_stays_bounded_starves_nothing_and_keeps_exact
         "the test must actually exercise real overlap to be a meaningful saturation proof, \
          not just 8 checks running one at a time: observed peak was only {peak}"
     );
+    // Inspect through a new database handle, independently of the RPC result:
+    // red checks and their exact diagnostics must be durable under saturation.
+    let reopened = Space::open(&layout.db_path()).unwrap();
+    let failures = reopened
+        .scan(
+            &rk_core::tuple::Pattern::category(rk_core::tuple::Category::Artifact)
+                .scope(&repo_name)
+                .identity("gate-failure"),
+        )
+        .unwrap();
+    assert_eq!(failures.len(), 1, "one red child must persist one failure");
+    let failure = &failures[0].payload;
+    assert_eq!(failure["exit"], 7);
+    assert_eq!(failure["verdict"], "fail");
+    assert_eq!(failure["timed_out"], false);
+    assert!(failure["stderr_tail"]
+        .as_str()
+        .unwrap()
+        .contains("sat-distinct-failure"));
+    let timings = reopened
+        .scan(
+            &rk_core::tuple::Pattern::category(rk_core::tuple::Category::Event)
+                .scope(&repo_name)
+                .identity("verification_admission"),
+        )
+        .unwrap();
+    assert_eq!(timings.len(), N_CHECKS, "timing includes the failed check");
+    assert!(timings
+        .iter()
+        .any(|t| t.payload["queue_wait_ms"].as_u64().unwrap() > 0));
 }
 
 /// `rk-daemon` doesn't build the `rk` binary itself (no build-time

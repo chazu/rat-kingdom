@@ -41,7 +41,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// Serializes the four `#[test]`s in this file (never any test in another
+/// Serializes the `#[test]`s in this file (never any test in another
 /// binary — cargo already runs test binaries one at a time, only the tests
 /// *within* one binary run concurrently by default). Each test here starts
 /// one or more real daemon processes, each with its own reviewer/lander/
@@ -54,24 +54,12 @@ use std::time::{Duration, Instant};
 /// without weakening what any single one proves or touching any other
 /// binary's concurrency.
 ///
-/// This does NOT make the file immune to a `60s`-bound miss under a full
-/// `cargo test --workspace` (or `mise run verify-full`) pass: that run's
-/// wall-clock length makes it far more likely to overlap host-level
-/// contention this file cannot see or serialize against — another rat's
-/// concurrent build/test in a sibling worktree, disk/CPU pressure, scheduler
-/// variance — than a short standalone `--test review_ceiling_crash_barrier`
-/// run. TKT-lonam-kupoz-makoz investigated one such single failure (green in
-/// isolation, green on immediate rerun) and confirmed it is this same
-/// generic, widely-recorded "flaky under full-workspace parallel load" class
-/// (see fleet artifact `structural-eval-test-parallelism`,
-/// 01M0BJNKZEKPCYSVA4R0AVHYS9, and the many prior tickets in this pattern) —
-/// NOT a timing bug in the durable-marker-write-vs-retry window itself, which
-/// stays deterministic regardless of host speed because it is pinned by the
-/// `fault-barrier`/`fault-barrier.reached` file handshake above, not a sleep.
-/// A structural fix (bounded cross-agent parallelism, or per-test process
-/// isolation via cargo-nextest) is tracked at the fleet level and needs
-/// operator sign-off before adoption; it is out of scope for a single test
-/// file to work around.
+/// A historical full-suite failure was not reproduced in the September 10
+/// investigation. Do not infer a root cause from an isolated successful rerun.
+/// The setup-failure regression below does prove a separate contention source:
+/// panics before `Crashed` existed leaked the daemon. Guard setup from the first
+/// start, retain exact crash assertions, and measure residual failures through
+/// `scripts/verification-load.py` instead of retrying tests until green.
 static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire [`TEST_SERIAL`] for the calling test's whole body. Recovers from
@@ -400,6 +388,12 @@ fn kill_owning_daemon(home: &Path, spare: Option<u32>) {
         return;
     }
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    // A detached daemon is reaped by the OS, not by this test. Wait within a
+    // finite teardown bound so subsequent fixtures do not overlap its exit.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// RAII teardown for a test that starts a real detached daemon but — unlike
@@ -416,6 +410,17 @@ struct DaemonGuard {
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         kill_owning_daemon(&self.home, None);
+    }
+}
+
+/// `Child` does not kill or reap on drop. Own detached CLI helpers through
+/// setup panics as well as the successful crash path.
+struct TestChild(std::process::Child);
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -496,6 +501,10 @@ fn live_agents_for(home: &Path, attempt: &str) -> Vec<Value> {
 /// inside the barrier, then SIGKILL it. Returns once the daemon process is
 /// confirmed dead and the barrier is disarmed for its successor.
 fn crash_at(barrier: &str) -> Crashed {
+    crash_at_with_setup_hook(barrier, |_| {})
+}
+
+fn crash_at_with_setup_hook(barrier: &str, setup_hook: impl FnOnce(&Path)) -> Crashed {
     let home = daemon_home(REVIEW_WORKFLOW, None);
     let (repo, head_sha) = candidate_repo(None);
     let repo_name = repo
@@ -505,6 +514,9 @@ fn crash_at(barrier: &str) -> Crashed {
         .to_string_lossy()
         .to_string();
     let home_path = home.path().to_path_buf();
+    let _setup_guard = DaemonGuard {
+        home: home_path.clone(),
+    };
 
     // Arm BEFORE anything can reach `settle_review_ceiling`. The only other
     // caller is the ceiling timeout, 30m out per this workflow's
@@ -539,21 +551,23 @@ fn crash_at(barrier: &str) -> Crashed {
     // including the review wait, here a deliberate hang — so it runs on its
     // own process and is never awaited. It dies with daemon A; that is part
     // of what daemon B has to converge out of.
-    let mut lander = rk(&home_path)
-        .args([
-            "land",
-            "feature",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--target",
-            "main",
-            "--task",
-            &task,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let lander = TestChild(
+        rk(&home_path)
+            .args([
+                "land",
+                "feature",
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--target",
+                "main",
+                "--task",
+                &task,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
 
     until("the candidate to reach awaiting_review", || {
         tuples(&home_path, &repo_name, "event", "landing_queue_entry")
@@ -586,23 +600,27 @@ fn crash_at(barrier: &str) -> Crashed {
         "refusing to SIGKILL this test process"
     );
 
+    setup_hook(&home_path);
+
     // Fire the cancel and leave it in flight: the daemon parks inside
     // `settle_review_ceiling`, so this process will never return.
-    let mut canceller = rk(&home_path)
-        .args([
-            "cancel-review",
-            "feature",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--target",
-            "main",
-            "--task",
-            &task,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let canceller = TestChild(
+        rk(&home_path)
+            .args([
+                "cancel-review",
+                "feature",
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--target",
+                "main",
+                "--task",
+                &task,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
 
     // THE deterministic point. Not a duration — the daemon telling us it is
     // parked inside the transition.
@@ -629,10 +647,8 @@ fn crash_at(barrier: &str) -> Crashed {
     // Disarm, so daemon B comes up able to complete the same transition.
     std::fs::remove_file(home_path.join("fault-barrier")).ok();
     std::fs::remove_file(&reached).ok();
-    let _ = lander.kill();
-    let _ = lander.wait();
-    let _ = canceller.kill();
-    let _ = canceller.wait();
+    drop(lander);
+    drop(canceller);
 
     Crashed {
         home,
@@ -750,6 +766,29 @@ fn crash_between_dismissal_and_marker_converges_exactly_once() {
     assert_converged_properties(&c);
 }
 
+/// A panic while assembling the fixture must not leave a detached daemon
+/// behind to contend with later tests. Inject at the exact pre-cancel stage;
+/// the completed `Crashed` fixture has not been constructed yet.
+#[test]
+fn setup_failure_reaps_its_daemon_before_removing_the_home() {
+    let _serial = serialize_test();
+    let mut pid = None;
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crash_at_with_setup_hook(BARRIER_PRE_MARKER, |home| {
+            pid = daemon_pid(home);
+            panic!("injected setup failure");
+        });
+    }));
+    assert!(failure.is_err());
+    let pid = pid.expect("injected failure must occur after daemon startup");
+    // Clean up even when the regression assertion fails on the old fixture.
+    let leaked = process_alive(pid);
+    if leaked {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+    assert!(!leaked, "fixture setup leaked daemon {pid}");
+}
+
 /// The mirror window: the settlement reached disk, then the daemon died
 /// before its caller could be told. The operator's natural retry must be
 /// REFUSED rather than settling a second time.
@@ -790,6 +829,50 @@ fn crash_after_durable_marker_refuses_the_retry_rather_than_settling_twice() {
         "the refused retry must not have written a second marker"
     );
 
+    assert_converged_properties(&c);
+}
+
+/// Force the recovery boundary observed under load: the durable workflow
+/// still names its spawn step when the review settlement has already committed.
+#[test]
+fn settled_review_cannot_launch_again_from_a_replayed_spawn_step() {
+    let _serial = serialize_test();
+    let c = crash_at(BARRIER_POST_MARKER);
+    let path = c
+        .home
+        .path()
+        .join("workflow-instances")
+        .join(format!("{}.json", c.attempt));
+    let mut instance: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    instance["status"] = serde_json::json!("running");
+    instance["current_step"] = serde_json::json!(0);
+    instance["context"]["active_agent"] = Value::Null;
+    instance["context"]["active_agent_spawn"] = Value::Null;
+    std::fs::write(&path, serde_json::to_vec(&instance).unwrap()).unwrap();
+    start_daemon(c.home.path());
+    until("replayed review spawn to reach a decision", || {
+        let instance: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        (instance["status"] != "running" || instance["current_step"].as_u64()? > 0).then_some(())
+    });
+    assert!(
+        live_agents_for(c.home.path(), &c.attempt).is_empty(),
+        "a settled review workflow must not launch another generation on restart"
+    );
+    // The old record remains historical evidence, but direct recovery must
+    // obey the same attempt fence as replayed workflow dispatch.
+    let agents = json_stdout(&rk(c.home.path()).args(["--json", "list"]).output().unwrap());
+    let old = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["workflow_instance"] == c.attempt)
+        .unwrap();
+    let resume = rk(c.home.path())
+        .args(["respawn", old["name"].as_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!resume.status.success());
+    assert!(String::from_utf8_lossy(&resume.stderr).contains("settled review attempt"));
     assert_converged_properties(&c);
 }
 
@@ -885,9 +968,20 @@ fn assert_converged_properties(c: &Crashed) {
     );
     // Same eventual-convergence property as the first `live_agents_for`
     // check above (see its comment): polled rather than snapshotted once.
-    until("re-enqueue to never revive the settled attempt", || {
-        live_agents_for(home, &c.attempt).is_empty().then_some(())
-    });
+    let started = Instant::now();
+    loop {
+        let live = live_agents_for(home, &c.attempt);
+        if live.is_empty() {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "settled attempt {} revived after re-enqueue {}: {live:?}",
+            c.attempt,
+            new_attempt
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// The gap the other tests in this file never cover: every scenario above

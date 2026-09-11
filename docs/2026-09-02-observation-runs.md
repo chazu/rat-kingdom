@@ -22,6 +22,8 @@ rk observe start \
   --stale-after 15m \
   --max-landing-age 10m \
   --max-ready-age 15m \
+  --progress-stall-after 15m \
+  --max-wait 30m \
   --max-cost-usd 100 \
   --output "$HOME/.rat-kingdom-observations/voxel-foreign-tenant"
 ```
@@ -98,7 +100,9 @@ The report covers:
 - convergence violations, stale tickets, and unclassified work holds;
 - overlapping live generations for one task and repeated landed side effects;
 - forced ungated landings;
-- intervention counts by class.
+- intervention counts by class;
+- independently derived progress stalls and progress-evidence gaps for live
+  generations (D1).
 
 Ready-queue age is observation-window time, not ticket lifetime. It starts when
 a selected ticket first appears ready in a sample, accumulates while the ticket
@@ -110,8 +114,53 @@ while still failing a run that leaves actionable work undispatched.
 A stale ticket is ownerless work already in `claimed`, `in_progress`, or
 `blocked` state whose ticket record has not changed within `--stale-after`.
 Open dependency-blocked tickets are not stale, and work with a live agent is
-covered by liveness and phase telemetry instead. Ready open work is measured by
-the ready-queue-age check rather than counted a second time as stale.
+covered by the progress evaluator below instead. Ready open work is measured
+by the ready-queue-age check rather than counted a second time as stale.
+
+### Independent progress evaluation (D1)
+
+A ticket with a `spawning`/`running` agent is excluded from ownerless-ticket
+staleness above, so a failed daemon supervisor sweep could otherwise leave a
+genuinely wedged generation looking healthy. The collector independently
+proves forward progress instead of trusting the daemon's own stuck-sweep
+classification (`work.current`'s `stalled` bucket):
+
+- Evidence is bound to canonical ticket identity, generation (`spawn`),
+  provider session (`session_id`) and RK execution attempt (`liveness.session`).
+  A resume can reuse the provider session while starting a new attempt; neither
+  it nor a concurrent generation inherits another attempt's progress clock.
+- A signature combines structured checkpoint **content** (summary, next step,
+  status), changed-output fingerprint, lifecycle state and reported result.
+  Repeating the same checkpoint with a new revision/timestamp is not progress.
+  Output churn during a transport retry does not advance the clock either.
+- Unchanged evidence past `--progress-stall-after` fails
+  `progress-stalled-tickets`. A self-declared verification, queue, review,
+  human-gate or recovery-backoff phase receives a fixed `--max-wait` deadline;
+  checkpoint chatter cannot renew a continuing wait. These declarations are
+  advisory evidence, not permission grants or independent proof that an actual
+  workflow approval exists. Authoritative workflow-gate/intervention consumers
+  remain the separately tracked D1 follow-ups.
+- `status.landing_queue_tasks` supplies authoritative queued-admission evidence
+  by repository, ticket and recorded source generation. Legacy aliases resolve
+  through the observed ticket set; an older unbound entry cannot excuse a worker
+  created after that queue phase began. The durable phase age consumes the same
+  fixed `--max-wait` allowance, including time before observation started.
+- Missing identities or usable evidence, and backwards observation clocks,
+  fail `progress-evidence-gaps`. Sampling gaps and unavailable RPCs also remain
+  explicit failures under the run's frozen coverage requirements.
+- Reports retain each stall's ticket/attempt, start, resolution and recurrence,
+  including work already delivered or replaced. Counts accumulate across the
+  entire observed cohort instead of dropping with the live-agent count.
+- Live collection, checkpoint reconstruction and offline reports use the same
+  transition function over raw samples. Cached metric fields cannot hide an
+  observed stall. Qualification evaluator version 2 consumes these incidents;
+  checkpoint format/evaluator changes force replay rather than fresh grace.
+
+The bound is observation-window time: the first sample establishes an attempt's
+baseline. Detection occurs after its frozen bound, plus the sampling interval
+and the RPC/sample deadline allowance. This does not infer unobserved progress
+history before collection began. Authoritative queue phase ages are the exception:
+they describe a persisted wait that can already be expired at the first sample.
 
 Spend is derived from matching agent generations active or updated during the
 run, including archived records, as a run-window delta. It is not the live-fleet snapshot shown by
@@ -135,5 +184,6 @@ retroactively. Collector fixes require a fresh pre-registered pilot.
 
 For the supervised foreign-tenant pilot, a passing report requires zero daemon
 outage samples, convergence violations, forced landings, duplicate dispatches,
-duplicate landings, stale tickets, and unclassified holds. Any failed check
-means repair and repeat or stop; it is not a passing pilot with a footnote.
+duplicate landings, stale tickets, unclassified holds, independently derived
+progress stalls, and progress-evidence gaps. Any failed check means repair and
+repeat or stop; it is not a passing pilot with a footnote.

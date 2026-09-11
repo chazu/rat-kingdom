@@ -553,6 +553,7 @@ impl<'a> ManagedVerification<'a> {
         // lockstep, so the two always agree on whether a slot was ever
         // waited for.
         let mut _admission_guard: Option<tokio::sync::OwnedSemaphorePermit> = None;
+        let admission_started = Instant::now();
         let admission_queue_wait_ms: Option<u64> = if admission_limit > 0 {
             match tokio::time::timeout(
                 timeout,
@@ -577,7 +578,7 @@ impl<'a> ManagedVerification<'a> {
                         agent,
                         command,
                         LOCK_TIMEOUT_EXIT,
-                        "fail",
+                        "infra",
                         false,
                         None,
                         "",
@@ -586,7 +587,40 @@ impl<'a> ManagedVerification<'a> {
                         false,
                         &[],
                     );
-                    return Err(rk_core::Error::other(stderr));
+                    let queue_wait_ms =
+                        u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    if let Some(progress) = &progress {
+                        progress.lock().unwrap().queue_wait_ms = Some(queue_wait_ms);
+                    }
+                    self.record_verification_admission_event(VerificationAdmissionOutcome {
+                        repo,
+                        agent,
+                        command,
+                        queue_wait_ms: Some(queue_wait_ms),
+                        duration: Duration::ZERO,
+                        exit: LOCK_TIMEOUT_EXIT,
+                        verdict: "infra",
+                    });
+                    // The check never started: there is no verdict on the
+                    // candidate and no execution timeout. Landing can use its
+                    // existing durable infrastructure-retry budget. An inline
+                    // exit gate still fails closed, even if it expects -2.
+                    if resolved.expect_exit.is_some() {
+                        return Err(rk_core::Error::other(stderr));
+                    }
+                    return Ok(json!({
+                        "exit": LOCK_TIMEOUT_EXIT,
+                        "stdout": "",
+                        "stdout_truncated": false,
+                        "stderr": stderr,
+                        "stderr_truncated": false,
+                        "timed_out": false,
+                        "no_exit_code": true,
+                        "signal": null,
+                        "verdict": "infra",
+                        "executed": false,
+                        "reason": "admission-timeout",
+                    }));
                 }
             }
         } else {
@@ -1519,10 +1553,30 @@ pub(crate) struct ProcessLiveness {
 }
 
 pub(crate) fn process_liveness(root: u32) -> ProcessLiveness {
-    let table = live_process_table();
+    process_liveness_with_snapshots(root, live_process_table)
+}
+
+/// A successful `ps` invocation can omit a live descendant under fork/exec
+/// contention. Corroborate negative evidence once before the silent-worker
+/// sweep acts on it. Keep snapshots separate: joining rows across them could
+/// invent an ancestry chain that never existed. There is no retry on positive
+/// evidence, no sleep, and never more than two reads for one observation.
+fn process_liveness_with_snapshots(
+    root: u32,
+    mut snapshot: impl FnMut() -> Vec<ProcessTableRow>,
+) -> ProcessLiveness {
+    let first = process_liveness_in_table(root, &snapshot());
+    if first.child_alive && first.live_verifier_descendants > 0 {
+        first
+    } else {
+        process_liveness_in_table(root, &snapshot())
+    }
+}
+
+fn process_liveness_in_table(root: u32, table: &[ProcessTableRow]) -> ProcessLiveness {
     let child_alive = table.iter().any(|row| row.pid == root && row_alive(row));
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for row in &table {
+    for row in table {
         children.entry(row.ppid).or_default().push(row.pid);
     }
     let mut visited = HashSet::from([root]);
@@ -2420,6 +2474,88 @@ impl ManagedVerificationRuns {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn liveness_corroborates_only_negative_snapshots_once() {
+        fn row(pid: u32, ppid: u32, comm: &str, stat: &str) -> ProcessTableRow {
+            ProcessTableRow {
+                pid,
+                ppid,
+                pgid: 10,
+                stat: stat.into(),
+                comm: comm.into(),
+            }
+        }
+        let live = || vec![row(10, 1, "sh", "S"), row(11, 10, "cargo", "S")];
+        let missed = || vec![row(10, 1, "sh", "S")];
+        let mut calls = 0;
+        let result = process_liveness_with_snapshots(10, || {
+            calls += 1;
+            if calls == 1 {
+                missed()
+            } else {
+                live()
+            }
+        });
+        assert!(result.child_alive);
+        assert_eq!(result.live_verifier_descendants, 1);
+        assert_eq!(calls, 2);
+
+        calls = 0;
+        let result = process_liveness_with_snapshots(10, || {
+            calls += 1;
+            live()
+        });
+        assert_eq!(result.live_verifier_descendants, 1);
+        assert_eq!(
+            calls, 1,
+            "positive evidence does not add another process scan"
+        );
+
+        calls = 0;
+        let result = process_liveness_with_snapshots(10, || {
+            calls += 1;
+            missed()
+        });
+        assert_eq!(result.live_verifier_descendants, 0);
+        assert_eq!(
+            calls, 2,
+            "persistent absence must remain negative and bounded"
+        );
+    }
+
+    #[test]
+    fn liveness_retry_does_not_join_snapshots_or_excuse_unrecognized_children() {
+        let row = |pid, ppid, comm: &str, stat: &str| ProcessTableRow {
+            pid,
+            ppid,
+            pgid: 10,
+            stat: stat.into(),
+            comm: comm.into(),
+        };
+        let mut calls = 0;
+        let result = process_liveness_with_snapshots(10, || {
+            calls += 1;
+            if calls == 1 {
+                vec![row(10, 1, "sh", "S"), row(11, 10, "sh", "S")]
+            } else {
+                // The old ancestor is missing; an unrelated cargo, a zombie,
+                // and a bare sleep are all insufficient liveness evidence.
+                vec![
+                    row(10, 1, "sh", "S"),
+                    row(12, 11, "cargo", "S"),
+                    row(13, 10, "rustc", "Z"),
+                    row(14, 10, "sleep", "S"),
+                ]
+            }
+        });
+        assert!(result.child_alive);
+        assert_eq!(result.live_verifier_descendants, 0);
+        assert_eq!(calls, 2);
+        let gone = process_liveness_with_snapshots(10, Vec::new);
+        assert!(!gone.child_alive);
+        assert_eq!(gone.live_verifier_descendants, 0);
+    }
     use super::*;
 
     #[tokio::test]

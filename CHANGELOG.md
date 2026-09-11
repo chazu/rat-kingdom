@@ -16,6 +16,19 @@ daemon **reactor** as the keystone. Most of the work below was delivered by the
 fleet reviewing and merging *itself* through the steward loop (see _How this was
 built_).
 
+### Collaboration reliability (2026-09-10)
+
+- Verification admission expiry reports infrastructure failure and uses the
+  existing one-retry budget; executed check failures remain failures.
+- Spawn stores canonical ticket identity; reopen recovery recognizes legacy
+  aliases. Negative verifier-process observations receive one corroborating scan.
+- Observation reports independently detect stalled attempts, retain incidents
+  through replay/restarts, and bound per-ticket landing-queue waits.
+- Review settlement durably fences launch and recovery before dismissing live
+  reviewers, preventing old workflows from reviving settled attempts after a crash.
+- Load probes retain exact failed-check evidence and measure admission limits;
+  crash fixtures clean up even when setup fails.
+
 ### BBS collaboration (2026-09-10)
 
 - Task-scoped peer briefings now accompany worker startup/resume, with

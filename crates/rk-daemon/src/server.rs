@@ -6989,7 +6989,20 @@ impl Daemon {
         let announcer = crate::recovery::RecoveryAnnouncer::new();
         let mut reopened = 0usize;
         for ticket in in_progress {
-            if queued_tickets.contains(&ticket.identity) {
+            // A legacy (TKT-<ULID>) ticket has a proquint alias; a live rat or
+            // a queued branch may be keyed on either spelling depending on
+            // which one the caller addressed it by. Comparing against only
+            // `ticket.identity` (canonical) misses the alias spelling and lets
+            // the sweep reopen a ticket that is actually owned or in flight.
+            let spellings = match self.tickets.id_spellings(&ticket.identity) {
+                Ok(spellings) => spellings,
+                Err(error) => {
+                    warn!(ticket = %ticket.identity, %error,
+                        "ticket reopen sweep: cannot establish identity, leaving ownership intact");
+                    continue;
+                }
+            };
+            if spellings.iter().any(|s| queued_tickets.contains(s)) {
                 // Branch is queued/gating/awaiting review — the owning rat
                 // going non-live here is expected (it may have already
                 // exited after handing off to the landing pipeline), not
@@ -7021,7 +7034,10 @@ impl Daemon {
                         return None;
                     }
                     self.supervisor.list().into_iter().find(|a| {
-                        a.state.is_live() && a.task.as_deref() == Some(ticket.identity.as_str())
+                        a.state.is_live()
+                            && a.task
+                                .as_deref()
+                                .is_some_and(|task| spellings.iter().any(|s| s == task))
                     })
                 });
             if agent.as_ref().is_some_and(|a| a.state.is_live()) {
@@ -10679,6 +10695,12 @@ impl Daemon {
             // without this a slowly-draining queue and a wedged one are
             // indistinguishable from the outside (probe O18).
             "landing_queue": crate::landing::landing_queue_summary(&self.space),
+            // Per-ticket landing-queue admission state — lets an external
+            // progress evaluator tell a ticket sitting in the bounded
+            // queued-admission wait apart from one that has gone silent
+            // (docs/2026-09-06-r1-qualification-deliverables.md D1 point 3),
+            // which the (repo, target)-keyed summary above cannot answer.
+            "landing_queue_tasks": crate::landing::landing_queue_task_states(&self.space),
             // Per-repo configured capacity/occupancy/waiting-reason for the
             // implementation, review, and verification lanes
             // (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — see `Supervisor::capacity_summary`.
@@ -13623,6 +13645,93 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(reopened, 1);
         let ticket = daemon.tickets.get(&id).unwrap().unwrap();
         assert_eq!(ticket.payload["status"], json!("open"));
+    }
+
+    /// Writes a legacy (`TKT-<ULID>`) ticket tuple directly, `in_progress`
+    /// from the start — mirrors `tickets::tests::seed_legacy` but for the
+    /// reopen sweep, which needs the ticket already `in_progress` rather than
+    /// `open`. A legacy ticket predates the proquint identity scheme, so its
+    /// durable identity never matches its own deterministic proquint alias —
+    /// exactly the spelling gap TKT-gotup-lamur-pahub is about.
+    fn seed_legacy_in_progress_ticket(daemon: &Daemon, identity: &str, assignee: Option<&str>) {
+        let payload = json!({
+            "title": "legacy ticket",
+            "status": "in_progress",
+            "parent": Value::Null,
+            "priority": "normal",
+            "labels": Vec::<String>::new(),
+            "depends_on": Vec::<String>::new(),
+            "assignee": assignee,
+            "created_by": "castle",
+            "created_at": "2026-08-19T00:00:00Z",
+            "updated_at": "2026-08-19T00:00:00Z",
+        });
+        let tuple = Tuple::new(Category::Task, "system", identity, "castle", payload)
+            .with_lifecycle(Lifecycle::Session);
+        daemon.space.out(tuple).unwrap();
+    }
+
+    /// A legacy ticket's branch queued for landing under its proquint ALIAS
+    /// (not its canonical `TKT-<ULID>` identity) must be recognised as the
+    /// same in-flight work, exactly like `a_ticket_whose_branch_is_queued_for_landing_is_not_reopened`
+    /// but naming the queue entry by the other spelling.
+    #[tokio::test]
+    async fn a_legacy_ticket_queued_under_its_alias_spelling_is_not_reopened() {
+        let (_dir, daemon) = daemon_with_agent("Legacy-Queued", AgentState::Completed);
+        let identity = "TKT-01J0000000000000000000AA";
+        seed_legacy_in_progress_ticket(&daemon, identity, Some("Legacy-Queued"));
+        let ticket = daemon.tickets.get(identity).unwrap().unwrap();
+        let alias = daemon.tickets.alias_of(&ticket).unwrap();
+
+        daemon
+            .space
+            .out(landing_queue_entry_tuple(&alias, "queued"))
+            .unwrap();
+
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
+
+        assert_eq!(reopened, 0);
+        let ticket = daemon.tickets.get(identity).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("in_progress"));
+    }
+
+    /// A legacy ticket's live owner, spawned with `task` set to the
+    /// ticket's proquint ALIAS rather than its canonical identity, must
+    /// still be recognised as the live owner by the null-assignee fallback
+    /// match — mirrors `a_null_assignee_ticket_with_a_live_task_match_is_never_touched`
+    /// but with the agent keyed on the other spelling.
+    #[tokio::test]
+    async fn a_legacy_ticket_with_a_live_task_match_under_its_alias_is_never_touched() {
+        // Placeholder task, same as `a_null_assignee_ticket_with_a_live_task_match_is_never_touched`:
+        // the alias is only known once the ticket exists, so the fixture's
+        // task is patched to it below.
+        let (dir, daemon) =
+            daemon_with_agent_task("Legacy-Drain-Owned", AgentState::Running, "tbd");
+        let identity = "TKT-01J0000000000000000000BB";
+        seed_legacy_in_progress_ticket(&daemon, identity, None);
+        let ticket = daemon.tickets.get(identity).unwrap().unwrap();
+        let alias = daemon.tickets.alias_of(&ticket).unwrap();
+
+        let mut records: HashMap<String, AgentRecord> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("agents.json")).unwrap())
+                .unwrap();
+        for record in records.values_mut() {
+            record.task = Some(alias.clone());
+        }
+        std::fs::write(
+            dir.path().join("agents.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+        let daemon = Daemon::new(Layout::at(dir.path()), &Config::default()).unwrap();
+
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
+
+        assert_eq!(reopened, 0);
+        let ticket = daemon.tickets.get(identity).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("in_progress"));
     }
 
     /// Daemon-level coverage of the phase-latency sweep's live-probe wiring

@@ -1,7 +1,10 @@
 //! Single-writer, incremental observation log. Checkpoints are disposable
 //! caches: replaying complete samples is sufficient to reconstruct them.
 
-use super::{ready_ticket_ids, write_json_atomic, Manifest, Sample, SAMPLES};
+use super::{
+    advance_sample_progress, ready_ticket_ids, write_json_atomic, Manifest, ProgressMetrics,
+    ProgressState, Sample, Thresholds, SAMPLES,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,6 +22,8 @@ const CHECKPOINT: &str = "collector.json";
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Checkpoint {
     manifest_digest: String,
+    #[serde(default)]
+    evaluator_version: u32,
     offset: u64,
     last_start: u64,
     last_digest: String,
@@ -26,6 +31,12 @@ struct Checkpoint {
     last_observed: Option<DateTime<Utc>>,
     event_cursor: Option<String>,
     ready_since: BTreeMap<String, DateTime<Utc>>,
+    /// D1's independent progress evaluator state, keyed by ticket identity.
+    /// Persisted (never just recomputed from the tail) so a restart resumes
+    /// the same stall clock and generation binding instead of granting a
+    /// fresh grace window — see `advance_progress_state`.
+    #[serde(default)]
+    progress: BTreeMap<String, ProgressState>,
 }
 
 pub(super) struct ObservationLog {
@@ -33,6 +44,7 @@ pub(super) struct ObservationLog {
     file: File,
     state: Checkpoint,
     recoveries: Vec<String>,
+    thresholds: Thresholds,
     #[cfg(test)]
     pub replayed_samples: usize,
 }
@@ -55,12 +67,15 @@ impl ObservationLog {
             .and_then(|bytes| serde_json::from_slice::<Checkpoint>(&bytes).ok());
         let state = match cached {
             Some(state)
-                if state.manifest_digest == digest && valid_checkpoint(&mut file, &state)? =>
+                if state.manifest_digest == digest
+                    && state.evaluator_version == super::PROGRESS_EVALUATOR_VERSION
+                    && valid_checkpoint(&mut file, &state)? =>
             {
                 state
             }
             _ => Checkpoint {
                 manifest_digest: digest,
+                evaluator_version: super::PROGRESS_EVALUATOR_VERSION,
                 ..Default::default()
             },
         };
@@ -69,6 +84,7 @@ impl ObservationLog {
             file,
             state,
             recoveries: Vec::new(),
+            thresholds: manifest.thresholds.clone(),
             #[cfg(test)]
             replayed_samples: 0,
         };
@@ -106,6 +122,11 @@ impl ObservationLog {
             .and_then(|since| now.signed_duration_since(*since).to_std().ok())
             .map_or(0, |age| age.as_secs())
     }
+    /// Preview without advancing the cache before the sample is durable.
+    pub fn progress_metrics(&self, sample: &Sample) -> ProgressMetrics {
+        let mut states = self.state.progress.clone();
+        advance_sample_progress(&mut states, sample, &self.thresholds)
+    }
     pub fn gap(&self, start: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
         now.signed_duration_since(self.state.last_observed.unwrap_or(start))
             .to_std()
@@ -141,6 +162,7 @@ impl ObservationLog {
                 .entry(id)
                 .or_insert(sample.observed_at);
         }
+        advance_sample_progress(&mut self.state.progress, sample, &self.thresholds);
         if let Some(cursor) = &sample.event_cursor {
             if self
                 .state

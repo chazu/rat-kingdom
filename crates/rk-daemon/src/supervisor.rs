@@ -666,6 +666,10 @@ pub struct Supervisor {
     /// a saturated implementation lane can never starve it. See
     /// [`crate::agents::Lane::Review`].
     review_admission_limits: LaneLimits,
+    /// Linearizes reviewer launch with a durable ceiling fence. Held only
+    /// during synchronous reviewer launch/registration or the fence write,
+    /// never over an async dismissal or a review wait.
+    review_dispatch: Mutex<()>,
     /// `[disk] min_free_gb` (0 = disabled), applied by `Daemon::new` from
     /// config. Defaults to 0 here — a bare `Supervisor` constructed directly
     /// by a test or another crate stays disk-guard-free unless it opts in via
@@ -1082,6 +1086,7 @@ impl Supervisor {
             verification: VerificationResources::default(),
             implementation_admission_limits: LaneLimits::default(),
             review_admission_limits: LaneLimits::default(),
+            review_dispatch: Mutex::new(()),
             min_free_disk_gb: AtomicU64::new(0),
             max_load_per_cpu_bits: AtomicU64::new(0f64.to_bits()),
             shared_cargo_target: AtomicBool::new(false),
@@ -1527,6 +1532,65 @@ impl Supervisor {
         }
     }
 
+    /// Prevent every future launch of this attempt before taking the live
+    /// agent snapshot for dismissal. The fence survives a crash before the
+    /// final settlement marker; the two events intentionally mean different
+    /// things. Callers run this synchronous lock/write off the Tokio workers.
+    pub(crate) fn fence_review_attempt(&self, repo: &str, attempt: &str) -> rk_core::Result<()> {
+        let _dispatch = self.review_dispatch.lock().unwrap();
+        if self.review_attempt_fenced(repo, attempt)? {
+            return Ok(());
+        }
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                repo,
+                "landing_review_dispatch_fenced",
+                "daemon",
+                serde_json::json!({"attempt": attempt}),
+            )
+            .with_lifecycle(rk_core::tuple::Lifecycle::Furniture),
+        )?;
+        Ok(())
+    }
+
+    fn review_attempt_fenced(&self, repo: &str, attempt: &str) -> rk_core::Result<bool> {
+        for identity in [
+            "landing_review_dispatch_fenced",
+            "landing_review_ceiling_settled",
+        ] {
+            if self
+                .space
+                .scan(
+                    &Pattern::category(Category::Event)
+                        .scope(repo)
+                        .identity(identity),
+                )?
+                .iter()
+                .any(|t| t.payload["attempt"].as_str() == Some(attempt))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn ensure_review_dispatch_open(
+        &self,
+        repo: &str,
+        review: Option<&rk_core::review::ReviewContext>,
+    ) -> rk_core::Result<()> {
+        if let Some(review) = review {
+            if self.review_attempt_fenced(repo, &review.attempt)? {
+                return Err(rk_core::Error::other(format!(
+                    "settled review attempt {} cannot launch or resume; re-enqueue a fresh attempt",
+                    review.attempt
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Async callers must not run Git discovery/worktree setup or harness
     /// launch on a Tokio worker. The synchronous method remains for already
     /// blocking supervisors and tests.
@@ -1557,7 +1621,7 @@ impl Supervisor {
     /// TOCTOU-race the other onto the same free slot.
     pub fn spawn(
         self: &Arc<Self>,
-        params: SpawnParams,
+        mut params: SpawnParams,
         fleet_wip_cap: usize,
     ) -> rk_core::Result<AgentRecord> {
         if self.dispatch_paused.load(Ordering::Relaxed) {
@@ -1566,8 +1630,29 @@ impl Supervisor {
             ));
         }
         validate_role(&params.role)?;
+        // Canonicalize a ticket reference to its durable identity before it is
+        // used for anything (branch/worktree naming, the journal record,
+        // PrimeContext, the lane wait key), so every future dispatch of a
+        // legacy ticket's proquint alias records `record.task` under the same
+        // spelling regardless of caller (CLI, a workflow's interpolated
+        // `Step::Spawn`, or a direct `agent.spawn` RPC). `resolve` is a cheap
+        // no-op for free-text task descriptions and onboarding `onb-` session
+        // ids: it returns `Ok(None)` unless `params.task` is an exact ticket
+        // identity or a well-formed legacy alias. This is additive to, not a
+        // replacement for, the `Tickets::id_spellings` comparison-side
+        // matching used elsewhere — a record already written under an alias
+        // spelling still needs that. An ambiguous alias fails before any
+        // spawn side effect instead of guessing an identity.
+        if let Some(ticket) = self.tickets.resolve(&params.task)? {
+            params.task = ticket.identity;
+        }
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
         let repo_name = self.repository_name(&repo)?;
+        let _review_dispatch = params
+            .review
+            .as_ref()
+            .map(|_| self.review_dispatch.lock().unwrap());
+        self.ensure_review_dispatch_open(&repo_name, params.review.as_ref())?;
         // Onboarding is the one pre-policy capability: its session id, fixed
         // branch/worktree, read-only role, and explicit base are daemon-owned.
         // Every ordinary worker still requires an activated repository policy.
@@ -2145,11 +2230,15 @@ impl Supervisor {
         attach: bool,
         spawn: Option<rk_core::id::SpawnId>,
     ) -> rk_core::Result<AgentRecord> {
+        // Take the launch lock before reading the generation so settlement
+        // cannot miss a launch whose registry/control update is still pending.
+        let _review_dispatch = self.review_dispatch.lock().unwrap();
         let record = self
             .lock_registry()
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        self.ensure_review_dispatch_open(&record.repo_name, record.review.as_ref())?;
         if spawn.is_some_and(|expected| expected != record.spawn_id()) {
             return Err(rk_core::Error::other(format!(
                 "stale generation for {name}: expected {spawn:?}, current is {}",
@@ -4346,11 +4435,15 @@ impl Supervisor {
         action_id: &str,
         target_harness: Option<&str>,
     ) -> rk_core::Result<crate::agents::RecoveryOutcome> {
+        // Take the launch lock before reading the generation so settlement
+        // cannot miss a launch whose registry/control update is still pending.
+        let _review_dispatch = self.review_dispatch.lock().unwrap();
         let record = self
             .lock_registry()
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        self.ensure_review_dispatch_open(&record.repo_name, record.review.as_ref())?;
         let recovery = match record.recovery.clone() {
             Some(recovery) => recovery,
             None => return Self::replay_receipt_or_refuse(name, action_id, &record),
@@ -5793,10 +5886,10 @@ impl Supervisor {
     /// candidate. This decides whether delivery evidence is applicable; it
     /// never decides whether delivery occurred.
     ///
-    /// `record.task` is stored verbatim from `SpawnParams.task` and is never
-    /// canonicalized, so it carries whichever spelling the spawn's caller
-    /// used — a legacy ticket's `TKT-<ULID>` identity or its proquint alias.
-    /// `task` here is likewise whatever spelling the `done` caller typed.
+    /// `Supervisor::spawn` canonicalizes a well-formed ticket reference before
+    /// it reaches `record.task`, but a record written before that landed can still carry a legacy ticket's proquint
+    /// alias instead of its `TKT-<ULID>` identity. `task` here is likewise
+    /// whatever spelling the `done` caller typed.
     /// Comparing the two raw would let a `done` addressed by one spelling
     /// miss a candidate locked under the other and fail OPEN, which is the
     /// TKT-18/46/147 dropped-land class this guard exists to prevent. Match
