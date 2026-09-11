@@ -2,8 +2,8 @@
 //! caches: replaying complete samples is sufficient to reconstruct them.
 
 use super::{
-    advance_sample_progress, ready_ticket_ids, write_json_atomic, Manifest, ProgressMetrics,
-    ProgressState, Sample, Thresholds, SAMPLES,
+    advance_sample_progress, load_interventions, ready_ticket_ids, write_json_atomic, Manifest,
+    ProgressMetrics, ProgressState, Sample, Thresholds, SAMPLES,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -123,9 +123,18 @@ impl ObservationLog {
             .map_or(0, |age| age.as_secs())
     }
     /// Preview without advancing the cache before the sample is durable.
-    pub fn progress_metrics(&self, sample: &Sample) -> ProgressMetrics {
+    /// Reloads declared-intervention evidence fresh each call: it lives in
+    /// its own append-only directory, not the cached checkpoint, so a gate
+    /// declared between samples is picked up without a restart.
+    pub fn progress_metrics(&self, sample: &Sample) -> Result<ProgressMetrics> {
+        let interventions = load_interventions(&self.run)?;
         let mut states = self.state.progress.clone();
-        advance_sample_progress(&mut states, sample, &self.thresholds)
+        Ok(advance_sample_progress(
+            &mut states,
+            sample,
+            &self.thresholds,
+            &interventions,
+        ))
     }
     pub fn gap(&self, start: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
         now.signed_duration_since(self.state.last_observed.unwrap_or(start))
@@ -147,13 +156,14 @@ impl ObservationLog {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&bytes)?;
         self.file.sync_data()?;
-        self.absorb(sample, &bytes);
+        self.absorb(sample, &bytes)?;
         self.checkpoint()?;
         self.recoveries.clear();
         Ok(())
     }
 
-    fn absorb(&mut self, sample: &Sample, bytes: &[u8]) {
+    fn absorb(&mut self, sample: &Sample, bytes: &[u8]) -> Result<()> {
+        let interventions = load_interventions(&self.run)?;
         let ready = ready_ticket_ids(sample);
         self.state.ready_since.retain(|id, _| ready.contains(id));
         for id in ready {
@@ -162,7 +172,12 @@ impl ObservationLog {
                 .entry(id)
                 .or_insert(sample.observed_at);
         }
-        advance_sample_progress(&mut self.state.progress, sample, &self.thresholds);
+        advance_sample_progress(
+            &mut self.state.progress,
+            sample,
+            &self.thresholds,
+            &interventions,
+        );
         if let Some(cursor) = &sample.event_cursor {
             if self
                 .state
@@ -178,6 +193,7 @@ impl ObservationLog {
         self.state.last_start = self.state.offset;
         self.state.offset += bytes.len() as u64;
         self.state.last_digest = hex::encode(Sha256::digest(bytes));
+        Ok(())
     }
 
     fn replay_tail(&mut self) -> Result<()> {
@@ -235,7 +251,7 @@ impl ObservationLog {
                     self.state.offset
                 );
             }
-            self.absorb(&sample, &bytes);
+            self.absorb(&sample, &bytes)?;
             #[cfg(test)]
             {
                 self.replayed_samples += 1;
