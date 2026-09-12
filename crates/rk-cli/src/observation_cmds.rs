@@ -27,8 +27,15 @@ const PROGRESS_EVALUATOR_VERSION: u32 = 3;
 /// removal). Version 2 is the coverage-aware evaluator: an absence-based
 /// check (forced/duplicate landings) or a merged-across-samples count
 /// (deliveries) no longer reads as a proven zero/pass when its required
-/// source never finished refreshing before the run ended.
-const REPORT_EVALUATOR_VERSION: u32 = 2;
+/// source never finished refreshing before the run ended. Version 3 folds
+/// `attributed_cost_usd`/`attributed_tokens` per spawn by each generation's
+/// LAST sampled reading instead of the historical MAX, and gains
+/// `usage_coverage`: a generation still live (not harness-terminal) at its
+/// last sample has not received its own final reconciliation, so summing
+/// per-spawn peaks across the run could — and, in the trial evidence this
+/// version fixes, did — permanently keep a pre-reconciliation ledger spike
+/// the harness itself later corrected down at a turn boundary.
+const REPORT_EVALUATOR_VERSION: u32 = 3;
 const MANIFEST: &str = "manifest.json";
 const SAMPLES: &str = "samples.jsonl";
 const INTERVENTIONS: &str = "interventions";
@@ -38,8 +45,11 @@ const CONTRACT_SCHEMA_VERSION: u32 = 1;
 /// complete ticket/event coverage before an absence-based resource check or
 /// a workload delivery count can pass — see `workload/delivery-coverage` and
 /// the coverage guards on `resources/forced-landings` and
-/// `resources/duplicate-landings`.
-const QUALIFICATION_EVALUATOR_VERSION: u32 = 3;
+/// `resources/duplicate-landings`. Version 4 adds the same guard to
+/// `resources/spend-usd`: it can no longer pass while `usage_coverage` is
+/// `Incomplete`, since a still-live generation's folded cost is a
+/// provisional ledger reading, not a settled total.
+const QUALIFICATION_EVALUATOR_VERSION: u32 = 4;
 const CONTRACT: &str = "contract.json";
 const EXERCISES: &str = "exercises";
 const QUALIFICATION: &str = "qualification.json";
@@ -379,8 +389,10 @@ struct Check {
     limit: Value,
     passed: bool,
     /// Set only for a check whose `observed` value depends on a source that
-    /// can go stale mid-run (ticket state, the event feed). Absent for a
-    /// check with no such dependency. See [`Coverage`].
+    /// can go stale mid-run (ticket state, the event feed) or on a
+    /// generation's own cost/usage ledger that has not yet reached a
+    /// harness-terminal reconciliation. Absent for a check with no such
+    /// dependency. See [`Coverage`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     coverage: Option<Coverage>,
 }
@@ -453,6 +465,15 @@ struct Report {
     ticket_coverage: CoverageStatus,
     attributed_cost_usd: f64,
     attributed_tokens: u64,
+    /// Coverage for `attributed_cost_usd`/`attributed_tokens`: `incomplete_samples`
+    /// here counts distinct generations still live (not harness-terminal) at
+    /// their last sample, and `uncovered_tail_secs` is the longest span since
+    /// any such generation's last sample. Their folded cost/tokens is the
+    /// harness's own last-known streaming ledger reading, not a reconciled
+    /// final total — it can still move, in either direction, before that
+    /// generation actually completes. See [`attributed_usage`].
+    #[serde(default)]
+    usage_coverage: CoverageStatus,
     max_landing_depth: u64,
     max_landing_age_secs: u64,
     max_ready_age_secs: u64,
@@ -1958,7 +1979,8 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         .filter(|ticket| manifest.tickets.is_empty() || selected_root(ticket, &manifest.tickets))
         .count() as u64;
     let correction_deliveries = delivered.len() as u64 - delivered_during_run;
-    let (attributed_cost_usd, attributed_tokens) = attributed_usage(&samples, manifest.started_at);
+    let (attributed_cost_usd, attributed_tokens, usage_coverage) =
+        attributed_usage(&samples, manifest.started_at);
     let max_landing_depth = max_metric(&samples, |m| m.landing_depth);
     let max_landing_age_secs = max_metric(&samples, |m| m.oldest_landing_age_secs);
     let max_ready_age_secs = max_metric(&samples, |m| m.oldest_ready_age_secs);
@@ -2097,16 +2119,18 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
             Check {
                 observed: json!(attributed_cost_usd),
                 limit: json!(limit),
-                passed: attributed_cost_usd <= limit,
-                coverage: None,
+                passed: attributed_cost_usd <= limit
+                    && usage_coverage.coverage == Coverage::Complete,
+                coverage: Some(usage_coverage.coverage),
             },
         );
     }
-    // Named, durable evidence of the two merged-across-samples sources
+    // Named, durable evidence of the three merged-across-samples sources
     // themselves, independent of any single check that consumes them — see
-    // `ticket_coverage`/`event_coverage` on `Report`.
+    // `ticket_coverage`/`event_coverage`/`usage_coverage` on `Report`.
     check_coverage(&mut checks, "ticket-coverage", &ticket_coverage);
     check_coverage(&mut checks, "event-coverage", &event_coverage);
+    check_coverage(&mut checks, "usage-coverage", &usage_coverage);
     let passed = checks.values().all(|check| check.passed);
     let mut evidence = BTreeMap::new();
     evidence.insert(
@@ -2148,6 +2172,7 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         ticket_coverage,
         attributed_cost_usd,
         attributed_tokens,
+        usage_coverage,
         max_landing_depth,
         max_landing_age_secs,
         max_ready_age_secs,
@@ -2603,11 +2628,22 @@ fn derive_qualification(run_dir: &Path) -> Result<QualificationResult> {
         ),
     );
     if let Some(limit) = contract.resources.max_spend_usd {
+        let usage_note = if report.usage_coverage.coverage == Coverage::Complete {
+            String::new()
+        } else {
+            format!(
+                "; usage coverage incomplete ({} generation(s) still live, {}s since last reconciled) \
+                 — this total is a provisional ledger reading, not a settled figure",
+                report.usage_coverage.incomplete_samples,
+                report.usage_coverage.uncovered_tail_secs.unwrap_or(0)
+            )
+        };
         require(
             "resources/spend-usd",
-            report.attributed_cost_usd <= limit,
+            report.attributed_cost_usd <= limit
+                && report.usage_coverage.coverage == Coverage::Complete,
             format!(
-                "attributed spend {:.4} USD against a limit of {limit:.4} USD",
+                "attributed spend {:.4} USD against a limit of {limit:.4} USD{usage_note}",
                 report.attributed_cost_usd
             ),
         );
@@ -2742,35 +2778,127 @@ fn delivery_in_window(ticket: &Value, start: DateTime<Utc>, end: DateTime<Utc>) 
         .unwrap_or(false)
 }
 
-fn attributed_usage(samples: &[Sample], started_at: DateTime<Utc>) -> (f64, u64) {
-    let mut by_spawn: HashMap<String, (DateTime<Utc>, f64, f64, u64, u64)> = HashMap::new();
-    for agent in samples.iter().flat_map(|sample| &sample.agents) {
-        let key = agent["spawn"]
-            .as_str()
-            .or_else(|| agent["name"].as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let created = parse_time(&agent["created_at"]).unwrap_or(started_at);
-        let cost = agent["cost_usd"].as_f64().unwrap_or(0.0);
-        let tokens = agent_tokens(agent);
-        by_spawn
-            .entry(key)
-            .and_modify(|row| {
-                row.1 = row.1.min(cost);
-                row.2 = row.2.max(cost);
-                row.3 = row.3.min(tokens);
-                row.4 = row.4.max(tokens);
-            })
-            .or_insert((created, cost, cost, tokens, tokens));
+/// One spawn's usage as folded across samples in chronological order: its
+/// first-seen reading (baselines a generation already running before
+/// `started_at`, so only spend accrued DURING this run is attributed), its
+/// LAST-seen reading (the freshest known state), and whether that reading
+/// was harness-terminal — see [`attributed_usage`].
+struct SpawnUsage {
+    created: DateTime<Utc>,
+    first_cost: f64,
+    first_tokens: u64,
+    last_cost: f64,
+    last_tokens: u64,
+    last_seen: DateTime<Utc>,
+    settled: bool,
+}
+
+/// Generation states from which no further harness event can revise
+/// `cost_usd`/`usage` on the same spawn — mirrors `AgentState::is_archivable`
+/// minus `dismissed`'s daemon-side archiving nuance, which does not matter
+/// here (a dismissed generation's cost is equally final).
+fn agent_state_settled(state: Option<&str>) -> bool {
+    matches!(
+        state,
+        Some("completed" | "failed" | "stopped" | "dismissed")
+    )
+}
+
+/// Attribute run-window cost/tokens per generation (`spawn`, falling back to
+/// `name`), folding each spawn to its LAST sampled reading rather than the
+/// historical maximum across the run, and report whether every folded
+/// generation had settled by then.
+///
+/// The daemon's own incremental usage ledger (summed from streaming `Usage`
+/// events) can run ahead of reality mid-turn, and an authoritative
+/// `Completed`/`result` reconciliation from the harness then corrects
+/// `cost_usd`/`usage` back down on the SAME spawn and session, no process
+/// restart in between — observed directly in trial evidence as a
+/// `running`-state peak followed by a `paused`-state correction to roughly
+/// half that value at the very next sample. Taking the max across samples
+/// permanently keeps whichever pre-correction peak an in-window sample
+/// happened to catch even after the harness has corrected it; two such
+/// peaks, summed across two generations, is exactly what overcounted a real
+/// trial's reported spend against the generations' own final totals. Folding
+/// by LAST instead reflects whatever the daemon has most recently
+/// reconciled to. A generation still live at run end has, by definition, not
+/// reached its own final reconciliation yet — its contribution is real spend
+/// so far, not double-counted or dropped, but it is provisional and could
+/// still move; such spawns are surfaced via the returned coverage rather
+/// than silently trusted as final.
+fn attributed_usage(samples: &[Sample], started_at: DateTime<Utc>) -> (f64, u64, CoverageStatus) {
+    let mut by_spawn: HashMap<String, SpawnUsage> = HashMap::new();
+    for sample in samples {
+        for agent in &sample.agents {
+            let key = agent["spawn"]
+                .as_str()
+                .or_else(|| agent["name"].as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let created = parse_time(&agent["created_at"]).unwrap_or(started_at);
+            let cost = agent["cost_usd"].as_f64().unwrap_or(0.0);
+            let tokens = agent_tokens(agent);
+            let settled = agent_state_settled(agent["state"].as_str());
+            by_spawn
+                .entry(key)
+                .and_modify(|row| {
+                    row.last_cost = cost;
+                    row.last_tokens = tokens;
+                    row.last_seen = sample.observed_at;
+                    row.settled = settled;
+                })
+                .or_insert(SpawnUsage {
+                    created,
+                    first_cost: cost,
+                    first_tokens: tokens,
+                    last_cost: cost,
+                    last_tokens: tokens,
+                    last_seen: sample.observed_at,
+                    settled,
+                });
+        }
     }
-    by_spawn.values().fold((0.0, 0), |(cost, tokens), row| {
-        let baseline_cost = if row.0 >= started_at { 0.0 } else { row.1 };
-        let baseline_tokens = if row.0 >= started_at { 0 } else { row.3 };
+    let ended_at = samples
+        .last()
+        .map(|sample| sample.observed_at)
+        .unwrap_or(started_at);
+    let unsettled = by_spawn.values().filter(|row| !row.settled).count() as u64;
+    let uncovered_tail_secs = by_spawn
+        .values()
+        .filter(|row| !row.settled)
+        .map(|row| {
+            ended_at
+                .signed_duration_since(row.last_seen)
+                .to_std()
+                .map_or(0, |gap| gap.as_secs())
+        })
+        .max();
+    let coverage = CoverageStatus {
+        coverage: if unsettled == 0 {
+            Coverage::Complete
+        } else {
+            Coverage::Incomplete
+        },
+        incomplete_samples: unsettled,
+        uncovered_tail_secs,
+    };
+    let (cost, tokens) = by_spawn.values().fold((0.0, 0), |(cost, tokens), row| {
+        let baseline_cost = if row.created >= started_at {
+            0.0
+        } else {
+            row.first_cost
+        };
+        let baseline_tokens = if row.created >= started_at {
+            0
+        } else {
+            row.first_tokens
+        };
         (
-            cost + (row.2 - baseline_cost).max(0.0),
-            tokens + row.4.saturating_sub(baseline_tokens),
+            cost + (row.last_cost - baseline_cost).max(0.0),
+            tokens + row.last_tokens.saturating_sub(baseline_tokens),
         )
-    })
+    });
+    (cost, tokens, coverage)
 }
 
 fn unique_events(samples: &[Sample]) -> BTreeMap<String, &Value> {
@@ -3230,6 +3358,14 @@ fn print_report(report: &Report) {
              event coverage incomplete ({} incomplete sample(s), {}s uncovered tail)",
             report.event_coverage.incomplete_samples,
             report.event_coverage.uncovered_tail_secs.unwrap_or(0),
+        );
+    }
+    if report.usage_coverage.coverage == Coverage::Incomplete {
+        println!(
+            "  NOTE attributed_cost_usd/attributed_tokens are PROVISIONAL: \
+             {} generation(s) still live, last reconciled up to {}s ago",
+            report.usage_coverage.incomplete_samples,
+            report.usage_coverage.uncovered_tail_secs.unwrap_or(0),
         );
     }
     for (name, check) in &report.checks {
@@ -5162,6 +5298,69 @@ mod tests {
         let report = derive_report(dir.path()).unwrap();
         assert!((report.attributed_cost_usd - 0.75).abs() < 0.0001);
         assert_eq!(report.attributed_tokens, 70);
+    }
+
+    /// Reproduces the trial evidence directly: a spawn's own ledger climbs
+    /// while `running`, then a `paused` turn-boundary reconciliation from the
+    /// harness corrects `cost_usd`/`usage` DOWN on the same spawn (no
+    /// restart, no new session), before a later `completed` sample settles
+    /// it slightly above the correction. The pre-fix evaluator (max across
+    /// samples) would have attributed the transient `running` peak (14.0);
+    /// the fix must attribute the settled final reading (7.5) instead.
+    #[test]
+    fn a_same_spawn_cost_correction_is_reconciled_to_the_settled_reading_not_the_peak() {
+        let (dir, _) = fixture();
+        let agent = |cost: f64, state: &str| {
+            json!({"spawn": "S1", "name": "Pretzel-14", "created_at": "2026-09-02T00:00:00Z",
+                   "state": state, "cost_usd": cost, "usage": {"output": 100}})
+        };
+        let mut peak = sample(1, "2026-09-02T00:00:30Z");
+        peak.agents = vec![agent(14.0, "running")];
+        let mut corrected = sample(2, "2026-09-02T00:01:00Z");
+        corrected.agents = vec![agent(6.9, "paused")];
+        let mut settled = sample(3, "2026-09-02T00:01:30Z");
+        settled.agents = vec![agent(7.5, "completed")];
+        for value in [peak, corrected, settled] {
+            append_json_line(&dir.path().join(SAMPLES), &value).unwrap();
+        }
+        let report = derive_report(dir.path()).unwrap();
+        assert!(
+            (report.attributed_cost_usd - 7.5).abs() < 0.0001,
+            "expected the settled final reading, got {}",
+            report.attributed_cost_usd
+        );
+        assert_eq!(report.usage_coverage.coverage, Coverage::Complete);
+        assert_eq!(report.usage_coverage.incomplete_samples, 0);
+    }
+
+    /// A generation still live at the run's last sample has not received its
+    /// own final harness reconciliation: its folded cost is real spend so
+    /// far, but provisional, and must not silently pass an under-budget
+    /// check as though it were a settled total.
+    #[test]
+    fn a_still_live_generation_leaves_attributed_spend_coverage_incomplete() {
+        let (dir, _) = fixture();
+        let mut first = sample(1, "2026-09-02T00:00:30Z");
+        first.agents = vec![json!({"spawn": "S1", "name": "Muenster-14",
+            "created_at": "2026-09-02T00:00:00Z", "state": "running",
+            "cost_usd": 0.5, "usage": {"output": 10}})];
+        let mut second = sample(2, "2026-09-02T00:01:00Z");
+        second.agents = vec![json!({"spawn": "S1", "name": "Muenster-14",
+            "created_at": "2026-09-02T00:00:00Z", "state": "running",
+            "cost_usd": 1.0, "usage": {"output": 20}})];
+        for value in [first, second] {
+            append_json_line(&dir.path().join(SAMPLES), &value).unwrap();
+        }
+        let report = derive_report(dir.path()).unwrap();
+        assert!((report.attributed_cost_usd - 1.0).abs() < 0.0001);
+        assert_eq!(report.usage_coverage.coverage, Coverage::Incomplete);
+        assert_eq!(report.usage_coverage.incomplete_samples, 1);
+        assert_eq!(report.usage_coverage.uncovered_tail_secs, Some(0));
+        assert!(
+            !report.checks["attributed-cost-usd"].passed,
+            "an under-budget reading from a still-live generation must not pass as settled"
+        );
+        assert!(!report.passed);
     }
 
     #[test]
