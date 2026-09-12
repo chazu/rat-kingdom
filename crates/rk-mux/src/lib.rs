@@ -17,13 +17,10 @@ use tracing::debug;
 
 pub struct HerdrMux;
 
-/// Stable identity of one detected agent generation. `terminal_id` anchors the
-/// pane while `session_id` stores Herdr's required `revision` as
-/// `revision:<number>`. The name is retained for state-file compatibility.
-///
-/// Do not use optional `agent_session` here. Some harnesses report it after
-/// interactive readiness, so switching from the revision to that late value
-/// makes a freshly registered agent appear to have replaced itself.
+/// Identity of one detected agent generation, anchored by terminal and agent
+/// kind. `session_id` stores either `agent-session:<value>` or the conservative
+/// `revision:<number>` fallback. The field name is retained for state-file
+/// compatibility, and the selected fence mode persists until re-registration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentIdentity {
     pub terminal_id: String,
@@ -163,11 +160,32 @@ impl HerdrMux {
     /// is not silently treated as the same King.
     pub fn exact_state(identity: &AgentIdentity) -> Option<AgentState> {
         let snapshot = Self::snapshot()?;
-        let entry = Self::agent_entry(&snapshot, &identity.terminal_id)?;
-        let current = identity_from_entry(entry).ok()?;
-        if current.session_id != identity.session_id {
+        Self::exact_state_from_snapshot(&snapshot, identity)
+    }
+
+    fn exact_state_from_snapshot(snapshot: &Value, identity: &AgentIdentity) -> Option<AgentState> {
+        // Names and labels may alias another terminal; they are lookup aids
+        // for registration, never proof of an already registered identity.
+        let entry = snapshot["result"]["snapshot"]["agents"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["terminal_id"].as_str() == Some(&identity.terminal_id))?;
+        if entry["agent"].as_str() != Some(&identity.agent) {
             return None;
         }
+        let fence = if identity.session_id.starts_with("agent-session:") {
+            reported_session_fence(entry)?
+        } else if identity.session_id.starts_with("revision:") {
+            revision_fence(entry)?
+        } else {
+            return None;
+        };
+        if fence != identity.session_id {
+            return None;
+        }
+        let mut current = identity_from_entry(entry).ok()?;
+        // Late session reporting must not silently upgrade a legacy identity.
+        current.session_id = fence;
         Some(AgentState {
             identity: current,
             status: entry["agent_status"].as_str().unwrap_or("unknown").into(),
@@ -207,17 +225,15 @@ impl HerdrMux {
         args: &[String],
         timeout_ms: u64,
     ) -> rk_core::Result<AgentIdentity> {
-        if Self::exact_state(identity).is_none() {
-            return Err(rk_core::Error::other(
-                "registered King generation is no longer present",
-            ));
-        }
+        let current = Self::exact_state(identity).ok_or_else(|| {
+            rk_core::Error::other("registered King generation is no longer present")
+        })?;
         let timeout = timeout_ms.clamp(1_000, 300_000).to_string();
         // Target the pane: Herdr 0.8 no longer resolves `terminal_id` here.
         run_herdr(&[
             "agent",
             "prompt",
-            &identity.pane_id,
+            &current.identity.pane_id,
             "/exit",
             "--wait",
             "--until",
@@ -225,7 +241,7 @@ impl HerdrMux {
             "--timeout",
             &timeout,
         ])?;
-        Self::start_in_pane(name, harness, &identity.pane_id, args)
+        Self::start_in_pane(name, harness, &current.identity.pane_id, args)
     }
 
     /// Herdr's semantic state for the pane: idle|working|blocked|done|unknown.
@@ -276,19 +292,24 @@ impl HerdrMux {
 
     /// Match an agent entry by herdr name/label/terminal id.
     fn agent_entry<'a>(snapshot: &'a Value, target: &str) -> Option<&'a Value> {
-        snapshot["result"]["snapshot"]["agents"]
-            .as_array()?
+        let agents = snapshot["result"]["snapshot"]["agents"].as_array()?;
+        // Persisted terminal targets must also win during command routing,
+        // even if another agent's name or label happens to equal that ID.
+        agents
             .iter()
-            .find(|a| {
-                [
-                    &a["name"],
-                    &a["label"],
-                    &a["terminal_id"],
-                    &a["pane_id"],
-                    &a["agent_session"]["value"],
-                ]
-                .iter()
-                .any(|f| f.as_str() == Some(target))
+            .find(|entry| entry["terminal_id"].as_str() == Some(target))
+            .or_else(|| {
+                agents.iter().find(|a| {
+                    [
+                        &a["name"],
+                        &a["label"],
+                        &a["terminal_id"],
+                        &a["pane_id"],
+                        &a["agent_session"]["value"],
+                    ]
+                    .iter()
+                    .any(|f| f.as_str() == Some(target))
+                })
             })
     }
 }
@@ -309,16 +330,26 @@ fn identity_from_entry(entry: &Value) -> rk_core::Result<AgentIdentity> {
     })
 }
 
-/// Fence one agent generation within a pane.
-///
-/// Use the one generation field every Herdr agent has. Optional
-/// `agent_session` can appear after startup and is therefore not stable across
-/// two adjacent snapshots of the same generation.
+/// Choose a fence when registering. Herdr's revision changes with ordinary
+/// metadata updates, so prefer the harness session when it is already known.
+/// Revision-only registrations remain conservative until explicitly replaced.
 fn generation_fence(entry: &Value) -> rk_core::Result<String> {
+    reported_session_fence(entry)
+        .or_else(|| revision_fence(entry))
+        .ok_or_else(|| rk_core::Error::other("herdr agent omitted session and revision"))
+}
+
+fn reported_session_fence(entry: &Value) -> Option<String> {
+    entry["agent_session"]["value"]
+        .as_str()
+        .filter(|session| !session.trim().is_empty())
+        .map(|session| format!("agent-session:{session}"))
+}
+
+fn revision_fence(entry: &Value) -> Option<String> {
     entry["revision"]
         .as_u64()
         .map(|revision| format!("revision:{revision}"))
-        .ok_or_else(|| rk_core::Error::other("herdr agent omitted revision"))
 }
 
 fn find_string_key(value: &Value, key: &str) -> Option<String> {
@@ -591,17 +622,100 @@ mod tests {
         assert!(HerdrMux::agent_entry(&snapshot, "Nibbles").is_none());
     }
 
-    /// Optional harness session reporting may lag interactive readiness. The
-    /// required pane revision is stable before and after that late report.
-    #[test]
-    fn generation_fence_is_stable_when_agent_session_appears_late() {
-        let reported: Value = serde_json::from_str(
-            r#"{"terminal_id":"term_1","pane_id":"w1:p1","revision":7,
-                "agent":"codex","cwd":"/repo","agent_session":{"value":"sess_abc"}}"#,
-        )
-        .unwrap();
-        assert_eq!(generation_fence(&reported).unwrap(), "revision:7");
+    fn reported_agent() -> Value {
+        serde_json::json!({
+            "terminal_id": "term_1", "pane_id": "w1:p1", "revision": 7,
+            "agent": "codex", "cwd": "/repo", "agent_status": "idle",
+            "focused": false, "agent_session": {"value": "sess_abc"}
+        })
+    }
 
+    fn exact_agent(entry: &Value, identity: &AgentIdentity) -> Option<AgentState> {
+        HerdrMux::exact_state_from_snapshot(
+            &serde_json::json!({"result": {"snapshot": {"agents": [entry]}}}),
+            identity,
+        )
+    }
+
+    #[test]
+    fn session_identity_survives_metadata_updates_and_state_round_trip() {
+        let mut entry = reported_agent();
+        let registered = identity_from_entry(&entry).unwrap();
+        assert_eq!(registered.session_id, "agent-session:sess_abc");
+        let persisted = serde_json::to_vec(&registered).unwrap();
+        let restored = serde_json::from_slice(&persisted).unwrap();
+        entry["revision"] = serde_json::json!(1070);
+        entry["agent_status"] = serde_json::json!("working");
+        entry["focused"] = serde_json::json!(true);
+        entry["cwd"] = serde_json::json!("/other/repo");
+        entry["pane_id"] = serde_json::json!("w2:p1");
+        let state = exact_agent(&entry, &restored).unwrap();
+        assert_eq!(state.identity.session_id, registered.session_id);
+        assert_eq!(state.identity.cwd, "/other/repo");
+        assert_eq!(state.identity.pane_id, "w2:p1");
+        assert_eq!(state.status, "working");
+        assert!(state.focused);
+    }
+
+    #[test]
+    fn session_identity_rejects_replacement_and_missing_session_metadata() {
+        let entry = reported_agent();
+        let registered = identity_from_entry(&entry).unwrap();
+        for (field, value) in [("terminal_id", "term_2"), ("agent", "claude")] {
+            let mut replaced = entry.clone();
+            replaced[field] = serde_json::json!(value);
+            assert!(exact_agent(&replaced, &registered).is_none(), "{field}");
+        }
+        for value in [
+            serde_json::json!("sess_replacement"),
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(42),
+            Value::Null,
+        ] {
+            let mut replaced = entry.clone();
+            replaced["agent_session"]["value"] = value;
+            assert!(exact_agent(&replaced, &registered).is_none());
+        }
+        let mut missing = entry;
+        missing.as_object_mut().unwrap().remove("agent_session");
+        assert!(exact_agent(&missing, &registered).is_none());
+    }
+
+    #[test]
+    fn exact_identity_does_not_accept_terminal_aliases() {
+        let entry = reported_agent();
+        let registered = identity_from_entry(&entry).unwrap();
+        let mut other = entry.clone();
+        other["terminal_id"] = serde_json::json!("term_other");
+        other["label"] = serde_json::json!(registered.terminal_id);
+        assert!(exact_agent(&other, &registered).is_none());
+        let snapshot = serde_json::json!({"result": {"snapshot": {"agents": [other, entry]}}});
+        assert_eq!(
+            HerdrMux::exact_state_from_snapshot(&snapshot, &registered)
+                .unwrap()
+                .identity
+                .terminal_id,
+            registered.terminal_id
+        );
+    }
+
+    #[test]
+    fn fence_modes_preserve_opaque_session_ids_and_reject_unknown_formats() {
+        let mut entry = reported_agent();
+        entry["agent_session"]["value"] = serde_json::json!("revision:7");
+        let mut registered = identity_from_entry(&entry).unwrap();
+        assert_eq!(registered.session_id, "agent-session:revision:7");
+        entry["revision"] = serde_json::json!(8);
+        assert!(exact_agent(&entry, &registered).is_some());
+        for unknown in ["revision:07", "sess_abc", "unknown:7", "agent-session:"] {
+            registered.session_id = unknown.into();
+            assert!(exact_agent(&entry, &registered).is_none(), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn revision_identity_retains_its_mode_when_session_appears_late() {
         // Verbatim shape of a live `claude` agent under herdr 0.8.2: healthy,
         // interactive, and carrying no `agent_session` key at all.
         let unreported: Value = serde_json::from_str(
@@ -616,14 +730,21 @@ mod tests {
         assert_eq!(identity.terminal_id, "term_2");
         assert_eq!(identity.agent, "claude");
 
-        // A replacement generation in the same pane must not read as the same
-        // King: Herdr bumps `revision` when a new agent takes the pane over.
-        let mut replaced = unreported.clone();
-        replaced["revision"] = serde_json::json!(3);
-        assert_ne!(
-            identity_from_entry(&replaced).unwrap().session_id,
-            identity.session_id
+        let persisted = serde_json::to_vec(&identity).unwrap();
+        let restored = serde_json::from_slice(&persisted).unwrap();
+        let mut reported = unreported.clone();
+        reported["agent_session"] = serde_json::json!({"value": "late_session"});
+        let state = exact_agent(&reported, &restored).unwrap();
+        assert_eq!(state.identity.session_id, "revision:1");
+        // Explicit registration can select the stronger fence.
+        assert_eq!(
+            identity_from_entry(&reported).unwrap().session_id,
+            "agent-session:late_session"
         );
+        // The fallback remains conservative when revision changes, whether
+        // that change is a replacement or merely new metadata.
+        reported["revision"] = serde_json::json!(3);
+        assert!(exact_agent(&reported, &restored).is_none());
 
         let neither: Value =
             serde_json::from_str(r#"{"terminal_id":"term_3","pane_id":"w1:p1"}"#).unwrap();
