@@ -7861,6 +7861,93 @@ checks: [
         test_pipeline_routed(home, space, HashMap::new(), TierRouting::default())
     }
 
+    #[tokio::test]
+    async fn admission_source_fence_preserves_explicit_reviewer_and_unbound_task_landings() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let pipeline = test_pipeline(home.path(), Space::open_in_memory().unwrap());
+        let ticket = pipeline
+            .tickets
+            .create(NewTicket {
+                title: "bind reviewed work".into(),
+                body: None,
+                scope: Some("repo".into()),
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        let spawn = rk_core::id::SpawnId::new();
+        let mut source: crate::agents::AgentRecord = serde_json::from_value(json!({
+            "name": "Reviewer", "spawn": spawn, "role": "reviewer", "harness": "fake",
+            "repo_name": "repo", "repo_root": repo.path(), "task": ticket.identity,
+            "branch": "reviewed", "target_branch": "implementation", "state": "completed",
+            "usage": rk_harness::TokenUsage::default(), "cost_usd": 0.0,
+            "created_at": Utc::now(), "updated_at": Utc::now(),
+        }))
+        .unwrap();
+        pipeline
+            .supervisor
+            .lock_registry()
+            .insert(source.clone())
+            .unwrap();
+        let mut entry = LandingQueueEntry {
+            repo_name: "repo".into(),
+            repo_path: repo.path().display().to_string(),
+            branch: "reviewed".into(),
+            target: "implementation".into(),
+            task: ticket.identity.clone(),
+            source_spawn: Some(spawn),
+            ..Default::default()
+        };
+        assert!(
+            pipeline.invalid_source_identity(&entry).unwrap().is_some(),
+            "automatic completion cannot land a reviewer generation"
+        );
+        entry.operator_fast_lane = true;
+        entry.target = "main".into();
+        assert!(
+            pipeline.invalid_source_identity(&entry).unwrap().is_none(),
+            "explicit approved workflow can land its chained reviewer branch"
+        );
+
+        source.task = None;
+        pipeline
+            .supervisor
+            .lock_registry()
+            .insert(source.clone())
+            .unwrap();
+        assert!(
+            pipeline.invalid_source_identity(&entry).unwrap().is_none(),
+            "an explicit real same-repo ticket can bind an unbound generation"
+        );
+        entry.task = "untracked-task".into();
+        assert!(pipeline.invalid_source_identity(&entry).unwrap().is_some());
+        entry.task = ticket.identity;
+        source.task = Some("different-work".into());
+        pipeline
+            .supervisor
+            .lock_registry()
+            .insert(source.clone())
+            .unwrap();
+        assert!(
+            pipeline.invalid_source_identity(&entry).unwrap().is_some(),
+            "manual authority never overrides a real task binding"
+        );
+
+        source.task = Some(entry.task.clone());
+        source.repo_name = "foreign".into();
+        pipeline.supervisor.lock_registry().insert(source).unwrap();
+        assert!(
+            pipeline.invalid_source_identity(&entry).unwrap().is_some(),
+            "manual reviewer submission remains repository fenced"
+        );
+    }
+
     /// [`test_pipeline`] with the daemon's GLOBAL agent profiles and cost-tier
     /// routing table populated — the two inputs `WorkflowEngine` consults when
     /// resolving a spawn, and therefore the only way to exercise reviewer tier

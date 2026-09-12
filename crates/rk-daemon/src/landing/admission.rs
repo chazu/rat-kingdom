@@ -471,7 +471,9 @@ impl LandingPipeline {
                 "source generation repository root differs from queued repository".into(),
             ));
         }
-        if record.role != "rat"
+        // Explicit operator/workflow landings may submit a chained reviewer
+        // branch. Automatic completion admission remains worker-only.
+        if !(record.role == "rat" || (entry.operator_fast_lane && record.role == "reviewer"))
             || record.branch.as_deref() != Some(entry.branch.as_str())
             || (!entry.operator_fast_lane && record.target_branch != entry.target)
         {
@@ -489,7 +491,15 @@ impl LandingPipeline {
         };
         let expected = canonical(record.task.as_deref().unwrap_or_default())?;
         let queued = canonical(&entry.task)?;
-        if expected.is_none() || queued.is_none() || expected != queued {
+        // resolve_land_task permits an operator to bind an otherwise unbound
+        // generation to a real ticket. An existing task is never overridden.
+        let explicit_binding = entry.operator_fast_lane
+            && record.task.is_none()
+            && self
+                .tickets
+                .resolve(&entry.task)?
+                .is_some_and(|ticket| ticket.scope == entry.repo_name);
+        if !explicit_binding && (expected.is_none() || queued.is_none() || expected != queued) {
             return Ok(Some(
                 "source generation task differs from queued repository/task".into(),
             ));
