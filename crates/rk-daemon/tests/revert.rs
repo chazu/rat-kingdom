@@ -494,7 +494,7 @@ async fn automatic_reactor_landing_can_be_reverted() {
     let ticket = client
         .call(
             "ticket.new",
-            json!({"title": "do the thing", "scope": "svc"}),
+            json!({"title": "do the thing", "scope": &repo_name}),
         )
         .await
         .unwrap();
