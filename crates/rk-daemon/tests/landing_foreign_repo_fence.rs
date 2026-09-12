@@ -100,7 +100,7 @@ async fn emit_harness_result(
         .call("agent.status", json!({"name": "rat-1"}))
         .await
         .unwrap();
-    let spawn: SpawnId = agent["spawn"].as_str().unwrap().parse().unwrap();
+    let spawn: SpawnId = agent["agent"]["spawn"].as_str().unwrap().parse().unwrap();
     client
         .call(
             "space.out",
@@ -366,7 +366,7 @@ async fn same_scope_completion_rejects_forged_generation_and_ticket_fields() {
         .call("agent.status", json!({"name":"rat-1"}))
         .await
         .unwrap();
-    let original = json!({"agent":"rat-1", "spawn":agent["spawn"], "role":"rat",
+    let original = json!({"agent":"rat-1", "spawn":agent["agent"]["spawn"], "role":"rat",
         "task":"shared-task", "branch":"rat/x/tkt-2", "target":"main", "head_sha":head,
         "is_error":false, "declared_done":true, "diff_class":"trivial"});
     for (field, value) in [

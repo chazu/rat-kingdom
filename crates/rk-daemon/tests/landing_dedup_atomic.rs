@@ -124,7 +124,7 @@ async fn emit_harness_result(client: &mut Client, repo_name: &str, c: Completion
         .call("agent.status", json!({"name": c.agent}))
         .await
         .unwrap();
-    let spawn: SpawnId = agent["spawn"].as_str().unwrap().parse().unwrap();
+    let spawn: SpawnId = agent["agent"]["spawn"].as_str().unwrap().parse().unwrap();
     client
         .call(
             "space.out",
