@@ -4207,6 +4207,47 @@ impl Daemon {
                 age_secs: entry.age_secs,
             })
             .collect();
+        // A completion whose candidate the queue already ran to a terminal,
+        // non-`landed` verdict (gate-held, no-gate, rework-filed, escalated,
+        // empty) before removing the live row — see `HeldLanding`'s doc for
+        // why this must stay distinct from an abandoned hand-off. Joined by
+        // the exact `(branch, head_sha)` the marker itself was written
+        // against, the same generation-exact key `completions` above is
+        // already scoped to.
+        let now = (self.request_clock)();
+        let mut held_landings = Vec::new();
+        for completion in &completions {
+            let pattern = Pattern::for_commit(
+                Category::Event,
+                crate::landing::LANDING_PROCESSED_IDENTITY,
+                &completion.branch,
+                &completion.head_sha,
+            )
+            .scope(repo.clone());
+            let Some(marker) = self.space.scan(&pattern)?.into_iter().rfind(|t| {
+                t.payload
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .is_some_and(|o| o != "landed")
+            }) else {
+                continue;
+            };
+            let outcome = marker
+                .payload
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            held_landings.push(crate::reconcile::HeldLanding {
+                task: completion.task.clone(),
+                source_spawn: Some(completion.spawn.clone()),
+                outcome,
+                age_secs: now
+                    .signed_duration_since(marker.created_at)
+                    .num_seconds()
+                    .max(0),
+            });
+        }
         let admission_grace_secs = self
             .reactor_config
             .interval_secs
@@ -4229,10 +4270,11 @@ impl Daemon {
             .collect();
 
         let handoff_facts = crate::reconcile::HandoffFacts {
-            now: (self.request_clock)(),
+            now,
             admission_grace_secs,
             completions,
             landings: landing_handoffs,
+            held_landings,
             id_spellings,
         };
 
@@ -7295,6 +7337,58 @@ impl Daemon {
         self.ticket_reopen_sweep_at(chrono::Utc::now()).await
     }
 
+    /// Whether `agent`'s own generation of `task` (any spelling in
+    /// `spellings`) already carries a terminal, non-`landed`
+    /// `landing_processed` marker: the queue admitted its candidate, ran it
+    /// to a verdict (gate-held, no-gate, rework-filed, escalated, empty),
+    /// and removed the live queue row. Without this carve-out, `stale_after`
+    /// alone would make the reopen sweep clear ownership and hand the
+    /// ticket back to `open` for a fresh claim — duplicating an
+    /// implementation that already has a durable decision
+    /// (TKT-novod-noloh-jodaf). Fenced to the exact source generation via
+    /// the completion's own `(branch, head_sha)`, the same pair the marker
+    /// itself was written against, so a stale hold from a superseded
+    /// generation can never suppress attention on a genuinely new
+    /// replacement worker.
+    fn held_landing_for(
+        &self,
+        scope: &str,
+        agent: &crate::agents::AgentRecord,
+        spellings: &[String],
+    ) -> rk_core::Result<bool> {
+        let completions: Vec<crate::reconcile::CompletionHandoff> = self
+            .space
+            .scan(&Pattern::for_spawn(
+                Category::Event,
+                "harness_result",
+                agent.spawn_id(),
+            ))?
+            .into_iter()
+            .filter(|tuple| tuple.scope == scope)
+            .filter_map(|tuple| crate::reconcile::CompletionHandoff::from_harness_result(&tuple))
+            .filter(|completion| spellings.iter().any(|s| s == &completion.task))
+            .collect();
+        for completion in &completions {
+            let pattern = Pattern::for_commit(
+                Category::Event,
+                crate::landing::LANDING_PROCESSED_IDENTITY,
+                &completion.branch,
+                &completion.head_sha,
+            )
+            .scope(scope.to_string());
+            let held = self.space.scan(&pattern)?.into_iter().any(|t| {
+                t.payload
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .is_some_and(|o| o != "landed")
+            });
+            if held {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Testable core of [`Self::ticket_reopen_sweep_once`]: `now` is injected
     /// rather than read from the clock, so a test can assert the 15-minute
     /// staleness bound without an actual 15-minute wait.
@@ -7381,6 +7475,22 @@ impl Daemon {
                 });
             if agent.as_ref().is_some_and(|a| a.state.is_live()) {
                 continue;
+            }
+            if let Some(agent) = &agent {
+                if self
+                    .held_landing_for(&ticket.scope, agent, &spellings)
+                    .unwrap_or(false)
+                {
+                    // This generation's candidate already reached a
+                    // terminal, non-`landed` verdict (gate-held, no-gate,
+                    // rework-filed, escalated, empty) after the live queue
+                    // row that carried it was removed — settled, not
+                    // abandoned. Leave it for the held-delivery recovery
+                    // path instead of clearing ownership here and inviting
+                    // a duplicate dispatch onto work that already has a
+                    // decision (TKT-novod-noloh-jodaf).
+                    continue;
+                }
             }
             let ticket_updated_at = ticket
                 .payload
@@ -13754,6 +13864,92 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(report.handoffs[0].phase, "completion_pending_admission");
     }
 
+    /// TKT-novod-noloh-jodaf: the landing queue can run a completed source's
+    /// candidate to a terminal, non-`landed` verdict (gate-held here) and
+    /// remove the live queue row well past the completion's own admission
+    /// grace window. Without `held_landings`, `reconcile_report` would read
+    /// this exactly like an abandoned hand-off and flag
+    /// `TERMINAL_ASSIGNEE_ACTIVE_WORK`, inviting the orchestrator to clear
+    /// ownership and redispatch onto work that already has a decision.
+    #[tokio::test]
+    async fn live_reconcile_treats_a_terminal_landing_hold_as_settled_not_abandoned() {
+        let (_dir, daemon) = daemon_with_agent("Held-1", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Held-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Held-1")
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/held-1/work",
+                    "head_sha": "def456",
+                }),
+            ))
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                crate::landing::LANDING_PROCESSED_IDENTITY,
+                "daemon",
+                json!({
+                    "branch": "rat/held-1/work",
+                    "target": "main",
+                    "target_head": "cafebabe",
+                    "head_sha": "def456",
+                    "task": ticket.identity,
+                    "outcome": "gate-held",
+                    "admission_hold": Value::Null,
+                    "admission_recovery": Value::Null,
+                }),
+            ))
+            .unwrap();
+
+        // Well past `admission_grace_secs` — a gate/review hold routinely
+        // outlives it.
+        let report = daemon.reconcile_report("repo".into()).await.unwrap();
+
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert_eq!(report.handoffs.len(), 1);
+        assert_eq!(report.handoffs[0].task, ticket.identity);
+        assert_eq!(report.handoffs[0].phase, "held");
+        assert_eq!(report.handoffs[0].status.as_deref(), Some("gate-held"));
+    }
+
     #[tokio::test]
     async fn a_live_owner_is_never_touched() {
         let (_dir, daemon) = daemon_with_agent("Live-1", AgentState::Running);
@@ -13766,6 +13962,91 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(reopened, 0);
         let ticket = daemon.tickets.get(&id).unwrap().unwrap();
         assert_eq!(ticket.payload["status"], json!("in_progress"));
+    }
+
+    /// TKT-novod-noloh-jodaf: once the queue has run a completed source's
+    /// candidate to a terminal, non-`landed` verdict and removed the live
+    /// queue row, the ticket's assignee reads exactly like a dead owner with
+    /// no hand-off — `queued_tickets` no longer contains it, and the
+    /// completion is typically well past the sweep's stale window by the
+    /// time a gate/review hold resolves. The sweep must leave it for the
+    /// held-delivery recovery path instead of clearing ownership and
+    /// reopening it for a duplicate dispatch.
+    #[tokio::test]
+    async fn a_held_landing_verdict_prevents_the_reopen_sweep_from_clearing_ownership() {
+        let (_dir, daemon) = daemon_with_agent("Held-1", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Held-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Held-1")
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/held-1/work",
+                    "head_sha": "def456",
+                }),
+            ))
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                crate::landing::LANDING_PROCESSED_IDENTITY,
+                "daemon",
+                json!({
+                    "branch": "rat/held-1/work",
+                    "target": "main",
+                    "target_head": "cafebabe",
+                    "head_sha": "def456",
+                    "task": ticket.identity,
+                    "outcome": "gate-held",
+                    "admission_hold": Value::Null,
+                    "admission_recovery": Value::Null,
+                }),
+            ))
+            .unwrap();
+
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
+
+        assert_eq!(reopened, 0);
+        let stored = daemon.tickets.get(&ticket.identity).unwrap().unwrap();
+        assert_eq!(stored.payload["status"], json!("in_progress"));
+        assert_eq!(stored.payload["assignee"], json!("Held-1"));
     }
 
     #[tokio::test]
@@ -13938,10 +14219,13 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(ticket.payload["status"], json!("open"));
     }
 
-    /// A ticket whose only `landing_processed` marker recorded a NON-landed
-    /// terminal outcome (gate-held, rework-filed, escalated) must still
-    /// reopen normally — landing-awareness is specifically about a landed
-    /// branch, not about "this ticket's work key was ever processed".
+    /// A `landing_processed` marker recording a NON-landed terminal outcome
+    /// (gate-held, rework-filed, escalated) only carves the sweep out when
+    /// it is fenced to an exact matching completion — see
+    /// `a_held_landing_verdict_prevents_the_reopen_sweep_from_clearing_ownership`.
+    /// With no completion event to join it to (as here), the marker alone
+    /// proves nothing about THIS ticket's current owner and must still
+    /// reopen normally.
     #[tokio::test]
     async fn a_ticket_with_a_non_landed_processing_marker_still_reopens() {
         let (_dir, daemon) = daemon_with_agent("GateHeld-1", AgentState::Failed);

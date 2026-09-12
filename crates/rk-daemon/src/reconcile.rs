@@ -171,6 +171,12 @@ pub struct CompletionHandoff {
     pub agent: String,
     pub spawn: String,
     pub recorded_at: DateTime<Utc>,
+    /// The branch/head this completion handed to the landing pipeline —
+    /// carried along so a caller can join it against a `landing_processed`
+    /// marker's own `(branch, head_sha)` key ([`HeldLanding`]) without a
+    /// second, independently-fenced scan.
+    pub branch: String,
+    pub head_sha: String,
 }
 
 impl CompletionHandoff {
@@ -198,6 +204,8 @@ impl CompletionHandoff {
             agent: payload.get("agent")?.as_str()?.to_string(),
             spawn: payload.get("spawn")?.as_str()?.to_string(),
             recorded_at: tuple.created_at,
+            branch: payload.get("branch")?.as_str()?.to_string(),
+            head_sha: payload.get("head_sha")?.as_str()?.to_string(),
         })
     }
 }
@@ -211,12 +219,36 @@ pub struct LandingHandoff {
     pub age_secs: i64,
 }
 
+/// A terminal, non-`landed` `landing_processed` marker for a completion this
+/// module already trusts: the queue admitted the source, ran it to a verdict
+/// (gate-held, no-gate, rework-filed, escalated, empty), and removed the
+/// live queue row — so by the time a caller reads `queued_tickets` the work
+/// is gone from the in-flight queue even though it was never abandoned.
+/// Without this, a hold that outlives [`HandoffFacts::admission_grace_secs`]
+/// (any real review/gate cycle does) reads exactly like a clean completion
+/// that never entered the queue at all, and invites the same redispatch a
+/// genuine orphan needs (TKT-novod-noloh-jodaf).
+///
+/// Fenced to the exact source generation via [`CompletionHandoff::branch`]/
+/// [`CompletionHandoff::head_sha`] — the same pair the marker itself was
+/// written against — never by task alone: a task fence would let a stale
+/// hold from a superseded generation suppress attention on a genuinely new
+/// replacement worker.
+#[derive(Debug, Clone)]
+pub struct HeldLanding {
+    pub task: String,
+    pub source_spawn: Option<String>,
+    pub outcome: String,
+    pub age_secs: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct HandoffFacts {
     pub now: DateTime<Utc>,
     pub admission_grace_secs: i64,
     pub completions: Vec<CompletionHandoff>,
     pub landings: Vec<LandingHandoff>,
+    pub held_landings: Vec<HeldLanding>,
     /// `ticket.identity -> every spelling that names it`
     /// ([`crate::tickets::Tickets::id_spellings`]), pre-resolved by the
     /// caller so this module stays pure. `landing.task`/`completion.task`
@@ -777,6 +809,32 @@ fn terminal_assignee_with_handoffs(
             continue;
         }
 
+        // The queue already ran this exact generation's candidate to a
+        // terminal, non-`landed` verdict and removed the live row — gone
+        // from `facts.landings` above, but settled, not abandoned. Without
+        // this the hold outlives the admission grace window (any real
+        // gate/review cycle does) and reads as a clean completion whose
+        // hand-off never arrived, inviting the orchestrator to clear
+        // ownership and redispatch onto work that already has a decision
+        // (TKT-novod-noloh-jodaf). Fenced to `spawn` exactly like the
+        // in-flight check above: a stale hold from a superseded generation
+        // must never suppress attention on a genuinely new replacement
+        // worker.
+        if let Some(held) = facts.held_landings.iter().find(|held| {
+            spellings.iter().any(|spelling| spelling == &held.task)
+                && held.source_spawn.as_deref() == Some(spawn.as_str())
+        }) {
+            handoffs.push(ActiveHandoff {
+                task: ticket.identity.clone(),
+                agent: agent.name.clone(),
+                spawn: spawn.clone(),
+                phase: "held".into(),
+                status: Some(held.outcome.clone()),
+                age_secs: held.age_secs.max(0),
+            });
+            continue;
+        }
+
         let completion = facts.completions.iter().find(|completion| {
             spellings
                 .iter()
@@ -1167,6 +1225,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
             landings: Vec::new(),
+            held_landings: Vec::new(),
             id_spellings: HashMap::new(),
         };
 
@@ -1204,6 +1263,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
             landings: Vec::new(),
+            held_landings: Vec::new(),
             id_spellings: HashMap::new(),
         };
 
@@ -1244,6 +1304,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
             landings: Vec::new(),
+            held_landings: Vec::new(),
             id_spellings: HashMap::new(),
         };
 
@@ -1304,6 +1365,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: Vec::new(),
             landings: vec![exact.clone()],
+            held_landings: Vec::new(),
             id_spellings: HashMap::new(),
         };
         let report = build_with_handoffs(
@@ -1347,6 +1409,102 @@ mod tests {
         assert!(report.handoffs.is_empty());
     }
 
+    /// TKT-novod-noloh-jodaf: the landing queue can run a completed source's
+    /// candidate all the way to a terminal, non-`landed` verdict (gate-held,
+    /// no-gate, rework-filed, escalated, empty) and then remove the live
+    /// queue row. By that point the source's own clean-completion grace
+    /// window has usually elapsed too, so without `held_landings` this reads
+    /// exactly like a clean completion whose hand-off never arrived — a
+    /// false `TERMINAL_ASSIGNEE_ACTIVE_WORK` that invites the orchestrator to
+    /// clear ownership and redispatch onto work that already has a decision.
+    #[test]
+    fn a_held_landing_verdict_is_settled_not_abandoned() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            serde_json::json!({"assignee": "Whisker"}),
+        );
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let held = HeldLanding {
+            task: "TKT-1".into(),
+            source_spawn: Some(a.spawn_id().to_string()),
+            outcome: "gate-held".into(),
+            age_secs: 900,
+        };
+        let facts = HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: Vec::new(),
+            held_landings: vec![held],
+            id_spellings: HashMap::new(),
+        };
+        let report = build_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &facts,
+        );
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert_eq!(report.handoffs.len(), 1);
+        assert_eq!(report.handoffs[0].phase, "held");
+        assert_eq!(report.handoffs[0].status.as_deref(), Some("gate-held"));
+        assert_eq!(report.handoffs[0].age_secs, 900);
+    }
+
+    /// A held verdict from a superseded generation (a different agent
+    /// spawn than the ticket's CURRENT terminal owner) must never suppress
+    /// attention on that current owner — otherwise a stale hold could hide
+    /// a genuinely abandoned replacement worker forever.
+    #[test]
+    fn a_held_landing_from_a_different_generation_does_not_suppress_the_violation() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            serde_json::json!({"assignee": "Whisker"}),
+        );
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let facts = HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: Vec::new(),
+            held_landings: vec![HeldLanding {
+                task: "TKT-1".into(),
+                source_spawn: Some(rk_core::id::SpawnId::new().to_string()),
+                outcome: "gate-held".into(),
+                age_secs: 900,
+            }],
+            id_spellings: HashMap::new(),
+        };
+        let report = build_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+            &facts,
+        );
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(
+            report.violations[0].kind,
+            kind::TERMINAL_ASSIGNEE_ACTIVE_WORK
+        );
+        assert!(report.handoffs.is_empty());
+    }
+
     /// `landing.task`/`completion.task` are captured verbatim from whatever
     /// spelling their caller used at spawn/enqueue time. A legacy ticket
     /// addressed by its proquint alias has handoff records keyed on the
@@ -1383,6 +1541,7 @@ mod tests {
                 status: "awaiting_review".into(),
                 age_secs: 5,
             }],
+            held_landings: Vec::new(),
             id_spellings: spellings.clone(),
         };
         let report = build_with_handoffs(
@@ -1411,6 +1570,7 @@ mod tests {
             admission_grace_secs: 300,
             completions: vec![CompletionHandoff::from_harness_result(&event).unwrap()],
             landings: Vec::new(),
+            held_landings: Vec::new(),
             id_spellings: spellings,
         };
         let report = build_with_handoffs(
