@@ -255,7 +255,11 @@ pub fn plan_with_handoffs(
         .collect();
     let (_handoffs, violations) =
         reconcile::terminal_assignee_with_handoffs(tickets, agents, landed_tickets, handoff_facts);
-    items.extend(violations.into_iter().map(|v| plan_stale_ownership(v, tickets)));
+    items.extend(
+        violations
+            .into_iter()
+            .map(|v| plan_stale_ownership(v, tickets)),
+    );
     items.sort_by(|a, b| a.violation_id.cmp(&b.violation_id));
     RepairPlan {
         scope: scope.to_string(),
@@ -1347,7 +1351,11 @@ mod tests {
     // mid-handoff must never become a `ClearStaleOwnership` item, while a
     // genuinely abandoned one still must.
 
-    fn clean_completion(agent: &AgentRecord, task: &str, recorded_at: chrono::DateTime<Utc>) -> Tuple {
+    fn clean_completion(
+        agent: &AgentRecord,
+        task: &str,
+        recorded_at: chrono::DateTime<Utc>,
+    ) -> Tuple {
         let mut tuple = Tuple::new(
             Category::Event,
             "myrepo",
@@ -1377,7 +1385,12 @@ mod tests {
     #[test]
     fn completion_within_grace_is_not_planned() {
         let now = Utc::now();
-        let t = ticket("TKT-1", "myrepo", "in_progress", json!({"assignee": "Whisker"}));
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
         let mut a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
         a.role = "rat".into();
         let event = clean_completion(&a, "TKT-1", now - chrono::Duration::seconds(30));
@@ -1403,7 +1416,12 @@ mod tests {
     #[test]
     fn expired_abandoned_completion_is_still_planned_for_clear_stale_ownership() {
         let now = Utc::now();
-        let t = ticket("TKT-1", "myrepo", "in_progress", json!({"assignee": "Whisker"}));
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
         let mut a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
         a.role = "rat".into();
         let event = clean_completion(&a, "TKT-1", now - chrono::Duration::seconds(301));
@@ -1433,7 +1451,12 @@ mod tests {
 
     #[test]
     fn live_landing_queue_membership_is_not_planned() {
-        let t = ticket("TKT-1", "myrepo", "in_progress", json!({"assignee": "Whisker"}));
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
         let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
         let facts = reconcile::HandoffFacts {
             now: Utc::now(),
@@ -1466,7 +1489,12 @@ mod tests {
     /// already has a decision (TKT-hotoz-ragik-judin).
     #[test]
     fn terminal_held_disposition_is_not_planned() {
-        let t = ticket("TKT-1", "myrepo", "in_progress", json!({"assignee": "Whisker"}));
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
         let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
         let facts = reconcile::HandoffFacts {
             now: Utc::now(),
@@ -1496,7 +1524,12 @@ mod tests {
     /// attention on the ticket's current terminal owner.
     #[test]
     fn a_held_landing_from_the_wrong_generation_does_not_suppress_planning() {
-        let t = ticket("TKT-1", "myrepo", "in_progress", json!({"assignee": "Whisker"}));
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
         let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
         let facts = reconcile::HandoffFacts {
             now: Utc::now(),
@@ -1529,7 +1562,12 @@ mod tests {
     #[test]
     fn a_completion_from_the_wrong_generation_is_still_planned() {
         let now = Utc::now();
-        let t = ticket("TKT-1", "myrepo", "in_progress", json!({"assignee": "Whisker"}));
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
         let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
         let mut event = clean_completion(&a, "TKT-1", now);
         event.payload["spawn"] = Value::String(rk_core::id::SpawnId::new().to_string());
@@ -1562,7 +1600,12 @@ mod tests {
         let now = Utc::now();
         let ulid_id = "TKT-01J000000000000000000404";
         let alias = "kuvip-dozor-fitat-samun";
-        let t = ticket(ulid_id, "myrepo", "in_progress", json!({"assignee": "Whisker"}));
+        let t = ticket(
+            ulid_id,
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
         let mut spellings = HashMap::new();
         spellings.insert(
             ulid_id.to_string(),
