@@ -724,6 +724,65 @@ mod current_need_tests {
         // ambiguous. Its historical row must remain conservative.
         assert_eq!(work["counts"]["stalled"], 5, "{work}");
     }
+
+    #[tokio::test]
+    async fn king_decisions_retire_a_closed_ticket_without_delivery_but_keep_unresolved_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon =
+            Daemon::new(Layout::at(temp.path().join("home")), &Default::default()).unwrap();
+        let before = Utc::now() - ChronoDuration::minutes(10);
+        for (task, status) in [
+            ("TKT-closed-no-delivery", "closed"),
+            ("TKT-done-not-delivered", "done"),
+            ("TKT-open", "open"),
+        ] {
+            daemon
+                .space
+                .out(Tuple::new(
+                    Category::Task,
+                    "tenant",
+                    task,
+                    "daemon",
+                    json!({"title": task, "status": "open"}),
+                ))
+                .unwrap();
+            if status != "open" {
+                daemon.tickets.set_status(task, status).await.unwrap();
+            }
+            daemon.space.out(need(task, before, None)).unwrap();
+        }
+
+        let (snapshot, _, has_work) = daemon.king_authoritative_snapshot().await.unwrap();
+        assert!(has_work);
+        let decisions = snapshot["decisions"].as_array().unwrap();
+        let subjects: Vec<&str> = decisions
+            .iter()
+            .filter_map(|d| d["subject"].as_str())
+            .collect();
+        // A permanently closed ticket has no live gate or agent action left,
+        // delivered or not: retired without needing Git proof.
+        assert!(
+            !subjects.contains(&"TKT-closed-no-delivery"),
+            "{decisions:?}"
+        );
+        // "done" is not terminal (still transitions to "closed") and carries
+        // no delivery record — the TKT-18/46/147 "approved but never landed"
+        // class must keep surfacing, never guessed away.
+        assert!(
+            subjects.contains(&"TKT-done-not-delivered"),
+            "{decisions:?}"
+        );
+        assert!(subjects.contains(&"TKT-open"), "{decisions:?}");
+        assert_eq!(
+            daemon
+                .space
+                .scan(&Pattern::category(Category::Need))
+                .unwrap()
+                .len(),
+            3,
+            "retirement must not delete historical evidence"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3998,7 +4057,14 @@ impl Daemon {
                 }
             }
         }
-        needs.retain(|need| !proven.contains(&need.id));
+        // A closed ticket is a terminal absorbing state (no transition leaves
+        // it), so its landing incident has no live gate or agent action left
+        // regardless of whether a delivery record exists — the same weaker,
+        // non-Git-proof "closed" signal `landing.rs`'s conflict-correction
+        // check already trusts. This retires the historical/closed-without-
+        // delivery class the proven-delivery check above cannot reach.
+        let dismissed = crate::current_needs::terminal_dismissals(&needs, &self.tickets)?;
+        needs.retain(|need| !proven.contains(&need.id) && !dismissed.contains(&need.id));
         let mut items = crate::inbox::build(
             &agents,
             &instances,

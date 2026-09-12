@@ -38,6 +38,45 @@ pub(crate) struct ResolutionCandidate {
     pub target: String,
 }
 
+/// A ticket closed by hand, with no delivery ever recorded on it, has no
+/// further gate or agent action available: `valid_transition` forbids every
+/// outgoing edge from `closed`, so it can never reopen for a fresh attempt.
+/// Mirrors the same "closed" trust `landing.rs`'s conflict-correction check
+/// already gives ticket status without a Git proof. Deliberately narrower
+/// than [`resolution_candidates`]: a ticket closed *by delivery* keeps using
+/// that path instead, because delivery does not foreclose a later recurrence
+/// on the same now-closed ticket (a fresh incident created after the landing
+/// must still surface, never guessed away just because the ticket is
+/// terminal) — this only dismisses the class delivery evidence can never
+/// reach at all.
+pub(crate) fn terminal_dismissals(
+    needs: &[Tuple],
+    tickets: &Tickets,
+) -> rk_core::Result<HashSet<RecordId>> {
+    let mut dismissed = HashSet::new();
+    for need in needs {
+        if need.category != Category::Need
+            || !rk_core::landing_names::is_landing_need(&need.identity)
+            || need.instance != "daemon"
+        {
+            continue;
+        }
+        let Some(task) = need.payload.get("task").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(ticket) = tickets.get(task)? else {
+            continue;
+        };
+        if ticket.scope != need.scope {
+            continue;
+        }
+        if ticket.payload["status"] == "closed" && delivery_of(&ticket).is_none() {
+            dismissed.insert(need.id);
+        }
+    }
+    Ok(dismissed)
+}
+
 /// A delivery of the same ticket onto the incident's intended target settles
 /// older incidents, including work salvaged by a replacement generation on a
 /// different source branch. Merely closing the ticket is insufficient.
