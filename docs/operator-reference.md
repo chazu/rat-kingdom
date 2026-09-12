@@ -20,6 +20,11 @@ Structured harness events drive the lifecycle.
 | [`maki`](https://maki.sh/docs) >= 0.5.2 | headless Claude-compatible stream-json harness | optional |
 | [`herdr`](https://herdr.dev) | attachable interactive rats | optional |
 
+Git 2.46 or newer lets reconciliation distinguish a removed local branch from
+a broken ref using [`show-ref --exists`](https://git-scm.com/docs/git-show-ref).
+Older Git can still confirm existing merged branches, but removed branches stay
+unresolved when their absence cannot be established safely.
+
 ## Install
 
 ```bash

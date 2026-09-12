@@ -11262,26 +11262,31 @@ fn cleared_branches_for_paths(
     paths: HashMap<String, std::path::PathBuf>,
 ) -> HashSet<(String, String)> {
     let mut cleared = HashSet::new();
-    // Ask git once per distinct (scope, branch): the same branch commonly
-    // carries several events (a retried land, a re-push), and the answer cannot
-    // differ between them.
-    let mut asked: HashSet<(String, String)> = HashSet::new();
+    // Coalesce repeated events without letting a legacy event lacking content
+    // proof mask a later proven event for the same branch and target.
+    let mut branches: HashMap<(String, String, String), bool> = HashMap::new();
     for (scope, branch, target, content_proven) in events {
-        if !content_proven {
-            continue;
-        }
-        let key = (scope.clone(), branch.clone());
-        if !asked.insert(key.clone()) {
-            continue;
-        }
+        *branches.entry((scope, branch, target)).or_default() |= content_proven;
+    }
+    for ((scope, branch, target), content_proven) in branches {
         let Some(path) = paths.get(&scope) else {
             continue;
         };
         let Ok(repo) = rk_git::Repo::discover(path) else {
             continue;
         };
-        if repo.branch_merged_or_gone(&branch, &target) {
-            cleared.insert(key);
+        let resolved = match repo.branch_exists_checked(&branch) {
+            // Explicit removal/archival retires attention even for old events
+            // without content proof. This does not establish ticket delivery.
+            Ok(false) => true,
+            // An existing empty branch equal to main is not evidence of work.
+            Ok(true) => {
+                content_proven && repo.is_ancestor(&format!("refs/heads/{branch}"), &target)
+            }
+            Err(_) => false,
+        };
+        if resolved {
+            cleared.insert((scope, branch));
         }
     }
     cleared
@@ -11305,6 +11310,34 @@ mod branch_clear_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn retired_legacy_branch_clears_attention_without_claiming_a_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git(path, &["init", "-b", "main"]);
+        git(path, &["config", "user.email", "r@x"]);
+        git(path, &["config", "user.name", "R"]);
+        std::fs::write(path.join("f"), "base\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "base"]);
+        git(path, &["checkout", "-b", "obsolete"]);
+        std::fs::write(path.join("f"), "superseded work\n").unwrap();
+        git(path, &["commit", "-am", "obsolete work"]);
+        let source = git(path, &["rev-parse", "HEAD"]);
+        let event = ("repo".into(), "obsolete".into(), "main".into(), false);
+        let paths = HashMap::from([("repo".to_string(), path.to_path_buf())]);
+        assert!(cleared_branches_for_paths(vec![event.clone()], paths.clone()).is_empty());
+
+        // Legacy branch_landed events have no content_free field. Archival
+        // retires attention without merging or deleting the abandoned work.
+        git(path, &["branch", "-m", "archive/obsolete"]);
+        let cleared = cleared_branches_for_paths(vec![event], paths);
+        assert!(cleared.contains(&("repo".into(), "obsolete".into())));
+        let repo = rk_git::Repo::discover(path).unwrap();
+        assert!(!repo.is_ancestor(&source, "main"));
+        assert_eq!(repo.rev_parse("archive/obsolete").unwrap(), source);
     }
 
     #[test]
@@ -11341,6 +11374,49 @@ mod branch_clear_tests {
             paths,
         );
         assert!(cleared.contains(&("repo".into(), "work".into())));
+
+        // Reading older evidence first must not lose a later content proof.
+        for proofs in [[false, true], [true, false]] {
+            let events = proofs
+                .into_iter()
+                .map(|proof| ("repo".into(), "work".into(), "main".into(), proof))
+                .collect();
+            let paths = HashMap::from([("repo".to_string(), repo.to_path_buf())]);
+            assert!(
+                cleared_branches_for_paths(events, paths).contains(&("repo".into(), "work".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_or_corrupt_git_never_proves_branch_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let events = vec![("repo".into(), "legacy".into(), "main".into(), false)];
+        assert!(cleared_branches_for_paths(events.clone(), HashMap::new()).is_empty());
+        let paths = HashMap::from([("repo".to_string(), path.to_path_buf())]);
+        assert!(cleared_branches_for_paths(events.clone(), paths.clone()).is_empty());
+
+        git(path, &["init", "-b", "main"]);
+        std::fs::write(path.join(".git/refs/heads/legacy"), "broken ref\n").unwrap();
+        let repo = rk_git::Repo::discover(path).unwrap();
+        assert!(repo.branch_exists_checked("legacy").is_err());
+        for proof in [false, true] {
+            let events = vec![("repo".into(), "legacy".into(), "main".into(), proof)];
+            assert!(cleared_branches_for_paths(events, paths.clone()).is_empty());
+        }
+        for unresolved in [
+            "ref: refs/heads/missing\n".to_string(),
+            format!("{}\n", "a".repeat(40)),
+        ] {
+            std::fs::write(path.join(".git/refs/heads/legacy"), unresolved).unwrap();
+            assert!(repo.branch_exists_checked("legacy").unwrap());
+            let events = vec![("repo".into(), "legacy".into(), "main".into(), true)];
+            assert!(cleared_branches_for_paths(events, paths.clone()).is_empty());
+        }
+        std::fs::remove_dir_all(path.join(".git")).unwrap();
+        assert!(repo.branch_exists_checked("legacy").is_err());
+        assert!(cleared_branches_for_paths(events, paths).is_empty());
     }
 }
 
