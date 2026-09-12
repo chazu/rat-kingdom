@@ -3,6 +3,13 @@
 //! `delivered-but-open` and `terminal-assignee-active-work` (stale
 //! ownership). Everything else the convergence report surfaces stays
 //! report-only and untouched by this command.
+//!
+//! `terminal-assignee-active-work` is planned with the same handoff evidence
+//! `rk reconcile` itself shows: a ticket whose owner's clean completion is
+//! still inside its admission grace window, still in flight through the
+//! live landing queue, or already settled a terminal held-landing verdict
+//! (gate-held/no-gate/rework-filed/escalated/empty) is never proposed for
+//! `ClearStaleOwnership` — only genuinely abandoned ownership is.
 
 use anyhow::Result;
 use clap::Args;
