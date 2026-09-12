@@ -762,7 +762,12 @@ pub fn build_with_handoffs(
     report
 }
 
-fn terminal_assignee_with_handoffs(
+/// Narrowly `pub(crate)` (not `pub`) so `reconcile_repair::plan_with_handoffs`
+/// can re-derive the exact same handoff-aware classification `build_with_handoffs`
+/// uses, instead of duplicating it — repair needs the raw `(handoffs, violations)`
+/// pair rather than a full [`ConvergenceReport`], since it only ever plans an
+/// action for the violations half and has no concept of a handoff.
+pub(crate) fn terminal_assignee_with_handoffs(
     tickets: &[Tuple],
     agents: &[AgentRecord],
     landed_tickets: &HashSet<String>,

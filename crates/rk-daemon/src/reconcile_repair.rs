@@ -222,6 +222,51 @@ pub fn plan(
     }
 }
 
+/// Handoff-aware form of [`plan`]. Kept separate so a caller that does not
+/// (yet) own fresh completion/landing/held-landing evidence keeps getting
+/// `plan`'s conservative legacy interpretation unchanged — exactly the
+/// relationship [`reconcile::build_with_handoffs`] has to [`reconcile::build`].
+///
+/// The only thing this changes from [`plan`] is which evidence proves
+/// `terminal-assignee-active-work`: it re-derives that violation from
+/// [`reconcile::terminal_assignee_with_handoffs`] (discarding the handoffs
+/// half of the pair — a [`RepairItem`] has no concept of a handoff, only
+/// `Planned`/`Held`) instead of the raw [`reconcile::terminal_assignee_active_work`].
+/// A ticket whose owner's clean completion is still inside its admission
+/// grace window, still in flight through the live landing queue, or already
+/// settled a terminal held-landing verdict is therefore never planned for
+/// `ClearStaleOwnership` — those are the exact false positives
+/// `reconcile::build_with_handoffs` closed for the autonomous reconcile-report
+/// path (TKT-novod-noloh-jodaf); this closes the same gap for the
+/// operator-invoked `reconcile-repair --apply` path (TKT-hotoz-ragik-judin).
+/// `delivered-but-open` planning is untouched — that check never looks at
+/// handoff evidence at all.
+pub fn plan_with_handoffs(
+    scope: &str,
+    tickets: &[Tuple],
+    agents: &[AgentRecord],
+    landed_tickets: &HashSet<String>,
+    facts: &RepairFacts,
+    handoff_facts: &reconcile::HandoffFacts,
+) -> RepairPlan {
+    let mut items: Vec<RepairItem> = reconcile::delivered_but_open(tickets)
+        .into_iter()
+        .map(|v| plan_delivered_but_open(v, tickets, facts))
+        .collect();
+    let (_handoffs, violations) =
+        reconcile::terminal_assignee_with_handoffs(tickets, agents, landed_tickets, handoff_facts);
+    items.extend(
+        violations
+            .into_iter()
+            .map(|v| plan_stale_ownership(v, tickets)),
+    );
+    items.sort_by(|a, b| a.violation_id.cmp(&b.violation_id));
+    RepairPlan {
+        scope: scope.to_string(),
+        items,
+    }
+}
+
 fn plan_delivered_but_open(
     v: reconcile::Violation,
     tickets: &[Tuple],
@@ -1295,5 +1340,393 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // -- plan_with_handoffs -------------------------------------------------
+    //
+    // These mirror reconcile.rs's own `build_with_handoffs` coverage (recent
+    // completion, expired completion, live landing, terminal held landing,
+    // wrong generation, legacy alias spellings) but assert on the *repair*
+    // plan those facts produce, not the report: a ticket whose owner is
+    // mid-handoff must never become a `ClearStaleOwnership` item, while a
+    // genuinely abandoned one still must.
+
+    fn clean_completion(
+        agent: &AgentRecord,
+        task: &str,
+        recorded_at: chrono::DateTime<Utc>,
+    ) -> Tuple {
+        let mut tuple = Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "castle",
+            json!({
+                "agent": agent.name,
+                "spawn": agent.spawn_id().to_string(),
+                "role": "rat",
+                "task": task,
+                "is_error": false,
+                "declared_done": true,
+                "branch": "rk/whisker/tkt-1",
+                "head_sha": "abc123",
+            }),
+        );
+        tuple.created_at = recorded_at;
+        tuple
+    }
+
+    fn no_ownership_items(p: &RepairPlan) -> bool {
+        !p.items
+            .iter()
+            .any(|i| i.kind == vkind::TERMINAL_ASSIGNEE_ACTIVE_WORK)
+    }
+
+    #[test]
+    fn completion_within_grace_is_not_planned() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+        let mut a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        a.role = "rat".into();
+        let event = clean_completion(&a, "TKT-1", now - chrono::Duration::seconds(30));
+        let facts = reconcile::HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: vec![reconcile::CompletionHandoff::from_harness_result(&event).unwrap()],
+            landings: Vec::new(),
+            held_landings: Vec::new(),
+            id_spellings: HashMap::new(),
+        };
+        let p = plan_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert!(p.items.is_empty(), "{:?}", p.items);
+    }
+
+    #[test]
+    fn expired_abandoned_completion_is_still_planned_for_clear_stale_ownership() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+        let mut a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        a.role = "rat".into();
+        let event = clean_completion(&a, "TKT-1", now - chrono::Duration::seconds(301));
+        let facts = reconcile::HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: vec![reconcile::CompletionHandoff::from_harness_result(&event).unwrap()],
+            landings: Vec::new(),
+            held_landings: Vec::new(),
+            id_spellings: HashMap::new(),
+        };
+        let p = plan_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].kind, vkind::TERMINAL_ASSIGNEE_ACTIVE_WORK);
+        assert!(matches!(
+            p.items[0].disposition,
+            Disposition::Planned(RepairAction::ClearStaleOwnership { .. })
+        ));
+    }
+
+    #[test]
+    fn live_landing_queue_membership_is_not_planned() {
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let facts = reconcile::HandoffFacts {
+            now: Utc::now(),
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: vec![reconcile::LandingHandoff {
+                task: "TKT-1".into(),
+                source_spawn: Some(a.spawn_id().to_string()),
+                status: "awaiting_review".into(),
+                age_secs: 42,
+            }],
+            held_landings: Vec::new(),
+            id_spellings: HashMap::new(),
+        };
+        let p = plan_with_handoffs(
+            "myrepo",
+            std::slice::from_ref(&t),
+            std::slice::from_ref(&a),
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert!(no_ownership_items(&p), "{:?}", p.items);
+    }
+
+    /// TKT-novod-noloh-jodaf's held-landing carve-out: a completed source
+    /// whose candidate already settled a terminal, non-`landed` verdict must
+    /// read as settled, not abandoned, in the *repair* plan too — otherwise
+    /// `rk reconcile-repair --apply` can reopen and redispatch work that
+    /// already has a decision (TKT-hotoz-ragik-judin).
+    #[test]
+    fn terminal_held_disposition_is_not_planned() {
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let facts = reconcile::HandoffFacts {
+            now: Utc::now(),
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: Vec::new(),
+            held_landings: vec![reconcile::HeldLanding {
+                task: "TKT-1".into(),
+                source_spawn: Some(a.spawn_id().to_string()),
+                outcome: "gate-held".into(),
+                age_secs: 900,
+            }],
+            id_spellings: HashMap::new(),
+        };
+        let p = plan_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert!(no_ownership_items(&p), "{:?}", p.items);
+    }
+
+    /// A held verdict from a superseded generation must never suppress
+    /// attention on the ticket's current terminal owner.
+    #[test]
+    fn a_held_landing_from_the_wrong_generation_does_not_suppress_planning() {
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let facts = reconcile::HandoffFacts {
+            now: Utc::now(),
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: Vec::new(),
+            held_landings: vec![reconcile::HeldLanding {
+                task: "TKT-1".into(),
+                source_spawn: Some(rk_core::id::SpawnId::new().to_string()),
+                outcome: "gate-held".into(),
+                age_secs: 900,
+            }],
+            id_spellings: HashMap::new(),
+        };
+        let p = plan_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].kind, vkind::TERMINAL_ASSIGNEE_ACTIVE_WORK);
+    }
+
+    /// A completion recorded under a different spawn than the ticket's
+    /// current owner (a superseded generation) must not be read as this
+    /// owner's own hand-off — the fence is exact-generation, not task alone.
+    #[test]
+    fn a_completion_from_the_wrong_generation_is_still_planned() {
+        let now = Utc::now();
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Completed);
+        let mut event = clean_completion(&a, "TKT-1", now);
+        event.payload["spawn"] = Value::String(rk_core::id::SpawnId::new().to_string());
+        let facts = reconcile::HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: vec![reconcile::CompletionHandoff::from_harness_result(&event).unwrap()],
+            landings: Vec::new(),
+            held_landings: Vec::new(),
+            id_spellings: HashMap::new(),
+        };
+        let p = plan_with_handoffs(
+            "myrepo",
+            &[t],
+            &[a],
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].kind, vkind::TERMINAL_ASSIGNEE_ACTIVE_WORK);
+    }
+
+    /// A legacy ticket's in-flight landing/completion recorded under its
+    /// proquint alias must still be recognized via `id_spellings`, not read
+    /// as abandoned just because the raw ticket identity never appears in
+    /// the handoff evidence verbatim.
+    #[test]
+    fn plan_with_handoffs_matches_legacy_alias_spellings() {
+        let now = Utc::now();
+        let ulid_id = "TKT-01J000000000000000000404";
+        let alias = "kuvip-dozor-fitat-samun";
+        let t = ticket(
+            ulid_id,
+            "myrepo",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+        let mut spellings = HashMap::new();
+        spellings.insert(
+            ulid_id.to_string(),
+            vec![ulid_id.to_string(), alias.to_string()],
+        );
+        let a = agent("Whisker", Some(ulid_id), AgentState::Completed);
+        let facts = reconcile::HandoffFacts {
+            now,
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: vec![reconcile::LandingHandoff {
+                task: alias.to_string(),
+                source_spawn: Some(a.spawn_id().to_string()),
+                status: "awaiting_review".into(),
+                age_secs: 5,
+            }],
+            held_landings: Vec::new(),
+            id_spellings: spellings,
+        };
+        let p = plan_with_handoffs(
+            "myrepo",
+            std::slice::from_ref(&t),
+            std::slice::from_ref(&a),
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert!(
+            no_ownership_items(&p),
+            "alias-spelled landing must be recognized as an in-flight handoff, not planned: {:?}",
+            p.items
+        );
+    }
+
+    /// `plan_with_handoffs` must not disturb `delivered-but-open` planning —
+    /// that check never consults handoff evidence at all.
+    #[test]
+    fn plan_with_handoffs_still_plans_delivered_but_open() {
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            delivery_json("abc123", "main", "rat/x/tkt-1"),
+        );
+        let facts = confirmed_facts("abc123", "main");
+        let p = plan_with_handoffs(
+            "myrepo",
+            &[t],
+            &[],
+            &HashSet::new(),
+            &facts,
+            &reconcile::HandoffFacts {
+                now: Utc::now(),
+                admission_grace_secs: 300,
+                completions: Vec::new(),
+                landings: Vec::new(),
+                held_landings: Vec::new(),
+                id_spellings: HashMap::new(),
+            },
+        );
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].kind, vkind::DELIVERED_BUT_OPEN);
+        assert!(matches!(
+            p.items[0].disposition,
+            Disposition::Planned(RepairAction::CloseDelivered { .. })
+        ));
+    }
+
+    /// The handoff-aware plan feeds the exact same CAS/idempotency machinery
+    /// as the legacy plan — `apply` has no idea which planner produced its
+    /// input, so a genuinely abandoned ticket still clears and journals
+    /// exactly once.
+    #[tokio::test]
+    async fn apply_from_plan_with_handoffs_clears_stale_ownership_and_journals() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        seed(
+            &space,
+            "TKT-1",
+            "in_progress",
+            json!({"assignee": "Whisker"}),
+        );
+
+        let live = tickets.list(Some("myrepo".into()), None, None).unwrap();
+        let a = agent("Whisker", Some("TKT-1"), AgentState::Dismissed);
+        let facts = reconcile::HandoffFacts {
+            now: Utc::now(),
+            admission_grace_secs: 300,
+            completions: Vec::new(),
+            landings: Vec::new(),
+            held_landings: Vec::new(),
+            id_spellings: HashMap::new(),
+        };
+        let p = plan_with_handoffs(
+            "myrepo",
+            &live,
+            std::slice::from_ref(&a),
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert_eq!(p.items.len(), 1);
+
+        let report = apply(p, &ctx(&tickets, &space, &[a])).await.unwrap();
+        assert!(matches!(report.results[0].outcome, Outcome::Applied { .. }));
+        let stored = tickets.get("TKT-1").unwrap().unwrap();
+        assert_eq!(stored.payload["status"], "open");
+        assert_eq!(stored.payload["assignee"], Value::Null);
+
+        // Idempotent replay: re-planning fresh state finds nothing left to do.
+        let live_after = tickets.list(Some("myrepo".into()), None, None).unwrap();
+        let p2 = plan_with_handoffs(
+            "myrepo",
+            &live_after,
+            &[],
+            &HashSet::new(),
+            &RepairFacts::default(),
+            &facts,
+        );
+        assert!(p2.items.is_empty());
+        let pattern = Pattern::category(Category::Event).identity(REPAIR_APPLIED_IDENTITY);
+        assert_eq!(space.scan(&pattern).unwrap().len(), 1);
     }
 }
