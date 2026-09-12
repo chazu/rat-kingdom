@@ -4163,6 +4163,145 @@ impl Daemon {
         Ok(crate::reconcile::to_json(&report))
     }
 
+    /// Freshly collect the generation-fenced hand-off evidence a
+    /// `HandoffFacts` needs: clean completions read off each terminal
+    /// owner's own `harness_result`, live landing-queue entries, and
+    /// terminal held-landing markers joined by exact `(branch, head_sha)`.
+    /// Extracted out of `reconcile_report` so a second caller can build the
+    /// same facts (e.g. a handoff-aware repair planner) without
+    /// re-deriving this scan-and-join by hand; always re-scanned against
+    /// `self.space`/`self.tickets`, never cached, so neither caller can act
+    /// on stale evidence. `tickets`/`agents` are still taken as parameters
+    /// — already scoped to `repo` by the caller — so this never re-lists
+    /// either store itself.
+    async fn collect_handoff_facts(
+        &self,
+        repo: &str,
+        tickets: &[Tuple],
+        agents: &[crate::agents::AgentRecord],
+    ) -> rk_core::Result<crate::reconcile::HandoffFacts> {
+        let landing_queue = crate::landing::landing_queue_snapshot(&self.space);
+
+        // A clean completion is a bounded pre-admission handoff only when its
+        // task, agent, and generation all match the terminal owner. Query by
+        // spawn first, then retain the repository scope: names and timestamps
+        // are deliberately not identity joins.
+        let mut completions = Vec::new();
+        let mut scanned_spawns = HashSet::new();
+        for ticket in tickets.iter().filter(|ticket| {
+            matches!(
+                ticket.payload.get("status").and_then(Value::as_str),
+                Some("claimed") | Some("in_progress")
+            )
+        }) {
+            let Some(agent) = crate::reconcile::resolve_owner(
+                &ticket.identity,
+                ticket.payload.get("assignee").and_then(Value::as_str),
+                agents,
+            ) else {
+                continue;
+            };
+            if agent.state != crate::agents::AgentState::Completed
+                || !scanned_spawns.insert(agent.spawn_id())
+            {
+                continue;
+            }
+            completions.extend(
+                self.space
+                    .scan(&Pattern::for_spawn(
+                        Category::Event,
+                        "harness_result",
+                        agent.spawn_id(),
+                    ))?
+                    .into_iter()
+                    .filter(|tuple| tuple.scope == repo)
+                    .filter_map(|tuple| {
+                        crate::reconcile::CompletionHandoff::from_harness_result(&tuple)
+                    }),
+            );
+        }
+        let landing_handoffs = landing_queue
+            .iter()
+            .filter(|entry| entry.repo == repo)
+            .map(|entry| crate::reconcile::LandingHandoff {
+                task: entry.task.clone(),
+                source_spawn: entry.source_spawn.map(|spawn| spawn.to_string()),
+                status: entry.status.as_str().to_string(),
+                age_secs: entry.age_secs,
+            })
+            .collect();
+        // A completion whose candidate the queue already ran to a terminal,
+        // non-`landed` verdict (gate-held, no-gate, rework-filed, escalated,
+        // empty) before removing the live row — see `HeldLanding`'s doc for
+        // why this must stay distinct from an abandoned hand-off. Joined by
+        // the exact `(branch, head_sha)` the marker itself was written
+        // against, the same generation-exact key `completions` above is
+        // already scoped to.
+        let now = (self.request_clock)();
+        let mut held_landings = Vec::new();
+        for completion in &completions {
+            let pattern = Pattern::for_commit(
+                Category::Event,
+                crate::landing::LANDING_PROCESSED_IDENTITY,
+                &completion.branch,
+                &completion.head_sha,
+            )
+            .scope(repo.to_string());
+            let Some(marker) = self.space.scan(&pattern)?.into_iter().rfind(|t| {
+                t.payload
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .is_some_and(|o| o != "landed")
+            }) else {
+                continue;
+            };
+            let outcome = marker
+                .payload
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            held_landings.push(crate::reconcile::HeldLanding {
+                task: completion.task.clone(),
+                source_spawn: Some(completion.spawn.clone()),
+                outcome,
+                age_secs: now
+                    .signed_duration_since(marker.created_at)
+                    .num_seconds()
+                    .max(0),
+            });
+        }
+        let admission_grace_secs = self
+            .reactor_config
+            .interval_secs
+            .saturating_mul(2)
+            .max(300)
+            .try_into()
+            .unwrap_or(i64::MAX);
+        // Pre-resolved here, not inside `reconcile::build_with_handoffs`,
+        // because that module is a pure function over already-scanned data
+        // with no `Tickets`/space access of its own (see its module doc).
+        // `landing.task`/`completion.task` are captured verbatim from
+        // whatever spelling their caller used at spawn/enqueue time — a
+        // legacy ticket's `TKT-<ULID>` identity or its proquint alias.
+        let id_spellings: HashMap<String, Vec<String>> = tickets
+            .iter()
+            .filter_map(|ticket| {
+                let spellings = self.tickets.id_spellings(&ticket.identity).ok()?;
+                Some((ticket.identity.clone(), spellings))
+            })
+            .collect();
+
+        Ok(crate::reconcile::HandoffFacts {
+            now,
+            admission_grace_secs,
+            completions,
+            landings: landing_handoffs,
+            held_landings,
+            id_spellings,
+        })
+    }
+
     /// The typed report `reconcile_value` renders to JSON — factored out so
     /// `crate::attention` (TKT-01M0E8PN9C41BWECGNW0990R3J) can consume the
     /// same live `Violation`s the operator-facing `reconcile.report` shows,
@@ -4225,124 +4364,7 @@ impl Daemon {
             .map(|entry| entry.task.clone())
             .collect::<HashSet<_>>();
 
-        // A clean completion is a bounded pre-admission handoff only when its
-        // task, agent, and generation all match the terminal owner. Query by
-        // spawn first, then retain the repository scope: names and timestamps
-        // are deliberately not identity joins.
-        let mut completions = Vec::new();
-        let mut scanned_spawns = HashSet::new();
-        for ticket in tickets.iter().filter(|ticket| {
-            matches!(
-                ticket.payload.get("status").and_then(Value::as_str),
-                Some("claimed") | Some("in_progress")
-            )
-        }) {
-            let Some(agent) = crate::reconcile::resolve_owner(
-                &ticket.identity,
-                ticket.payload.get("assignee").and_then(Value::as_str),
-                &agents,
-            ) else {
-                continue;
-            };
-            if agent.state != crate::agents::AgentState::Completed
-                || !scanned_spawns.insert(agent.spawn_id())
-            {
-                continue;
-            }
-            completions.extend(
-                self.space
-                    .scan(&Pattern::for_spawn(
-                        Category::Event,
-                        "harness_result",
-                        agent.spawn_id(),
-                    ))?
-                    .into_iter()
-                    .filter(|tuple| tuple.scope == repo)
-                    .filter_map(|tuple| {
-                        crate::reconcile::CompletionHandoff::from_harness_result(&tuple)
-                    }),
-            );
-        }
-        let landing_handoffs = landing_queue
-            .iter()
-            .filter(|entry| entry.repo == repo)
-            .map(|entry| crate::reconcile::LandingHandoff {
-                task: entry.task.clone(),
-                source_spawn: entry.source_spawn.map(|spawn| spawn.to_string()),
-                status: entry.status.as_str().to_string(),
-                age_secs: entry.age_secs,
-            })
-            .collect();
-        // A completion whose candidate the queue already ran to a terminal,
-        // non-`landed` verdict (gate-held, no-gate, rework-filed, escalated,
-        // empty) before removing the live row — see `HeldLanding`'s doc for
-        // why this must stay distinct from an abandoned hand-off. Joined by
-        // the exact `(branch, head_sha)` the marker itself was written
-        // against, the same generation-exact key `completions` above is
-        // already scoped to.
-        let now = (self.request_clock)();
-        let mut held_landings = Vec::new();
-        for completion in &completions {
-            let pattern = Pattern::for_commit(
-                Category::Event,
-                crate::landing::LANDING_PROCESSED_IDENTITY,
-                &completion.branch,
-                &completion.head_sha,
-            )
-            .scope(repo.clone());
-            let Some(marker) = self.space.scan(&pattern)?.into_iter().rfind(|t| {
-                t.payload
-                    .get("outcome")
-                    .and_then(Value::as_str)
-                    .is_some_and(|o| o != "landed")
-            }) else {
-                continue;
-            };
-            let outcome = marker
-                .payload
-                .get("outcome")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            held_landings.push(crate::reconcile::HeldLanding {
-                task: completion.task.clone(),
-                source_spawn: Some(completion.spawn.clone()),
-                outcome,
-                age_secs: now
-                    .signed_duration_since(marker.created_at)
-                    .num_seconds()
-                    .max(0),
-            });
-        }
-        let admission_grace_secs = self
-            .reactor_config
-            .interval_secs
-            .saturating_mul(2)
-            .max(300)
-            .try_into()
-            .unwrap_or(i64::MAX);
-        // Pre-resolved here, not inside `reconcile::build_with_handoffs`,
-        // because that module is a pure function over already-scanned data
-        // with no `Tickets`/space access of its own (see its module doc).
-        // `landing.task`/`completion.task` are captured verbatim from
-        // whatever spelling their caller used at spawn/enqueue time — a
-        // legacy ticket's `TKT-<ULID>` identity or its proquint alias.
-        let id_spellings: HashMap<String, Vec<String>> = tickets
-            .iter()
-            .filter_map(|ticket| {
-                let spellings = self.tickets.id_spellings(&ticket.identity).ok()?;
-                Some((ticket.identity.clone(), spellings))
-            })
-            .collect();
-
-        let handoff_facts = crate::reconcile::HandoffFacts {
-            now,
-            admission_grace_secs,
-            completions,
-            landings: landing_handoffs,
-            held_landings,
-            id_spellings,
-        };
+        let handoff_facts = self.collect_handoff_facts(&repo, &tickets, &agents).await?;
 
         // Both branch-shaped self-clearing checks reuse the exact machinery
         // `rk inbox` uses: the dropped-land half of `cleared_branches`, and a
@@ -14193,6 +14215,304 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(report.handoffs[0].task, ticket.identity);
         assert_eq!(report.handoffs[0].phase, "held");
         assert_eq!(report.handoffs[0].status.as_deref(), Some("gate-held"));
+    }
+
+    /// `HeldLanding` is joined to a completion by the exact `(branch,
+    /// head_sha)` a `landing_processed` marker was itself written against —
+    /// never by task alone (`HeldLanding`'s own doc). A marker left over from
+    /// an earlier, superseded generation of the same branch must not attach
+    /// to the newer completion that replaced it, or a genuinely fresh
+    /// worker's completion would read as already held for a decision that
+    /// was actually about its predecessor.
+    #[tokio::test]
+    async fn collect_handoff_facts_fences_held_landing_to_the_exact_generation() {
+        let (_dir, daemon) = daemon_with_agent("Regen-1", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Regen-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Regen-1")
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/regen-1/work",
+                    "head_sha": "newsha1",
+                }),
+            ))
+            .unwrap();
+        // A terminal held marker left over from an earlier, superseded
+        // generation of the same branch — different head_sha.
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                crate::landing::LANDING_PROCESSED_IDENTITY,
+                "daemon",
+                json!({
+                    "branch": "rat/regen-1/work",
+                    "target": "main",
+                    "target_head": "cafebabe",
+                    "head_sha": "oldsha0",
+                    "task": ticket.identity,
+                    "outcome": "gate-held",
+                    "admission_hold": Value::Null,
+                    "admission_recovery": Value::Null,
+                }),
+            ))
+            .unwrap();
+
+        let tickets = daemon
+            .tickets
+            .list(Some("repo".into()), None, None)
+            .unwrap();
+        let agents: Vec<_> = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .filter(|a| a.repo_name == "repo")
+            .collect();
+        let facts = daemon
+            .collect_handoff_facts("repo", &tickets, &agents)
+            .await
+            .unwrap();
+
+        assert_eq!(facts.completions.len(), 1);
+        assert_eq!(facts.completions[0].head_sha, "newsha1");
+        assert!(
+            facts.held_landings.is_empty(),
+            "a stale-generation marker must not attach to a newer completion: {:?}",
+            facts.held_landings
+        );
+    }
+
+    /// A `harness_result` event is joined to a completion by `tuple.scope ==
+    /// repo`, not merely by spawn id — spawn ids are globally unique, but the
+    /// filter is what keeps a caller's fresh facts confined to the repo it
+    /// asked for even if a stray event were ever recorded under the wrong
+    /// scope. Two repos, each with a completed owner and a same-shaped
+    /// completion event, must each see only their own.
+    #[tokio::test]
+    async fn collect_handoff_facts_scopes_completions_to_the_requested_repo() {
+        let (_dir, daemon) = daemon_with_agent("Cross-1", AgentState::Completed);
+        let ticket_a = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo-a".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket_a.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Cross-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Cross-1")
+            .unwrap();
+        // This owner's completion is correctly scoped to repo-a...
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo-a",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket_a.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/cross-1/work",
+                    "head_sha": "sha-a",
+                }),
+            ))
+            .unwrap();
+        // ...but the same spawn also has a stray event recorded under a
+        // different repo's scope, which must never leak into repo-a's facts.
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo-b",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket_a.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/cross-1/work",
+                    "head_sha": "sha-b",
+                }),
+            ))
+            .unwrap();
+
+        let tickets_a = daemon
+            .tickets
+            .list(Some("repo-a".into()), None, None)
+            .unwrap();
+        let agents_a: Vec<_> = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .filter(|a| a.repo_name == "repo")
+            .collect();
+        let facts = daemon
+            .collect_handoff_facts("repo-a", &tickets_a, &agents_a)
+            .await
+            .unwrap();
+
+        assert_eq!(facts.completions.len(), 1);
+        assert_eq!(facts.completions[0].head_sha, "sha-a");
+    }
+
+    /// Conservative-by-construction: a `harness_result` missing the
+    /// generation fields `HeldLanding` needs to join on (or one that never
+    /// declared a clean, final done) must not be read as a completion at all
+    /// — `CompletionHandoff::from_harness_result` already enforces this, but
+    /// the shared collector must not paper over a missing/conflicting event
+    /// with a default or partial fact. A malformed event alongside a
+    /// well-formed one for a different, unrelated ticket must not disturb
+    /// the well-formed one either.
+    #[tokio::test]
+    async fn collect_handoff_facts_ignores_incomplete_or_undeclared_completions() {
+        let (_dir, daemon) = daemon_with_agent("Sparse-1", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Sparse-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Sparse-1")
+            .unwrap();
+        // Declared done, but with no branch/head_sha at all — nothing to
+        // fence a hold against, so this must not become a completion.
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                }),
+            ))
+            .unwrap();
+        // Same spawn, this time reporting an error — a real, later event
+        // that must not be mistaken for a clean completion either.
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": true,
+                    "declared_done": false,
+                    "branch": "rat/sparse-1/work",
+                    "head_sha": "shouldnotcount",
+                }),
+            ))
+            .unwrap();
+
+        let tickets = daemon
+            .tickets
+            .list(Some("repo".into()), None, None)
+            .unwrap();
+        let agents: Vec<_> = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .filter(|a| a.repo_name == "repo")
+            .collect();
+        let facts = daemon
+            .collect_handoff_facts("repo", &tickets, &agents)
+            .await
+            .unwrap();
+
+        assert!(
+            facts.completions.is_empty(),
+            "malformed/undeclared events must not be read as completions: {:?}",
+            facts.completions
+        );
+        assert!(facts.held_landings.is_empty());
     }
 
     #[tokio::test]
