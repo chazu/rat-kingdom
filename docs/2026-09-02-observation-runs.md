@@ -74,6 +74,34 @@ Classes are:
 Each record is a separately created JSON file. Concurrent writers therefore
 cannot corrupt a shared journal line.
 
+### Declared human-gate waits
+
+A `human-gate` record can additionally bind a bounded progress-clock
+exemption (not just a report tally) by supplying `--owner <rat-name>` and
+`--spawn <spawn-id>`:
+
+```sh
+rk observe record "$RUN" \
+  --class human-gate \
+  --ticket TKT-... \
+  --owner Gruyere-14 \
+  --spawn S123 \
+  --summary "waiting on operator sign-off before continuing" \
+  --evidence bbs:need-01
+```
+
+Both fields are optional and default to absent on old records; a record
+missing either one is counted in `interventions` but never exempts a stall
+-- absent or ambiguous evidence is never a trusted exemption. When both are
+present, the collector's independent progress evaluator (below) treats it
+exactly like the existing self-declared/queued bounded waits: it exempts the
+matching ticket+owner+generation from `progress-stalled-tickets` starting at
+the record's own `observed_at`, for the run's frozen `--max-wait` allowance,
+and no longer. A duplicate or later re-declaration of the same gate cannot
+push that deadline out, a declaration cannot retroactively excuse a sample
+observed before it was written, and a generation replacement (new `spawn`)
+never inherits a predecessor's declaration.
+
 ## Evidence and metrics
 
 An observation directory contains:
@@ -136,10 +164,18 @@ classification (`work.current`'s `stalled` bucket):
 - Unchanged evidence past `--progress-stall-after` fails
   `progress-stalled-tickets`. A self-declared verification, queue, review,
   human-gate or recovery-backoff phase receives a fixed `--max-wait` deadline;
-  checkpoint chatter cannot renew a continuing wait. These declarations are
-  advisory evidence, not permission grants or independent proof that an actual
-  workflow approval exists. Authoritative workflow-gate/intervention consumers
-  remain the separately tracked D1 follow-ups.
+  checkpoint chatter cannot renew a continuing wait. The agent's own
+  self-reported status string is advisory evidence, not a permission grant or
+  independent proof that an actual workflow approval exists.
+- A typed `human-gate` intervention record (see "Declared human-gate waits"
+  above) supplies an independently authoritative bounded wait instead: it
+  requires an explicit `--owner`/`--spawn` match against the exact live
+  generation, not just a self-reported status string, and shares the same
+  fixed `--max-wait` deadline anchored to the record's own `observed_at`.
+  Missing or mismatched ticket/owner/generation evidence never grants this
+  exemption. The daemon-side workflow-gate producer and the integration that
+  joins it to this observer are tracked separately (TKT-rahit-hihud-vusuv,
+  TKT-lokoj-zidup-fujih).
 - `status.landing_queue_tasks` supplies authoritative queued-admission evidence
   by repository, ticket and recorded source generation. Legacy aliases resolve
   through the observed ticket set; an older unbound entry cannot excuse a worker

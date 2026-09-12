@@ -121,6 +121,15 @@ pub struct RecordArgs {
     actor: Option<String>,
     #[arg(long = "evidence")]
     evidence: Vec<String>,
+    /// Rat identity this declared wait covers, e.g. `agent["name"]`. Only a
+    /// `human-gate` intervention carrying both this and `--spawn` can ever
+    /// supply a bounded-wait exemption.
+    #[arg(long)]
+    owner: Option<String>,
+    /// Exact live generation (`agent["spawn"]`) this declared wait covers.
+    /// A replacement generation needs its own declaration.
+    #[arg(long)]
+    spawn: Option<String>,
 }
 
 #[derive(Args)]
@@ -316,6 +325,17 @@ struct Intervention {
     ticket: Option<String>,
     actor: String,
     evidence: Vec<String>,
+    /// The rat identity (`agent["name"]`) a declared human-gate wait is
+    /// bound to. Absent on historical records and on any intervention that
+    /// is not a declared bounded wait; a missing owner never grants an
+    /// exemption (see [`declared_gate_wait_since`]).
+    #[serde(default)]
+    owner: Option<String>,
+    /// The exact live generation (`agent["spawn"]`) a declared human-gate
+    /// wait is bound to. A generation replacement mints a new spawn, so a
+    /// declaration recorded for a predecessor never carries over.
+    #[serde(default)]
+    spawn: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -875,11 +895,12 @@ async fn collect_sample(
             .events
             .sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     }
+    let progress = log.progress_metrics(&sample)?;
     sample.metrics = derive_metrics_with_ready_age(
         &sample,
         manifest,
         |ticket| log.ready_age(ticket, sample.observed_at),
-        log.progress_metrics(&sample),
+        progress,
     );
     sample.sampling.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     sample.sampling.rpc_timeouts = client.timeouts;
@@ -1077,6 +1098,10 @@ fn resolve_progress_episode(state: &mut ProgressState, now: DateTime<Utc>, reaso
     }
 }
 
+/// `queued_since`, despite the name, is the caller's combined durable-wait
+/// evidence: either a landing-queue admission or a declared human-gate
+/// intervention (see `advance_sample_progress`), whichever started earlier.
+/// Both share the one `max_wait_secs` bound below.
 fn advance_progress_state(
     previous: Option<&ProgressState>,
     agent: &Value,
@@ -1206,6 +1231,34 @@ fn landing_wait_since(sample: &Sample, agent: &Value) -> Option<DateTime<Utc>> {
         .min()
 }
 
+/// Join only a declared `human-gate` intervention recorded for this exact
+/// ticket, owner and generation. A missing or mismatched owner/spawn never
+/// grants an exemption -- absent or ambiguous evidence is not a trusted
+/// exemption. The earliest matching declaration wins, so a duplicate or
+/// repeated re-declaration for the same gate cannot push its deadline
+/// later, and filtering on `observed_at <= now` means a declaration
+/// recorded after a given sample can never retroactively excuse it (the
+/// bound itself is still enforced by [`advance_progress_state`] against the
+/// run's frozen `max_wait_secs`, exactly like the landing-queue wait).
+fn declared_gate_wait_since(
+    interventions: &[Intervention],
+    agent: &Value,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let task = agent["task"].as_str().filter(|t| !t.is_empty())?;
+    let spawn = agent["spawn"].as_str().filter(|s| !s.is_empty())?;
+    let owner = agent["name"].as_str().filter(|n| !n.is_empty())?;
+    interventions
+        .iter()
+        .filter(|iv| iv.class == InterventionClass::HumanGate)
+        .filter(|iv| iv.ticket.as_deref() == Some(task))
+        .filter(|iv| iv.owner.as_deref() == Some(owner))
+        .filter(|iv| iv.spawn.as_deref() == Some(spawn))
+        .filter(|iv| iv.observed_at <= now)
+        .map(|iv| iv.observed_at)
+        .min()
+}
+
 /// Shared by live collection, checkpoint reconstruction and report replay.
 /// Cumulative episodes include delivered/replaced generations, not only the
 /// agents that happen to remain live in this sample.
@@ -1213,6 +1266,7 @@ fn advance_sample_progress(
     states: &mut BTreeMap<String, ProgressState>,
     sample: &Sample,
     thresholds: &Thresholds,
+    interventions: &[Intervention],
 ) -> ProgressMetrics {
     let mut stalled = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
@@ -1246,12 +1300,20 @@ fn advance_sample_progress(
             .entry(ticket.into())
             .or_default()
             .insert(key.clone());
+        let declared_since = landing_wait_since(sample, &agent)
+            .into_iter()
+            .chain(declared_gate_wait_since(
+                interventions,
+                &agent,
+                sample.observed_at,
+            ))
+            .min();
         let (reading, state) = advance_progress_state(
             states.get(&key),
             &agent,
             sample.observed_at,
             thresholds,
-            landing_wait_since(sample, &agent),
+            declared_since,
         );
         match reading {
             ProgressReading::Stalled => {
@@ -1279,10 +1341,14 @@ fn advance_sample_progress(
     }
 }
 
-fn replay_progress(samples: &mut [Sample], thresholds: &Thresholds) -> Vec<ProgressEpisode> {
+fn replay_progress(
+    samples: &mut [Sample],
+    thresholds: &Thresholds,
+    interventions: &[Intervention],
+) -> Vec<ProgressEpisode> {
     let mut states = BTreeMap::new();
     for sample in samples {
-        let progress = advance_sample_progress(&mut states, sample, thresholds);
+        let progress = advance_sample_progress(&mut states, sample, thresholds, interventions);
         sample.metrics.progress_stalled_tickets = progress.stalled;
         sample.metrics.progress_unresolved_tickets = progress.unresolved;
         sample.metrics.progress_stall_episodes = progress.episodes;
@@ -1429,11 +1495,22 @@ fn ready_ticket_ids(sample: &Sample) -> BTreeSet<String> {
 
 #[cfg(test)]
 fn derive_sample_metrics(sample: &Sample, manifest: &Manifest, prior: &[Sample]) -> SampleMetrics {
+    derive_sample_metrics_with_interventions(sample, manifest, prior, &[])
+}
+
+#[cfg(test)]
+fn derive_sample_metrics_with_interventions(
+    sample: &Sample,
+    manifest: &Manifest,
+    prior: &[Sample],
+    interventions: &[Intervention],
+) -> SampleMetrics {
     let mut states = BTreeMap::new();
     for previous in prior {
-        advance_sample_progress(&mut states, previous, &manifest.thresholds);
+        advance_sample_progress(&mut states, previous, &manifest.thresholds, interventions);
     }
-    let progress = advance_sample_progress(&mut states, sample, &manifest.thresholds);
+    let progress =
+        advance_sample_progress(&mut states, sample, &manifest.thresholds, interventions);
     derive_metrics_with_ready_age(
         sample,
         manifest,
@@ -1483,6 +1560,8 @@ fn record(args: RecordArgs, as_json: bool) -> Result<()> {
         ticket: args.ticket,
         actor: args.actor.unwrap_or_else(|| "operator".into()),
         evidence: args.evidence,
+        owner: args.owner,
+        spawn: args.spawn,
     };
     let path = args
         .run
@@ -1557,11 +1636,11 @@ fn qualify(args: QualifyArgs, as_json: bool) -> Result<()> {
 fn derive_report(run_dir: &Path) -> Result<Report> {
     let manifest = load_manifest(run_dir)?;
     let mut samples = load_samples(run_dir)?;
-    let progress_episodes = replay_progress(&mut samples, &manifest.thresholds);
+    let interventions = load_interventions(run_dir)?;
+    let progress_episodes = replay_progress(&mut samples, &manifest.thresholds, &interventions);
     if samples.is_empty() {
         bail!("{} contains no samples", run_dir.display());
     }
-    let interventions = load_interventions(run_dir)?;
     let ended_at = samples.last().expect("nonempty").observed_at;
     let elapsed_secs = ended_at
         .signed_duration_since(manifest.started_at)
@@ -1822,9 +1901,9 @@ fn derive_qualification(run_dir: &Path) -> Result<QualificationResult> {
     let contract = &frozen.contract;
     let manifest = load_manifest(run_dir)?;
     let mut samples = load_samples(run_dir)?;
-    replay_progress(&mut samples, &manifest.thresholds);
-    let report = derive_report(run_dir)?;
     let interventions = load_interventions(run_dir)?;
+    replay_progress(&mut samples, &manifest.thresholds, &interventions);
+    let report = derive_report(run_dir)?;
     let exercises = load_exercises(run_dir)?;
 
     let mut checks = Vec::new();
@@ -2971,6 +3050,8 @@ mod tests {
                 ticket: Some("TKT-correction".into()),
                 actor: None,
                 evidence: vec![],
+                owner: None,
+                spawn: None,
             },
             false,
         )
@@ -3351,7 +3432,7 @@ mod tests {
         }]}));
         let mut states = BTreeMap::new();
         assert_eq!(
-            advance_sample_progress(&mut states, &first, &manifest.thresholds).stalled,
+            advance_sample_progress(&mut states, &first, &manifest.thresholds, &[]).stalled,
             0
         );
         let mut second = first.clone();
@@ -3360,21 +3441,26 @@ mod tests {
         // Content chatter cannot extend an authoritative queue phase.
         second.agents[0]["progress"]["summary"] = json!("still queued");
         assert_eq!(
-            advance_sample_progress(&mut states, &second, &manifest.thresholds).stalled,
+            advance_sample_progress(&mut states, &second, &manifest.thresholds, &[]).stalled,
             1
         );
         let mut samples = vec![first.clone(), second.clone()];
-        assert_eq!(replay_progress(&mut samples, &manifest.thresholds).len(), 1);
+        assert_eq!(
+            replay_progress(&mut samples, &manifest.thresholds, &[]).len(),
+            1
+        );
         assert_eq!(samples[1].metrics.progress_stalled_tickets, 1);
         // Starting observation after the wait expired is already a stall.
         assert_eq!(
-            advance_sample_progress(&mut BTreeMap::new(), &second, &manifest.thresholds).stalled,
+            advance_sample_progress(&mut BTreeMap::new(), &second, &manifest.thresholds, &[])
+                .stalled,
             1
         );
         let mut missing = first;
         missing.agents[0]["progress"] = Value::Null;
         missing.agents[0]["liveness"] = Value::Null;
-        let metrics = advance_sample_progress(&mut BTreeMap::new(), &missing, &manifest.thresholds);
+        let metrics =
+            advance_sample_progress(&mut BTreeMap::new(), &missing, &manifest.thresholds, &[]);
         assert_eq!(
             metrics.unresolved, 0,
             "bound queue identity supplies evidence"
@@ -3587,28 +3673,28 @@ mod tests {
         agent["progress"]["status"] = json!("verifying: unit tests");
         first.agents = vec![agent.clone()];
         assert_eq!(
-            advance_sample_progress(&mut states, &first, &manifest.thresholds).episodes,
+            advance_sample_progress(&mut states, &first, &manifest.thresholds, &[]).episodes,
             0
         );
         let mut second = sample(2, "2026-09-02T00:00:03Z");
         agent["progress"]["summary"] = json!("still verifying");
         second.agents = vec![agent.clone()];
         assert_eq!(
-            advance_sample_progress(&mut states, &second, &manifest.thresholds).stalled,
+            advance_sample_progress(&mut states, &second, &manifest.thresholds, &[]).stalled,
             1
         );
         agent["progress"]["summary"] = json!("still waiting again");
         let mut third = sample(3, "2026-09-02T00:00:04Z");
         third.agents = vec![agent.clone()];
         assert_eq!(
-            advance_sample_progress(&mut states, &third, &manifest.thresholds).episodes,
+            advance_sample_progress(&mut states, &third, &manifest.thresholds, &[]).episodes,
             1,
             "status chatter cannot renew a wait or create another stall onset"
         );
         agent["state"] = json!("completed");
         let mut fourth = sample(4, "2026-09-02T00:00:05Z");
         fourth.agents = vec![agent];
-        let metrics = advance_sample_progress(&mut states, &fourth, &manifest.thresholds);
+        let metrics = advance_sample_progress(&mut states, &fourth, &manifest.thresholds, &[]);
         assert_eq!(metrics.stalled, 0);
         assert_eq!(metrics.episodes, 1);
         assert_eq!(
@@ -3618,11 +3704,11 @@ mod tests {
         let mut another = stalled_agent_fixture();
         another["task"] = json!("TKT-2");
         fourth.agents = vec![another];
-        advance_sample_progress(&mut states, &fourth, &manifest.thresholds);
+        advance_sample_progress(&mut states, &fourth, &manifest.thresholds, &[]);
         let mut fifth = sample(5, "2026-09-02T00:00:08Z");
         fifth.agents = fourth.agents;
         assert_eq!(
-            advance_sample_progress(&mut states, &fifth, &manifest.thresholds).episodes,
+            advance_sample_progress(&mut states, &fifth, &manifest.thresholds, &[]).episodes,
             2,
             "a retired ticket's incident must not disappear when a different ticket stalls"
         );
@@ -3644,7 +3730,7 @@ mod tests {
         let log = ObservationLog::open(dir.path(), &manifest).unwrap();
         let mut third = sample(3, "2026-09-02T00:00:06Z");
         third.agents = first.agents;
-        let live = log.progress_metrics(&third);
+        let live = log.progress_metrics(&third).unwrap();
         assert_eq!(live.stalled, 1);
         drop(log);
         let report = derive_report(dir.path()).unwrap();
@@ -3653,8 +3739,14 @@ mod tests {
         assert!(!report.checks["progress-stalled-tickets"].passed);
         fs::remove_file(dir.path().join("collector.json")).unwrap();
         let rebuilt = ObservationLog::open(dir.path(), &manifest).unwrap();
-        assert_eq!(rebuilt.progress_metrics(&third).stalled, live.stalled);
-        assert_eq!(rebuilt.progress_metrics(&third).episodes, live.episodes);
+        assert_eq!(
+            rebuilt.progress_metrics(&third).unwrap().stalled,
+            live.stalled
+        );
+        assert_eq!(
+            rebuilt.progress_metrics(&third).unwrap().episodes,
+            live.episodes
+        );
     }
 
     #[test]
@@ -3696,11 +3788,12 @@ mod tests {
         // `rk observe sample` would use.
         let mut log = ObservationLog::open(dir.path(), &manifest).unwrap();
         for mut value in [first, second] {
+            let progress = log.progress_metrics(&value).unwrap();
             value.metrics = derive_metrics_with_ready_age(
                 &value,
                 &manifest,
                 |t| log.ready_age(t, value.observed_at),
-                log.progress_metrics(&value),
+                progress,
             );
             log.append(&value).unwrap();
         }
@@ -3715,6 +3808,8 @@ mod tests {
             ticket: Some("TKT-1".into()),
             actor: "operator".into(),
             evidence: vec![],
+            owner: None,
+            spawn: None,
         };
         write_new_json(
             &dir.path().join(INTERVENTIONS).join("int-1.json"),
@@ -3732,6 +3827,240 @@ mod tests {
             !report.passed,
             "an independently stalled generation must fail the run even with an \
              ad-hoc intervention recorded and zero daemon-reported stale tickets"
+        );
+    }
+
+    #[test]
+    fn a_declared_human_gate_excuses_only_its_own_ticket_owner_and_generation() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 60;
+
+        let mut agent = stalled_agent_fixture();
+        agent["name"] = json!("Gruyere-14");
+        let matching = Intervention {
+            schema_version: SCHEMA_VERSION,
+            id: "gate-1".into(),
+            observed_at: "2026-09-02T00:00:00Z".parse().unwrap(),
+            class: InterventionClass::HumanGate,
+            summary: "waiting on operator sign-off".into(),
+            ticket: Some("TKT-1".into()),
+            actor: "chaz".into(),
+            evidence: vec!["bbs:need-01".into()],
+            owner: Some("Gruyere-14".into()),
+            spawn: Some("S1".into()),
+        };
+
+        let now: DateTime<Utc> = "2026-09-02T00:30:00Z".parse().unwrap();
+        // The unmodified declaration is the positive control: it must match
+        // before any of the negative mutations below are trusted.
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&matching), &agent, now).is_some(),
+            "control declaration should match"
+        );
+
+        // Wrong ticket, wrong owner, wrong generation and wrong class must
+        // never excuse.
+        let mut wrong_ticket = matching.clone();
+        wrong_ticket.ticket = Some("TKT-2".into());
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&wrong_ticket), &agent, now).is_none()
+        );
+
+        let mut wrong_owner = matching.clone();
+        wrong_owner.owner = Some("Other-Rat".into());
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&wrong_owner), &agent, now).is_none()
+        );
+
+        let mut missing_owner = matching.clone();
+        missing_owner.owner = None;
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&missing_owner), &agent, now).is_none(),
+            "missing owner is not authority evidence"
+        );
+
+        let mut wrong_spawn = matching.clone();
+        wrong_spawn.spawn = Some("S2".into());
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&wrong_spawn), &agent, now).is_none()
+        );
+
+        let mut missing_spawn = matching.clone();
+        missing_spawn.spawn = None;
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&missing_spawn), &agent, now).is_none(),
+            "missing generation identity is not a trusted exemption"
+        );
+
+        let mut wrong_class = matching.clone();
+        wrong_class.class = InterventionClass::AdHoc;
+        assert!(
+            declared_gate_wait_since(std::slice::from_ref(&wrong_class), &agent, now).is_none()
+        );
+
+        // A declaration recorded after the sample it would apply to cannot
+        // retroactively excuse that earlier sample.
+        let mut future = matching.clone();
+        future.observed_at = "2026-09-02T00:05:00Z".parse().unwrap();
+        assert!(
+            declared_gate_wait_since(
+                std::slice::from_ref(&future),
+                &agent,
+                "2026-09-02T00:01:00Z".parse().unwrap()
+            )
+            .is_none(),
+            "a later declaration must not retroactively excuse an earlier sample"
+        );
+
+        // The exact matching declaration exempts the stall within its
+        // allowance, and stalls again once the frozen bound expires.
+        let first = {
+            let mut sample = sample(1, "2026-09-02T00:00:00Z");
+            sample.agents = vec![agent.clone()];
+            sample
+        };
+        let mut second = sample(2, "2026-09-02T00:00:30Z");
+        second.agents = vec![agent.clone()];
+        let metrics_second = derive_sample_metrics_with_interventions(
+            &second,
+            &manifest,
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&matching),
+        );
+        assert_eq!(
+            metrics_second.progress_stalled_tickets, 0,
+            "a declared human gate must stay exempt within its allowance"
+        );
+
+        let mut third = sample(3, "2026-09-02T00:05:00Z");
+        third.agents = vec![agent];
+        let metrics_third = derive_sample_metrics_with_interventions(
+            &third,
+            &manifest,
+            &[first, second],
+            std::slice::from_ref(&matching),
+        );
+        assert_eq!(
+            metrics_third.progress_stalled_tickets, 1,
+            "an expired declared-gate exemption must not keep the run healthy"
+        );
+    }
+
+    #[test]
+    fn duplicate_human_gate_declarations_cannot_extend_the_same_allowance() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 10;
+        let mut agent = stalled_agent_fixture();
+        agent["name"] = json!("Gruyere-14");
+        let gate = |id: &str, observed_at: &str| Intervention {
+            schema_version: SCHEMA_VERSION,
+            id: id.into(),
+            observed_at: observed_at.parse().unwrap(),
+            class: InterventionClass::HumanGate,
+            summary: "waiting on operator sign-off".into(),
+            ticket: Some("TKT-1".into()),
+            actor: "chaz".into(),
+            evidence: vec![],
+            owner: Some("Gruyere-14".into()),
+            spawn: Some("S1".into()),
+        };
+        // A second, later declaration for the exact same gate must not push
+        // the deadline out past the first declaration's own allowance.
+        let interventions = vec![
+            gate("gate-1", "2026-09-02T00:00:00Z"),
+            gate("gate-2", "2026-09-02T00:00:05Z"),
+        ];
+        let mut states = BTreeMap::new();
+        let first = {
+            let mut sample = sample(1, "2026-09-02T00:00:06Z");
+            sample.agents = vec![agent.clone()];
+            sample
+        };
+        advance_sample_progress(&mut states, &first, &manifest.thresholds, &interventions);
+        // 11s after the *first* declaration (past its 10s allowance), even
+        // though it is only 6s after the duplicate re-declaration.
+        let mut second = sample(2, "2026-09-02T00:00:11Z");
+        second.agents = vec![agent];
+        let metrics =
+            advance_sample_progress(&mut states, &second, &manifest.thresholds, &interventions);
+        assert_eq!(
+            metrics.stalled, 1,
+            "a duplicate declaration must not extend the original gate's deadline"
+        );
+    }
+
+    #[test]
+    fn a_generation_replacement_does_not_inherit_a_predecessors_human_gate() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 3600;
+        let mut agent = stalled_agent_fixture();
+        agent["name"] = json!("Gruyere-14");
+        let interventions = vec![Intervention {
+            schema_version: SCHEMA_VERSION,
+            id: "gate-1".into(),
+            observed_at: "2026-09-02T00:00:00Z".parse().unwrap(),
+            class: InterventionClass::HumanGate,
+            summary: "waiting on operator sign-off".into(),
+            ticket: Some("TKT-1".into()),
+            actor: "chaz".into(),
+            evidence: vec![],
+            owner: Some("Gruyere-14".into()),
+            spawn: Some("S1".into()),
+        }];
+        let mut states = BTreeMap::new();
+        let first = {
+            let mut sample = sample(1, "2026-09-02T00:00:00Z");
+            sample.agents = vec![agent.clone()];
+            sample
+        };
+        advance_sample_progress(&mut states, &first, &manifest.thresholds, &interventions);
+
+        // A respawn mints a new generation (new spawn) that the recorded
+        // gate was never declared for.
+        agent["spawn"] = json!("S2");
+        let mut second = sample(2, "2026-09-02T00:00:01Z");
+        second.agents = vec![agent];
+        let metrics =
+            advance_sample_progress(&mut states, &second, &manifest.thresholds, &interventions);
+        assert_eq!(
+            metrics.unresolved, 0,
+            "a fresh generation with real progress evidence is resolved, not unresolved"
+        );
+        assert_eq!(
+            metrics.stalled, 0,
+            "a fresh generation starts its own clock rather than inheriting a stall"
+        );
+    }
+
+    #[test]
+    fn historical_intervention_records_missing_owner_and_spawn_compat() {
+        let dir = TempDir::new().unwrap();
+        let legacy_path = dir.path().join("legacy.json");
+        fs::write(
+            &legacy_path,
+            r#"{"schema_version":1,"id":"legacy-1","observed_at":"2026-09-02T00:00:00Z",
+               "class":"human-gate","summary":"pre-D1 record","ticket":"TKT-1",
+               "actor":"operator","evidence":[]}"#,
+        )
+        .unwrap();
+        let bytes = fs::read(&legacy_path).unwrap();
+        let legacy: Intervention = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.owner, None);
+        assert_eq!(legacy.spawn, None);
+
+        let mut agent = stalled_agent_fixture();
+        agent["name"] = json!("Gruyere-14");
+        assert!(
+            declared_gate_wait_since(
+                std::slice::from_ref(&legacy),
+                &agent,
+                "2026-09-02T00:00:01Z".parse().unwrap()
+            )
+            .is_none(),
+            "a historical record with no owner/spawn identity must never grant an exemption"
         );
     }
 
@@ -3803,6 +4132,8 @@ mod tests {
                 ticket: Some("TKT-1".into()),
                 actor: None,
                 evidence: vec!["event:1".into()],
+                owner: None,
+                spawn: None,
             },
             true,
         )
@@ -4111,6 +4442,8 @@ mod tests {
                 ticket: None,
                 actor: None,
                 evidence: vec![],
+                owner: None,
+                spawn: None,
             },
             true,
         )
