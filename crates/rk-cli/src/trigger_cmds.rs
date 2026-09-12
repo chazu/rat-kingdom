@@ -177,9 +177,30 @@ pub struct ConflictGroup {
     pub triggers: Vec<ConflictEntry>,
 }
 
+/// A repo-local `action: "land"` trigger that cannot possibly tell a
+/// completion from its own repo apart from one belonging to another
+/// registered repo — the shape the Glossolalia incident's stale
+/// `steward-landing-on-completion` copy took (TKT-kavok-didit-nojid). The
+/// reactor's own runtime identity fence (`Reactor::fire_land_action`
+/// refusing `repo_name != tuple.scope`) now stops this from ever landing a
+/// foreign branch, but a trigger file shaped this way still burns every
+/// OTHER repo's completions through `MAX_FIRE_ATTEMPTS` retries before
+/// giving up — this audit exists so an operator finds the misconfiguration
+/// before that happens, not from the resulting obstacle spam.
+#[derive(Debug, Serialize)]
+pub struct ForeignCaptureHazard {
+    /// The repo whose `.rk/triggers.cue` deploys the hazardous trigger.
+    pub repo: String,
+    pub trigger: String,
+    pub file: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ConflictsReport {
     pub groups: Vec<ConflictGroup>,
+    #[serde(default)]
+    pub foreign_capture: Vec<ForeignCaptureHazard>,
 }
 
 /// Flag every group of >1 active trigger sharing an identical `match`
@@ -233,7 +254,68 @@ pub fn conflicts(layout: &Layout, repo: &str) -> Result<ConflictsReport> {
         group.triggers.sort_by(|a, b| a.name.cmp(&b.name));
     }
     groups.sort_by(|a, b| a.triggers[0].name.cmp(&b.triggers[0].name));
-    Ok(ConflictsReport { groups })
+
+    let foreign_capture = foreign_capture_hazards(layout)?;
+    Ok(ConflictsReport {
+        groups,
+        foreign_capture,
+    })
+}
+
+/// Scan every registered repo's `.rk/triggers.cue` (not just the one `--repo`
+/// selected — the whole point is that this hazard is invisible from any
+/// single repo's own vantage point, see [`ForeignCaptureHazard`]) for a
+/// repo-local `action: "land"` trigger with no `repo:` override and no
+/// `match.scope` pinned to that repo's own name. Either escapes the hazard:
+/// an explicit `repo:` is an operator's deliberate routing decision (and the
+/// reactor still same-repo-fences `action: "land"` regardless at runtime); a
+/// `match.scope` equal to the repo's own name can, by construction, never
+/// match a foreign tuple in the first place.
+///
+/// Best-effort: no registry file yet (a fresh `~/.rat-kingdom` with nothing
+/// registered) is not an error, just nothing to scan.
+fn foreign_capture_hazards(layout: &Layout) -> Result<Vec<ForeignCaptureHazard>> {
+    let registry_path = layout.home().join("repos.json");
+    if !registry_path.exists() {
+        return Ok(Vec::new());
+    }
+    let registry = rk_daemon::repos::RepoRegistry::load(&registry_path)
+        .with_context(|| format!("read repo registry {}", registry_path.display()))?;
+
+    let mut hazards = Vec::new();
+    for record in registry.list() {
+        let file = record.path.join(".rk").join(REPO_LOCAL_FILENAME);
+        if !file.exists() {
+            continue;
+        }
+        let triggers = rk_workflow::load_triggers(&file)
+            .with_context(|| format!("parse {}", file.display()))?;
+        for trigger in triggers {
+            if trigger.action != rk_workflow::TriggerAction::Land || trigger.repo.is_some() {
+                continue;
+            }
+            let scoped_to_self = trigger
+                .matcher
+                .scope
+                .as_deref()
+                .is_some_and(|scope| scope == record.name);
+            if scoped_to_self {
+                continue;
+            }
+            hazards.push(ForeignCaptureHazard {
+                repo: record.name.clone(),
+                trigger: trigger.name,
+                file: file.display().to_string(),
+                reason: format!(
+                    "action \"land\" with no `repo:` override and no `match.scope: \"{}\"` — \
+                     matches a completion from any registered repo, not just this one",
+                    record.name
+                ),
+            });
+        }
+    }
+    hazards.sort_by(|a, b| (&a.repo, &a.trigger).cmp(&(&b.repo, &b.trigger)));
+    Ok(hazards)
 }
 
 fn drift_row(label: &str, target: &Path, source: Option<&PathBuf>) -> DriftRow {
@@ -546,5 +628,135 @@ mod tests {
 
         let report = conflicts(&layout, repo.path().to_str().unwrap()).unwrap();
         assert!(report.groups.is_empty());
+    }
+
+    /// Registers a repo directly in `<home>/repos.json`, the on-disk file
+    /// `foreign_capture_hazards` reads — no activated `.rk/repo.cue` policy
+    /// needed, since the audit never calls `RepoRecord::effective_policy`.
+    fn register_repo(layout: &Layout, name: &str, path: &Path) {
+        use rk_daemon::repos::{RepoRecord, RepoRegistry};
+        let mut reg = RepoRegistry::load(&layout.home().join("repos.json")).unwrap();
+        reg.add(RepoRecord {
+            name: name.into(),
+            path: path.to_path_buf(),
+            created_at: chrono::Utc::now(),
+            host: None,
+            activated_policy: None,
+        })
+        .unwrap();
+    }
+
+    /// The exact incident shape (TKT-kavok-didit-nojid): a repo-local
+    /// `action: "land"` trigger with neither a `repo:` override nor a
+    /// `match.scope` pinning it to its own repo can parse-match a completion
+    /// from ANY registered repo. `rk trigger conflicts` must surface this
+    /// even when invoked against the OTHER (victim) repo, since the hazard
+    /// lives entirely in a repo the caller may never have looked at.
+    #[test]
+    fn foreign_capture_hazard_flags_unscoped_repo_local_land_trigger() {
+        let home = tempfile::tempdir().unwrap();
+        let rk_repo = tempfile::tempdir().unwrap();
+        let other_repo = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        register_repo(&layout, "rat-kingdom", rk_repo.path());
+        register_repo(&layout, "glossolalia", other_repo.path());
+
+        fs::create_dir_all(other_repo.path().join(".rk")).unwrap();
+        fs::write(
+            other_repo.path().join(".rk").join(REPO_LOCAL_FILENAME),
+            "triggers: [{name: \"steward-landing-on-completion\", action: \"land\", match: {category: \"event\", identity: \"harness_result\", search: \"\\\"role\\\":\\\"rat\\\"\"}}]\n",
+        )
+        .unwrap();
+
+        // Audited from the VICTIM repo's own side — it has no local trigger
+        // file of its own at all.
+        let report = conflicts(&layout, rk_repo.path().to_str().unwrap()).unwrap();
+        assert!(report.groups.is_empty());
+        assert_eq!(
+            report.foreign_capture.len(),
+            1,
+            "{:?}",
+            report.foreign_capture
+        );
+        assert_eq!(report.foreign_capture[0].repo, "glossolalia");
+        assert_eq!(
+            report.foreign_capture[0].trigger,
+            "steward-landing-on-completion"
+        );
+    }
+
+    #[test]
+    fn foreign_capture_hazard_is_clear_when_scoped_to_own_repo() {
+        let home = tempfile::tempdir().unwrap();
+        let rk_repo = tempfile::tempdir().unwrap();
+        let other_repo = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        register_repo(&layout, "rat-kingdom", rk_repo.path());
+        register_repo(&layout, "glossolalia", other_repo.path());
+
+        fs::create_dir_all(other_repo.path().join(".rk")).unwrap();
+        fs::write(
+            other_repo.path().join(".rk").join(REPO_LOCAL_FILENAME),
+            "triggers: [{name: \"steward-landing-on-completion\", action: \"land\", match: {category: \"event\", identity: \"harness_result\", scope: \"glossolalia\"}}]\n",
+        )
+        .unwrap();
+
+        let report = conflicts(&layout, rk_repo.path().to_str().unwrap()).unwrap();
+        assert!(
+            report.foreign_capture.is_empty(),
+            "{:?}",
+            report.foreign_capture
+        );
+    }
+
+    #[test]
+    fn foreign_capture_hazard_is_clear_with_explicit_repo_override() {
+        let home = tempfile::tempdir().unwrap();
+        let rk_repo = tempfile::tempdir().unwrap();
+        let other_repo = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        register_repo(&layout, "rat-kingdom", rk_repo.path());
+        register_repo(&layout, "glossolalia", other_repo.path());
+
+        fs::create_dir_all(other_repo.path().join(".rk")).unwrap();
+        fs::write(
+            other_repo.path().join(".rk").join(REPO_LOCAL_FILENAME),
+            "triggers: [{name: \"deliberate-cross-repo\", action: \"land\", repo: \"glossolalia\", match: {category: \"event\", identity: \"harness_result\"}}]\n",
+        )
+        .unwrap();
+
+        let report = conflicts(&layout, rk_repo.path().to_str().unwrap()).unwrap();
+        assert!(
+            report.foreign_capture.is_empty(),
+            "an explicit repo: override is an operator decision, not an implicit capture: {:?}",
+            report.foreign_capture
+        );
+    }
+
+    /// A repo-local `action: "workflow"` (the default) trigger fanning out
+    /// unscoped is the existing, still-supported "repo overrides/extends
+    /// castle" shape — only `action: "land"` is same-repo-only.
+    #[test]
+    fn foreign_capture_hazard_ignores_non_land_actions() {
+        let home = tempfile::tempdir().unwrap();
+        let rk_repo = tempfile::tempdir().unwrap();
+        let other_repo = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        register_repo(&layout, "rat-kingdom", rk_repo.path());
+        register_repo(&layout, "glossolalia", other_repo.path());
+
+        fs::create_dir_all(other_repo.path().join(".rk")).unwrap();
+        fs::write(
+            other_repo.path().join(".rk").join(REPO_LOCAL_FILENAME),
+            "triggers: [{name: \"ordinary-workflow\", match: {category: \"event\", identity: \"some_event\"}, run: \"some-workflow\"}]\n",
+        )
+        .unwrap();
+
+        let report = conflicts(&layout, rk_repo.path().to_str().unwrap()).unwrap();
+        assert!(
+            report.foreign_capture.is_empty(),
+            "{:?}",
+            report.foreign_capture
+        );
     }
 }
