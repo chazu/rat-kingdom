@@ -31,6 +31,17 @@ const CONTRACT: &str = "contract.json";
 const EXERCISES: &str = "exercises";
 const QUALIFICATION: &str = "qualification.json";
 const DEFAULT_MIN_CONTINUATION_SAMPLES: u64 = 1;
+/// Rows requested per `space.scan` event page. Small enough that even a
+/// heavier-than-average event payload keeps a full page well under the
+/// daemon's response frame cap; halved further (see [`call_event_page`]) if a
+/// page still comes back `frame_too_large`.
+const EVENT_PAGE_LIMIT: usize = 500;
+/// Hard ceiling on bounded event pages walked within one `collect_sample`
+/// call. The per-RPC/sample deadlines are the primary bound; this keeps a
+/// pathologically large backlog from looping for the entire deadline budget
+/// on event history alone, starving nothing but leaving the rest for a later
+/// sample.
+const MAX_EVENT_PAGES_PER_SAMPLE: u32 = 20;
 
 #[derive(Subcommand)]
 pub enum ObservationCommand {
@@ -317,6 +328,13 @@ struct SamplingEvidence {
     rpc_timeouts: Vec<String>,
     deadline_exceeded: bool,
     recovered_appends: Vec<String>,
+    /// The `after_id` cursor value at which event collection stalled because
+    /// the single next event exceeds the response frame cap on its own —
+    /// pagination cannot shrink a one-row page any further. Explicit,
+    /// persisted coverage evidence: the completeness frontier holds here
+    /// rather than silently advancing past an event nothing ever read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oversized_event_after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -791,12 +809,19 @@ async fn collect_sample(
     reader.connect(layout, &mut sample.errors).await;
     sample.daemon_reachable = reader.client.is_some();
     let mut client = reader;
-    sample.status = call(&mut client, "status", json!({}), &mut sample.errors).await;
-    sample.king = call(&mut client, "king.status", json!({}), &mut sample.errors)
-        .await
-        .map(compact_king);
+    sample.status = call(&mut client, layout, "status", json!({}), &mut sample.errors).await;
+    sample.king = call(
+        &mut client,
+        layout,
+        "king.status",
+        json!({}),
+        &mut sample.errors,
+    )
+    .await
+    .map(compact_king);
     sample.work = call(
         &mut client,
+        layout,
         "work.current",
         json!({"repo": manifest.repo}),
         &mut sample.errors,
@@ -804,6 +829,7 @@ async fn collect_sample(
     .await;
     sample.reconcile = call(
         &mut client,
+        layout,
         "reconcile.report",
         json!({"repo": manifest.repo}),
         &mut sample.errors,
@@ -811,6 +837,7 @@ async fn collect_sample(
     .await;
     if let Some(value) = call(
         &mut client,
+        layout,
         "ticket.list",
         json!({"scope": manifest.repo}),
         &mut sample.errors,
@@ -835,6 +862,7 @@ async fn collect_sample(
         .collect();
     if let Some(value) = call(
         &mut client,
+        layout,
         "agent.list",
         json!({"include_archived": true}),
         &mut sample.errors,
@@ -872,34 +900,77 @@ async fn collect_sample(
             })
             .collect();
     }
-    let mut event_params =
-        json!({"category": "event", "scope": manifest.repo, "newest": after_id.is_none()});
-    if let Some(after_id) = &after_id {
-        event_params["after_id"] = json!(after_id);
-    }
-    if let Some(value) = call(&mut client, "space.scan", event_params, &mut sample.errors).await {
-        if value["truncated"] == true {
-            sample.errors.push(
-                "space.scan: truncated event page; further history remains unobserved".into(),
-            );
-        }
-        sample.events = values(&value, "tuples");
-        sample.event_cursor = sample
-            .events
-            .iter()
-            .filter_map(|event| event["id"].as_str())
-            .max()
-            .map(str::to_string)
-            .or(after_id);
-        sample.events.retain(|event| {
-            DateTime::parse_from_rfc3339(event["created_at"].as_str().unwrap_or(""))
-                .map(|at| at.with_timezone(&Utc) >= manifest.started_at)
-                .unwrap_or(false)
+    // Bound event collection: page oldest-first from an explicit cursor so no
+    // one request can pull an unscoped backlog. A run with no checkpoint yet
+    // starts at the run's OWN boundary (`RecordId::floor_at`), never an
+    // unscoped `newest` scan of the whole category/scope history — that
+    // unbounded bootstrap, repeated identically on every retry, was the
+    // trial's `frame_too_large` failure mode (it can never recover, because
+    // nothing about the request shrinks between attempts).
+    let boundary = RecordId::floor_at(manifest.started_at).to_string();
+    let mut cursor = after_id.clone().unwrap_or_else(|| boundary.clone());
+    let mut cursor_confirmed = after_id.is_some();
+    let mut page_limit = EVENT_PAGE_LIMIT;
+    let mut pages = 0u32;
+    loop {
+        let event_params = json!({
+            "category": "event",
+            "scope": manifest.repo,
+            "newest": false,
+            "after_id": cursor,
+            "limit": page_limit,
         });
-        sample
-            .events
-            .sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        match call_event_page(&mut client, layout, event_params, &mut sample.errors).await {
+            ScanPageOutcome::Page(value) => {
+                cursor_confirmed = true;
+                let truncated = value["truncated"] == true;
+                let page = values(&value, "tuples");
+                page_limit = EVENT_PAGE_LIMIT;
+                if page.is_empty() {
+                    break;
+                }
+                if let Some(max_id) = page.iter().filter_map(|event| event["id"].as_str()).max() {
+                    cursor = max_id.to_string();
+                }
+                sample.events.extend(page);
+                pages += 1;
+                if !truncated {
+                    break;
+                }
+                if pages >= MAX_EVENT_PAGES_PER_SAMPLE {
+                    sample.errors.push(format!(
+                        "space.scan: stopped after {MAX_EVENT_PAGES_PER_SAMPLE} bounded pages this sample; remaining history collects on a later sample"
+                    ));
+                    break;
+                }
+            }
+            // A page shrinks as far as one row and still cannot fit: the next
+            // event past `cursor` is oversized on its own. Hold the frontier
+            // there — advancing it would silently move past unseen data —
+            // and record which id it is stuck behind so the gap is explicit,
+            // persisted coverage evidence rather than a vanished event.
+            ScanPageOutcome::FrameTooLarge if page_limit > 1 => {
+                page_limit = (page_limit / 2).max(1);
+            }
+            ScanPageOutcome::FrameTooLarge => {
+                sample.sampling.oversized_event_after = Some(cursor.clone());
+                sample.errors.push(format!(
+                    "space.scan: the event immediately after {cursor} exceeds the response frame cap on its own; coverage frontier held, excluded pending manual recovery"
+                ));
+                break;
+            }
+            ScanPageOutcome::Stopped => break,
+        }
     }
+    sample.event_cursor = cursor_confirmed.then_some(cursor);
+    sample.events.retain(|event| {
+        DateTime::parse_from_rfc3339(event["created_at"].as_str().unwrap_or(""))
+            .map(|at| at.with_timezone(&Utc) >= manifest.started_at)
+            .unwrap_or(false)
+    });
+    sample
+        .events
+        .sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     log.capture_interventions(&mut sample)?;
     let progress = log.progress_metrics(&sample)?;
     sample.metrics = derive_metrics_with_ready_age(
@@ -965,18 +1036,37 @@ impl SampleReader {
                 "RPC"
             }
         ));
-        // A late response must never be mistaken for the next method's reply.
+        // A late response must never be mistaken for the next method's reply
+        // on the SAME socket, so the connection itself is discarded here.
+        // That is a per-RPC recovery decision, not a verdict on the rest of
+        // the sample: `ensure_connected` opens a fresh one for whatever the
+        // caller asks for next, as long as the overall sample deadline still
+        // allows it. One slow or unavailable source must not silently
+        // starve every read that was scheduled after it.
         self.client = None;
+    }
+    /// Guarantee a live connection before the next RPC, reconnecting after a
+    /// prior timeout dropped one. A no-op when already connected. Returns
+    /// whether a client is available to call.
+    async fn ensure_connected(&mut self, layout: &Layout, errors: &mut Vec<String>) -> bool {
+        if self.client.is_none() && tokio::time::Instant::now() < self.deadline {
+            self.connect(layout, errors).await;
+        }
+        self.client.is_some()
     }
 }
 
 async fn call(
     reader: &mut SampleReader,
+    layout: &Layout,
     method: &str,
     params: Value,
     errors: &mut Vec<String>,
 ) -> Option<Value> {
-    if reader.client.is_some() && tokio::time::Instant::now() >= reader.deadline {
+    if !reader.ensure_connected(layout, errors).await {
+        return None;
+    }
+    if tokio::time::Instant::now() >= reader.deadline {
         reader.timed_out(method, errors);
         return None;
     }
@@ -991,6 +1081,56 @@ async fn call(
         Err(_) => {
             reader.timed_out(method, errors);
             None
+        }
+    }
+}
+
+/// Outcome of one bounded `space.scan` event page request.
+enum ScanPageOutcome {
+    Page(Value),
+    /// The daemon downgraded this page to `frame_too_large` (see
+    /// `rk_daemon::proto::codes::FRAME_TOO_LARGE`): the requested page
+    /// itself, even bounded, is still too big to fit one response frame.
+    FrameTooLarge,
+    /// Connect/timeout/other RPC failure; already recorded in `errors`.
+    Stopped,
+}
+
+/// Like [`call`], but distinguishes a `frame_too_large` response so the
+/// caller can shrink its page and retry instead of treating it like any
+/// other RPC failure.
+async fn call_event_page(
+    reader: &mut SampleReader,
+    layout: &Layout,
+    params: Value,
+    errors: &mut Vec<String>,
+) -> ScanPageOutcome {
+    if !reader.ensure_connected(layout, errors).await {
+        return ScanPageOutcome::Stopped;
+    }
+    if tokio::time::Instant::now() >= reader.deadline {
+        reader.timed_out("space.scan", errors);
+        return ScanPageOutcome::Stopped;
+    }
+    let deadline = reader.next_deadline();
+    let Some(client) = reader.client.as_mut() else {
+        return ScanPageOutcome::Stopped;
+    };
+    match tokio::time::timeout_at(deadline, client.call("space.scan", params)).await {
+        Ok(Ok(value)) => ScanPageOutcome::Page(value),
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            let frame_too_large = message.contains(rk_daemon::proto::codes::FRAME_TOO_LARGE);
+            errors.push(format!("space.scan: {message}"));
+            if frame_too_large {
+                ScanPageOutcome::FrameTooLarge
+            } else {
+                ScanPageOutcome::Stopped
+            }
+        }
+        Err(_) => {
+            reader.timed_out("space.scan", errors);
+            ScanPageOutcome::Stopped
         }
     }
 }
@@ -3078,6 +3218,287 @@ mod tests {
         assert_eq!(collected.sampling.rpc_timeouts, ["king.status"]);
         assert!(collected.sampling.elapsed_ms < 2000);
         assert!(!derive_report(dir.path()).unwrap().passed);
+    }
+
+    /// TKT-maruk-fazam-gazug: a slow diagnostic source (`work.current` in the
+    /// trial) must not starve every read scheduled after it. The old
+    /// behaviour discarded the connection on any RPC timeout and never
+    /// reopened one, so ticket/agent/event collection silently went missing
+    /// for the rest of the sample. `SampleReader::ensure_connected` now
+    /// reconnects (a fresh socket, never the stale one) whenever the overall
+    /// sample deadline still allows it.
+    #[tokio::test]
+    async fn a_slow_source_does_not_starve_later_essential_reads() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (dir, mut manifest) = fixture();
+        manifest.rpc_timeout_secs = 1;
+        manifest.sample_timeout_secs = 5;
+        write_json_atomic(&dir.path().join(MANIFEST), &manifest).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(layout.socket_path()).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut stream = tokio::io::BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let method = request["method"].as_str().unwrap().to_string();
+                        if method == "work.current" {
+                            // Slower than the RPC timeout; the client gives up
+                            // on this connection before any reply is sent.
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            break;
+                        }
+                        let value = match method.as_str() {
+                            "status" => {
+                                json!({"pid": 1, "build_version": "test", "landing_queue": []})
+                            }
+                            "king.status" => json!({"state": {}}),
+                            "reconcile.report" => json!({"violations": []}),
+                            "ticket.list" => json!({"tickets": []}),
+                            "agent.list" => json!({"agents": []}),
+                            "space.scan" => json!({"tuples": [], "truncated": false}),
+                            _ => panic!("unexpected observation RPC {method}"),
+                        };
+                        let response = json!({"id": request["id"], "result": value,
+                            "server_version": rk_core::version::BUILD_VERSION});
+                        if stream
+                            .get_mut()
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let collected =
+            tokio::time::timeout(Duration::from_secs(4), append_sample(&layout, dir.path()))
+                .await
+                .unwrap()
+                .unwrap();
+        server.abort();
+        assert!(collected.status.is_some());
+        assert!(collected.king.is_some());
+        assert!(
+            collected.work.is_none(),
+            "the slow source itself never completes"
+        );
+        assert_eq!(collected.sampling.rpc_timeouts, ["work.current"]);
+        assert!(
+            !collected.sampling.deadline_exceeded,
+            "the overall sample budget was not exhausted, only the one RPC"
+        );
+        assert!(
+            collected.reconcile.is_some(),
+            "an essential source recovered via reconnect after the slow one"
+        );
+        assert!(collected.tickets.is_empty());
+        assert!(
+            collected.agents.is_empty(),
+            "agent.list ran too, not just the first read after the timeout"
+        );
+        assert_eq!(
+            collected.event_cursor,
+            Some(RecordId::floor_at(manifest.started_at).to_string()),
+            "space.scan ran too, bootstrapped from the run's own boundary"
+        );
+    }
+
+    /// TKT-maruk-fazam-gazug: bootstrap must never ask for the whole
+    /// category/scope history. A run with no checkpoint starts its `after_id`
+    /// at the run's own boundary (`RecordId::floor_at(started_at)`) instead
+    /// of `newest: true` with no smaller bound — a pre-run event is excluded
+    /// from the request itself, not filtered out after arriving. A backlog
+    /// wider than one bounded page (simulated here with an artificial 2-row
+    /// server page, independent of the client's much larger requested
+    /// `limit`) is walked to completion within one `collect_sample` call via
+    /// repeated bounded round trips, accumulating without gaps or duplicates.
+    #[tokio::test]
+    async fn event_bootstrap_bounds_history_to_the_runs_own_window() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (dir, manifest) = fixture();
+        let stale_at = manifest.started_at - chrono::Duration::seconds(60);
+        let stale = json!({"id": RecordId::floor_at(stale_at).to_string(),
+            "created_at": stale_at.to_rfc3339()});
+        let mut events = vec![stale];
+        for offset in [1, 11, 21, 31, 41] {
+            let at = manifest.started_at + chrono::Duration::seconds(offset);
+            events.push(
+                json!({"id": RecordId::floor_at(at).to_string(), "created_at": at.to_rfc3339()}),
+            );
+        }
+        events.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        let in_window: Vec<Value> = events[1..].to_vec();
+
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(layout.socket_path()).unwrap();
+        let scan_params = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let scan_params_server = scan_params.clone();
+        let server_events = events.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let value = match method {
+                    "status" => json!({"pid": 1, "build_version": "test", "landing_queue": []}),
+                    "king.status" => json!({"state": {}}),
+                    "work.current" => {
+                        json!({"ready_tickets": [], "actionable": [], "decision_required": [], "stalled": []})
+                    }
+                    "reconcile.report" => json!({"violations": []}),
+                    "ticket.list" => json!({"tickets": []}),
+                    "agent.list" => json!({"agents": []}),
+                    "space.scan" => {
+                        scan_params_server
+                            .lock()
+                            .unwrap()
+                            .push(request["params"].clone());
+                        let after_id = request["params"]["after_id"].as_str().unwrap();
+                        let mut page: Vec<Value> = server_events
+                            .iter()
+                            .filter(|event| event["id"].as_str().unwrap() > after_id)
+                            .cloned()
+                            .collect();
+                        page.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+                        // Force multiple round trips regardless of the
+                        // client's requested `limit`.
+                        let truncated = page.len() > 2;
+                        page.truncate(2);
+                        json!({"tuples": page, "truncated": truncated})
+                    }
+                    _ => panic!("unexpected observation RPC {method}"),
+                };
+                let response = json!({"id": request["id"], "result": value,
+                    "server_version": rk_core::version::BUILD_VERSION});
+                stream
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let collected = append_sample(&layout, dir.path()).await.unwrap();
+        server.abort();
+
+        let calls = scan_params.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 3,
+            "the 5-event in-window backlog needed more than one bounded page: {calls:?}"
+        );
+        assert_eq!(
+            calls[0]["after_id"].as_str().unwrap(),
+            RecordId::floor_at(manifest.started_at).to_string(),
+            "bootstrap starts at the run's own boundary, not an unscoped newest scan"
+        );
+        assert_eq!(
+            calls[0]["limit"].as_u64().unwrap() as usize,
+            EVENT_PAGE_LIMIT,
+            "every page is explicitly bounded before wire serialization"
+        );
+        assert_eq!(
+            collected.events.len(),
+            in_window.len(),
+            "the pre-window event was never requested, and none of the in-window ones were dropped or duplicated"
+        );
+        assert_eq!(
+            collected.event_cursor,
+            in_window
+                .last()
+                .map(|event| event["id"].as_str().unwrap().to_string())
+        );
+    }
+
+    /// TKT-maruk-fazam-gazug: a page that cannot shrink below one row and
+    /// still comes back `frame_too_large` means a single event is oversized
+    /// on its own. Recovery must hold the completeness frontier at the last
+    /// confirmed cursor rather than silently skip past the unseen event, and
+    /// must say explicitly which id it is stuck behind.
+    #[tokio::test]
+    async fn an_oversized_single_event_holds_the_frontier_with_explicit_coverage() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (dir, manifest) = fixture();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(layout.socket_path()).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let response = if method == "space.scan" {
+                    json!({"id": request["id"], "error": {"code": "frame_too_large",
+                        "message": "response too large (21100000 bytes, limit 16777216); narrow the request (e.g. drop --all/--archived, or filter by repo)"},
+                        "server_version": rk_core::version::BUILD_VERSION})
+                } else {
+                    let value = match method {
+                        "status" => json!({"pid": 1, "build_version": "test", "landing_queue": []}),
+                        "king.status" => json!({"state": {}}),
+                        "work.current" => {
+                            json!({"ready_tickets": [], "actionable": [], "decision_required": [], "stalled": []})
+                        }
+                        "reconcile.report" => json!({"violations": []}),
+                        "ticket.list" => json!({"tickets": []}),
+                        "agent.list" => json!({"agents": []}),
+                        _ => panic!("unexpected observation RPC {method}"),
+                    };
+                    json!({"id": request["id"], "result": value,
+                        "server_version": rk_core::version::BUILD_VERSION})
+                };
+                stream
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let collected = append_sample(&layout, dir.path()).await.unwrap();
+        server.abort();
+
+        let boundary = RecordId::floor_at(manifest.started_at).to_string();
+        assert_eq!(
+            collected.sampling.oversized_event_after,
+            Some(boundary.clone())
+        );
+        assert!(collected.events.is_empty());
+        assert_eq!(
+            collected.event_cursor, None,
+            "the frontier must not silently advance past the oversized event"
+        );
+        assert!(
+            collected
+                .errors
+                .iter()
+                .any(|error| error.contains("exceeds the response frame cap")
+                    && error.contains(&boundary)),
+            "{:?}",
+            collected.errors
+        );
     }
 
     #[test]

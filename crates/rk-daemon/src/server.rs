@@ -11021,12 +11021,21 @@ impl Daemon {
         };
         // `--hot`, or any `--top N` cap, follows the strongest trail first;
         // `newest` follows plain insertion recency; otherwise the default
-        // oldest-first scan is unchanged.
+        // oldest-first scan is unchanged. `limit` narrows a non-hot page below
+        // the default cap (a bounded reader paging a large category/scope
+        // through `after_id` without pulling every row the hard cap allows);
+        // it has no effect once `hot`/`top` select the ranked path, which
+        // already has its own N via `top`.
+        let hot = params.hot || params.top.is_some();
         let requested_top = params.top;
-        let limit = requested_top
-            .unwrap_or(MAX_SCAN_TUPLES)
-            .min(MAX_SCAN_TUPLES);
-        let result = if params.hot || params.top.is_some() {
+        let limit = if hot {
+            requested_top
+                .unwrap_or(MAX_SCAN_TUPLES)
+                .min(MAX_SCAN_TUPLES)
+        } else {
+            params.limit.unwrap_or(MAX_SCAN_TUPLES).min(MAX_SCAN_TUPLES)
+        };
+        let result = if hot {
             self.space
                 .scan_hot(&params.pattern, Some(limit.saturating_add(1)))
         } else if params.newest {
@@ -11561,6 +11570,12 @@ struct ScanParams {
     top: Option<usize>,
     #[serde(default)]
     newest: bool,
+    /// Caps a non-hot page below [`MAX_SCAN_TUPLES`] so a caller paging a
+    /// large category/scope through `after_id` can keep each response frame
+    /// small, independent of `top` (which selects the ranked/hot path).
+    /// Ignored when `hot` or `top` is set.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -12816,6 +12831,60 @@ mod agent_fact_authorisation_tests {
             raw.error.as_ref().map(|error| error.code.as_str()),
             Some(codes::FORBIDDEN)
         );
+    }
+
+    /// TKT-maruk-fazam-gazug: `limit` narrows a non-hot page below
+    /// `MAX_SCAN_TUPLES` so a bounded reader (the flow observer) can page a
+    /// large category/scope through `after_id` without ever asking for more
+    /// rows than fit comfortably under the response frame cap. It must have
+    /// no effect on the ranked path, which already has its own `top`.
+    #[test]
+    fn scan_limit_narrows_a_non_hot_page_independent_of_top() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new_in_memory(Layout::at(dir.path()), "test-castle".into()).unwrap();
+        let out = |identity: &str| {
+            daemon.handle_out(Request {
+                id: identity.into(),
+                method: "space.out".into(),
+                auth: String::new(),
+                caller: "operator".into(),
+                client_version: None,
+                params: json!({
+                    "category": "need",
+                    "scope": "repo",
+                    "identity": identity,
+                    "payload": {}
+                }),
+            })
+        };
+        for n in 0..5 {
+            assert!(out(&format!("n{n}")).error.is_none());
+        }
+        let scan = |params: Value| {
+            daemon.handle_scan(Request {
+                id: "scan".into(),
+                method: "space.scan".into(),
+                auth: String::new(),
+                caller: "operator".into(),
+                client_version: None,
+                params,
+            })
+        };
+
+        let limited = scan(json!({"category": "need", "scope": "repo", "limit": 2}));
+        let result = limited.result.unwrap();
+        assert_eq!(result["tuples"].as_array().unwrap().len(), 2);
+        assert_eq!(result["truncated"], true);
+
+        // `top` alone still selects the ranked path, unaffected by `limit`.
+        let hot = scan(json!({"category": "need", "scope": "repo", "top": 2, "limit": 2}));
+        assert_eq!(hot.result.unwrap()["tuples"].as_array().unwrap().len(), 2);
+
+        // Omitting `limit` is unchanged: the full page under the hard cap.
+        let unbounded = scan(json!({"category": "need", "scope": "repo"}));
+        let result = unbounded.result.unwrap();
+        assert_eq!(result["tuples"].as_array().unwrap().len(), 5);
+        assert_eq!(result["truncated"], false);
     }
 }
 
