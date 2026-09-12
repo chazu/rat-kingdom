@@ -20,7 +20,7 @@ mod store;
 use store::ObservationLog;
 
 const SCHEMA_VERSION: u32 = 1;
-const PROGRESS_EVALUATOR_VERSION: u32 = 2;
+const PROGRESS_EVALUATOR_VERSION: u32 = 3;
 const MANIFEST: &str = "manifest.json";
 const SAMPLES: &str = "samples.jsonl";
 const INTERVENTIONS: &str = "interventions";
@@ -301,6 +301,10 @@ struct Sample {
     event_cursor: Option<String>,
     /// New repository events since the preceding sample.
     events: Vec<Value>,
+    /// Exact declaration evidence visible when this sample was collected.
+    /// Historical samples without this field never acquire later exemptions.
+    #[serde(default)]
+    declared_interventions: Vec<Intervention>,
     metrics: SampleMetrics,
     #[serde(default)]
     sampling: SamplingEvidence,
@@ -773,6 +777,7 @@ async fn collect_sample(
         agents: Vec::new(),
         event_cursor: None,
         events: Vec::new(),
+        declared_interventions: Vec::new(),
         metrics: SampleMetrics::default(),
         sampling: SamplingEvidence::default(),
     };
@@ -895,6 +900,7 @@ async fn collect_sample(
             .events
             .sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     }
+    log.capture_interventions(&mut sample)?;
     let progress = log.progress_metrics(&sample)?;
     sample.metrics = derive_metrics_with_ready_age(
         &sample,
@@ -1025,6 +1031,10 @@ struct ProgressState {
     stalled_since: Option<DateTime<Utc>>,
     episodes: u64,
     history: Vec<ProgressEpisode>,
+    /// A productive checkpoint ends this generation's declared allowance.
+    /// Re-reading or repeating its declaration cannot reactivate it.
+    #[serde(default)]
+    declared_wait_retired: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1134,6 +1144,7 @@ fn advance_progress_state(
             stalled_since: None,
             episodes: 0,
             history: Vec::new(),
+            declared_wait_retired: false,
         }
     } else {
         previous.expect("same attempt has a prior state").clone()
@@ -1268,18 +1279,46 @@ fn advance_sample_progress(
     thresholds: &Thresholds,
     interventions: &[Intervention],
 ) -> ProgressMetrics {
+    let canonical_task = |task: &str| {
+        if sample
+            .tickets
+            .iter()
+            .any(|t| t["identity"].as_str() == Some(task))
+        {
+            return Some(task.to_string());
+        }
+        let matches: BTreeSet<_> = sample
+            .tickets
+            .iter()
+            .filter(|t| t["alias"].as_str() == Some(task))
+            .filter_map(|t| t["identity"].as_str())
+            .collect();
+        match matches.len() {
+            0 => Some(task.to_string()),
+            1 => Some(matches.first().unwrap().to_string()),
+            _ => None,
+        }
+    };
+    let declarations: Vec<_> = interventions
+        .iter()
+        .cloned()
+        .map(|mut iv| {
+            iv.ticket = iv.ticket.as_deref().and_then(&canonical_task);
+            iv
+        })
+        .collect();
     let mut stalled = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut live_by_ticket: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for raw_agent in &sample.agents {
         let mut agent = raw_agent.clone();
-        if let Some(ticket) = sample
-            .tickets
-            .iter()
-            .find(|t| t["alias"].is_string() && t["alias"] == agent["task"])
-        {
-            agent["task"] = ticket["identity"].clone();
+        if let Some(raw) = agent["task"].as_str() {
+            let Some(task) = canonical_task(raw) else {
+                unresolved.insert(raw.to_string());
+                continue;
+            };
+            agent["task"] = json!(task);
         }
         let key = progress_key(&agent);
         if !seen.insert(key.clone()) {
@@ -1300,21 +1339,45 @@ fn advance_sample_progress(
             .entry(ticket.into())
             .or_default()
             .insert(key.clone());
+        let declaration = declared_gate_wait_since(&declarations, &agent, sample.observed_at);
+        let previous = states.get(&key);
+        let retired = states.values().any(|state| {
+            state.ticket == ticket
+                && state.spawn.as_deref() == agent["spawn"].as_str()
+                && state.declared_wait_retired
+        }) || previous.is_some_and(|state| {
+            state.declared_wait_retired
+                || declaration.is_some_and(|since| {
+                    since <= state.last_observed
+                        && sample.observed_at >= state.last_observed
+                        && !progress_is_waiting(&agent)
+                        && agent["progress"]["status"]
+                            .as_str()
+                            .is_some_and(|s| !s.is_empty())
+                        && agent["liveness"]["reconnect_events"].as_u64().unwrap_or(0) == 0
+                        && serde_json::from_str::<Value>(&state.signature)
+                            .ok()
+                            .is_some_and(|old| {
+                                // Output fingerprints and repeated timestamp updates are not
+                                // evidence that a declared human gate has ended.
+                                old[0] != agent["progress"]["summary"]
+                                    || old[1] != agent["progress"]["next"]
+                                    || old[2] != agent["progress"]["status"]
+                            })
+                })
+        });
         let declared_since = landing_wait_since(sample, &agent)
             .into_iter()
-            .chain(declared_gate_wait_since(
-                interventions,
-                &agent,
-                sample.observed_at,
-            ))
+            .chain(declaration.filter(|_| !retired))
             .min();
-        let (reading, state) = advance_progress_state(
-            states.get(&key),
+        let (reading, mut state) = advance_progress_state(
+            previous,
             &agent,
             sample.observed_at,
             thresholds,
             declared_since,
         );
+        state.declared_wait_retired = retired;
         match reading {
             ProgressReading::Stalled => {
                 stalled.insert(ticket.to_string());
@@ -1341,14 +1404,15 @@ fn advance_sample_progress(
     }
 }
 
-fn replay_progress(
-    samples: &mut [Sample],
-    thresholds: &Thresholds,
-    interventions: &[Intervention],
-) -> Vec<ProgressEpisode> {
+fn replay_progress(samples: &mut [Sample], thresholds: &Thresholds) -> Vec<ProgressEpisode> {
     let mut states = BTreeMap::new();
     for sample in samples {
-        let progress = advance_sample_progress(&mut states, sample, thresholds, interventions);
+        let progress = advance_sample_progress(
+            &mut states,
+            sample,
+            thresholds,
+            &sample.declared_interventions,
+        );
         sample.metrics.progress_stalled_tickets = progress.stalled;
         sample.metrics.progress_unresolved_tickets = progress.unresolved;
         sample.metrics.progress_stall_episodes = progress.episodes;
@@ -1637,7 +1701,7 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
     let manifest = load_manifest(run_dir)?;
     let mut samples = load_samples(run_dir)?;
     let interventions = load_interventions(run_dir)?;
-    let progress_episodes = replay_progress(&mut samples, &manifest.thresholds, &interventions);
+    let progress_episodes = replay_progress(&mut samples, &manifest.thresholds);
     if samples.is_empty() {
         bail!("{} contains no samples", run_dir.display());
     }
@@ -1902,7 +1966,7 @@ fn derive_qualification(run_dir: &Path) -> Result<QualificationResult> {
     let manifest = load_manifest(run_dir)?;
     let mut samples = load_samples(run_dir)?;
     let interventions = load_interventions(run_dir)?;
-    replay_progress(&mut samples, &manifest.thresholds, &interventions);
+    replay_progress(&mut samples, &manifest.thresholds);
     let report = derive_report(run_dir)?;
     let exercises = load_exercises(run_dir)?;
 
@@ -3213,6 +3277,7 @@ mod tests {
             agents: vec![],
             event_cursor: None,
             events: vec![],
+            declared_interventions: vec![],
             metrics: SampleMetrics::default(),
             sampling: SamplingEvidence::default(),
         }
@@ -3445,10 +3510,7 @@ mod tests {
             1
         );
         let mut samples = vec![first.clone(), second.clone()];
-        assert_eq!(
-            replay_progress(&mut samples, &manifest.thresholds, &[]).len(),
-            1
-        );
+        assert_eq!(replay_progress(&mut samples, &manifest.thresholds).len(), 1);
         assert_eq!(samples[1].metrics.progress_stalled_tickets, 1);
         // Starting observation after the wait expired is already a stall.
         assert_eq!(
@@ -4033,6 +4095,175 @@ mod tests {
             metrics.stalled, 0,
             "a fresh generation starts its own clock rather than inheriting a stall"
         );
+    }
+
+    #[test]
+    fn declared_wait_retires_on_productive_checkpoint_and_replay_matches() {
+        let (dir, mut manifest) = fixture();
+        manifest.thresholds.max_wait_secs = 2;
+        manifest.thresholds.progress_stall_after_secs = 1;
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        let mut agent = stalled_agent_fixture();
+        agent["name"] = json!("Worker");
+        agent["task"] = json!("TKT-alias");
+        first.agents = vec![agent];
+        first.tickets = vec![json!({"identity":"TKT-1", "alias":"TKT-alias"})];
+        first.declared_interventions = vec![Intervention {
+            schema_version: SCHEMA_VERSION,
+            id: "gate-1".into(),
+            observed_at: first.observed_at,
+            class: InterventionClass::HumanGate,
+            summary: "operator decision".into(),
+            ticket: Some("TKT-alias".into()),
+            actor: "operator".into(),
+            evidence: vec![],
+            owner: Some("Worker".into()),
+            spawn: Some("S1".into()),
+        }];
+        let mut waiting = first.clone();
+        waiting.sequence = 2;
+        waiting.observed_at += chrono::Duration::seconds(2);
+        waiting.agents[0]["liveness"]["output_fingerprint"] = json!(43);
+        let mut expired = waiting.clone();
+        expired.sequence = 3;
+        expired.observed_at += chrono::Duration::seconds(1);
+        let mut resumed = expired.clone();
+        resumed.sequence = 4;
+        resumed.observed_at += chrono::Duration::seconds(1);
+        resumed.agents[0]["progress"]["summary"] = json!("implemented the selected behavior");
+        let mut silent = resumed.clone();
+        silent.sequence = 5;
+        silent.observed_at += chrono::Duration::seconds(2);
+        // Even a repeated declaration cannot grant a new allowance after resumption.
+        let mut duplicate = first.declared_interventions[0].clone();
+        duplicate.id = "gate-2".into();
+        duplicate.observed_at = resumed.observed_at;
+        silent.declared_interventions.push(duplicate);
+        let mut samples = vec![first, waiting, expired, resumed, silent];
+        let mut log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        let mut counts = Vec::new();
+        for sample in &samples {
+            counts.push(log.progress_metrics(sample).unwrap().stalled);
+            log.append(sample).unwrap();
+        }
+        assert_eq!(counts, [0, 0, 1, 0, 1]);
+        drop(log);
+        fs::remove_file(dir.path().join("collector.json")).unwrap();
+        let rebuilt = ObservationLog::open(dir.path(), &manifest).unwrap();
+        assert_eq!(
+            rebuilt
+                .progress_metrics(samples.last().unwrap())
+                .unwrap()
+                .stalled,
+            1
+        );
+        let episodes = replay_progress(&mut samples, &manifest.thresholds);
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(episodes[0].resolved_at, Some(samples[3].observed_at));
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| s.metrics.progress_stalled_tickets)
+                .collect::<Vec<_>>(),
+            counts
+        );
+    }
+
+    #[test]
+    fn declared_wait_rejects_ambiguous_alias_and_cannot_reactivate_after_session_change() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.max_wait_secs = 60;
+        manifest.thresholds.progress_stall_after_secs = 1;
+        let mut value = sample(1, "2026-09-02T00:00:00Z");
+        let mut agent = stalled_agent_fixture();
+        agent["name"] = json!("Worker");
+        value.agents = vec![agent];
+        value.tickets = vec![
+            json!({"identity":"TKT-1","alias":"ambiguous"}),
+            json!({"identity":"TKT-2","alias":"ambiguous"}),
+        ];
+        let mut gate = Intervention {
+            schema_version: SCHEMA_VERSION,
+            id: "gate".into(),
+            observed_at: value.observed_at,
+            class: InterventionClass::HumanGate,
+            summary: "decision".into(),
+            ticket: Some("ambiguous".into()),
+            actor: "operator".into(),
+            evidence: vec![],
+            owner: Some("Worker".into()),
+            spawn: Some("S1".into()),
+        };
+        let mut states = BTreeMap::new();
+        advance_sample_progress(&mut states, &value, &manifest.thresholds, &[gate.clone()]);
+        value.observed_at += chrono::Duration::seconds(3);
+        assert_eq!(
+            advance_sample_progress(&mut states, &value, &manifest.thresholds, &[gate.clone()])
+                .stalled,
+            1
+        );
+        value.agents[0]["task"] = json!("ambiguous");
+        assert_eq!(
+            advance_sample_progress(&mut states, &value, &manifest.thresholds, &[gate.clone()])
+                .unresolved,
+            1
+        );
+        value.agents[0]["task"] = json!("TKT-1");
+        gate.ticket = Some("TKT-1".into());
+        states.clear();
+        advance_sample_progress(&mut states, &value, &manifest.thresholds, &[gate.clone()]);
+        value.observed_at += chrono::Duration::seconds(1);
+        value.agents[0]["progress"]["summary"] = json!("implemented decision");
+        advance_sample_progress(&mut states, &value, &manifest.thresholds, &[gate.clone()]);
+        assert!(states.values().any(|s| s.declared_wait_retired));
+        value.observed_at += chrono::Duration::seconds(1);
+        value.agents[0]["liveness"]["session"] = json!("new-attempt");
+        advance_sample_progress(&mut states, &value, &manifest.thresholds, &[gate.clone()]);
+        value.observed_at += chrono::Duration::seconds(2);
+        assert_eq!(
+            advance_sample_progress(&mut states, &value, &manifest.thresholds, &[gate]).stalled,
+            1
+        );
+    }
+
+    #[test]
+    fn later_declaration_with_reversed_clock_cannot_rewrite_frozen_samples() {
+        let (dir, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 60;
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        let mut agent = stalled_agent_fixture();
+        agent["name"] = json!("Worker");
+        first.agents = vec![agent];
+        let mut second = first.clone();
+        second.sequence = 2;
+        second.observed_at += chrono::Duration::seconds(3);
+        let mut log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        log.capture_interventions(&mut first).unwrap();
+        log.append(&first).unwrap();
+        log.capture_interventions(&mut second).unwrap();
+        assert_eq!(log.progress_metrics(&second).unwrap().stalled, 1);
+        log.append(&second).unwrap();
+        drop(log);
+        let late = Intervention {
+            schema_version: SCHEMA_VERSION,
+            id: "late".into(),
+            observed_at: first.observed_at,
+            class: InterventionClass::HumanGate,
+            summary: "written later with rolled-back wall clock".into(),
+            ticket: Some("TKT-1".into()),
+            actor: "operator".into(),
+            evidence: vec![],
+            owner: Some("Worker".into()),
+            spawn: Some("S1".into()),
+        };
+        write_new_json(&dir.path().join(INTERVENTIONS).join("late.json"), &late).unwrap();
+        fs::remove_file(dir.path().join("collector.json")).unwrap();
+        let rebuilt = ObservationLog::open(dir.path(), &manifest).unwrap();
+        assert_eq!(rebuilt.progress_metrics(&second).unwrap().stalled, 1);
+        let mut frozen = vec![first, second];
+        assert_eq!(replay_progress(&mut frozen, &manifest.thresholds).len(), 1);
+        assert_eq!(frozen[1].metrics.progress_stalled_tickets, 1);
     }
 
     #[test]

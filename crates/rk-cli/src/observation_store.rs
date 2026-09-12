@@ -122,18 +122,20 @@ impl ObservationLog {
             .and_then(|since| now.signed_duration_since(*since).to_std().ok())
             .map_or(0, |age| age.as_secs())
     }
-    /// Preview without advancing the cache before the sample is durable.
-    /// Reloads declared-intervention evidence fresh each call: it lives in
-    /// its own append-only directory, not the cached checkpoint, so a gate
-    /// declared between samples is picked up without a restart.
+    /// Freeze declaration membership once, before evaluating this sample.
+    pub fn capture_interventions(&self, sample: &mut Sample) -> Result<()> {
+        sample.declared_interventions = load_interventions(&self.run)?;
+        Ok(())
+    }
+
+    /// Preview using the same frozen evidence that append/replay will use.
     pub fn progress_metrics(&self, sample: &Sample) -> Result<ProgressMetrics> {
-        let interventions = load_interventions(&self.run)?;
         let mut states = self.state.progress.clone();
         Ok(advance_sample_progress(
             &mut states,
             sample,
             &self.thresholds,
-            &interventions,
+            &sample.declared_interventions,
         ))
     }
     pub fn gap(&self, start: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
@@ -163,7 +165,6 @@ impl ObservationLog {
     }
 
     fn absorb(&mut self, sample: &Sample, bytes: &[u8]) -> Result<()> {
-        let interventions = load_interventions(&self.run)?;
         let ready = ready_ticket_ids(sample);
         self.state.ready_since.retain(|id, _| ready.contains(id));
         for id in ready {
@@ -176,7 +177,7 @@ impl ObservationLog {
             &mut self.state.progress,
             sample,
             &self.thresholds,
-            &interventions,
+            &sample.declared_interventions,
         );
         if let Some(cursor) = &sample.event_cursor {
             if self

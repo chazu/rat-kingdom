@@ -208,3 +208,60 @@ pub async fn start_daemon(layout: &Layout) -> Client {
     }
     panic!("daemon repeatedly lost the singleton-lock race against {layout:?}");
 }
+
+/// Seed a real durable generation before starting a synthetic-completion daemon.
+#[allow(dead_code)]
+pub fn seed_landing_generation(
+    home: &Path,
+    repo: &Path,
+    name: &str,
+    task: &str,
+    branch: &str,
+    target: &str,
+) {
+    use rk_daemon::agents::{AgentRecord, AgentState, Registry};
+    std::fs::create_dir_all(home).unwrap();
+    let created_at = chrono::Utc::now();
+    let record = AgentRecord {
+        name: name.into(),
+        spawn: Some(rk_core::id::SpawnId::new()),
+        role: "rat".into(),
+        coordination: None,
+        harness: "fake".into(),
+        permission_mode: None,
+        model: None,
+        repo_root: repo.canonicalize().unwrap(),
+        repo_name: repo.file_name().unwrap().to_string_lossy().into_owned(),
+        task: Some(task.into()),
+        branch: Some(branch.into()),
+        fork_point: None,
+        worktree: None,
+        target_branch: target.into(),
+        parent: None,
+        workflow_instance: None,
+        review: None,
+        coordinator: None,
+        session_id: None,
+        attach_target: None,
+        pid: None,
+        merge_commit: None,
+        state: AgentState::Completed,
+        result: None,
+        progress: None,
+        crashed: false,
+        stderr_tail: None,
+        usage: Default::default(),
+        cost_usd: 0.0,
+        created_at,
+        updated_at: created_at,
+        archived_at: None,
+        liveness: Default::default(),
+        transport_outage: None,
+        recovery: None,
+        recovery_receipt: None,
+    };
+    Registry::load(&home.join("agents.json"))
+        .unwrap()
+        .insert(record)
+        .unwrap();
+}

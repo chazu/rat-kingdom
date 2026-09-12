@@ -96,7 +96,11 @@ async fn emit_harness_result(
     head_sha: &str,
     task: &str,
 ) {
-    let spawn = SpawnId::new();
+    let agent = client
+        .call("agent.status", json!({"name": "rat-1"}))
+        .await
+        .unwrap();
+    let spawn: SpawnId = agent["spawn"].as_str().unwrap().parse().unwrap();
     client
         .call(
             "space.out",
@@ -204,6 +208,14 @@ async fn repo_local_unscoped_land_trigger_never_captures_a_foreign_repos_complet
     .unwrap();
 
     let layout = Layout::at(home.path());
+    support::seed_landing_generation(
+        home.path(),
+        &victim,
+        "rat-1",
+        "tkt-1",
+        "rat/x/tkt-1",
+        "main",
+    );
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -285,6 +297,7 @@ async fn repo_local_unscoped_land_trigger_still_lands_its_own_repos_completion()
     let head_sha = make_branch(&repo, "rat/x/tkt-2", "work.txt", "v1\n");
 
     let layout = Layout::at(home.path());
+    support::seed_landing_generation(home.path(), &repo, "rat-1", "tkt-2", "rat/x/tkt-2", "main");
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -317,4 +330,104 @@ async fn repo_local_unscoped_land_trigger_still_lands_its_own_repos_completion()
     assert!(gave_up_obstacles(&mut client).await.is_empty());
 
     handle.abort();
+}
+
+/// Same-scope payloads are still untrusted until the generation and ticket agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_scope_completion_rejects_forged_generation_and_ticket_fields() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("solo-repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    write_checks(&repo, FAST_CHECKS);
+    std::fs::write(repo.join(".rk/triggers.cue"), UNSCOPED_LAND_TRIGGER).unwrap();
+    let head = make_branch(&repo, "rat/x/tkt-2", "work.txt", "v1\n");
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "rat-1",
+        "shared-task",
+        "rat/x/tkt-2",
+        "main",
+    );
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    client
+        .call(
+            "repo.add",
+            json!({"name":"solo-repo", "path":repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    let agent = client
+        .call("agent.status", json!({"name":"rat-1"}))
+        .await
+        .unwrap();
+    let original = json!({"agent":"rat-1", "spawn":agent["spawn"], "role":"rat",
+        "task":"shared-task", "branch":"rat/x/tkt-2", "target":"main", "head_sha":head,
+        "is_error":false, "declared_done":true, "diff_class":"trivial"});
+    for (field, value) in [
+        ("spawn", json!(SpawnId::new().to_string())),
+        ("agent", json!("impostor")),
+        ("task", json!("different-task")),
+        ("task", json!("TKT-missing")),
+        ("branch", json!("rat/other/branch")),
+        ("target", json!("other-target")),
+    ] {
+        let before = gave_up_obstacles(&mut client).await.len();
+        let mut bad = original.clone();
+        bad[field] = value;
+        client
+            .call(
+                "space.out",
+                json!({"category":"event", "scope":"solo-repo",
+            "identity":"harness_result", "payload":bad}),
+            )
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            assert!(queue_entries(&mut client, "solo-repo").await.is_empty());
+            if gave_up_obstacles(&mut client).await.len() > before {
+                break;
+            }
+            nudge_reactor(&mut client).await;
+        }
+        assert!(
+            gave_up_obstacles(&mut client).await.len() > before,
+            "missing diagnostic for {field}"
+        );
+    }
+    // A task that now resolves to another repository is not valid merely
+    // because its raw spelling agrees with the source generation.
+    client
+        .call(
+            "space.out",
+            json!({"category":"task", "scope":"foreign-repo",
+        "identity":"shared-task", "payload":{"status":"open"}}),
+        )
+        .await
+        .unwrap();
+    let before = gave_up_obstacles(&mut client).await.len();
+    client
+        .call(
+            "space.out",
+            json!({"category":"event", "scope":"solo-repo",
+        "identity":"harness_result", "payload":original}),
+        )
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        assert!(queue_entries(&mut client, "solo-repo").await.is_empty());
+        if gave_up_obstacles(&mut client).await.len() > before {
+            break;
+        }
+        nudge_reactor(&mut client).await;
+    }
+    assert!(gave_up_obstacles(&mut client).await.len() > before);
+    assert!(processed_markers(&mut client, "solo-repo").await.is_empty());
+    handle.abort();
+    let _ = handle.await;
 }

@@ -1276,6 +1276,17 @@ impl Reactor {
             }
         };
 
+        if let Err(error) =
+            self.validate_landing_source(payload, repo_name, repo_path, source_spawn)
+        {
+            return self.give_up_or_retry(
+                key,
+                &trigger.name,
+                tuple_id,
+                format!("reactor trigger '{}': {error}", trigger.name),
+            );
+        }
+
         let entry = LandingQueueEntry {
             repo_name: repo_name.to_string(),
             repo_path: repo_path.to_string(),
@@ -1318,6 +1329,61 @@ impl Reactor {
                 ),
             ),
         }
+    }
+
+    /// Completion fields must agree with the durable generation and ticket,
+    /// including after archival/replay. A tuple's spelling alone is not proof.
+    fn validate_landing_source(
+        &self,
+        payload: &Value,
+        repo_name: &str,
+        repo_path: &str,
+        spawn: rk_core::id::SpawnId,
+    ) -> rk_core::Result<()> {
+        let record = self
+            .supervisor
+            .as_ref()
+            .and_then(|supervisor| {
+                supervisor
+                    .lock_registry()
+                    .list_all()
+                    .into_iter()
+                    .find(|record| record.spawn_id() == spawn)
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                rk_core::Error::other("landing completion has no authoritative source generation")
+            })?;
+        if record.repo_name != repo_name
+            || record.repo_root.canonicalize()? != std::path::Path::new(repo_path).canonicalize()?
+            || payload["agent"].as_str() != Some(record.name.as_str())
+            || record.role != "rat"
+            || payload["branch"].as_str() != record.branch.as_deref()
+            || payload["target"].as_str().unwrap_or("main") != record.target_branch
+        {
+            return Err(rk_core::Error::other("landing completion disagrees with its source generation repository/agent/branch/target"));
+        }
+        let canonical_task = |raw: &str| -> rk_core::Result<String> {
+            match self.tickets.resolve(raw)? {
+                Some(ticket) if ticket.scope == repo_name => Ok(ticket.identity),
+                Some(_) => Err(rk_core::Error::other(
+                    "landing completion ticket belongs to another repository",
+                )),
+                None if raw.starts_with("TKT-") => Err(rk_core::Error::other(
+                    "landing completion ticket is missing",
+                )),
+                // Ad hoc work has a generation-bound free-text task, not a ticket.
+                None => Ok(raw.to_string()),
+            }
+        };
+        if canonical_task(payload["task"].as_str().unwrap_or_default())?
+            != canonical_task(record.task.as_deref().unwrap_or_default())?
+        {
+            return Err(rk_core::Error::other(
+                "landing completion task disagrees with its source generation",
+            ));
+        }
+        Ok(())
     }
 
     /// Durably hold a fire that matched a trigger already at its `maxInFlight`

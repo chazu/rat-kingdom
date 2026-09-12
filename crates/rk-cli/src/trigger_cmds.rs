@@ -265,12 +265,9 @@ pub fn conflicts(layout: &Layout, repo: &str) -> Result<ConflictsReport> {
 /// Scan every registered repo's `.rk/triggers.cue` (not just the one `--repo`
 /// selected — the whole point is that this hazard is invisible from any
 /// single repo's own vantage point, see [`ForeignCaptureHazard`]) for a
-/// repo-local `action: "land"` trigger with no `repo:` override and no
-/// `match.scope` pinned to that repo's own name. Either escapes the hazard:
-/// an explicit `repo:` is an operator's deliberate routing decision (and the
-/// reactor still same-repo-fences `action: "land"` regardless at runtime); a
-/// `match.scope` equal to the repo's own name can, by construction, never
-/// match a foreign tuple in the first place.
+/// repo-local `action: "land"` trigger whose `match.scope` is not pinned to
+/// its resolved destination. Explicit routing does not exempt an unscoped
+/// trigger: it can still match completions from unrelated repositories.
 ///
 /// Best-effort: no registry file yet (a fresh `~/.rat-kingdom` with nothing
 /// registered) is not an error, just nothing to scan.
@@ -291,14 +288,15 @@ fn foreign_capture_hazards(layout: &Layout) -> Result<Vec<ForeignCaptureHazard>>
         let triggers = rk_workflow::load_triggers(&file)
             .with_context(|| format!("parse {}", file.display()))?;
         for trigger in triggers {
-            if trigger.action != rk_workflow::TriggerAction::Land || trigger.repo.is_some() {
+            if trigger.action != rk_workflow::TriggerAction::Land {
                 continue;
             }
+            let destination = trigger.repo.as_deref().unwrap_or(&record.name);
             let scoped_to_self = trigger
                 .matcher
                 .scope
                 .as_deref()
-                .is_some_and(|scope| scope == record.name);
+                .is_some_and(|scope| scope == destination);
             if scoped_to_self {
                 continue;
             }
@@ -307,9 +305,8 @@ fn foreign_capture_hazards(layout: &Layout) -> Result<Vec<ForeignCaptureHazard>>
                 trigger: trigger.name,
                 file: file.display().to_string(),
                 reason: format!(
-                    "action \"land\" with no `repo:` override and no `match.scope: \"{}\"` — \
-                     matches a completion from any registered repo, not just this one",
-                    record.name
+                    "action \"land\" is not scoped to destination '{}' and can match foreign completions",
+                    destination
                 ),
             });
         }
@@ -710,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_capture_hazard_is_clear_with_explicit_repo_override() {
+    fn foreign_capture_hazard_flags_unscoped_explicit_repo_override() {
         let home = tempfile::tempdir().unwrap();
         let rk_repo = tempfile::tempdir().unwrap();
         let other_repo = tempfile::tempdir().unwrap();
@@ -727,8 +724,8 @@ mod tests {
 
         let report = conflicts(&layout, rk_repo.path().to_str().unwrap()).unwrap();
         assert!(
-            report.foreign_capture.is_empty(),
-            "an explicit repo: override is an operator decision, not an implicit capture: {:?}",
+            report.foreign_capture.len() == 1,
+            "an explicit destination still needs a matching scope: {:?}",
             report.foreign_capture
         );
     }

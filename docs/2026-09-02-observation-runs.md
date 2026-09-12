@@ -223,3 +223,19 @@ outage samples, convergence violations, forced landings, duplicate dispatches,
 duplicate landings, stale tickets, unclassified holds, independently derived
 progress stalls, and progress-evidence gaps. Any failed check means repair and
 repeat or stop; it is not a passing pilot with a footnote.
+
+
+Declared wait evidence is frozen into each new sample's
+`declared_interventions` field. Live evaluation, checkpoint reconstruction and
+report replay use that same evidence; a later declaration cannot rewrite an
+earlier sample even if the wall clock moves backward. Historical samples with
+no frozen declarations grant no declared-wait exemption. Collector caches are
+versioned and rebuilt when evaluator semantics change.
+
+Ticket aliases are resolved against the sample's canonical ticket rows. A
+productive, non-wait checkpoint retires the generation's declared allowance;
+output chatter and repeated declarations cannot restart it. Subsequent silence
+uses the ordinary progress bound, and the earlier stall episode remains in the
+report. This slice provides one declared allowance per observed generation;
+multiple distinct gate episodes within a generation need a future explicit
+episode identity rather than renewing the same allowance implicitly.

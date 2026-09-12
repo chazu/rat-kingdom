@@ -120,7 +120,11 @@ struct Completion<'a> {
 /// without needing to reproduce the full respawn/pause machinery that
 /// produced the duplicate `task_done` in the field.
 async fn emit_harness_result(client: &mut Client, repo_name: &str, c: Completion<'_>) {
-    let spawn = SpawnId::new();
+    let agent = client
+        .call("agent.status", json!({"name": c.agent}))
+        .await
+        .unwrap();
+    let spawn: SpawnId = agent["spawn"].as_str().unwrap().parse().unwrap();
     client
         .call(
             "space.out",
@@ -239,6 +243,14 @@ async fn sequential_duplicate_reactor_completions_converge_to_one_live_entry() {
     let head_sha = make_branch(&repo, "rat/dedup-seq/tkt-1", "work.txt", "v1\n");
 
     let layout = Layout::at(home.path());
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Deyna-9",
+        "dedup-seq-task",
+        "rat/dedup-seq/tkt-1",
+        "main",
+    );
     let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -437,6 +449,14 @@ checks: [
     let head_sha = make_branch(&repo, "rat/dedup-midgate/tkt-1", "work.txt", "v1\n");
 
     let layout = Layout::at(home.path());
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Deyna-9",
+        "dedup-midgate-task",
+        "rat/dedup-midgate/tkt-1",
+        "main",
+    );
     let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -543,6 +563,14 @@ async fn restart_preserves_the_landing_dedup_invariant() {
     let mut config = rk_core::config::Config::default();
     config.harness.default = "fake".into();
 
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Deyna-9",
+        "dedup-restart-task",
+        "rat/dedup-restart/tkt-1",
+        "main",
+    );
     let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
@@ -682,6 +710,14 @@ checks: [
     // Daemon A: a genuinely on-disk `Space` (`Daemon::new`, not
     // `new_in_memory`) — a second `Daemon::new` below must inherit this
     // one's durable state, not start from an empty store.
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Deyna-9",
+        "dedup-restart-midgate-task",
+        "rat/dedup-restart-midgate/tkt-1",
+        "main",
+    );
     let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
@@ -785,6 +821,22 @@ async fn a_different_head_under_the_same_task_is_independently_admissible() {
     assert_ne!(head_a, head_b);
 
     let layout = Layout::at(home.path());
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Rat-A",
+        "shared-task",
+        "rat/dedup-distinct-head/tkt-1a",
+        "main",
+    );
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Rat-B",
+        "shared-task",
+        "rat/dedup-distinct-head/tkt-1b",
+        "main",
+    );
     let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -880,6 +932,22 @@ async fn a_different_head_under_a_different_task_is_independently_admissible() {
     assert_ne!(head_a, head_b);
 
     let layout = Layout::at(home.path());
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Rat-A",
+        "task-a",
+        "rat/dedup-distinct-head-task/tkt-a",
+        "main",
+    );
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Rat-B",
+        "task-b",
+        "rat/dedup-distinct-head-task/tkt-b",
+        "main",
+    );
     let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -988,6 +1056,14 @@ async fn same_head_resubmitted_under_a_different_task_fails_closed() {
     let head_sha = make_branch(&repo, "rat/dedup-task-mismatch/tkt-1", "work.txt", "v1\n");
 
     let layout = Layout::at(home.path());
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Deyna-9",
+        "real-task",
+        "rat/dedup-task-mismatch/tkt-1",
+        "main",
+    );
     let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -1107,6 +1183,14 @@ async fn same_head_retargeted_to_a_different_branch_is_independently_admissible(
     let head_sha = make_branch(&repo, "rat/dedup-retarget/tkt-1", "work.txt", "v1\n");
 
     let layout = Layout::at(home.path());
+    support::seed_landing_generation(
+        home.path(),
+        &repo,
+        "Methuselah-11",
+        "tkt-retarget",
+        "rat/dedup-retarget/tkt-1",
+        "predecessor-target",
+    );
     let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -1157,19 +1241,16 @@ async fn same_head_retargeted_to_a_different_branch_is_independently_admissible(
 
     // Then: the operator resubmits the IDENTICAL branch/head at `main`. This
     // is the retarget — a distinct candidate, not a redelivery.
-    emit_harness_result(
-        &mut client,
-        &repo_name,
-        Completion {
-            agent: "operator",
-            branch: "rat/dedup-retarget/tkt-1",
-            target: "main",
-            head_sha: &head_sha,
-            task: "tkt-retarget",
-            diff_class: "trivial",
-        },
-    )
-    .await;
+    client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo.to_string_lossy(), "branch": "rat/dedup-retarget/tkt-1",
+                "target": "main", "keep_branch": true
+            }),
+        )
+        .await
+        .unwrap();
 
     assert!(
         wait_until_marker_count(&mut client, &repo_name, 2, 300).await,
