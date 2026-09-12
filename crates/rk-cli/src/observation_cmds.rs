@@ -1328,6 +1328,24 @@ fn progress_is_waiting(agent: &Value) -> bool {
     })
 }
 
+/// Unlike [`progress_is_waiting`] (any self-reported wait-shaped status, used
+/// to detect when a declared gate's own claim has moved on for retirement),
+/// a bare self-reported `human-gate` status must never by itself grant the
+/// bounded-wait exemption -- forged or careless status text is not proof.
+/// Only authoritative corroboration (an admitted landing-queue row, a
+/// matched daemon `workflow-gate` row, or an explicit declared Intervention
+/// -- all folded into the caller's `queued_since`) can excuse a human-gate
+/// wait. Every other self-reported wait class is unchanged and still
+/// trusted on its own report.
+fn self_report_grants_wait(agent: &Value) -> bool {
+    agent["progress"]["status"].as_str().is_some_and(|status| {
+        matches!(
+            status.to_ascii_lowercase().split([':', ' ']).next(),
+            Some("verifying" | "queued" | "awaiting-review" | "recovery-backoff")
+        )
+    })
+}
+
 fn resolve_progress_episode(state: &mut ProgressState, now: DateTime<Utc>, reason: &str) {
     if state.stalled_since.take().is_some() {
         if let Some(episode) = state.history.last_mut() {
@@ -1338,9 +1356,10 @@ fn resolve_progress_episode(state: &mut ProgressState, now: DateTime<Utc>, reaso
 }
 
 /// `queued_since`, despite the name, is the caller's combined durable-wait
-/// evidence: either a landing-queue admission or a declared human-gate
-/// intervention (see `advance_sample_progress`), whichever started earlier.
-/// Both share the one `max_wait_secs` bound below.
+/// evidence: a landing-queue admission, a daemon-authoritative `workflow-gate`
+/// row, or a declared human-gate intervention (see `advance_sample_progress`),
+/// whichever started earlier. All three share the one `max_wait_secs` bound
+/// below.
 fn advance_progress_state(
     previous: Option<&ProgressState>,
     agent: &Value,
@@ -1389,7 +1408,7 @@ fn advance_progress_state(
         state.signature = signature;
         state.changed_at = now;
     }
-    let waiting = queued_since.is_some() || progress_is_waiting(agent);
+    let waiting = queued_since.is_some() || self_report_grants_wait(agent);
     if waiting {
         let since = queued_since.unwrap_or(now);
         let previous = state.wait_started_at.get_or_insert(since);
@@ -1469,6 +1488,38 @@ fn landing_wait_since(sample: &Sample, agent: &Value) -> Option<DateTime<Utc>> {
             Some(since)
         })
         .min()
+}
+
+/// Join a current daemon-authoritative `workflow-gate` row (TKT-rahit-hihud-vusuv:
+/// `InboxItem.ticket`, surfaced unchanged through `work.current`) to this
+/// exact ticket and repository. The producer resolves `ticket` through
+/// `Tickets::resolve` and fails closed to `None` on a missing/ambiguous/
+/// foreign-repo `taskId`, so a plain identity/scope match here is already
+/// canonical and repo-isolated -- no alias resolution needed on this side.
+///
+/// Unlike `landing_wait_since`, the producer supplies no per-gate-entry
+/// timestamp (an `Instance` tracks only the whole run's `started_at`), so
+/// this source's own anchor is simply "this sample" -- the caller's
+/// existing `wait_started_at.get_or_insert(..).min(..)` retains the
+/// earliest sample in which the join first held, exactly like a bare
+/// self-reported wait status does. A gate that resolves (approved,
+/// rejected, or the instance completes) stops appearing in a later
+/// sample's `work.current` entirely, so this source clears itself with no
+/// retirement bookkeeping, unlike a durable declared Intervention record
+/// which persists until a human deletes it.
+fn workflow_gate_wait_since(sample: &Sample, agent: &Value) -> Option<DateTime<Utc>> {
+    let work = sample.work.as_ref()?;
+    let task = agent["task"].as_str().filter(|t| !t.is_empty())?;
+    let repo = agent["repo_name"].as_str()?;
+    ["actionable", "decision_required", "stalled"]
+        .into_iter()
+        .flat_map(|field| work[field].as_array().into_iter().flatten())
+        .any(|row| {
+            row["kind"] == "workflow-gate"
+                && row["ticket"].as_str() == Some(task)
+                && row["scope"].as_str() == Some(repo)
+        })
+        .then_some(sample.observed_at)
 }
 
 /// Join only a declared `human-gate` intervention recorded for this exact
@@ -1597,6 +1648,7 @@ fn advance_sample_progress(
         });
         let declared_since = landing_wait_since(sample, &agent)
             .into_iter()
+            .chain(workflow_gate_wait_since(sample, &agent))
             .chain(declaration.filter(|_| !retired))
             .min();
         let (reading, mut state) = advance_progress_state(
@@ -5065,6 +5117,245 @@ mod tests {
         assert_eq!(
             metrics.stalled, 0,
             "a fresh generation starts its own clock rather than inheriting a stall"
+        );
+    }
+
+    /// The exact real `work.current` row shape a daemon emits for a parked
+    /// approval gate (`inbox::build`, kind `workflow-gate`, serialized via
+    /// `InboxItem`'s hand-written `Serialize`) -- see TKT-rahit-hihud-vusuv's
+    /// producer contract (BBS 01M28QNCH0YY9NS4AGS58JGF62).
+    fn workflow_gate_row(ticket: &str, repo: &str) -> Value {
+        json!({
+            "urgency": 90,
+            "kind": "workflow-gate",
+            "subject": "wf-abc123",
+            "ticket": ticket,
+            "scope": repo,
+            "detail": "release-gate parked at approval gate (step 3)",
+            "disposition": {
+                "kind": "decision-required",
+                "commands": ["rk approve wf-abc123", "rk reject wf-abc123"],
+            },
+            "action": "rk approve wf-abc123  |  rk reject wf-abc123",
+        })
+    }
+
+    fn sample_with_workflow_gate(sequence: u64, at: &str, ticket: &str, repo: &str) -> Sample {
+        let mut value = sample(sequence, at);
+        value.work = Some(json!({
+            "actionable": [],
+            "decision_required": [workflow_gate_row(ticket, repo)],
+            "stalled": [],
+        }));
+        value
+    }
+
+    #[test]
+    fn bare_self_reported_human_gate_status_does_not_excuse_without_corroboration() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 3600;
+        let mut agent = stalled_agent_fixture();
+        agent["repo_name"] = json!("repo");
+        agent["progress"]["status"] = json!("human-gate: waiting on operator sign-off");
+
+        let mut states = BTreeMap::new();
+        let mut first = sample(1, "2026-09-02T00:00:00Z");
+        first.agents = vec![agent.clone()];
+        assert_eq!(
+            advance_sample_progress(&mut states, &first, &manifest.thresholds, &[]).stalled,
+            0,
+            "a fresh signature is progressing on first observation"
+        );
+        let mut second = sample(2, "2026-09-02T00:00:02Z");
+        second.agents = vec![agent];
+        let metrics = advance_sample_progress(&mut states, &second, &manifest.thresholds, &[]);
+        assert_eq!(
+            metrics.stalled, 1,
+            "forged or careless self-reported human-gate status text alone must not \
+             grant the bounded-wait exemption; it falls through to the ordinary \
+             progress-stall bound"
+        );
+    }
+
+    #[test]
+    fn self_reported_wait_classes_other_than_human_gate_remain_trusted_without_corroboration() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 60;
+        for status in ["verifying", "queued", "awaiting-review", "recovery-backoff"] {
+            let mut agent = stalled_agent_fixture();
+            agent["repo_name"] = json!("repo");
+            agent["progress"]["status"] = json!(status);
+            let mut states = BTreeMap::new();
+            let mut first = sample(1, "2026-09-02T00:00:00Z");
+            first.agents = vec![agent.clone()];
+            advance_sample_progress(&mut states, &first, &manifest.thresholds, &[]);
+            let mut second = sample(2, "2026-09-02T00:00:30Z");
+            second.agents = vec![agent];
+            let metrics = advance_sample_progress(&mut states, &second, &manifest.thresholds, &[]);
+            assert_eq!(
+                metrics.stalled, 0,
+                "{status} must remain self-report-trusted without corroboration, unchanged by \
+                 this ticket's human-gate-only scope"
+            );
+        }
+    }
+
+    #[test]
+    fn a_matched_workflow_gate_row_corroborates_a_bounded_wait_and_expires_on_schedule() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 60;
+        let mut agent = stalled_agent_fixture();
+        agent["repo_name"] = json!("repo");
+        // No self-reported wait status at all -- the daemon row is the only
+        // evidence, proving the corroboration path does not depend on the
+        // agent's own text.
+        agent["progress"]["status"] = json!("implementing");
+
+        let mut states = BTreeMap::new();
+        let mut first = sample_with_workflow_gate(1, "2026-09-02T00:00:00Z", "TKT-1", "repo");
+        first.agents = vec![agent.clone()];
+        assert_eq!(
+            advance_sample_progress(&mut states, &first, &manifest.thresholds, &[]).stalled,
+            0
+        );
+
+        let mut second = sample_with_workflow_gate(2, "2026-09-02T00:00:30Z", "TKT-1", "repo");
+        second.agents = vec![agent.clone()];
+        assert_eq!(
+            advance_sample_progress(&mut states, &second, &manifest.thresholds, &[]).stalled,
+            0,
+            "still within the 60s bound anchored at the first observed gate row"
+        );
+
+        let mut third = sample_with_workflow_gate(3, "2026-09-02T00:01:05Z", "TKT-1", "repo");
+        third.agents = vec![agent];
+        assert_eq!(
+            advance_sample_progress(&mut states, &third, &manifest.thresholds, &[]).stalled,
+            1,
+            "an expired workflow-gate-corroborated wait must not keep the run healthy"
+        );
+    }
+
+    #[test]
+    fn workflow_gate_row_never_excuses_a_mismatched_ticket_repo_or_kind() {
+        let mut agent = stalled_agent_fixture();
+        agent["repo_name"] = json!("repo");
+        let mut value = sample(1, "2026-09-02T00:00:00Z");
+        value.work = Some(json!({
+            "actionable": [],
+            "decision_required": [workflow_gate_row("TKT-1", "repo")],
+            "stalled": [],
+        }));
+        assert!(
+            workflow_gate_wait_since(&value, &agent).is_some(),
+            "control row should match"
+        );
+
+        for (field, bad) in [
+            ("ticket", json!("TKT-OTHER")),
+            ("scope", json!("other-repo")),
+            ("kind", json!("obstacle")),
+            ("ticket", Value::Null),
+        ] {
+            let mut row = workflow_gate_row("TKT-1", "repo");
+            row[field] = bad;
+            value.work = Some(json!({"actionable": [], "decision_required": [row], "stalled": []}));
+            assert!(
+                workflow_gate_wait_since(&value, &agent).is_none(),
+                "bad {field}"
+            );
+        }
+
+        // Duplicate projections of the exact same gate in one sample never
+        // manufacture more than one match.
+        value.work = Some(json!({
+            "actionable": [],
+            "decision_required": [workflow_gate_row("TKT-1", "repo"), workflow_gate_row("TKT-1", "repo")],
+            "stalled": [],
+        }));
+        assert_eq!(
+            workflow_gate_wait_since(&value, &agent),
+            Some(value.observed_at)
+        );
+    }
+
+    #[test]
+    fn workflow_gate_disappearance_clears_the_wait_without_retirement_bookkeeping() {
+        let (_, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 5;
+        manifest.thresholds.max_wait_secs = 3600;
+        let mut agent = stalled_agent_fixture();
+        agent["repo_name"] = json!("repo");
+
+        let mut states = BTreeMap::new();
+        let mut first = sample_with_workflow_gate(1, "2026-09-02T00:00:00Z", "TKT-1", "repo");
+        first.agents = vec![agent.clone()];
+        assert_eq!(
+            advance_sample_progress(&mut states, &first, &manifest.thresholds, &[]).stalled,
+            0
+        );
+
+        // The gate resolves (approved/rejected): it simply stops appearing.
+        // No retirement flag is needed -- the source clears itself.
+        let mut second = sample(2, "2026-09-02T00:00:03Z");
+        second.agents = vec![agent.clone()];
+        let metrics = advance_sample_progress(&mut states, &second, &manifest.thresholds, &[]);
+        assert_eq!(
+            metrics.stalled, 0,
+            "cleared source falls back to the ordinary progress bound, still within it"
+        );
+
+        let mut third = sample(3, "2026-09-02T00:00:07Z");
+        third.agents = vec![agent];
+        let metrics = advance_sample_progress(&mut states, &third, &manifest.thresholds, &[]);
+        assert_eq!(
+            metrics.stalled, 1,
+            "unchanged signature past the ordinary bound once corroboration clears"
+        );
+    }
+
+    #[test]
+    fn workflow_gate_wait_survives_progress_replay_and_checkpoint_restart() {
+        let (dir, mut manifest) = fixture();
+        manifest.thresholds.progress_stall_after_secs = 1;
+        manifest.thresholds.max_wait_secs = 10;
+        let mut agent = stalled_agent_fixture();
+        agent["repo_name"] = json!("repo");
+
+        let mut first = sample_with_workflow_gate(1, "2026-09-02T00:00:00Z", "TKT-1", "repo");
+        first.agents = vec![agent.clone()];
+        let mut second = sample_with_workflow_gate(2, "2026-09-02T00:00:05Z", "TKT-1", "repo");
+        second.agents = vec![agent.clone()];
+        // The gate resolves; content chatter alone cannot extend an
+        // authoritative wait that already started.
+        let mut third = sample(3, "2026-09-02T00:00:20Z");
+        third.agents = vec![agent];
+
+        let mut log = ObservationLog::open(dir.path(), &manifest).unwrap();
+        let mut counts = Vec::new();
+        for value in [&first, &second, &third] {
+            counts.push(log.progress_metrics(value).unwrap().stalled);
+            log.append(value).unwrap();
+        }
+        assert_eq!(counts, [0, 0, 1]);
+
+        drop(log);
+        fs::remove_file(dir.path().join("collector.json")).unwrap();
+        let rebuilt = ObservationLog::open(dir.path(), &manifest).unwrap();
+        assert_eq!(rebuilt.progress_metrics(&third).unwrap().stalled, 1);
+
+        let mut samples = vec![first, second, third];
+        let episodes = replay_progress(&mut samples, &manifest.thresholds);
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| s.metrics.progress_stalled_tickets)
+                .collect::<Vec<_>>(),
+            counts
         );
     }
 
