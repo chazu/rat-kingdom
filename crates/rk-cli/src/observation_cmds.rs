@@ -21,12 +21,25 @@ use store::ObservationLog;
 
 const SCHEMA_VERSION: u32 = 1;
 const PROGRESS_EVALUATOR_VERSION: u32 = 3;
+/// Bumped whenever `derive_report`'s evaluation semantics change in a way a
+/// consumer must know about even though the on-disk `Report` shape only grew
+/// additively (new fields are `#[serde(default)]`, never a breaking rename or
+/// removal). Version 2 is the coverage-aware evaluator: an absence-based
+/// check (forced/duplicate landings) or a merged-across-samples count
+/// (deliveries) no longer reads as a proven zero/pass when its required
+/// source never finished refreshing before the run ended.
+const REPORT_EVALUATOR_VERSION: u32 = 2;
 const MANIFEST: &str = "manifest.json";
 const SAMPLES: &str = "samples.jsonl";
 const INTERVENTIONS: &str = "interventions";
 const REPORT: &str = "report.json";
 const CONTRACT_SCHEMA_VERSION: u32 = 1;
-const QUALIFICATION_EVALUATOR_VERSION: u32 = 2;
+/// Bumped alongside `REPORT_EVALUATOR_VERSION`: qualification now requires
+/// complete ticket/event coverage before an absence-based resource check or
+/// a workload delivery count can pass — see `workload/delivery-coverage` and
+/// the coverage guards on `resources/forced-landings` and
+/// `resources/duplicate-landings`.
+const QUALIFICATION_EVALUATOR_VERSION: u32 = 3;
 const CONTRACT: &str = "contract.json";
 const EXERCISES: &str = "exercises";
 const QUALIFICATION: &str = "qualification.json";
@@ -365,11 +378,53 @@ struct Check {
     observed: Value,
     limit: Value,
     passed: bool,
+    /// Set only for a check whose `observed` value depends on a source that
+    /// can go stale mid-run (ticket state, the event feed). Absent for a
+    /// check with no such dependency. See [`Coverage`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coverage: Option<Coverage>,
+}
+
+/// Whether a merged-across-samples signal (repository ticket state, or the
+/// event feed) was refreshed all the way through the end of the run.
+/// `Complete` is the only state that licenses reading an absence in that
+/// signal (e.g. zero deliveries, zero forced landings) as a proven fact
+/// rather than an unproven lower bound — see [`CoverageStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum Coverage {
+    #[default]
+    Complete,
+    Incomplete,
+}
+
+/// Provenance for one such signal. `incomplete_samples` counts samples whose
+/// read of this source did not finish (a cascaded RPC timeout skip, a hard
+/// RPC error, or — for the event feed — an oversized-frame stall);
+/// `uncovered_tail_secs`, set only when `coverage` is `Incomplete`, is the
+/// wall-clock span between the last sample that fully refreshed this source
+/// and the run's end. Because a ticket's delivery record is written once and
+/// never retracted (closed is a terminal ticket state), a gap in the middle
+/// of a run is self-healing as soon as one later sample re-reads it; only an
+/// UNCLOSED tail at the end of the run can permanently hide a real change,
+/// which is exactly what `uncovered_tail_secs` measures.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CoverageStatus {
+    coverage: Coverage,
+    incomplete_samples: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uncovered_tail_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Report {
     schema_version: u32,
+    /// Version of `derive_report`'s evaluation semantics, independent of
+    /// `schema_version` (which describes the manifest/sample format this run
+    /// was collected under and never changes when only derivation logic
+    /// does). See [`REPORT_EVALUATOR_VERSION`].
+    #[serde(default)]
+    evaluator_version: u32,
     run_id: String,
     name: String,
     repo: String,
@@ -389,6 +444,13 @@ struct Report {
     #[serde(default)]
     correction_deliveries: u64,
     throughput_per_hour: f64,
+    /// Coverage for `delivered_during_run`/`correction_deliveries`/
+    /// `throughput_per_hour`: whether `ticket.list` was successfully
+    /// refreshed through the end of the run. When `Incomplete`, those three
+    /// fields are a verified LOWER BOUND, not a proven count — a delivery
+    /// that landed after the last successful read is invisible to this run.
+    #[serde(default)]
+    ticket_coverage: CoverageStatus,
     attributed_cost_usd: f64,
     attributed_tokens: u64,
     max_landing_depth: u64,
@@ -398,6 +460,12 @@ struct Report {
     forced_landings: u64,
     duplicate_dispatches: u64,
     duplicate_landings: u64,
+    /// Coverage for `forced_landings`/`duplicate_landings`: whether the
+    /// repository event feed was drained to the run's live tip by the end of
+    /// the run. When `Incomplete`, a zero here is not proof no such event
+    /// occurred — see [`Coverage`].
+    #[serde(default)]
+    event_coverage: CoverageStatus,
     max_stale_tickets: u64,
     max_unclassified_holds: u64,
     /// D1's independently derived stall count: live generations whose own
@@ -1873,6 +1941,14 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
             .filter_map(|sample| sample.status.as_ref()?.get("pid")?.as_u64()),
     );
     let king_replacements = transitions(samples.iter().filter_map(king_generation));
+    let ticket_coverage = source_coverage(
+        &samples,
+        manifest.started_at,
+        ended_at,
+        sample_tickets_fresh,
+    );
+    let event_coverage =
+        source_coverage(&samples, manifest.started_at, ended_at, sample_events_fresh);
     let delivered = latest_tickets(&samples)
         .into_values()
         .filter(|ticket| delivery_in_window(ticket, manifest.started_at, ended_at))
@@ -1971,11 +2047,15 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         max_reconcile_violations,
         manifest.thresholds.max_reconcile_violations,
     );
-    check(
+    // Event-derived absence checks: a zero here only proves no such event
+    // occurred if the event feed was actually drained through the end of the
+    // run. See `event_coverage` and `check_with_coverage`.
+    check_with_coverage(
         &mut checks,
         "forced-landings",
         forced_landings,
         manifest.thresholds.max_forced_landings,
+        event_coverage.coverage,
     );
     check(
         &mut checks,
@@ -1983,11 +2063,12 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         duplicate_dispatches,
         manifest.thresholds.max_duplicate_dispatches,
     );
-    check(
+    check_with_coverage(
         &mut checks,
         "duplicate-landings",
         duplicate_landings,
         manifest.thresholds.max_duplicate_landings,
+        event_coverage.coverage,
     );
     check(&mut checks, "stale-tickets", max_stale_tickets, 0);
     check(
@@ -2017,9 +2098,15 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
                 observed: json!(attributed_cost_usd),
                 limit: json!(limit),
                 passed: attributed_cost_usd <= limit,
+                coverage: None,
             },
         );
     }
+    // Named, durable evidence of the two merged-across-samples sources
+    // themselves, independent of any single check that consumes them — see
+    // `ticket_coverage`/`event_coverage` on `Report`.
+    check_coverage(&mut checks, "ticket-coverage", &ticket_coverage);
+    check_coverage(&mut checks, "event-coverage", &event_coverage);
     let passed = checks.values().all(|check| check.passed);
     let mut evidence = BTreeMap::new();
     evidence.insert(
@@ -2036,6 +2123,7 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
     );
     Ok(Report {
         schema_version: SCHEMA_VERSION,
+        evaluator_version: REPORT_EVALUATOR_VERSION,
         run_id: manifest.id,
         name: manifest.name,
         repo: manifest.repo,
@@ -2057,6 +2145,7 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         } else {
             delivered_during_run as f64 * 3600.0 / elapsed_secs as f64
         },
+        ticket_coverage,
         attributed_cost_usd,
         attributed_tokens,
         max_landing_depth,
@@ -2066,6 +2155,7 @@ fn derive_report(run_dir: &Path) -> Result<Report> {
         forced_landings,
         duplicate_dispatches,
         duplicate_landings,
+        event_coverage,
         max_stale_tickets,
         max_unclassified_holds,
         max_progress_stalled_tickets,
@@ -2086,8 +2176,160 @@ fn check(checks: &mut BTreeMap<String, Check>, name: &str, observed: u64, limit:
             observed: json!(observed),
             limit: json!(limit),
             passed: observed <= limit,
+            coverage: None,
         },
     );
+}
+
+/// Like [`check`], but for an absence-based check whose `observed` count is
+/// derived from a source that can be mid-refresh at run end (the event
+/// feed). `observed <= limit` alone can never justify `passed: true` when
+/// `coverage` is `Incomplete` — a gap could be hiding the very occurrence
+/// the check exists to catch. An observed value that already exceeds the
+/// limit still fails regardless of coverage: that is real, positive
+/// evidence, not something a gap could manufacture.
+fn check_with_coverage(
+    checks: &mut BTreeMap<String, Check>,
+    name: &str,
+    observed: u64,
+    limit: u64,
+    coverage: Coverage,
+) {
+    checks.insert(
+        name.into(),
+        Check {
+            observed: json!(observed),
+            limit: json!(limit),
+            passed: observed <= limit && coverage == Coverage::Complete,
+            coverage: Some(coverage),
+        },
+    );
+}
+
+/// A human-readable clause describing an incomplete source, empty when
+/// `status` is `Complete`. Shared by qualification requirement detail text.
+fn coverage_note(label: &str, status: &CoverageStatus) -> String {
+    if status.coverage == Coverage::Complete {
+        String::new()
+    } else {
+        format!(
+            "; {label} coverage incomplete ({} incomplete sample(s), {}s uncovered tail) — a zero here is not proven absence",
+            status.incomplete_samples,
+            status.uncovered_tail_secs.unwrap_or(0)
+        )
+    }
+}
+
+/// Publish one source's own coverage as a named, durable check: `passed`
+/// exactly when nothing about that source's evidence in this run is
+/// unresolved. Distinct from `check_with_coverage`, which uses this same
+/// status but as a MODIFIER on top of a separate observed/limit comparison.
+fn check_coverage(checks: &mut BTreeMap<String, Check>, name: &str, status: &CoverageStatus) {
+    checks.insert(
+        name.into(),
+        Check {
+            observed: json!(status.incomplete_samples),
+            limit: json!(0),
+            passed: status.coverage == Coverage::Complete,
+            coverage: Some(status.coverage),
+        },
+    );
+}
+
+/// RPC methods `collect_sample` calls, in order, up to and including
+/// `ticket.list`. A `deadline exceeded; remaining reads skipped` timeout
+/// (see `SampleReader::timed_out`) on any earlier method in this list drops
+/// the connection and skips every read scheduled after it in the same
+/// sample, `ticket.list` included — see `collect_sample`'s fixed RPC order.
+const PRE_TICKET_RPCS: &[&str] = &[
+    "connect",
+    "status",
+    "king.status",
+    "work.current",
+    "reconcile.report",
+];
+/// As [`PRE_TICKET_RPCS`], extended through `agent.list` — the last read
+/// before event-page collection begins.
+const PRE_EVENT_RPCS: &[&str] = &[
+    "connect",
+    "status",
+    "king.status",
+    "work.current",
+    "reconcile.report",
+    "ticket.list",
+    "agent.list",
+];
+
+/// Whether any of `rpcs` reported the specific cascading-skip timeout that
+/// `SampleReader::timed_out` emits, which drops the connection and skips
+/// every subsequent read in the same sample.
+fn cascaded_skip(errors: &[String], rpcs: &[&str]) -> bool {
+    errors.iter().any(|error| {
+        rpcs.iter()
+            .any(|rpc| error.starts_with(&format!("{rpc}: ")))
+            && error.contains("deadline exceeded; remaining reads skipped")
+    })
+}
+
+/// Whether this sample's `tickets`/`lineage` reflect a `ticket.list` read
+/// that actually ran, as opposed to being empty only because an earlier
+/// timeout in the same sample skipped it (see `PRE_TICKET_RPCS`) or the read
+/// itself failed.
+fn sample_tickets_fresh(sample: &Sample) -> bool {
+    !cascaded_skip(&sample.errors, PRE_TICKET_RPCS)
+        && !sample
+            .errors
+            .iter()
+            .any(|error| error.starts_with("ticket.list:"))
+}
+
+/// Whether this sample's event-page loop drained to the live tip: no
+/// upstream cascade skip, no `space.scan` failure — old-format unbounded-scan
+/// `frame_too_large` text and the newer bounded-retry/oversized-frame
+/// messages alike, since both are recorded with the same `"space.scan: "`
+/// prefix — and no held oversized-event frontier.
+fn sample_events_fresh(sample: &Sample) -> bool {
+    !cascaded_skip(&sample.errors, PRE_EVENT_RPCS)
+        && !sample
+            .errors
+            .iter()
+            .any(|error| error.starts_with("space.scan:"))
+        && sample.sampling.oversized_event_after.is_none()
+}
+
+/// Coverage for one merged-across-samples source. Conservative by
+/// construction: a sample this run's evaluator does not recognize as
+/// "fresh" for `fresh` counts against coverage, so an unrecognized old-format
+/// error still yields `Incomplete` rather than silently assuming success.
+fn source_coverage(
+    samples: &[Sample],
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    fresh: impl Fn(&Sample) -> bool,
+) -> CoverageStatus {
+    let incomplete_samples = samples.iter().filter(|sample| !fresh(sample)).count() as u64;
+    let last_fresh = samples
+        .iter()
+        .rev()
+        .find(|sample| fresh(sample))
+        .map(|sample| sample.observed_at);
+    match last_fresh {
+        Some(at) if at >= ended_at => CoverageStatus {
+            coverage: Coverage::Complete,
+            incomplete_samples,
+            uncovered_tail_secs: None,
+        },
+        other => CoverageStatus {
+            coverage: Coverage::Incomplete,
+            incomplete_samples,
+            uncovered_tail_secs: Some(
+                ended_at
+                    .signed_duration_since(other.unwrap_or(started_at))
+                    .to_std()
+                    .map_or(0, |gap| gap.as_secs()),
+            ),
+        },
+    }
 }
 
 /// Evaluate one run against its frozen acceptance contract. Pure over the
@@ -2123,8 +2365,28 @@ fn derive_qualification(run_dir: &Path) -> Result<QualificationResult> {
         "workload/root-deliveries",
         report.delivered_during_run >= contract.workload.min_root_deliveries,
         format!(
-            "{} root deliveries against a minimum of {}; idle elapsed time alone cannot satisfy workload",
-            report.delivered_during_run, contract.workload.min_root_deliveries
+            "{} root deliveries against a minimum of {}; idle elapsed time alone cannot satisfy workload{}",
+            report.delivered_during_run,
+            contract.workload.min_root_deliveries,
+            coverage_note("ticket", &report.ticket_coverage)
+        ),
+    );
+    // A minimum-count requirement already fails safe on an undercount, but a
+    // gap that never resolves before the run ends must still be surfaced on
+    // its own: it can otherwise vanish from view whenever the minimum
+    // happens to be zero or is met by evidence gathered before the gap.
+    require(
+        "workload/delivery-coverage",
+        report.ticket_coverage.coverage == Coverage::Complete,
+        format!(
+            "ticket coverage {:?}; {} incomplete sample(s){}",
+            report.ticket_coverage.coverage,
+            report.ticket_coverage.incomplete_samples,
+            report
+                .ticket_coverage
+                .uncovered_tail_secs
+                .map(|secs| format!(", {secs}s uncovered tail"))
+                .unwrap_or_default()
         ),
     );
     require(
@@ -2312,18 +2574,24 @@ fn derive_qualification(run_dir: &Path) -> Result<QualificationResult> {
     );
     require(
         "resources/duplicate-landings",
-        report.duplicate_landings <= contract.resources.max_duplicate_landings,
+        report.duplicate_landings <= contract.resources.max_duplicate_landings
+            && report.event_coverage.coverage == Coverage::Complete,
         format!(
-            "{} duplicate landing(s) against a limit of {}",
-            report.duplicate_landings, contract.resources.max_duplicate_landings
+            "{} duplicate landing(s) against a limit of {}{}",
+            report.duplicate_landings,
+            contract.resources.max_duplicate_landings,
+            coverage_note("event", &report.event_coverage)
         ),
     );
     require(
         "resources/forced-landings",
-        report.forced_landings <= contract.resources.max_forced_landings,
+        report.forced_landings <= contract.resources.max_forced_landings
+            && report.event_coverage.coverage == Coverage::Complete,
         format!(
-            "{} forced landing(s) against a limit of {}",
-            report.forced_landings, contract.resources.max_forced_landings
+            "{} forced landing(s) against a limit of {}{}",
+            report.forced_landings,
+            contract.resources.max_forced_landings,
+            coverage_note("event", &report.event_coverage)
         ),
     );
     require(
@@ -2948,13 +3216,33 @@ fn print_report(report: &Report) {
         report.throughput_per_hour,
         report.attributed_cost_usd,
     );
+    if report.ticket_coverage.coverage == Coverage::Incomplete {
+        println!(
+            "  NOTE delivered_during_run/correction_deliveries/throughput_per_hour are a LOWER BOUND: \
+             ticket coverage incomplete ({} incomplete sample(s), {}s uncovered tail)",
+            report.ticket_coverage.incomplete_samples,
+            report.ticket_coverage.uncovered_tail_secs.unwrap_or(0),
+        );
+    }
+    if report.event_coverage.coverage == Coverage::Incomplete {
+        println!(
+            "  NOTE forced_landings/duplicate_landings are NOT proven zero: \
+             event coverage incomplete ({} incomplete sample(s), {}s uncovered tail)",
+            report.event_coverage.incomplete_samples,
+            report.event_coverage.uncovered_tail_secs.unwrap_or(0),
+        );
+    }
     for (name, check) in &report.checks {
         println!(
-            "  {:<28} {:<4} observed {} <= {}",
+            "  {:<28} {:<4} observed {} <= {}{}",
             name,
             if check.passed { "PASS" } else { "FAIL" },
             check.observed,
             check.limit,
+            match check.coverage {
+                Some(Coverage::Incomplete) => " (coverage incomplete)",
+                _ => "",
+            },
         );
     }
     println!("  interventions {:?}", report.interventions);
@@ -3541,6 +3829,132 @@ mod tests {
             false,
         )
         .unwrap();
+    }
+
+    /// TKT-durap-simip-nadim: the trial evidence this replays
+    /// (rk-flow-trial-20260911T170220Z) had `work.current` starve
+    /// `ticket.list` for the rest of the run right after a real delivery
+    /// landed outside the observer's view. `delivered_during_run` must not
+    /// read as a proven zero when the tail after the last successful ticket
+    /// read is never covered again before the run ends.
+    #[test]
+    fn an_uncovered_ticket_tail_marks_delivery_metrics_as_a_lower_bound() {
+        let (dir, _) = fixture();
+        let first = sample(1, "2026-09-02T00:00:30Z");
+        let mut second = sample(2, "2026-09-02T00:01:00Z");
+        second.errors = vec!["work.current: RPC deadline exceeded; remaining reads skipped".into()];
+        second.tickets = vec![];
+        let mut third = sample(3, "2026-09-02T00:01:30Z");
+        third.errors = second.errors.clone();
+        third.tickets = vec![];
+        for value in [first, second, third] {
+            append_json_line(&dir.path().join(SAMPLES), &value).unwrap();
+        }
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(report.ticket_coverage.coverage, Coverage::Incomplete);
+        assert_eq!(report.ticket_coverage.incomplete_samples, 2);
+        assert_eq!(report.ticket_coverage.uncovered_tail_secs, Some(60));
+        assert_eq!(report.delivered_during_run, 0, "no delivery was ever captured, so this is only a lower bound — see the coverage flag, not this count, for proof");
+        let check = &report.checks["ticket-coverage"];
+        assert!(!check.passed, "{check:?}");
+        assert_eq!(check.coverage, Some(Coverage::Incomplete));
+        assert!(
+            !report.passed,
+            "an unresolved tail gap must fail the run closed, not disappear"
+        );
+    }
+
+    /// TKT-durap-simip-nadim: the same trial never successfully drained a
+    /// single event page (every sample failed with `space.scan:
+    /// frame_too_large`, the old unbounded-scan error text). `forced_landings`
+    /// and `duplicate_landings` are absence checks — zero only proves nothing
+    /// happened if the event feed was actually read. A ticket read succeeding
+    /// in the same sample must not be treated as evidence about events.
+    #[test]
+    fn an_unread_event_feed_prevents_a_false_pass_on_forced_and_duplicate_landings() {
+        let (dir, _) = fixture();
+        let mut value = sample(1, "2026-09-02T00:00:30Z");
+        value.errors = vec![
+            "space.scan: protocol: frame_too_large: response too large (21113109 bytes, limit 16777216); narrow the request".into(),
+        ];
+        value.events = vec![];
+        append_json_line(&dir.path().join(SAMPLES), &value).unwrap();
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(report.event_coverage.coverage, Coverage::Incomplete);
+        assert_eq!(
+            report.ticket_coverage.coverage,
+            Coverage::Complete,
+            "a space.scan failure must not implicate ticket.list, which ran and completed earlier in the same sample"
+        );
+        for name in ["forced-landings", "duplicate-landings"] {
+            let check = &report.checks[name];
+            assert_eq!(check.observed, json!(0));
+            assert!(
+                !check.passed,
+                "{name}: observed 0 must not read as a proven zero without event coverage: {check:?}"
+            );
+            assert_eq!(check.coverage, Some(Coverage::Incomplete));
+        }
+        assert!(!report.passed);
+    }
+
+    /// Acceptance counterpart to the two tests above: when every sample's
+    /// read of a source actually completed, an observed zero is a KNOWN
+    /// zero, not a lower bound — coverage must read `Complete` and the
+    /// corresponding checks must pass on their own merits.
+    #[test]
+    fn complete_coverage_reports_a_known_zero_not_a_lower_bound() {
+        let (dir, _) = fixture();
+        append_json_line(
+            &dir.path().join(SAMPLES),
+            &sample(1, "2026-09-02T00:00:30Z"),
+        )
+        .unwrap();
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(report.ticket_coverage.coverage, Coverage::Complete);
+        assert_eq!(report.ticket_coverage.incomplete_samples, 0);
+        assert_eq!(report.ticket_coverage.uncovered_tail_secs, None);
+        assert_eq!(report.event_coverage.coverage, Coverage::Complete);
+        assert_eq!(report.delivered_during_run, 0);
+        assert!(report.checks["ticket-coverage"].passed);
+        assert!(report.checks["event-coverage"].passed);
+        assert!(report.checks["forced-landings"].passed);
+        assert!(report.checks["duplicate-landings"].passed);
+    }
+
+    /// A gap that a minimum-count requirement would never surface on its own
+    /// (a floor of zero is trivially met by an unproven zero) must still be
+    /// visible and fail qualification closed — it cannot "disappear when
+    /// another source is healthy" (acceptance, TKT-durap-simip-nadim).
+    #[test]
+    fn qualification_fails_on_an_uncovered_ticket_tail_even_when_the_minimum_is_zero() {
+        let (dir, manifest) = fixture();
+        let contract = contract_fixture(&manifest);
+        assert_eq!(contract.workload.min_root_deliveries, 0);
+        freeze_test_contract(&dir, &contract);
+        let first = sample(1, "2026-09-02T00:00:30Z");
+        let mut second = sample(2, "2026-09-02T00:01:00Z");
+        second.errors = vec!["work.current: RPC deadline exceeded; remaining reads skipped".into()];
+        for value in [first, second] {
+            append_json_line(&dir.path().join(SAMPLES), &value).unwrap();
+        }
+        let result = derive_qualification(dir.path()).unwrap();
+        assert!(!result.qualified);
+        let root_deliveries = result
+            .checks
+            .iter()
+            .find(|check| check.requirement == "workload/root-deliveries")
+            .unwrap();
+        assert!(
+            root_deliveries.passed,
+            "a floor of zero is trivially met even by an unproven count: {root_deliveries:?}"
+        );
+        let coverage = result
+            .checks
+            .iter()
+            .find(|check| check.requirement == "workload/delivery-coverage")
+            .unwrap();
+        assert!(!coverage.passed, "{coverage:?}");
     }
 
     #[tokio::test]
