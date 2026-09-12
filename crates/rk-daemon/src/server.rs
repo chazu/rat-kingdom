@@ -4419,6 +4419,14 @@ impl Daemon {
     /// plan down to one violation's own subject before applying, so that
     /// resolving one attention item can never repair a sibling ticket as a
     /// side effect).
+    ///
+    /// Uses `reconcile_repair::plan_with_handoffs` — the same handoff-aware
+    /// `terminal_assignee_with_handoffs` evidence `reconcile_report` builds
+    /// via `collect_handoff_facts` — so `rk reconcile-repair --apply` cannot
+    /// plan `ClearStaleOwnership` against a ticket whose owner's completion
+    /// is still inside its admission grace window, still in flight through
+    /// the live landing queue, or already settled a terminal held-landing
+    /// verdict (TKT-hotoz-ragik-judin).
     async fn build_repair_plan(
         &self,
         repo: &str,
@@ -4451,7 +4459,6 @@ impl Daemon {
             })
             .filter(|task| !task.is_empty())
             .collect();
-        let queued_tickets = crate::landing::tasks_in_landing_queue(&self.space);
 
         let delivered_pairs: HashSet<(String, String)> = tickets
             .iter()
@@ -4473,13 +4480,15 @@ impl Daemon {
             diverged,
         };
 
-        Ok(crate::reconcile_repair::plan(
+        let handoff_facts = self.collect_handoff_facts(repo, &tickets, &agents).await?;
+
+        Ok(crate::reconcile_repair::plan_with_handoffs(
             repo,
             &tickets,
             &agents,
             &landed_tickets,
-            &queued_tickets,
             &facts,
+            &handoff_facts,
         ))
     }
 
@@ -14215,6 +14224,324 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(report.handoffs[0].task, ticket.identity);
         assert_eq!(report.handoffs[0].phase, "held");
         assert_eq!(report.handoffs[0].status.as_deref(), Some("gate-held"));
+    }
+
+    /// TKT-hotoz-ragik-judin: `build_repair_plan` (the source for
+    /// `rk reconcile-repair --apply`) must see the same handoff evidence
+    /// `reconcile_report` does, not the raw `terminal_assignee_active_work`
+    /// check. A clean completion still inside its admission grace window
+    /// must never be planned for `ClearStaleOwnership` — the ticket has an
+    /// owner who just finished, not a stale one.
+    #[tokio::test]
+    async fn build_repair_plan_holds_off_a_completion_still_inside_admission_grace() {
+        let (_dir, daemon) = daemon_with_agent("Fresh-1", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Fresh-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Fresh-1")
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/fresh-1/work",
+                    "head_sha": "grace123",
+                }),
+            ))
+            .unwrap();
+
+        let plan = daemon.build_repair_plan("repo").await.unwrap();
+        assert!(
+            plan.items.is_empty(),
+            "a completion inside admission grace must not be planned: {:?}",
+            plan.items
+        );
+
+        let report = daemon
+            .reconcile_repair_value("repo".into(), false)
+            .await
+            .unwrap();
+        let results = report["results"].as_array().cloned().unwrap_or_default();
+        assert!(results.is_empty(), "{report}");
+    }
+
+    /// A candidate still sitting in the live landing queue must not be
+    /// planned for `ClearStaleOwnership` — the same in-flight carve-out
+    /// `reconcile_report` gives it via `HandoffFacts::landings`.
+    #[tokio::test]
+    async fn build_repair_plan_holds_off_a_candidate_still_in_the_landing_queue() {
+        let (_dir, daemon) = daemon_with_agent("Queued-1", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Queued-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Queued-1")
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/queued-1/work",
+                    "head_sha": "queued123",
+                }),
+            ))
+            .unwrap();
+        let now = chrono::Utc::now();
+        daemon
+            .space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    "repo",
+                    "landing_queue_entry",
+                    "daemon",
+                    json!({
+                        "repo_name": "repo",
+                        "repo_path": "/tmp/repo",
+                        "branch": "rat/queued-1/work",
+                        "target": "main",
+                        "head_sha": "queued123",
+                        "diff_class": "trivial",
+                        "task": ticket.identity,
+                        "source_spawn": owner.spawn_id(),
+                        "seq": 1,
+                        "status": "queued",
+                        "rev": 0,
+                        "enqueued_at": now,
+                        "phase_entered_at": now,
+                    }),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+
+        let plan = daemon.build_repair_plan("repo").await.unwrap();
+        assert!(
+            plan.items.is_empty(),
+            "a candidate still in the live landing queue must not be planned: {:?}",
+            plan.items
+        );
+
+        let report = daemon
+            .reconcile_repair_value("repo".into(), false)
+            .await
+            .unwrap();
+        let results = report["results"].as_array().cloned().unwrap_or_default();
+        assert!(results.is_empty(), "{report}");
+    }
+
+    /// A completion whose candidate the queue already ran to a terminal,
+    /// non-`landed` verdict (gate-held here) must not be planned for
+    /// `ClearStaleOwnership` even though the completion itself is long past
+    /// its admission grace window — the same held-landing carve-out
+    /// `reconcile_report` gives it.
+    #[tokio::test]
+    async fn build_repair_plan_holds_off_a_terminal_held_landing() {
+        let (_dir, daemon) = daemon_with_agent("Held-2", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Held-2".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let owner = daemon
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|agent| agent.name == "Held-2")
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "harness_result",
+                "castle",
+                json!({
+                    "agent": owner.name,
+                    "spawn": owner.spawn_id(),
+                    "role": "rat",
+                    "task": ticket.identity,
+                    "is_error": false,
+                    "declared_done": true,
+                    "branch": "rat/held-2/work",
+                    "head_sha": "held456",
+                }),
+            ))
+            .unwrap();
+        daemon
+            .space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                crate::landing::LANDING_PROCESSED_IDENTITY,
+                "daemon",
+                json!({
+                    "branch": "rat/held-2/work",
+                    "target": "main",
+                    "target_head": "cafebabe",
+                    "head_sha": "held456",
+                    "task": ticket.identity,
+                    "outcome": "gate-held",
+                    "admission_hold": Value::Null,
+                    "admission_recovery": Value::Null,
+                }),
+            ))
+            .unwrap();
+
+        // Well past `admission_grace_secs` — a gate/review hold routinely
+        // outlives it.
+        let plan = daemon.build_repair_plan("repo").await.unwrap();
+        assert!(
+            plan.items.is_empty(),
+            "a terminal held-landing verdict must not be planned as stale ownership: {:?}",
+            plan.items
+        );
+
+        let report = daemon
+            .reconcile_repair_value("repo".into(), true)
+            .await
+            .unwrap();
+        let results = report["results"].as_array().cloned().unwrap_or_default();
+        assert!(results.is_empty(), "apply must also be a no-op: {report}");
+        let ticket_after = daemon.tickets.get(&ticket.identity).unwrap().unwrap();
+        assert_eq!(
+            ticket_after.payload["status"], "in_progress",
+            "a held landing's ticket must never be reopened by repair"
+        );
+    }
+
+    /// Genuinely abandoned ownership — no completion, no queue membership,
+    /// no held-landing verdict at all, just a terminal agent still on record
+    /// as owning open work — must still plan (and, on apply, actually
+    /// execute) `ClearStaleOwnership`. Proves the handoff wiring only
+    /// SUPPRESSES false positives; it must not swallow a real one.
+    #[tokio::test]
+    async fn build_repair_plan_still_clears_genuinely_stale_ownership() {
+        let (_dir, daemon) = daemon_with_agent("Abandoned-1", AgentState::Completed);
+        let ticket = daemon
+            .tickets
+            .create(NewTicket {
+                scope: Some("repo".into()),
+                ..new_ticket()
+            })
+            .await
+            .unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: Some("Abandoned-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // No `harness_result`, no landing-queue entry, no held-landing
+        // marker at all — the owner simply settled terminal with nothing to
+        // show for it.
+
+        let plan = daemon.build_repair_plan("repo").await.unwrap();
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert!(
+            matches!(
+                plan.items[0].disposition,
+                crate::reconcile_repair::Disposition::Planned(
+                    crate::reconcile_repair::RepairAction::ClearStaleOwnership { .. }
+                )
+            ),
+            "{:?}",
+            plan.items[0].disposition
+        );
+
+        let report = daemon
+            .reconcile_repair_value("repo".into(), true)
+            .await
+            .unwrap();
+        let results = report["results"].as_array().cloned().unwrap_or_default();
+        assert_eq!(results.len(), 1, "{report}");
+        assert_eq!(results[0]["outcome"]["status"], "applied");
+
+        let ticket_after = daemon.tickets.get(&ticket.identity).unwrap().unwrap();
+        assert_eq!(ticket_after.payload["status"], "open");
+        assert_eq!(ticket_after.payload["assignee"], Value::Null);
     }
 
     /// `HeldLanding` is joined to a completion by the exact `(branch,
