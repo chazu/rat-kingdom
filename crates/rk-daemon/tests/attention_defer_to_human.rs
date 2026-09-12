@@ -76,6 +76,9 @@ fn init_repo(dir: &Path) {
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
     support::install_default_repository_policy(dir);
+    // These holds lack dispatch metadata, not their source branch. A missing
+    // branch is retired attention; keep actual unmerged work for deferral.
+    branch_off_main(dir, "feature", "feature.txt");
 }
 
 fn branch_off_main(dir: &Path, branch: &str, file: &str) -> String {

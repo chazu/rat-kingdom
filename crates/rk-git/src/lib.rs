@@ -238,6 +238,20 @@ impl Repo {
         Ok(Self { root })
     }
 
+    /// Open exactly this checkout root, including a linked worktree. Unlike
+    /// discovery, this must not fall back to an enclosing repository when the
+    /// requested checkout has lost its Git metadata.
+    pub fn open_checkout(path: &Path) -> rk_core::Result<Self> {
+        let top = git_in(path, &["rev-parse", "--show-toplevel"])?;
+        if Path::new(top.trim()).canonicalize()? != path.canonicalize()? {
+            return Err(rk_core::Error::other(format!(
+                "{} is not the discovered checkout root",
+                path.display()
+            )));
+        }
+        Self::discover(path)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -265,6 +279,31 @@ impl Repo {
             &format!("refs/heads/{branch}"),
         ])
         .is_ok()
+    }
+
+    /// Local ref presence with read failures preserved. Use this when an
+    /// absent branch retires attention: a Git error is not proof of removal.
+    /// Git before 2.46 lacks `show-ref --exists`; on those versions only a
+    /// successful verification proves presence, while absence stays unknown.
+    pub fn branch_exists_checked(&self, branch: &str) -> rk_core::Result<bool> {
+        let reference = format!("refs/heads/{branch}");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["show-ref", "--exists", &reference])
+            .output()
+            .map_err(|e| rk_core::Error::other(format!("git not runnable: {e}")))?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(2) => Ok(false),
+            Some(129) => self
+                .git(&["show-ref", "--verify", "--quiet", &reference])
+                .map(|_| true),
+            _ => Err(rk_core::Error::other(format!(
+                "cannot read local branch {branch}: {}",
+                failure_reason(&output)
+            ))),
+        }
     }
 
     pub fn is_dirty(&self) -> rk_core::Result<bool> {
