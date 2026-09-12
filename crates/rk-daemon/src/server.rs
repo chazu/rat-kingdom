@@ -768,7 +768,10 @@ mod current_need_tests {
         // "done" is not terminal (still transitions to "closed") and carries
         // no delivery record — the TKT-18/46/147 "approved but never landed"
         // class must keep surfacing, never guessed away.
-        assert!(subjects.contains(&"TKT-done-not-delivered"), "{decisions:?}");
+        assert!(
+            subjects.contains(&"TKT-done-not-delivered"),
+            "{decisions:?}"
+        );
         assert!(subjects.contains(&"TKT-open"), "{decisions:?}");
         assert_eq!(
             daemon
