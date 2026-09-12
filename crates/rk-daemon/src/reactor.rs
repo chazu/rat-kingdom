@@ -1178,6 +1178,38 @@ impl Reactor {
             );
         };
 
+        // Fail-closed repo identity fence (TKT-kavok-didit-nojid): `repo_name`
+        // was resolved from `trigger.repo` / the trigger file's own
+        // `source_repo`, never validated against WHERE the completion
+        // actually happened. `tuple.scope` is not: it is the one field in
+        // this whole path the daemon itself stamped — `route_completion`
+        // (`supervisor.rs`) calls `emit_event(&record.repo_name, ...)` using
+        // the resolved filesystem repo the generation actually ran in, never
+        // the trigger's own idea of "my repo". An unscoped repo-local
+        // trigger (no `match.scope`, no `repo:` override — the exact shape a
+        // stale copy of the landing-pipeline feed takes) resolves `repo_name`
+        // to the repo it happens to be DEPLOYED in regardless of which repo
+        // emitted the tuple, so it silently retargets a foreign completion's
+        // branch/head/task onto this repo's LandingQueue: a branch that will
+        // never exist here, spinning `running_gates` forever with no
+        // candidate sha. Landing has no legitimate cross-repo use (a
+        // branch/commit are only ever meaningful in the repo that produced
+        // them), so this fence applies unconditionally — an explicit
+        // `repo:` override is not an escape hatch for `action: "land"`.
+        if repo_name != tuple.scope {
+            return self.give_up_or_retry(
+                key,
+                &trigger.name,
+                tuple_id,
+                format!(
+                    "reactor trigger '{}' resolved destination repo '{}' but the completion's \
+                     authoritative source repo (tuple scope) is '{}' — refusing to enqueue a \
+                     cross-repo landing candidate",
+                    trigger.name, repo_name, tuple.scope
+                ),
+            );
+        }
+
         // Fail-closed admission (design doc §1.5, `harness-result-declared-done`):
         // only a rat that both finished cleanly AND declared itself done is a
         // landing candidate — a mid-flight kill or budget stop still records
