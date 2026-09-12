@@ -915,9 +915,21 @@ wake replayable to the next spawn.
 
 For an existing manually-created King, recover the pane or terminal id with
 `herdr api snapshot` and pass that value to `rk king register`. Registration
-is fenced by Herdr's required pane revision: replacing the agent in the pane requires
-registration of the replacement unless RK itself performed a checkpointed
-restart or hibernation.
+matches the exact terminal and agent kind, using the reported harness session
+when available. Ordinary Herdr metadata revision changes then leave the King
+registered. Replacing the agent requires registration of the replacement unless
+RK itself performed a checkpointed restart or hibernation.
+
+When the harness session is unavailable at registration, RK conservatively uses
+Herdr's revision instead. That fallback can detach a live King after an ordinary
+metadata update. Existing revision registrations retain that mode even if session
+reporting appears later; explicitly run `rk king register <terminal-id> --holder
+king` once the session is reported to establish the stronger fence. A registration
+bound to a session never falls back to revision if the reported session disappears.
+
+`rk king at` validates the registered identity and attaches through its current
+pane. Herdr 0.8 does not resolve reported harness session IDs as agent targets,
+so replacement between that check and attachment remains a narrow race.
 
 When woken, the delegate claims and pulls, acts only within the existing
 authority policy, then settles the envelope:
@@ -955,8 +967,9 @@ but does not rerun the full `rk prime --role operator` text. Re-prime it
 manually after replacement when the complete operator reference is needed.
 
 `rk king tick` runs one cycle immediately for diagnostics. With no registered
-King the loop is a no-op; a stale terminal or changed Herdr pane revision fails
-closed until explicitly re-registered.
+King the loop is a no-op; a changed terminal, agent kind, or selected generation
+fence fails closed until explicitly re-registered. Metadata revision changes
+affect only registrations using the revision fallback.
 
 ## Workflows
 

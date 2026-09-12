@@ -182,21 +182,15 @@ async fn attach(client: &mut Client) -> Result<()> {
         anyhow::bail!("no King is registered; use `rk king spawn`");
     };
     let identity: rk_mux::AgentIdentity = serde_json::from_value(value.clone().into())?;
-    if rk_mux::HerdrMux::exact_state(&identity).is_none() {
-        anyhow::bail!("registered King generation is absent; use `rk king spawn`");
-    }
+    let current = rk_mux::HerdrMux::exact_state(&identity).ok_or_else(|| {
+        anyhow::anyhow!("registered King generation is absent; use `rk king spawn`")
+    })?;
     use std::os::unix::process::CommandExt;
-    // Prefer the harness-reported generation id over the pane: if Herdr
-    // replaces the process after the exact-state check above, attaching by
-    // generation fails closed rather than handing the human an unregistered
-    // successor in the same pane. A synthetic `revision:` fence is not a
-    // Herdr target, so fall back to the pane and accept that narrow race.
-    let target = if identity.session_id.starts_with("revision:") {
-        &identity.pane_id
-    } else {
-        &identity.session_id
-    };
-    let argv = rk_mux::HerdrMux::attach_argv(target);
+    // Herdr 0.8 resolves attach targets by pane/name, not by the reported
+    // harness session ID or RK's stored discriminator. Use the current pane
+    // from the exact identity check. Herdr cannot fence the remaining narrow
+    // race between that check and attachment to a successor in the pane.
+    let argv = rk_mux::HerdrMux::attach_argv(&current.identity.pane_id);
     let error = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
     Err(anyhow::anyhow!("failed to exec herdr attach: {error}"))
 }
