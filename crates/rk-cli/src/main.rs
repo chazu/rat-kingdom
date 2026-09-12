@@ -187,6 +187,8 @@ enum Command {
     /// Dispatch one fresh review attempt for a candidate whose prior review
     /// was fenced at the landing pipeline's wait ceiling.
     ReenqueueReview(agent_cmds::ReenqueueReviewArgs),
+    /// Retry one exact admission-only landing hold through normal gates.
+    RetryLandingAdmission(agent_cmds::RetryLandingAdmissionArgs),
     /// Explicitly cancel a candidate's currently active review attempt.
     CancelReview(agent_cmds::CancelReviewArgs),
     /// Undo a bad landing: revert an agent's recorded merge commit and reopen
@@ -1225,6 +1227,9 @@ async fn main() -> Result<()> {
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Land(args) => agent_cmds::land(&layout, args, cli.json).await?,
+        Command::RetryLandingAdmission(args) => {
+            agent_cmds::retry_landing_admission(&layout, args, cli.json).await?
+        }
         Command::ReenqueueReview(args) => {
             agent_cmds::reenqueue_review(&layout, args, cli.json).await?
         }

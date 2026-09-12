@@ -177,6 +177,44 @@ pub struct LandArgs {
 }
 
 #[derive(Args)]
+pub struct RetryLandingAdmissionArgs {
+    /// Repository path or registered name.
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+    /// Exact landing_admission_hold evidence id.
+    #[arg(long)]
+    pub hold: String,
+    /// Why capacity admission can be retried now.
+    #[arg(long)]
+    pub reason: String,
+}
+
+pub async fn retry_landing_admission(
+    layout: &Layout,
+    args: RetryLandingAdmissionArgs,
+    as_json: bool,
+) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
+    let result = client
+        .call(
+            "repo.land.retry_admission",
+            json!({"repo": repo, "hold": args.hold, "reason": args.reason}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "admission recovery {}: {}",
+            result["recovery"].as_str().unwrap_or("?"),
+            result["status"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+#[derive(Args)]
 pub struct ReenqueueReviewArgs {
     /// Branch whose review attempt was ceiling-settled.
     pub branch: String,

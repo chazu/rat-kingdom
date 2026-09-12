@@ -528,6 +528,9 @@ const REVIEW_POLL_SLICE: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const REVIEW_POLL_SLICE: Duration = Duration::from_millis(150);
 
+mod admission;
+use admission::{AdmissionWindow, ADMISSION_HOLD_IDENTITY};
+
 /// One landing candidate: a completed rat's branch, prepared into an exact
 /// merge object, gated, then either advanced or routed through review. Mirrors the
 /// reactor's queued-fire tuple shape (`repo_name`/`repo_path` as two
@@ -536,6 +539,12 @@ const REVIEW_POLL_SLICE: Duration = Duration::from_millis(150);
 /// need) rather than inventing a new convention.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LandingQueueEntry {
+    #[serde(default)]
+    pub(crate) admission: Option<AdmissionWindow>,
+    #[serde(default)]
+    pub(crate) admission_hold: Option<String>,
+    #[serde(default)]
+    pub(crate) admission_recovery: Option<String>,
     pub(crate) repo_name: String,
     pub(crate) repo_path: String,
     pub(crate) branch: String,
@@ -1047,6 +1056,8 @@ impl LandingQueue {
         // `Queued` does not; `Landing` -> `Queued` does). Zeroing it here
         // first would make every requeue look like a same-phase move and
         // carry a stale merge-phase clock into the verification lane.
+        retry.admission = None;
+        retry.admission_hold = None;
         retry.candidate_sha = None;
         retry.candidate_base = None;
         retry.candidate_ref = None;
@@ -1184,6 +1195,7 @@ impl Default for RetrySchedule {
 type ResolvedGateCheck = (rk_workflow::Check, Vec<(String, String)>, Duration);
 
 struct ResolvedGatePlan {
+    admission_timeout: Duration,
     checks: Vec<ResolvedGateCheck>,
     edge_class: LandingEdgeClass,
     full_check_required: bool,
@@ -1364,6 +1376,7 @@ impl Default for GateConfig {
 /// What became of one dequeued candidate.
 #[derive(Debug)]
 pub(crate) enum LandingOutcome {
+    Quarantined(Tuple),
     /// Gates passed and the candidate either needed no LLM judgment
     /// (doc-only/trivial diff) or got an APPROVE (fresh or cached) — routed
     /// advanced through `Supervisor::land_prepared`. Carries the exact typed
@@ -1398,7 +1411,9 @@ pub(crate) enum LandingOutcome {
     Escalated(Tuple),
     /// The target moved after this exact merge object passed gates. Nothing
     /// landed; the work was re-enqueued at the tail for rebuild and retest.
-    Requeued { seq: u64 },
+    Requeued {
+        seq: u64,
+    },
     /// The work key already carried a terminal `landing_processed` marker
     /// when this entry was processed — the daemon crashed in the window
     /// between `mark_processed` and the queue-entry removal on a prior run.
@@ -1467,6 +1482,7 @@ enum GateRunOutcome {
     /// infrastructure-death retry just came back failing (inline or resumed
     /// after a crash).
     InfraRetryExhausted,
+    AdmissionHeld,
 }
 
 impl GateRunOutcome {
@@ -1642,6 +1658,12 @@ impl LandingPipeline {
         else {
             return 0;
         };
+        let Ok(held) = self
+            .space
+            .scan(&Pattern::category(Category::Event).identity(ADMISSION_HOLD_IDENTITY))
+        else {
+            return 0;
+        };
         let Ok(revert_candidates) = self.supervisor.pending_revert_candidates() else {
             // Unreadable recovery evidence cannot authorize destructive GC.
             return 0;
@@ -1656,6 +1678,33 @@ impl LandingPipeline {
                     .map(str::to_string)
             })
             .collect();
+        let Ok(quarantined) = self
+            .space
+            .scan(&Pattern::category(Category::Event).identity("landing_queue_quarantine"))
+        else {
+            return 0;
+        };
+        live.extend(quarantined.iter().filter_map(|t| {
+            t.payload["entry"]["candidate_ref"]
+                .as_str()
+                .map(str::to_string)
+        }));
+        for archived in &quarantined {
+            if let Some(affected) = archived.payload["affected_candidates"].as_array() {
+                live.extend(
+                    affected
+                        .iter()
+                        .filter_map(|c| c["candidate_ref"].as_str().map(str::to_string)),
+                );
+            }
+        }
+        // Historical holds keep their refs until explicit terminal cleanup; absence
+        // of a queue row alone must never discard an authorized recovery candidate.
+        live.extend(held.iter().filter_map(|t| {
+            t.payload["entry"]["candidate_ref"]
+                .as_str()
+                .map(str::to_string)
+        }));
         let mut paths: BTreeSet<PathBuf> = registered_paths.into_iter().collect();
         for (path, candidate_ref) in revert_candidates {
             paths.insert(path);
@@ -1819,6 +1868,9 @@ impl LandingPipeline {
                     "branch": branch, "target": target, "merged": prior == "landed",
                     "delivered": prior == "landed", "status": prior,
                 }),
+                LandingOutcome::Quarantined(evidence) => {
+                    json!({"status": "quarantined", "evidence": evidence.id.to_string(), "merged": false, "delivered": false})
+                }
                 LandingOutcome::Requeued { .. } => unreachable!(),
             });
         }
@@ -1890,7 +1942,13 @@ impl LandingPipeline {
     /// target ref gone), is treated as current — sticky, matching this
     /// dedup's pre-existing behavior — rather than guessed at either way.
     fn admission_marker(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
-        Ok(self.processed_marker(entry)?.filter(|marker| {
+        let marker = self.processed_marker(entry)?;
+        if let Some(marker) = &marker {
+            if self.recovery_supersedes(entry, marker)? {
+                return Ok(None);
+            }
+        }
+        Ok(marker.filter(|marker| {
             if marker.payload.get("outcome").and_then(Value::as_str) == Some("landed") {
                 return true;
             }
@@ -2051,7 +2109,7 @@ impl LandingPipeline {
             LandingOutcome::NoGate(_) => "no-gate",
             LandingOutcome::ReworkFiled(_) => "rework-filed",
             LandingOutcome::Escalated(_) => "escalated",
-            LandingOutcome::Requeued { .. } => return Ok(()),
+            LandingOutcome::Requeued { .. } | LandingOutcome::Quarantined(_) => return Ok(()),
             // A reconciled entry's marker already exists from the run that
             // performed the side effects; writing a second would corrupt the
             // one-current-marker-per-work-key invariant `processed_marker`
@@ -2073,6 +2131,8 @@ impl LandingPipeline {
                 "head_sha": entry.head_sha,
                 "task": entry.task,
                 "outcome": outcome_str,
+                "admission_hold": entry.admission_hold,
+                "admission_recovery": entry.admission_recovery,
             }),
         )
         .with_lifecycle(Lifecycle::Furniture);
@@ -2144,6 +2204,10 @@ impl LandingPipeline {
     }
 
     async fn process_entry(&self, entry: &LandingQueueEntry) -> rk_core::Result<LandingOutcome> {
+        if let Some(outcome) = self.quarantine_invalid_source(entry)? {
+            return Ok(outcome);
+        }
+
         // Crash-window reconciliation (review round 2): a crash between
         // `mark_processed` and the caller's queue removal leaves both the
         // marker and the queue entry. The marker is the truth — never repeat
@@ -2178,6 +2242,15 @@ impl LandingPipeline {
         };
         if let Some(outcome) = self.recover_completed_land(&entry, &git_repo).await? {
             return Ok(outcome);
+        }
+        if entry.admission_recovery.is_some() {
+            if let Err(error) = self.validate_recovery_refs(&entry) {
+                let outcome = LandingOutcome::Escalated(
+                    self.escalate(&entry, format!("admission recovery stopped: {error}"))?,
+                );
+                self.mark_processed(&entry, &outcome)?;
+                return Ok(outcome);
+            }
         }
         // Re-checked fresh here (not just at admission): a candidate can sit
         // `Queued` while the target catches up to its exact head through an
@@ -2242,7 +2315,9 @@ impl LandingPipeline {
             .execute_gate_plan_at(&mut entry, &git_repo, gate_plan, &candidate.commit)
             .await?;
         if gate_outcome != GateRunOutcome::Pass {
-            git_repo.discard_candidate(&candidate.candidate_ref)?;
+            if gate_outcome != GateRunOutcome::AdmissionHeld {
+                git_repo.discard_candidate(&candidate.candidate_ref)?;
+            }
             // The durable gate-failure artifact carries the evidence; the
             // need row is what makes the hold VISIBLE in `rk inbox` — parity
             // with the CUE landing's escalation contract. A hold that
@@ -2253,7 +2328,11 @@ impl LandingPipeline {
             // stays `true` for the rest of this candidate's gate run even
             // after a retry PASSES, so reading it here would misreport a
             // later, unrelated ordinary failure as a retry exhaustion.
-            let text = if gate_outcome == GateRunOutcome::InfraRetryExhausted {
+            let text = if gate_outcome == GateRunOutcome::AdmissionHeld {
+                format!("landing: verification admission expired before execution for {} on {}; hold {}. Release capacity, then use rk retry-landing-admission --repo {} --hold {} --reason <reason>. Named gates and review still apply.",
+                    entry.task, entry.branch, entry.admission_hold.as_deref().unwrap_or("unknown"),
+                    entry.repo_name, entry.admission_hold.as_deref().unwrap_or("unknown"))
+            } else if gate_outcome == GateRunOutcome::InfraRetryExhausted {
                 format!(
                     "landing: run gate FAILED for {} on {} after an automatic infrastructure-death retry was exhausted — branch held unmerged; read the durable gate-failure and landing_gate_infra_retry artifacts for the evidence",
                     entry.task, entry.branch
@@ -2307,6 +2386,12 @@ impl LandingPipeline {
         candidate: &rk_git::PreparedMerge,
         result: &StaleTarget,
     ) -> rk_core::Result<LandingOutcome> {
+        if entry.admission_recovery.is_some() {
+            let outcome = LandingOutcome::Escalated(self.escalate(entry,
+                "admission recovery stopped because target moved after verification; original candidate retained".into())?);
+            self.mark_processed(entry, &outcome)?;
+            return Ok(outcome);
+        }
         repo.discard_candidate(&candidate.candidate_ref)?;
         let seq = self.queue.requeue_tail(entry)?;
         let actual = &result.actual;
@@ -2347,10 +2432,84 @@ impl LandingPipeline {
         &self,
         mut entries: Vec<LandingQueueEntry>,
     ) -> rk_core::Result<Vec<(LandingQueueEntry, LandingOutcome)>> {
-        if entries.len() <= 1
-            || entries
+        let mut quarantined = Vec::new();
+        let mut valid = Vec::new();
+        for entry in entries {
+            if let Some(outcome) = self.quarantine_invalid_source(&entry)? {
+                // Retire proven invalid rows even if another member later has
+                // a transient Git error. The archive precedes this deletion.
+                self.queue.remove(&entry)?;
+                quarantined.push((entry, outcome));
+            } else {
+                valid.push(entry);
+            }
+        }
+        entries = valid;
+        if !quarantined.is_empty() {
+            // A prepared batch may contain the quarantined member's changes.
+            // Never land that same object through one of its surviving tickets.
+            let contaminated: BTreeSet<_> = quarantined
                 .iter()
-                .any(|entry| !matches!(entry.diff_class.as_str(), "doc-only" | "trivial"))
+                .filter_map(|(e, _)| e.candidate_sha.clone())
+                .collect();
+            let removed_branches: BTreeSet<_> =
+                quarantined.iter().map(|(e, _)| e.branch.clone()).collect();
+            let mut survivors = Vec::new();
+            for entry in entries {
+                if entry
+                    .candidate_sha
+                    .as_ref()
+                    .is_some_and(|c| contaminated.contains(c))
+                    || entry
+                        .batch_branches
+                        .iter()
+                        .any(|b| removed_branches.contains(b))
+                {
+                    let outcome = self.archive_quarantine(&entry,
+                        "prepared cohort contains a quarantined source; preserve candidate evidence and resubmit valid sources through fresh gates".into())?;
+                    self.queue.remove(&entry)?;
+                    quarantined.push((entry, outcome));
+                } else {
+                    survivors.push(entry);
+                }
+            }
+            quarantined.extend(Box::pin(self.process_batch(survivors)).await?);
+            return Ok(quarantined);
+        }
+        let capacity_admission = entries.first().is_some_and(|e| {
+            self.engine
+                .verification()
+                .uses_capacity_admission(&e.repo_name)
+        });
+        if capacity_admission
+            && entries.iter().any(|e| !e.batch_branches.is_empty())
+            && entries.iter().any(|e| e.batch_branches.is_empty())
+        {
+            // A fresh arrival must never be absorbed into a legacy prepared
+            // cohort. Preserve its exact membership across a mixed restart.
+            let (singletons, legacy): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|e| e.batch_branches.is_empty());
+            let mut outcomes = Vec::new();
+            for entry in singletons {
+                let outcome = self.process_entry(&entry).await?;
+                self.queue.remove(&entry)?;
+                outcomes.push((entry, outcome));
+            }
+            outcomes.extend(Box::pin(self.process_batch(legacy)).await?);
+            return Ok(outcomes);
+        }
+        if entries.len() <= 1
+            || (entries.iter().all(|e| e.batch_branches.is_empty())
+                && entries.first().is_some_and(|e| {
+                    self.engine
+                        .verification()
+                        .uses_capacity_admission(&e.repo_name)
+                }))
+            || entries.iter().any(|entry| {
+                entry.admission_recovery.is_some()
+                    || !matches!(entry.diff_class.as_str(), "doc-only" | "trivial")
+            })
         {
             let mut outcomes = Vec::with_capacity(entries.len());
             for entry in entries {
@@ -2438,11 +2597,24 @@ impl LandingPipeline {
         // in-memory copy and its durable tuple, which would otherwise let a
         // later `bisect_batch`/`mark_processed` pass over `entries` grant a
         // second retry the durable store had already spent.
-        if !self
+        let gate_outcome = self
             .execute_gate_plan_at(&mut entries[0], &repo, gate_plan, &candidate.commit)
-            .await?
-            .passed()
-        {
+            .await?;
+        if gate_outcome == GateRunOutcome::AdmissionHeld {
+            // Retain the batch and its evidence. Explicit single-candidate recovery
+            // refuses batches; a real target advance can rebuild through normal admission.
+            let first = entries[0].clone();
+            let mut outcomes = Vec::new();
+            for mut entry in entries {
+                entry.admission = first.admission.clone();
+                entry.admission_hold = first.admission_hold.clone();
+                self.escalate(&entry, "landing: batch verification admission expired before execution; held without spending child-death retries".into())?;
+                self.mark_processed(&entry, &LandingOutcome::GateHeld)?;
+                outcomes.push((entry, LandingOutcome::GateHeld));
+            }
+            return Ok(outcomes);
+        }
+        if !gate_outcome.passed() {
             return self.bisect_batch(entries, Some(&candidate)).await;
         }
 
@@ -6339,6 +6511,7 @@ impl LandingPipeline {
     /// loop, so one repo's transient fault must not stall every other repo's
     /// landing traffic). A panicking drain task is treated the same way.
     pub(crate) async fn run_cycle(self: &Arc<Self>) -> rk_core::Result<Vec<LandingOutcome>> {
+        self.resume_admission_recoveries()?;
         let mut in_flight = tokio::task::JoinSet::new();
         for (repo_name, target) in self.queue.pending_keys()? {
             let pipeline = Arc::clone(self);
@@ -6448,6 +6621,7 @@ impl LandingPipeline {
         self.touch_gate_worktree_marker(&entry.repo_name, &entry.target);
 
         let ResolvedGatePlan {
+            admission_timeout,
             checks,
             edge_class,
             full_check_required,
@@ -6500,6 +6674,11 @@ impl LandingPipeline {
                 }),
         );
 
+        if entry.admission.is_none() {
+            entry.admission = Some(AdmissionWindow::new(admission_timeout));
+            self.queue
+                .persist(entry, LandingEntryStatus::RunningGates)?;
+        }
         let id = format!("landing:{}", entry.branch);
         for (check_index, (check, env, timeout)) in checks.into_iter().enumerate() {
             // This check's position in the plan, not a rework-round counter:
@@ -6590,10 +6769,16 @@ impl LandingPipeline {
                     passed_checks.push(check.name.clone());
                     continue;
                 }
+                let capacity_started = Instant::now();
                 let retry_outcome = self
                     .engine
                     .verification()
                     .run(crate::managed_verification::CheckExecution {
+                        admission_timeout: Some(self.admission_remaining(
+                            entry,
+                            &check.name,
+                            tested_sha,
+                        )?),
                         id: &id,
                         repo: &entry.repo_name,
                         agent: "daemon",
@@ -6606,6 +6791,10 @@ impl LandingPipeline {
                         progress: Some(Arc::clone(&progress)),
                     })
                     .await;
+                self.charge_admission_elapsed(entry, capacity_started.elapsed())?;
+                if self.record_admission_hold(entry, &check.name, tested_sha, &retry_outcome)? {
+                    return Ok(GateRunOutcome::AdmissionHeld);
+                }
                 if !self
                     .finish_infra_retry(
                         entry,
@@ -6666,10 +6855,16 @@ impl LandingPipeline {
                 continue;
             }
 
+            let capacity_started = Instant::now();
             let outcome = self
                 .engine
                 .verification()
                 .run(crate::managed_verification::CheckExecution {
+                    admission_timeout: Some(self.admission_remaining(
+                        entry,
+                        &check.name,
+                        tested_sha,
+                    )?),
                     id: &id,
                     repo: &entry.repo_name,
                     agent: "daemon",
@@ -6682,6 +6877,10 @@ impl LandingPipeline {
                     progress: Some(Arc::clone(&progress)),
                 })
                 .await;
+            self.charge_admission_elapsed(entry, capacity_started.elapsed())?;
+            if self.record_admission_hold(entry, &check.name, tested_sha, &outcome)? {
+                return Ok(GateRunOutcome::AdmissionHeld);
+            }
             match outcome {
                 Ok(result) if result.get("verdict").and_then(Value::as_str) == Some("pass") => {}
                 // An infrastructure fault (admission expired before launch,
@@ -6719,10 +6918,16 @@ impl LandingPipeline {
                         &result,
                         false,
                     )?;
+                    let capacity_started = Instant::now();
                     let retry_outcome = self
                         .engine
                         .verification()
                         .run(crate::managed_verification::CheckExecution {
+                            admission_timeout: Some(self.admission_remaining(
+                                entry,
+                                &check.name,
+                                tested_sha,
+                            )?),
                             id: &id,
                             repo: &entry.repo_name,
                             agent: "daemon",
@@ -6735,6 +6940,10 @@ impl LandingPipeline {
                             progress: Some(Arc::clone(&progress)),
                         })
                         .await;
+                    self.charge_admission_elapsed(entry, capacity_started.elapsed())?;
+                    if self.record_admission_hold(entry, &check.name, tested_sha, &retry_outcome)? {
+                        return Ok(GateRunOutcome::AdmissionHeld);
+                    }
                     if !self
                         .finish_infra_retry(
                             entry,
@@ -7352,6 +7561,7 @@ impl LandingPipeline {
         };
 
         Ok(ResolvedGatePlan {
+            admission_timeout: gates.gate_timeout,
             checks,
             edge_class,
             full_check_required,
@@ -8052,6 +8262,7 @@ workflow: {
         let result = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "landing-t1-interface",
                 repo: "/repo",
                 agent: "daemon",
@@ -9648,8 +9859,8 @@ workflow: {
     /// one-retry budget as an infrastructure death. Congestion that persists
     /// through the retry still holds; neither case manufactures a passing proof.
     #[tokio::test]
-    async fn admission_timeout_retries_once_then_passes_or_holds() {
-        for release_on_retry in [true, false] {
+    async fn healthy_admission_wait_does_not_spend_execution_or_retry_budget() {
+        for _ in [()] {
             let home = tempfile::tempdir().unwrap();
             let repo_dir = tempfile::tempdir().unwrap();
             init_repo(repo_dir.path());
@@ -9697,80 +9908,29 @@ workflow: {
                 .resolve_gate_plan_at(&entry, &git_repo, &GateConfig::default(), &head_sha)
                 .await
                 .unwrap();
-            // Shorten the policy check's admission/execution allowance only
-            // in this fixture; release is synchronized on durable retry evidence.
-            plan.checks[0].2 = Duration::from_secs(1);
+            plan.checks[0].2 = Duration::from_millis(100);
             let release = async {
-                if release_on_retry {
-                    tokio::time::timeout(Duration::from_secs(15), async {
-                        loop {
-                            if !space
-                                .scan(
-                                    &Pattern::category(Category::Event)
-                                        .identity(GATE_INFRA_RETRY_IDENTITY),
-                                )
-                                .unwrap()
-                                .is_empty()
-                            {
-                                assert!(!executed.exists(), "first attempt must not execute");
-                                drop(permit.take());
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                        }
-                    })
-                    .await
-                    .expect("admission expiry must grant one retry");
-                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(!executed.exists(), "queued check must not execute");
+                drop(permit.take());
             };
             let (outcome, ()) = tokio::join!(
                 pipeline.execute_gate_plan_at(&mut entry, &git_repo, plan, &head_sha),
                 release
             );
-            assert_eq!(
-                outcome.unwrap(),
-                if release_on_retry {
-                    GateRunOutcome::Pass
-                } else {
-                    GateRunOutcome::InfraRetryExhausted
-                }
+            assert_eq!(outcome.unwrap(), GateRunOutcome::Pass);
+            assert!(
+                !entry.gate_infra_retry_used,
+                "capacity waiting is not a child death"
             );
-            assert!(entry.gate_infra_retry_used);
-            assert_eq!(executed.exists(), release_on_retry);
-            if release_on_retry {
-                assert_eq!(
-                    std::fs::read_to_string(&executed).unwrap().lines().count(),
-                    1
-                );
-            }
-            let events = space
+            assert!(space
                 .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
-                .unwrap();
-            assert_eq!(events.len(), 2, "one attempt plus exactly one retry");
-            let first = events.iter().find(|e| e.payload["ordinal"] == 1).unwrap();
-            let second = events.iter().find(|e| e.payload["ordinal"] == 2).unwrap();
-            assert_eq!(first.payload["verdict"], "infra");
+                .unwrap()
+                .is_empty());
             assert_eq!(
-                first.payload["exit"],
-                crate::managed_verification::LOCK_TIMEOUT_EXIT
+                std::fs::read_to_string(&executed).unwrap().lines().count(),
+                1
             );
-            assert_eq!(
-                second.payload["verdict"],
-                if release_on_retry { "pass" } else { "infra" }
-            );
-            assert_eq!(
-                first.payload["candidate_sha"],
-                second.payload["candidate_sha"]
-            );
-            let admissions = space
-                .scan(
-                    &Pattern::category(Category::Event)
-                        .identity(crate::managed_verification::VERIFICATION_ADMISSION_IDENTITY),
-                )
-                .unwrap();
-            assert!(admissions.iter().any(|e| e.payload["verdict"] == "infra"
-                && e.payload["duration_ms"] == 0
-                && e.payload["queue_wait_ms"].as_u64().unwrap() >= 1000));
             assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
         }
     }
@@ -17646,5 +17806,518 @@ checks: [
             reuse_events.iter().all(|t| t.payload["check"] != "verify"),
             "verify must never be credited as reused once its environment policy changed: {reuse_events:?}"
         );
+    }
+    fn admission_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Space,
+        LandingPipeline,
+        LandingQueueEntry,
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let commands = format!(
+            r#"checks: [
+            {{name: "landing-protected-paths", command: "echo policy >> '{}'"}},
+            {{name: "landing-diff-scope", command: "echo scope >> '{}'"}},
+            {{name: "verify", command: "echo verify >> '{}'"}},
+        ]"#,
+            home.path().join("executed").display(),
+            home.path().join("executed").display(),
+            home.path().join("executed").display()
+        );
+        write_checks(dir.path(), &commands);
+        activate_landing_policy(
+            home.path(),
+            dir.path(),
+            rk_workflow::LandingPolicy {
+                gate_timeout: "10s".into(),
+                ..Default::default()
+            },
+        );
+        git(dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(dir.path().join("feature.md"), "admission recovery\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "add feature"]);
+        git(dir.path(), &["checkout", "main"]);
+        let space = Space::open(&home.path().join("test-space.db")).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+        let entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: rk_git::Repo::discover(dir.path())
+                .unwrap()
+                .root()
+                .display()
+                .to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: rev_parse(dir.path(), "feature"),
+            task: "bounded admission fixture".into(),
+            diff_class: "doc-only".into(),
+            keep_branch: true,
+            admission: Some(AdmissionWindow::new(Duration::from_millis(200))),
+            ..Default::default()
+        };
+        (home, dir, space, pipeline, entry)
+    }
+
+    async fn expire_admission(pipeline: &LandingPipeline, entry: &LandingQueueEntry) -> Tuple {
+        let permit = pipeline
+            .supervisor
+            .acquire_verification_admission("code-repo", 1)
+            .await;
+        pipeline.enqueue(entry.clone()).unwrap();
+        let result = pipeline
+            .process_next("code-repo", "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, LandingOutcome::GateHeld));
+        drop(permit);
+        let holds = pipeline
+            .space
+            .scan(&Pattern::category(Category::Event).identity(ADMISSION_HOLD_IDENTITY))
+            .unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].payload["result"]["executed"], false);
+        assert_eq!(holds[0].payload["entry"]["gate_infra_retry_used"], false);
+        assert!(pipeline
+            .space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap()
+            .is_empty());
+        holds.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn admission_hold_recovery_is_exact_once_across_restarts_and_crash_windows() {
+        let (home, dir, space, pipeline, entry) = admission_fixture();
+        let before = rev_parse(dir.path(), "main");
+        let hold = expire_admission(&pipeline, &entry).await;
+        let hold_id = hold.id.to_string();
+        assert_eq!(rev_parse(dir.path(), "main"), before);
+        assert!(!home.path().join("executed").exists());
+        assert!(
+            pipeline.enqueue(entry.clone()).unwrap().is_none(),
+            "ordinary unchanged-head redelivery remains held"
+        );
+        let candidate = hold.payload["entry"]["candidate_sha"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let candidate_ref = hold.payload["entry"]["candidate_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            pipeline.sweep_orphaned_candidate_refs([dir.path().to_path_buf()]),
+            0
+        );
+        assert_eq!(rev_parse(dir.path(), &candidate_ref), candidate);
+        let replies = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                pipeline
+                    .retry_admission(dir.path(), &hold_id, "capacity released")
+                    .unwrap()
+            });
+            let b = scope.spawn(|| {
+                pipeline
+                    .retry_admission(dir.path(), &hold_id, "duplicate request")
+                    .unwrap()
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(replies.0["recovery"], replies.1["recovery"]);
+        assert_eq!(
+            pipeline
+                .queue
+                .scan_current("code-repo", Some("main"))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Simulate a crash after durable receipt but before enqueue. The receipt
+        // must restore the same attempt with the same deadline on the next cycle.
+        let queued = pipeline
+            .queue
+            .claim_next("code-repo", "main")
+            .unwrap()
+            .unwrap();
+        let granted = serde_json::to_value(&queued.admission).unwrap();
+        pipeline.queue.remove(&queued).unwrap();
+        drop(pipeline);
+        drop(space);
+        let space = Space::open(&home.path().join("test-space.db")).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline.resume_admission_recoveries().unwrap();
+        let resumed = pipeline
+            .queue
+            .claim_next("code-repo", "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(&resumed.admission).unwrap(), granted);
+        assert_eq!(resumed.candidate_sha.as_deref(), Some(candidate.as_str()));
+        assert!(matches!(
+            pipeline.process_entry(&resumed).await.unwrap(),
+            LandingOutcome::Landed(_)
+        ));
+        // Crash after terminal settlement, before queue removal.
+        assert!(matches!(
+            pipeline.process_next("code-repo", "main").await.unwrap(),
+            Some(LandingOutcome::Reconciled(_))
+        ));
+        let done = pipeline
+            .retry_admission(dir.path(), &hold_id, "lost RPC reply")
+            .unwrap();
+        assert_eq!(done["status"], "landed");
+        assert_eq!(rev_parse(dir.path(), "main"), candidate);
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("executed"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        assert!(
+            space.get(hold.id).unwrap().is_some(),
+            "original hold evidence survives delivery"
+        );
+        assert!(pipeline.queue.pending_keys().unwrap().is_empty());
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("landing_admission_recovery"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_retry_refuses_changed_refs_and_ordinary_or_legacy_failures() {
+        let (_home, dir, space, pipeline, entry) = admission_fixture();
+        let hold = expire_admission(&pipeline, &entry).await;
+        let ordinary = pipeline.processed_marker(&entry).unwrap().unwrap();
+        assert!(pipeline
+            .retry_admission(dir.path(), &ordinary.id.to_string(), "not a typed hold")
+            .is_err());
+        assert!(pipeline
+            .retry_admission(dir.path(), &hold.id.to_string(), " ")
+            .is_err());
+        let foreign = tempfile::tempdir().unwrap();
+        assert!(pipeline
+            .retry_admission(foreign.path(), &hold.id.to_string(), "wrong repo")
+            .is_err());
+        git(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "target advanced"],
+        );
+        assert!(pipeline
+            .retry_admission(dir.path(), &hold.id.to_string(), "stale target")
+            .is_err());
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity("landing_admission_recovery"))
+            .unwrap()
+            .is_empty());
+        assert!(pipeline.queue.pending_keys().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_deadline_does_not_renew_on_restart_or_clock_rollback() {
+        let (home, dir, space, pipeline, mut entry) = admission_fixture();
+        entry.admission = Some(AdmissionWindow::new(Duration::ZERO));
+        pipeline.enqueue(entry).unwrap();
+        drop(pipeline);
+        drop(space);
+        let space = Space::open(&home.path().join("test-space.db")).unwrap();
+        let pipeline = test_pipeline(home.path(), space);
+        assert!(matches!(
+            pipeline.process_next("code-repo", "main").await.unwrap(),
+            Some(LandingOutcome::GateHeld)
+        ));
+        assert!(!home.path().join("executed").exists());
+        let held = pipeline
+            .space
+            .scan(&Pattern::category(Category::Event).identity(ADMISSION_HOLD_IDENTITY))
+            .unwrap()
+            .remove(0);
+        let mut raw = held.payload["entry"].clone();
+        raw["admission"]["observed_at"] = json!(Utc::now() + chrono::Duration::hours(1));
+        let mut entry: LandingQueueEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            pipeline
+                .admission_remaining(&mut entry, "test", "candidate")
+                .unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            rev_parse(dir.path(), "main"),
+            held.payload["entry"]["candidate_base"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_source_is_quarantined_and_does_not_block_valid_batch_member() {
+        let (home, dir, space, pipeline, mut valid) = admission_fixture();
+        valid.admission = None;
+        let mut invalid = valid.clone();
+        invalid.branch = "rat/foreign/never-existed".into();
+        invalid.source_spawn = Some(rk_core::id::SpawnId::new());
+        pipeline.queue.enqueue(invalid.clone()).unwrap();
+        pipeline.queue.enqueue(valid).unwrap();
+        let entries = pipeline.queue.claim_batch("code-repo", "main", 8).unwrap();
+        // Simulate archive-before-remove; normal processing must reuse that archive.
+        assert!(matches!(
+            pipeline.quarantine_invalid_source(&entries[0]).unwrap(),
+            Some(LandingOutcome::Quarantined(_))
+        ));
+        let outcomes = pipeline.process_batch(entries).await.unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|(_, o)| matches!(o, LandingOutcome::Quarantined(_))));
+        assert!(outcomes
+            .iter()
+            .any(|(_, o)| matches!(o, LandingOutcome::Landed(_))));
+        for (entry, _) in outcomes {
+            pipeline.queue.remove(&entry).unwrap();
+        }
+        assert!(pipeline.queue.pending_keys().unwrap().is_empty());
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("landing_queue_quarantine"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            pipeline.processed_marker(&invalid).unwrap().is_none(),
+            "quarantine cannot bar a corrected generation"
+        );
+        assert!(home.path().join("executed").exists());
+        assert!(rk_git::Repo::discover(dir.path())
+            .unwrap()
+            .is_ancestor(&invalid.head_sha, "main"));
+    }
+    #[tokio::test]
+    async fn admission_restart_keeps_prepared_singletons_separate_from_fresh_peers() {
+        let (home, dir, space, pipeline, mut first) = admission_fixture();
+        first.admission = Some(AdmissionWindow::new(Duration::ZERO));
+        git(dir.path(), &["checkout", "-b", "feature-two"]);
+        std::fs::write(dir.path().join("second.md"), "second feature\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "second feature"]);
+        git(dir.path(), &["checkout", "main"]);
+        let second = LandingQueueEntry {
+            branch: "feature-two".into(),
+            head_sha: rev_parse(dir.path(), "feature-two"),
+            ..first.clone()
+        };
+        pipeline.queue.enqueue(first).unwrap();
+        let mut prepared = pipeline
+            .queue
+            .claim_next("code-repo", "main")
+            .unwrap()
+            .unwrap();
+        let repo = rk_git::Repo::discover(dir.path()).unwrap();
+        let rk_git::PrepareOutcome::Prepared(candidate) =
+            repo.prepare_merge("feature", "main").unwrap()
+        else {
+            panic!("prepare")
+        };
+        prepared.candidate_sha = Some(candidate.commit.clone());
+        prepared.candidate_base = Some(candidate.base);
+        prepared.candidate_ref = Some(candidate.candidate_ref);
+        pipeline
+            .queue
+            .persist(&mut prepared, LandingEntryStatus::RunningGates)
+            .unwrap();
+        pipeline.queue.enqueue(second).unwrap();
+        drop(pipeline);
+        drop(space);
+        let space = Space::open(&home.path().join("test-space.db")).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+        let results = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(results.len(), 2);
+        let holds = space
+            .scan(&Pattern::category(Category::Event).identity(ADMISSION_HOLD_IDENTITY))
+            .unwrap();
+        assert_eq!(holds.len(), 2);
+        assert!(holds.iter().all(|h| h.payload["retry_eligible"] == true
+            && h.payload["entry"]["batch_branches"] == json!([])));
+        assert!(holds
+            .iter()
+            .any(|h| h.payload["entry"]["candidate_sha"] == candidate.commit));
+        assert!(!home.path().join("executed").exists());
+    }
+
+    #[tokio::test]
+    async fn quarantined_prepared_candidate_remains_referenced_across_startup_sweep() {
+        let (_home, dir, space, pipeline, mut entry) = admission_fixture();
+        let repo = rk_git::Repo::discover(dir.path()).unwrap();
+        let rk_git::PrepareOutcome::Prepared(candidate) =
+            repo.prepare_merge("feature", "main").unwrap()
+        else {
+            panic!("prepare")
+        };
+        entry.source_spawn = Some(rk_core::id::SpawnId::new());
+        entry.candidate_sha = Some(candidate.commit.clone());
+        entry.candidate_base = Some(candidate.base);
+        entry.candidate_ref = Some(candidate.candidate_ref.clone());
+        pipeline.queue.enqueue(entry).unwrap();
+        assert!(matches!(
+            pipeline.process_next("code-repo", "main").await.unwrap(),
+            Some(LandingOutcome::Quarantined(_))
+        ));
+        assert_eq!(
+            pipeline.sweep_orphaned_candidate_refs([dir.path().to_path_buf()]),
+            0
+        );
+        assert_eq!(
+            rev_parse(dir.path(), &candidate.candidate_ref),
+            candidate.commit
+        );
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+            .unwrap()
+            .is_empty());
+    }
+    #[tokio::test]
+    async fn admission_fresh_arrival_is_not_absorbed_into_a_legacy_prepared_batch() {
+        let (home, dir, _space, pipeline, mut original) = admission_fixture();
+        original.admission = Some(AdmissionWindow::new(Duration::ZERO));
+        for (branch, file) in [("second", "second.md"), ("fresh", "fresh.md")] {
+            git(dir.path(), &["checkout", "-b", branch, "main"]);
+            std::fs::write(dir.path().join(file), branch).unwrap();
+            git(dir.path(), &["add", "."]);
+            git(dir.path(), &["commit", "-m", branch]);
+        }
+        git(dir.path(), &["checkout", "main"]);
+        let repo = rk_git::Repo::discover(dir.path()).unwrap();
+        let branches = vec!["feature".to_string(), "second".to_string()];
+        let rk_git::PrepareOutcome::Prepared(candidate) =
+            repo.prepare_merge_batch(&branches, "main").unwrap()
+        else {
+            panic!("prepare")
+        };
+        for branch in &branches {
+            let entry = LandingQueueEntry {
+                branch: branch.clone(),
+                head_sha: rev_parse(dir.path(), branch),
+                candidate_sha: Some(candidate.commit.clone()),
+                candidate_base: Some(candidate.base.clone()),
+                candidate_ref: Some(candidate.candidate_ref.clone()),
+                batch_branches: branches.clone(),
+                ..original.clone()
+            };
+            pipeline.queue.enqueue(entry).unwrap();
+        }
+        let fresh_head = rev_parse(dir.path(), "fresh");
+        pipeline
+            .queue
+            .enqueue(LandingQueueEntry {
+                branch: "fresh".into(),
+                head_sha: fresh_head.clone(),
+                admission: None,
+                ..original
+            })
+            .unwrap();
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 3);
+        assert!(repo.is_ancestor(&fresh_head, "main"));
+        assert!(!repo.is_ancestor(&candidate.commit, "main"));
+        let holds = pipeline
+            .space
+            .scan(&Pattern::category(Category::Event).identity(ADMISSION_HOLD_IDENTITY))
+            .unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].payload["entry"]["batch_branches"], json!(branches));
+        assert_ne!(holds[0].payload["entry"]["branch"], "fresh");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("executed"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+    }
+    #[tokio::test]
+    async fn quarantine_never_lands_a_shared_candidate_through_its_surviving_member() {
+        for restart in [false, true] {
+            let (home, dir, space, mut pipeline, mut first) = admission_fixture();
+            first.admission = None;
+            git(dir.path(), &["checkout", "-b", "second", "main"]);
+            std::fs::write(dir.path().join("second.md"), "second feature\n").unwrap();
+            git(dir.path(), &["add", "."]);
+            git(dir.path(), &["commit", "-m", "second feature"]);
+            git(dir.path(), &["checkout", "main"]);
+            let before = rev_parse(dir.path(), "main");
+            let repo = rk_git::Repo::discover(dir.path()).unwrap();
+            let branches = vec!["feature".to_string(), "second".to_string()];
+            let rk_git::PrepareOutcome::Prepared(candidate) =
+                repo.prepare_merge_batch(&branches, "main").unwrap()
+            else {
+                panic!("prepare")
+            };
+            for (i, branch) in branches.iter().enumerate() {
+                pipeline
+                    .queue
+                    .enqueue(LandingQueueEntry {
+                        branch: branch.clone(),
+                        head_sha: rev_parse(dir.path(), branch),
+                        candidate_sha: (!(restart && i == 0)).then(|| candidate.commit.clone()),
+                        candidate_base: Some(candidate.base.clone()),
+                        candidate_ref: (!(restart && i == 0))
+                            .then(|| candidate.candidate_ref.clone()),
+                        batch_branches: branches.clone(),
+                        source_spawn: (i == 0).then(rk_core::id::SpawnId::new),
+                        ..first.clone()
+                    })
+                    .unwrap();
+            }
+            if restart {
+                let invalid = pipeline
+                    .queue
+                    .claim_next("code-repo", "main")
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    pipeline.quarantine_invalid_source(&invalid).unwrap(),
+                    Some(LandingOutcome::Quarantined(_))
+                ));
+                pipeline.queue.remove(&invalid).unwrap();
+                drop(pipeline);
+                drop(space);
+                pipeline = test_pipeline(
+                    home.path(),
+                    Space::open(&home.path().join("test-space.db")).unwrap(),
+                );
+                assert_eq!(
+                    pipeline.sweep_orphaned_candidate_refs([dir.path().to_path_buf()]),
+                    0
+                );
+            }
+            let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+            assert_eq!(outcomes.len(), if restart { 1 } else { 2 });
+            assert!(outcomes
+                .iter()
+                .all(|o| matches!(o, LandingOutcome::Quarantined(_))));
+            assert_eq!(rev_parse(dir.path(), "main"), before);
+            assert!(!home.path().join("executed").exists());
+            assert_eq!(
+                pipeline.sweep_orphaned_candidate_refs([dir.path().to_path_buf()]),
+                0
+            );
+            assert_eq!(
+                rev_parse(dir.path(), &candidate.candidate_ref),
+                candidate.commit
+            );
+            assert!(pipeline.queue.pending_keys().unwrap().is_empty());
+        }
     }
 }

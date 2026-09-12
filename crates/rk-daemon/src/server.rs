@@ -3673,6 +3673,24 @@ impl Daemon {
                     Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
                 })
             }
+            "repo.land.retry_admission" => {
+                let params: RepoLandRetryAdmissionParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error))
+                    }
+                };
+                reply(
+                    match self.landing().retry_admission(
+                        std::path::Path::new(&params.repo),
+                        &params.hold,
+                        &params.reason,
+                    ) {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                    },
+                )
+            }
             "repo.land.reenqueue" => {
                 let params: RepoLandReenqueueParams = match parse_params(&req.params) {
                     Ok(params) => params,
@@ -11784,6 +11802,13 @@ fn default_main_branch() -> String {
 /// is the settled attempt id an escalation's `RESOLVE WITH:` text hands the
 /// operator — see [`crate::landing::LandingPipeline::reenqueue_after_ceiling`].
 #[derive(Deserialize)]
+struct RepoLandRetryAdmissionParams {
+    repo: String,
+    hold: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
 struct RepoLandReenqueueParams {
     repo: String,
     branch: String,
@@ -13222,6 +13247,36 @@ mod authorize_reasoned_tests {
         let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
         assert!(!allowed);
         assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn repo_land_retry_admission_refuses_an_ordinary_rat() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "repo.land.retry_admission".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"repo": ".", "branch": "b", "task": "t", "attempt": "a"}),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn repo_land_retry_admission_allows_the_operator() {
+        let (_dir, daemon) = test_daemon();
+        let request = req("operator", "repo.land.retry_admission", "");
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: Default::default(),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(allowed);
+        assert_eq!(reason, "");
     }
 
     #[test]

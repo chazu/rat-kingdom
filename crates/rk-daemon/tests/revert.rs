@@ -319,7 +319,7 @@ async fn merge_one_rat(client: &mut Client, repo: &Path) -> (String, String) {
     let ticket = client
         .call(
             "ticket.new",
-            json!({"title": "do the thing", "scope": "svc"}),
+            json!({"title": "do the thing", "scope": repo.file_name().unwrap().to_string_lossy()}),
         )
         .await
         .unwrap();

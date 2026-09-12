@@ -2583,6 +2583,7 @@ impl WorkflowEngine {
 
         self.verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id,
                 repo,
                 agent: &agent,
@@ -5519,6 +5520,7 @@ test a::flaky ... FAILED
         let via_agent_path = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "inst-agent",
                 repo: "/repo",
                 agent: "Whisker",
@@ -5535,6 +5537,7 @@ test a::flaky ... FAILED
         let via_bare_dir = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "inst-daemon",
                 repo: "/repo",
                 agent: "daemon",
@@ -5588,6 +5591,7 @@ test a::flaky ... FAILED
         let err = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "inst-daemon-fail",
                 repo: "/repo/daemon-gate",
                 agent: "daemon",
@@ -5642,6 +5646,7 @@ test a::flaky ... FAILED
         let result = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "inst-contention-retry",
                 repo: "/repo/daemon-gate",
                 agent: "daemon",
@@ -5691,6 +5696,7 @@ test a::flaky ... FAILED
         let err = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "inst-contention-exhausted",
                 repo: "/repo/daemon-gate",
                 agent: "daemon",
@@ -5746,6 +5752,7 @@ test a::flaky ... FAILED
         let err = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "inst-genuine-fail",
                 repo: "/repo/daemon-gate",
                 agent: "daemon",
@@ -6676,6 +6683,7 @@ test a::flaky ... FAILED
         let landing = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "inst-landing",
                 repo: repo_name,
                 agent: "daemon",
@@ -6795,6 +6803,7 @@ test a::flaky ... FAILED
         let path_side = engine
             .verification()
             .run(crate::managed_verification::CheckExecution {
+                admission_timeout: None,
                 id: "inst-path",
                 repo: &repo_path,
                 agent: "daemon",

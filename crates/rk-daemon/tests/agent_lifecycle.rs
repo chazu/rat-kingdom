@@ -223,7 +223,7 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
     let ticket = client
         .call(
             "ticket.new",
-            json!({"title": "do the thing", "scope": "svc"}),
+            json!({"title": "do the thing", "scope": repo_dir.path().file_name().unwrap().to_string_lossy()}),
         )
         .await
         .unwrap();
@@ -330,7 +330,7 @@ async fn ticket_dispatched_rat_with_content_free_branch_does_not_close_its_ticke
     let ticket = client
         .call(
             "ticket.new",
-            json!({"title": "already delivered elsewhere", "scope": "svc"}),
+            json!({"title": "already delivered elsewhere", "scope": repo_dir.path().file_name().unwrap().to_string_lossy()}),
         )
         .await
         .unwrap();
@@ -407,7 +407,7 @@ async fn ticket_with_a_queued_landing_entry_is_not_closed_on_dismiss() {
     let ticket = client
         .call(
             "ticket.new",
-            json!({"title": "still queued elsewhere", "scope": "svc"}),
+            json!({"title": "still queued elsewhere", "scope": repo_dir.path().file_name().unwrap().to_string_lossy()}),
         )
         .await
         .unwrap();

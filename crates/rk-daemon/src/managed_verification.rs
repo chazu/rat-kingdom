@@ -26,6 +26,7 @@ pub(crate) struct CheckExecution<'a> {
     pub resolved: &'a ResolvedRun,
     pub env: &'a [(String, String)],
     pub timeout: Duration,
+    pub admission_timeout: Option<Duration>,
     pub previous_result: Option<&'a Value>,
     pub progress: Option<Arc<Mutex<RunProgress>>>,
 }
@@ -46,6 +47,10 @@ pub(crate) struct ManagedVerification<'a> {
 }
 
 impl<'a> ManagedVerification<'a> {
+    pub(crate) fn uses_capacity_admission(&self, repo: &str) -> bool {
+        self.shared_cargo_target || self.resources.admission.limit_for(repo) > 0
+    }
+
     pub(crate) fn new(
         layout: &'a Layout,
         space: &'a Space,
@@ -165,6 +170,7 @@ impl<'a> ManagedVerification<'a> {
         };
         let run_id = format!("verify-run:{agent}");
         let run_fut = self.run(CheckExecution {
+            admission_timeout: None,
             id: &run_id,
             repo: repo_name,
             agent,
@@ -486,6 +492,7 @@ impl<'a> ManagedVerification<'a> {
     /// docs/proposals/daemon-native-landing-pipeline.md T1->T2 interface.
     pub(crate) async fn run(self, request: CheckExecution<'_>) -> rk_core::Result<Value> {
         let CheckExecution {
+            admission_timeout,
             id,
             repo,
             agent,
@@ -499,133 +506,84 @@ impl<'a> ManagedVerification<'a> {
         } = request;
         let identity = repo_identity(self.layout, repo);
         let repo = identity.as_str();
-        // Serialize this check's entire run (every retry attempt) against
-        // every other same-repo check also opted into `sharedCargoTarget`,
-        // when `[disk] shared_cargo_target` actually has agents sharing one
-        // CARGO_TARGET_DIR per repo (TKT-01M0CFA1RX36SJ7DV4YWGHQ9BT). Held
-        // for the rest of this function's scope — including every early
-        // return below — and dropped on exit, so the next queued check only
-        // ever proceeds once this one is fully done touching the shared dir.
-        // Bounded by this check's own timeout: if the queue is deep enough
-        // that a check cannot even START within its own declared budget,
-        // that is as good as it failing outright — fail closed rather than
-        // let the wait grow unbounded.
-        let _test_exec_guard = if resolved.shared_cargo_target && self.shared_cargo_target {
-            match tokio::time::timeout(timeout, self.resources.test_exec_lock.acquire(repo)).await {
-                Ok(guard) => Some(guard),
-                Err(_) => {
-                    let stderr = format!(
-                        "run step: `{command}` did not acquire the shared CARGO_TARGET_DIR \
-                         test-execution lock for repo `{repo}` within {timeout:?} — queued \
-                         behind other same-repo checks that also set sharedCargoTarget"
-                    );
-                    self.record_gate_failure(
-                        id,
-                        repo,
-                        agent,
-                        command,
-                        LOCK_TIMEOUT_EXIT,
-                        "fail",
-                        false,
-                        None,
-                        "",
-                        false,
-                        &stderr,
-                        false,
-                        &[],
-                    );
+        // One capacity budget spans both locks. Named check execution gets
+        // its own timeout only after all admission resources are acquired.
+        let admission_limit = self.resources.admission.limit_for(repo);
+        let admission_started = Instant::now();
+        let wait_budget = admission_timeout.unwrap_or(timeout);
+        let acquire = async {
+            let test_guard = if resolved.shared_cargo_target && self.shared_cargo_target {
+                Some(self.resources.test_exec_lock.acquire(repo).await)
+            } else {
+                None
+            };
+            let admission = if admission_limit > 0 {
+                self.resources
+                    .admission
+                    .acquire(repo, admission_limit)
+                    .await
+            } else {
+                None
+            };
+            (test_guard, admission)
+        };
+        let (_test_exec_guard, admission) = match if wait_budget.is_zero() {
+            None
+        } else {
+            tokio::time::timeout(wait_budget, acquire).await.ok()
+        } {
+            Some(guards) => guards,
+            None => {
+                let stderr = format!(
+                    "run step: `{command}` did not acquire verification capacity for repo `{repo}` within {wait_budget:?} (shared CARGO_TARGET_DIR lock / verification admission; WIP limit {admission_limit})"
+                );
+                let queue_wait_ms =
+                    u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if let Some(progress) = &progress {
+                    progress.lock().unwrap().queue_wait_ms = Some(queue_wait_ms);
+                }
+                self.record_gate_failure(
+                    id,
+                    repo,
+                    agent,
+                    command,
+                    LOCK_TIMEOUT_EXIT,
+                    "infra",
+                    false,
+                    None,
+                    "",
+                    false,
+                    &stderr,
+                    false,
+                    &[],
+                );
+                self.record_verification_admission_event(VerificationAdmissionOutcome {
+                    repo,
+                    agent,
+                    command,
+                    queue_wait_ms: Some(queue_wait_ms),
+                    duration: Duration::ZERO,
+                    exit: LOCK_TIMEOUT_EXIT,
+                    verdict: "infra",
+                });
+                if resolved.expect_exit.is_some()
+                    || (admission_timeout.is_none()
+                        && resolved.shared_cargo_target
+                        && self.shared_cargo_target)
+                {
                     return Err(rk_core::Error::other(stderr));
                 }
+                return Ok(json!({
+                    "exit": LOCK_TIMEOUT_EXIT, "stdout": "", "stdout_truncated": false,
+                    "stderr": stderr, "stderr_truncated": false, "timed_out": false,
+                    "no_exit_code": true, "signal": null, "verdict": "infra",
+                    "executed": false, "reason": "admission-timeout", "queue_wait_ms": queue_wait_ms,
+                }));
             }
-        } else {
-            None
         };
-
-        // Every managed check shares the repository's admission limit.
-        // Cargo directory serialization is an independent resource above;
-        // setting sharedCargoTarget never opts out of general admission.
-        // Both guards span all retry attempts and release on every exit.
-        let admission_limit = self.resources.admission.limit_for(repo);
-        // Bound to this function's scope (dropped, releasing the permit, on
-        // every return path below — including an early one — exactly like
-        // `_test_exec_guard`). `None` when admission control is disabled or
-        // no limit was configured; `admission_queue_wait_ms` is `None` in
-        // lockstep, so the two always agree on whether a slot was ever
-        // waited for.
-        let mut _admission_guard: Option<tokio::sync::OwnedSemaphorePermit> = None;
-        let admission_started = Instant::now();
-        let admission_queue_wait_ms: Option<u64> = if admission_limit > 0 {
-            match tokio::time::timeout(
-                timeout,
-                self.resources.admission.acquire(repo, admission_limit),
-            )
-            .await
-            {
-                Ok(Some((permit, wait))) => {
-                    _admission_guard = Some(permit);
-                    Some(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))
-                }
-                Ok(None) => None,
-                Err(_) => {
-                    let stderr = format!(
-                        "run step: `{command}` did not acquire the verification admission \
-                         queue for repo `{repo}` within {timeout:?} — WIP limit {admission_limit} \
-                         reached"
-                    );
-                    self.record_gate_failure(
-                        id,
-                        repo,
-                        agent,
-                        command,
-                        LOCK_TIMEOUT_EXIT,
-                        "infra",
-                        false,
-                        None,
-                        "",
-                        false,
-                        &stderr,
-                        false,
-                        &[],
-                    );
-                    let queue_wait_ms =
-                        u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    if let Some(progress) = &progress {
-                        progress.lock().unwrap().queue_wait_ms = Some(queue_wait_ms);
-                    }
-                    self.record_verification_admission_event(VerificationAdmissionOutcome {
-                        repo,
-                        agent,
-                        command,
-                        queue_wait_ms: Some(queue_wait_ms),
-                        duration: Duration::ZERO,
-                        exit: LOCK_TIMEOUT_EXIT,
-                        verdict: "infra",
-                    });
-                    // The check never started: there is no verdict on the
-                    // candidate and no execution timeout. Landing can use its
-                    // existing durable infrastructure-retry budget. An inline
-                    // exit gate still fails closed, even if it expects -2.
-                    if resolved.expect_exit.is_some() {
-                        return Err(rk_core::Error::other(stderr));
-                    }
-                    return Ok(json!({
-                        "exit": LOCK_TIMEOUT_EXIT,
-                        "stdout": "",
-                        "stdout_truncated": false,
-                        "stderr": stderr,
-                        "stderr_truncated": false,
-                        "timed_out": false,
-                        "no_exit_code": true,
-                        "signal": null,
-                        "verdict": "infra",
-                        "executed": false,
-                        "reason": "admission-timeout",
-                    }));
-                }
-            }
-        } else {
-            None
-        };
+        let admission_queue_wait_ms = (admission_limit > 0 || _test_exec_guard.is_some())
+            .then(|| u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let _admission_guard = admission.map(|(permit, _)| permit);
         let run_started = Instant::now();
         if let Some(progress) = &progress {
             let mut p = progress.lock().unwrap();
@@ -2620,5 +2578,44 @@ mod tests {
             .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_IDENTITY))
             .unwrap()
             .is_empty());
+    }
+    #[tokio::test]
+    async fn ordinary_shared_lock_admission_expiry_without_expect_exit_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, true);
+        let _held = resources.test_exec_lock.acquire("repo").await;
+        let resolved = ResolvedRun {
+            command: "touch should-not-execute".into(),
+            cwd: None,
+            expect_exit: None,
+            timeout: "50ms".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: Default::default(),
+            retry_on_fail: 0,
+            shared_cargo_target: true,
+        };
+        let result = verifier
+            .run(CheckExecution {
+                id: "ordinary-workflow",
+                repo: "repo",
+                agent: "rat",
+                dir: home.path(),
+                command: &resolved.command,
+                resolved: &resolved,
+                env: &[],
+                timeout: Duration::from_millis(50),
+                admission_timeout: None,
+                previous_result: None,
+                progress: None,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "a workflow must not advance after a check that never ran"
+        );
+        assert!(!home.path().join("should-not-execute").exists());
     }
 }
