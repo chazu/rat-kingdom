@@ -11272,7 +11272,7 @@ fn cleared_branches_for_paths(
         let Some(path) = paths.get(&scope) else {
             continue;
         };
-        let Ok(repo) = rk_git::Repo::discover(path) else {
+        let Ok(repo) = rk_git::Repo::open_checkout(path) else {
             continue;
         };
         let resolved = match repo.branch_exists_checked(&branch) {
@@ -11338,6 +11338,25 @@ mod branch_clear_tests {
         let repo = rk_git::Repo::discover(path).unwrap();
         assert!(!repo.is_ancestor(&source, "main"));
         assert_eq!(repo.rev_parse("archive/obsolete").unwrap(), source);
+
+        // Registered linked worktrees remain valid checkout roots; they use
+        // the same branch refs even though their Git metadata lives elsewhere.
+        let linked = path.join("linked");
+        git(
+            path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-work",
+                linked.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let paths = HashMap::from([("repo".to_string(), linked)]);
+        let event = ("repo".into(), "obsolete".into(), "main".into(), false);
+        assert!(cleared_branches_for_paths(vec![event], paths)
+            .contains(&("repo".into(), "obsolete".into())));
     }
 
     #[test]
@@ -11416,6 +11435,21 @@ mod branch_clear_tests {
         }
         std::fs::remove_dir_all(path.join(".git")).unwrap();
         assert!(repo.branch_exists_checked("legacy").is_err());
+        assert!(cleared_branches_for_paths(events, paths).is_empty());
+    }
+
+    #[test]
+    fn unavailable_nested_checkout_does_not_clear_using_its_parent_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]);
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        git(&nested, &["init", "-b", "main"]);
+        std::fs::remove_dir_all(nested.join(".git")).unwrap();
+        // Ordinary discovery succeeds by finding the unrelated parent repo.
+        assert!(rk_git::Repo::discover(&nested).is_ok());
+        let paths = HashMap::from([("repo".to_string(), nested)]);
+        let events = vec![("repo".into(), "legacy".into(), "main".into(), false)];
         assert!(cleared_branches_for_paths(events, paths).is_empty());
     }
 }

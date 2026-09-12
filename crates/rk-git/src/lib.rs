@@ -238,6 +238,20 @@ impl Repo {
         Ok(Self { root })
     }
 
+    /// Open exactly this checkout root, including a linked worktree. Unlike
+    /// discovery, this must not fall back to an enclosing repository when the
+    /// requested checkout has lost its Git metadata.
+    pub fn open_checkout(path: &Path) -> rk_core::Result<Self> {
+        let top = git_in(path, &["rev-parse", "--show-toplevel"])?;
+        if Path::new(top.trim()).canonicalize()? != path.canonicalize()? {
+            return Err(rk_core::Error::other(format!(
+                "{} is not the discovered checkout root",
+                path.display()
+            )));
+        }
+        Self::discover(path)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
