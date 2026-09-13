@@ -158,6 +158,19 @@ claims of terminal-author reuse. Legacy records without sufficient identity stay
 unattributed. Stable ordering and explicit schema/evaluator version make replay
 deterministic. All read/export limits must reveal truncation.
 
+Freeze the root tickets and a native lineage rule before dispatch. Cost scope
+includes every descendant ticket through `parent`, regardless of outcome, and
+reviewer tasks whose actual `AgentRecord.review.task` names an included ticket
+in the same repo. Record those native bindings and generations; do not infer a
+review relationship from a task-name prefix. Materialize future task IDs under
+this prior rule in `consumer_tasks`, retaining the frozen plan and snapshots.
+Implementation descendants remain eligible reuse consumers; reviewer support
+rows are accounting only. Count accepted root deliveries as the productivity
+denominator and all implementation, rework and review attempts in its cost
+numerator. With no accepted roots the ratio is undefined. Missing lineage or
+cost evidence remains unknown: a complete task-local cost row never proves
+complete batch coverage. Apply this identical rule to all comparison arms.
+
 Task completion, the final provider cost report, and physical process exit are
 separate observations. Native observations bind both the agent generation and
 the particular process launch; a manual respawn can retain the generation while
