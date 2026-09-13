@@ -526,6 +526,102 @@ fn unknown_coverage() -> Coverage {
     }
 }
 
+/// One occurrence bound to real evidence already in the capture — never a
+/// bare assertion — plus the operator's stated reason it counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnnotatedEvidence {
+    pub evidence: String,
+    pub reason: String,
+}
+
+/// A bounded, task-scoped operator judgment of repeated investigation,
+/// rework, or a real intervention that daemon telemetry alone does not
+/// establish end-to-end (design doc: "repeated investigations and rework,
+/// with reviewed evidence" — "do not turn an agent's estimate of time saved
+/// into measured savings"). `deny_unknown_fields` on both this and
+/// `AnnotatedEvidence` so no invented duration or savings figure can be
+/// smuggled in through an unknown key: only a COUNT of evidenced occurrences
+/// is ever reported, and each one is bound to a resolvable capture record,
+/// never trusted as a bare reviewer claim. Distinct from `Review`, which is
+/// scoped to one source/consumer pair rather than one task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedAnnotation {
+    pub task: String,
+    pub repo: String,
+    #[serde(default)]
+    pub repeated_investigations: Vec<AnnotatedEvidence>,
+    #[serde(default)]
+    pub rework: Vec<AnnotatedEvidence>,
+    #[serde(default)]
+    pub interventions: Vec<AnnotatedEvidence>,
+}
+
+/// A reviewed annotation may only speak about a task already frozen into
+/// delivery scope (`frozen_task_scope`) — the same rule a `Review.declares`
+/// pair must satisfy — and at most once per (task, repo): a retrospective
+/// annotation cannot introduce new scope or be silently duplicated to
+/// inflate a count.
+fn validate_reviewed_annotations(manifest: &Manifest, annotations: &[ReviewedAnnotation]) -> Result<()> {
+    let frozen: BTreeSet<(String, String)> = frozen_task_scope(manifest)
+        .into_iter()
+        .map(|s| (s.task, s.repo))
+        .collect();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for a in annotations {
+        if !seen.insert((a.task.clone(), a.repo.clone())) {
+            bail!(
+                "duplicate reviewed annotation for task {} in repo {}",
+                a.task,
+                a.repo
+            );
+        }
+        if !frozen.contains(&(a.task.clone(), a.repo.clone())) {
+            bail!(
+                "reviewed annotation for task {} in repo {} is not in the frozen delivery scope \
+                 (must already appear in manifest.consumer_tasks or an eligible_pairs \
+                 consumer_task)",
+                a.task,
+                a.repo
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parses the `--reviews` file as either a bare `Review` array (the existing,
+/// still-supported shape — `reviewed_annotations` defaults to empty) or an
+/// object `{"reviews": [...], "reviewed_annotations": [...]}`. Mirrors
+/// `parse_tuple_capture`'s bare-array-or-envelope pattern so the file format
+/// grows without breaking either an existing caller or the CLI acceptance
+/// tests that write a bare array today.
+pub fn parse_reviews_file(raw: &Value) -> Result<(Vec<Review>, Vec<ReviewedAnnotation>)> {
+    if raw.is_array() {
+        let reviews: Vec<Review> = serde_json::from_value(raw.clone())
+            .context("reviews file does not match the expected schema")?;
+        return Ok((reviews, Vec::new()));
+    }
+    if raw.is_object() {
+        let reviews: Vec<Review> = match raw.get("reviews") {
+            Some(v) => serde_json::from_value(v.clone())
+                .context("reviews file's `reviews` field does not match the expected schema")?,
+            None => Vec::new(),
+        };
+        let reviewed_annotations: Vec<ReviewedAnnotation> = match raw.get("reviewed_annotations") {
+            Some(v) => serde_json::from_value(v.clone()).context(
+                "reviews file's `reviewed_annotations` field does not match the expected schema",
+            )?,
+            None => Vec::new(),
+        };
+        return Ok((reviews, reviewed_annotations));
+    }
+    bail!(
+        "reviews file must be a JSON array (bare `Review` list) or an object with `reviews`/\
+         `reviewed_annotations` fields"
+    )
+}
+
 /// Merges `manifest.eligible_pairs` (predeclared) with pairs minted by
 /// `Review.declares` entries (live enrollment), validating that every
 /// minted pair is bound to an already-frozen batch/task scope and that no
@@ -896,19 +992,33 @@ pub struct DeliveryCost {
     /// absence is unknown, not a negative.
     pub accepted: Option<bool>,
     pub acceptance_evidence: Option<String>,
+    /// Resolved evidence ids from `ReviewedAnnotation` for this task. Operator
+    /// judgment, kept distinct from `rework_spans`/`attention_hold_spans`
+    /// (daemon-observed lower bounds) rather than summed with them — a
+    /// reviewer's count and a span count answer different questions and
+    /// silently adding them would misstate both.
+    pub reviewed_repeated_investigations: Vec<String>,
+    pub reviewed_rework: Vec<String>,
+    pub reviewed_interventions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QualitySummary {
     /// `attention_hold` phase spans in this repo and window. A LOWER BOUND on
-    /// operator interventions: one that left no span is not counted. Reviewed
-    /// annotations that could close that gap are the parent ticket's scope.
+    /// operator interventions: one that left no span is not counted.
     pub attention_hold_spans: usize,
     pub interventions_known: usize,
     pub interventions_coverage: String,
     pub rework_spans: usize,
     pub incorrect_reuse: usize,
     pub regressions: Vec<String>,
+    /// Resolved `ReviewedAnnotation` counts across every delivery, kept
+    /// SEPARATE from the daemon-observed span counts above: a reviewer's
+    /// bounded, evidenced judgment answers a different question than a
+    /// telemetry lower bound, and summing them would misstate both.
+    pub reviewed_repeated_investigations: usize,
+    pub reviewed_rework: usize,
+    pub reviewed_interventions: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1185,6 +1295,38 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
     }
 }
 
+/// Resolves one `ReviewedAnnotation` evidence list (repeated-investigation,
+/// rework or intervention) against the capture, reusing `check_evidence`'s
+/// artifact/repo/non-string rules so a reviewed annotation is held to the same
+/// bar as a finding's own evidence. `Unknown` and `Invalid` are reported, never
+/// silently dropped or silently trusted; only `Resolved` items are counted.
+fn resolve_annotated_evidence(
+    items: &[AnnotatedEvidence],
+    by_id: &BTreeMap<&str, &Value>,
+    repo: &str,
+    kind: &str,
+    invalid: &mut Vec<InvalidRecord>,
+    unresolved: &mut Vec<InvalidRecord>,
+) -> Vec<String> {
+    let mut resolved = Vec::new();
+    for item in items {
+        match check_evidence(&json!([item.evidence.clone()]), by_id, repo) {
+            EvidenceCheck::Resolved => resolved.push(item.evidence.clone()),
+            EvidenceCheck::Unknown(reason) => unresolved.push(InvalidRecord {
+                record: item.evidence.clone(),
+                kind: kind.to_string(),
+                reason,
+            }),
+            EvidenceCheck::Invalid(reason) => invalid.push(InvalidRecord {
+                record: item.evidence.clone(),
+                kind: kind.to_string(),
+                reason,
+            }),
+        }
+    }
+    resolved
+}
+
 /// Whether `source` is something a receipt may legitimately name. Mirrors the
 /// daemon's own `bbs.reuse` rule (crates/rk-daemon/src/bbs.rs): an ordinary
 /// artifact with NO `bbs_kind` at all — reusable regardless of lifecycle,
@@ -1254,6 +1396,14 @@ struct ExitRow {
     exit_code: Option<i64>,
     crashed: Option<bool>,
     prior_state: Option<String>,
+    /// `true` when this launch had already been superseded by a later one
+    /// under the same `spawn` by the time this exit was recorded. When set,
+    /// `prior_state`/`crashed` describe the SUCCESSOR, not this launch, and
+    /// are nulled out at the source rather than defaulted — so a stale exit
+    /// must never be read as "nothing happened after the last result"
+    /// (`s2-stale-event-observation-contract`, `TKT-tulir-kotah-gisub`).
+    /// Absent on records predating that contract; treated as not-stale.
+    stale_session: Option<bool>,
     record: String,
 }
 
@@ -1560,6 +1710,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 exit_code: t["payload"]["exit_code"].as_i64(),
                 crashed: t["payload"]["crashed"].as_bool(),
                 prior_state: t["payload"]["prior_state"].as_str().map(str::to_string),
+                stale_session: t["payload"]["stale_session"].as_bool(),
                 record: record_id(t),
             });
             continue;
@@ -1715,6 +1866,14 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
+            // The frozen window is enforced here exactly as it is for every
+            // other native observation (exposure/open/launch events): a
+            // receipt created outside it is excluded and counted under
+            // `observations_out_of_window`, not silently admitted as a valid
+            // claim (review 01M2CS8FMFPCPZKFPM65VGV5BH, TKT-figil-fobud-niluk).
+            if !admit(&mut idx, t, created_at(t)) {
+                continue;
+            }
             // A receipt authored by a generation is itself proof the
             // generation ran, so it also serves as launch evidence.
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
@@ -1744,6 +1903,11 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                     kind: ASSESSMENT.into(),
                     reason,
                 });
+                continue;
+            }
+            // Same window enforcement as REUSE above: an out-of-window verdict
+            // must not be admitted as a valid assessment.
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             let receipt = str_field(t, &["payload", "receipt"]).to_string();
@@ -1871,6 +2035,19 @@ fn resolve_author_exit(
             exit.agent
         ));
     }
+    // `stale_session: true` means a LATER launch of this same generation
+    // already existed by the time this exit was recorded: the daemon nulls
+    // out prior_state/crashed because they would describe that successor,
+    // not this launch. The exit is real, but it is direct proof a relaunch
+    // already happened, so it cannot establish the terminal generation state
+    // at the time of the reuse (`TKT-tulir-kotah-gisub`).
+    if exit.stale_session == Some(true) {
+        return Err(format!(
+            "{evidence_id} is a stale-session exit: a later launch of generation {source_spawn} \
+             already existed when it was recorded, so it cannot establish the terminal state at \
+             the time of the reuse"
+        ));
+    }
     let Some(exited_at) = exit.exited_at else {
         return Err(format!("{evidence_id} carries no parsable exited_at"));
     };
@@ -1970,6 +2147,22 @@ fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
                 .into(),
         );
     };
+    // A stale-session exit's `prior_state` is nulled at the SOURCE because it
+    // would otherwise describe a successor launch, not this one — it is not
+    // "nothing happened between", it is "unknown". Only a non-stale absent
+    // `prior_state` (legacy shape, or genuinely nothing recorded) is read as a
+    // match (`TKT-tulir-kotah-gisub`).
+    if exit.prior_state.is_none() && exit.stale_session == Some(true) {
+        return (
+            false,
+            format!(
+                "exit {} is a stale-session record: its prior_state is unknown (it would \
+                 describe a successor launch, not this one), so this segment cannot be confirmed \
+                 final",
+                exit.record
+            ),
+        );
+    }
     match exit.prior_state.as_deref() {
         None => (
             true,
@@ -2001,13 +2194,29 @@ fn opt_sum(acc: &mut Option<i64>, v: Option<i64>) {
     }
 }
 
+/// Computes the deterministic report with no reviewed task-scoped annotations
+/// (repeated-investigation/rework/intervention). Equivalent to
+/// `compute_full(manifest, capture, reviews, &[])`. Test-only: every real
+/// caller (the CLI) goes through `compute_full` directly so it can pass
+/// parsed reviewed annotations.
+#[cfg(test)]
+fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) -> Result<Report> {
+    compute_full(manifest, capture, reviews, &[])
+}
+
 /// Computes the deterministic report. Same inputs always produce the same
 /// output (stable sort keys throughout; no reliance on hash-map iteration
 /// order, wall-clock "now", or randomness).
 #[allow(clippy::too_many_lines)]
-pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) -> Result<Report> {
+pub fn compute_full(
+    manifest: &Manifest,
+    capture: &TupleCapture,
+    reviews: &[Review],
+    reviewed_annotations: &[ReviewedAnnotation],
+) -> Result<Report> {
     validate_manifest(manifest)?;
     let all_pairs = validate_and_merge_pairs(manifest, reviews)?;
+    validate_reviewed_annotations(manifest, reviewed_annotations)?;
 
     let idx = build_index(capture, manifest);
     let review_by_pair: BTreeMap<&str, &Review> =
@@ -2023,6 +2232,40 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
     let mut ambiguous_assessments: Vec<AmbiguousAssessment> = Vec::new();
     let mut author_exit_unsupported: Vec<AuthorExitUnsupported> = Vec::new();
     let mut pairs_out: Vec<PairResult> = Vec::new();
+
+    // Reviewed task-scoped annotations: resolved once, up front, then looked
+    // up per task in the delivery loop below.
+    let mut invalid_records: Vec<InvalidRecord> = idx.invalid.clone();
+    #[allow(clippy::type_complexity)]
+    let mut reviewed_by_task: BTreeMap<(String, String), (Vec<String>, Vec<String>, Vec<String>)> =
+        BTreeMap::new();
+    for a in reviewed_annotations {
+        let repeated = resolve_annotated_evidence(
+            &a.repeated_investigations,
+            &idx.by_id,
+            &a.repo,
+            "reviewed_repeated_investigation",
+            &mut invalid_records,
+            &mut unresolved,
+        );
+        let rework = resolve_annotated_evidence(
+            &a.rework,
+            &idx.by_id,
+            &a.repo,
+            "reviewed_rework",
+            &mut invalid_records,
+            &mut unresolved,
+        );
+        let interventions = resolve_annotated_evidence(
+            &a.interventions,
+            &idx.by_id,
+            &a.repo,
+            "reviewed_intervention",
+            &mut invalid_records,
+            &mut unresolved,
+        );
+        reviewed_by_task.insert((a.task.clone(), a.repo.clone()), (repeated, rework, interventions));
+    }
 
     for pair in &sorted_pairs {
         // A duplicate identity is counted once and REPORTED, so a repeated
@@ -2534,6 +2777,9 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
     let mut tasks_without_native_records = Vec::new();
     let mut attention_hold_spans = 0usize;
     let mut rework_spans = 0usize;
+    let mut reviewed_repeated_investigations_total = 0usize;
+    let mut reviewed_rework_total = 0usize;
+    let mut reviewed_interventions_total = 0usize;
     for scope in frozen_task_scope(manifest) {
         // Spans are pre-filtered by repo and window here because
         // `build_critical_path` dedups on `(phase, attempt)` across whatever
@@ -2746,7 +2992,17 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
                             last.cost_basis
                         ));
                     }
-                    (true, Some(_), _) => {}
+                    (true, Some(_), other) => {
+                        // A final result carrying a figure under neither known
+                        // basis (e.g. the producer's own `unknown` basis for a
+                        // stale/mixed-basis segment). Never pooled with either
+                        // total and never silently dropped.
+                        unknown_cost.push(format!(
+                            "{spawn}/{session}/{}: reported cost has unrecognized cost_basis={other:?}, \
+                             not pooled",
+                            provider_session.as_deref().unwrap_or("no-provider-session")
+                        ));
+                    }
                 }
                 cost_segments.push(CostSegment {
                     spawn: spawn.to_string(),
@@ -2805,6 +3061,15 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             .flatten();
         unknown_cost.sort();
 
+        let (reviewed_repeated_investigations, reviewed_rework, reviewed_interventions) =
+            reviewed_by_task
+                .get(&(scope.task.clone(), scope.repo.clone()))
+                .cloned()
+                .unwrap_or_default();
+        reviewed_repeated_investigations_total += reviewed_repeated_investigations.len();
+        reviewed_rework_total += reviewed_rework.len();
+        reviewed_interventions_total += reviewed_interventions.len();
+
         deliveries.push(DeliveryCost {
             task: scope.task.clone(),
             repo: scope.repo.clone(),
@@ -2833,6 +3098,9 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             phase_ms,
             accepted,
             acceptance_evidence,
+            reviewed_repeated_investigations,
+            reviewed_rework,
+            reviewed_interventions,
         });
     }
     deliveries.sort_by(|a, b| (&a.repo, &a.task).cmp(&(&b.repo, &b.task)));
@@ -2855,6 +3123,9 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         rework_spans,
         incorrect_reuse,
         regressions,
+        reviewed_repeated_investigations: reviewed_repeated_investigations_total,
+        reviewed_rework: reviewed_rework_total,
+        reviewed_interventions: reviewed_interventions_total,
     };
 
     excluded.sort_by(|a, b| (&a.pair, &a.reason).cmp(&(&b.pair, &b.reason)));
@@ -2878,7 +3149,7 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         },
         tuples_truncated: capture.truncated,
         capture: idx.capture.clone(),
-        invalid_records: idx.invalid.clone(),
+        invalid_records,
         unresolved_records: unresolved,
         // Author-exit and per-delivery cost are DERIVED as of evaluator version
         // 3. What remains genuinely underived is named here, so its absence
@@ -3111,6 +3382,18 @@ pub fn render(report: &Report) -> String {
             for u in &d.unknown_cost {
                 let _ = writeln!(out, "    unknown cost: {u}");
             }
+            if !d.reviewed_repeated_investigations.is_empty()
+                || !d.reviewed_rework.is_empty()
+                || !d.reviewed_interventions.is_empty()
+            {
+                let _ = writeln!(
+                    out,
+                    "    reviewed: repeated_investigations={} rework={} interventions={}",
+                    d.reviewed_repeated_investigations.len(),
+                    d.reviewed_rework.len(),
+                    d.reviewed_interventions.len()
+                );
+            }
         }
     }
     if !report.tasks_without_native_records.is_empty() {
@@ -3129,6 +3412,14 @@ pub fn render(report: &Report) -> String {
         report.quality.rework_spans,
         report.quality.incorrect_reuse,
         report.quality.regressions.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "  reviewed (operator judgment, not daemon facts): repeated_investigations={} rework={} \
+         interventions={}",
+        report.quality.reviewed_repeated_investigations,
+        report.quality.reviewed_rework,
+        report.quality.reviewed_interventions
     );
     let _ = writeln!(
         out,
@@ -3325,6 +3616,79 @@ mod tests {
                 "is_error": false,
                 "declared_done": true,
                 "cost_usd": 0.5
+            }
+        })
+    }
+
+    /// `agent_exit` (S2 contract, identity `bbs-agent-exit`): castle-authored
+    /// physical-exit evidence, never `harness_result`. `stale_session: Some(true)`
+    /// models a delayed exit for a launch already superseded by a later one
+    /// under the same `spawn`; its `prior_state`/`crashed` are nulled at the
+    /// source (`TKT-tulir-kotah-gisub`), not because nothing happened.
+    #[allow(clippy::too_many_arguments)]
+    fn agent_exit(
+        id: &str,
+        repo: &str,
+        task: &str,
+        agent: &str,
+        spawn: &str,
+        session: &str,
+        launched_at: Option<&str>,
+        exited_at: Option<&str>,
+        prior_state: Option<&str>,
+        crashed: bool,
+        stale_session: Option<bool>,
+        created: &str,
+    ) -> Value {
+        json!({
+            "id": id,
+            "category": "event",
+            "scope": repo,
+            "identity": "bbs-agent-exit",
+            "instance": CASTLE,
+            "lifecycle": "furniture",
+            "created_at": created,
+            "payload": {
+                "schema_version": 1, "bbs_kind": AGENT_EXIT, "repo": repo, "task": task,
+                "agent": agent, "spawn": spawn, "session": session,
+                "launched_at": launched_at, "exited_at": exited_at,
+                "prior_state": prior_state, "crashed": crashed, "exit_code": 0,
+                "stale_session": stale_session
+            }
+        })
+    }
+
+    /// `agent_final_usage` (S2 contract, identity `bbs-agent-final-usage`):
+    /// castle-authored provider-cost evidence, keyed with `agent_exit` on
+    /// `(spawn, session)`. `cost_basis` is the ONLY field that gates whether a
+    /// figure may be pooled as a provider-reported total.
+    #[allow(clippy::too_many_arguments)]
+    fn agent_final_usage(
+        id: &str,
+        repo: &str,
+        task: &str,
+        spawn: &str,
+        session: &str,
+        provider_session: Option<&str>,
+        state: Option<&str>,
+        cost_usd: Option<f64>,
+        cost_basis: &str,
+        observed_at: &str,
+        created: &str,
+    ) -> Value {
+        json!({
+            "id": id,
+            "category": "event",
+            "scope": repo,
+            "identity": "bbs-agent-final-usage",
+            "instance": CASTLE,
+            "lifecycle": "furniture",
+            "created_at": created,
+            "payload": {
+                "schema_version": 1, "bbs_kind": AGENT_FINAL_USAGE, "repo": repo, "task": task,
+                "spawn": spawn, "session": session, "provider_session": provider_session,
+                "state": state, "cost_usd": cost_usd, "cost_basis": cost_basis,
+                "observed_at": observed_at
             }
         })
     }
@@ -3773,18 +4137,16 @@ mod tests {
         assert_eq!(r.mechanism.effects, 3);
         assert_eq!(r.mechanism.batches, 2);
         // The effect and batch counts clear the bar, and the goal STILL must
-        // not pass: the author-exit sub-goal cannot be evaluated in this
-        // evaluator version, and the previous one would have passed it here on
-        // a `harness_result` that establishes no physical exit. A goal that
-        // cannot be evaluated does not report as met.
+        // not pass: the only cited terminal evidence is a `harness_result`,
+        // which this evaluator version explicitly refuses as author-exit
+        // proof (task-completion evidence, not a physical exit). Unlike a
+        // truncated capture, this is not "cannot be evaluated" — it is simply
+        // not met, so `goal_blocked_reason` stays `None`.
         assert_eq!(r.mechanism.author_exit_effects, 0);
         assert!(!r.mechanism.goal_met);
-        assert!(r
-            .mechanism
-            .goal_blocked_reason
-            .as_ref()
-            .unwrap()
-            .contains("author-exit derivation is not implemented"));
+        assert!(r.mechanism.goal_blocked_reason.is_none());
+        assert_eq!(r.author_exit_unsupported.len(), 1);
+        assert!(r.author_exit_unsupported[0].reason.contains("still alive"));
     }
 
     #[test]
@@ -3954,17 +4316,8 @@ mod tests {
         assert!(compute(&m, &c, &[r]).is_err());
     }
 
-    // ------------------------------------------------------------------
-    // Slice A reports cost/duration as UNSUPPORTED rather than estimating it.
-    // The six aggregation tests that used to live here asserted properties of
-    // a derivation that produced false positives — a provisional
-    // `harness_result` cost summed as a measured total, a `merge` span read as
-    // an accepted delivery, a phase-duration sum labelled active work. They
-    // return with the real derivation in TKT-bonik-vuruv-mivuh.
-    // ------------------------------------------------------------------
-
     #[test]
-    fn deliveries_come_from_frozen_scope_and_report_cost_as_unsupported() {
+    fn deliveries_come_from_frozen_scope_with_no_native_records_at_all() {
         // OMITTED DENOMINATOR the previous version had: deliveries were derived
         // from the pairs that survived evaluation, so a frozen task with no
         // eligible source and no receipt vanished along with its accounting.
@@ -3983,17 +4336,245 @@ mod tests {
         assert_eq!(d.task, "TKT-lonely");
         assert_eq!(d.repo, "repo");
         assert_eq!(d.enrollment, "frozen_consumer_task");
-        assert_eq!(d.derivation_status, "unsupported");
-        // Every figure is an explicit unknown, never a manufactured zero.
-        assert_eq!(d.cost_usd, None);
+        // No native record at all for this task: every figure is an explicit
+        // unknown, never a manufactured zero.
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert_eq!(d.cost_coverage, "none_observed");
         assert_eq!(d.active_work_ms, None);
         assert_eq!(d.process_lifetime_ms, None);
         assert_eq!(d.accepted, None);
-        assert_eq!(report.quality.interventions, None);
+        assert_eq!(
+            report.tasks_without_native_records,
+            vec!["repo/TKT-lonely".to_string()]
+        );
         assert!(report
             .quality
             .interventions_coverage
             .contains("lower bound"));
+    }
+
+    #[test]
+    fn author_exit_is_credited_from_a_valid_agent_exit_observation() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+            agent_exit(
+                "ax1",
+                "repo",
+                "TKT-source",
+                "author",
+                "author-gen",
+                "sess-1",
+                Some("2026-01-01T00:00:00Z"),
+                Some("2026-01-01T12:00:00Z"),
+                None,
+                false,
+                None,
+                "2026-01-01T12:00:00Z",
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![review_with_exit("p1", "ax1", false)];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert!(r.author_exit_unsupported.is_empty());
+        assert_eq!(r.author_exit_reuse, vec!["p1".to_string()]);
+        assert_eq!(r.mechanism.author_exit_effects, 1);
+        assert!(only(&r).author_terminal);
+        assert_eq!(
+            only(&r).author_terminal_evidence,
+            Some("ax1".to_string())
+        );
+    }
+
+    #[test]
+    fn author_exit_is_not_credited_from_a_stale_session_exit() {
+        // stale_session: true means a LATER launch of this same generation
+        // already existed when this exit was recorded; prior_state/crashed are
+        // nulled at the source rather than describing this launch.
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+            agent_exit(
+                "ax1",
+                "repo",
+                "TKT-source",
+                "author",
+                "author-gen",
+                "sess-1",
+                Some("2026-01-01T00:00:00Z"),
+                Some("2026-01-01T12:00:00Z"),
+                None,
+                false,
+                Some(true),
+                "2026-01-01T12:00:00Z",
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![review_with_exit("p1", "ax1", false)];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert!(r.author_exit_reuse.is_empty());
+        assert_eq!(r.author_exit_unsupported.len(), 1);
+        assert!(r.author_exit_unsupported[0]
+            .reason
+            .contains("stale-session"));
+    }
+
+    #[test]
+    fn cost_is_credited_when_a_segment_is_final_and_provider_reported() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-1".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let tuples = vec![
+            agent_final_usage(
+                "u1", "repo", "TKT-1", "gen-1", "sess-1", Some("prov-1"), Some("completed"),
+                Some(1.5), PROVIDER_COST_BASIS, "2026-01-01T11:00:00Z", "2026-01-01T11:00:00Z",
+            ),
+            agent_exit(
+                "ax1", "repo", "TKT-1", "gen-1", "gen-1", "sess-1",
+                Some("2026-01-01T10:00:00Z"), Some("2026-01-01T12:00:00Z"),
+                Some("completed"), false, None, "2026-01-01T12:00:00Z",
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.deliveries.len(), 1);
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(d.reported_cost_estimate_usd, Some(1.5));
+        assert_eq!(d.process_lifetime_ms, Some(2 * 60 * 60 * 1000));
+        assert!(d.unknown_cost.is_empty());
+    }
+
+    #[test]
+    fn cost_stays_partial_when_more_work_followed_the_last_result() {
+        // The last usage result said `paused`, but the exit's prior_state was
+        // `running`: work happened after that result, so the reported amount
+        // is partial, not final.
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-1".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let tuples = vec![
+            agent_final_usage(
+                "u1", "repo", "TKT-1", "gen-1", "sess-1", Some("prov-1"), Some("paused"),
+                Some(3.0), PROVIDER_COST_BASIS, "2026-01-01T11:00:00Z", "2026-01-01T11:00:00Z",
+            ),
+            agent_exit(
+                "ax1", "repo", "TKT-1", "gen-1", "gen-1", "sess-1",
+                Some("2026-01-01T10:00:00Z"), Some("2026-01-01T12:00:00Z"),
+                Some("running"), false, None, "2026-01-01T12:00:00Z",
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "partial");
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert_eq!(d.partial_reported_usd, Some(3.0));
+        assert_eq!(d.unknown_cost.len(), 1);
+    }
+
+    #[test]
+    fn cost_is_missing_when_no_final_usage_observation_exists() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-1".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let tuples = vec![harness_result(
+            "h1",
+            "gen-1",
+            "TKT-1",
+            "2026-01-01T12:00:00Z",
+        )];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "missing");
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert_eq!(d.completions, 1);
+        assert_eq!(d.failed_completions, 0);
+    }
+
+    #[test]
+    fn reviewed_annotation_counts_resolved_evidence_and_reports_bad_evidence() {
+        let mut m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-1".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        m.eligible_pairs = vec![];
+        let c = capture(vec![], Order::Unknown);
+        let annotations = vec![ReviewedAnnotation {
+            task: "TKT-1".into(),
+            repo: "repo".into(),
+            repeated_investigations: vec![AnnotatedEvidence {
+                evidence: "ev-1".into(),
+                reason: "same root cause chased twice".into(),
+            }],
+            rework: vec![],
+            interventions: vec![AnnotatedEvidence {
+                evidence: "not-in-capture".into(),
+                reason: "operator unblocked a stuck review".into(),
+            }],
+        }];
+        let r = compute_full(&m, &c, &[], &annotations).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.reviewed_repeated_investigations, vec!["ev-1".to_string()]);
+        assert_eq!(d.reviewed_interventions.len(), 0, "unresolved evidence is not counted");
+        assert_eq!(r.quality.reviewed_repeated_investigations, 1);
+        assert_eq!(r.quality.reviewed_interventions, 0);
+        assert!(r
+            .unresolved_records
+            .iter()
+            .any(|u| u.record == "not-in-capture" && u.kind == "reviewed_intervention"));
+    }
+
+    #[test]
+    fn reviewed_annotation_for_a_task_outside_frozen_scope_is_an_input_error() {
+        let m = manifest(vec![]);
+        let c = capture(vec![], Order::Unknown);
+        let annotations = vec![ReviewedAnnotation {
+            task: "TKT-not-frozen".into(),
+            repo: "repo".into(),
+            repeated_investigations: vec![],
+            rework: vec![],
+            interventions: vec![],
+        }];
+        assert!(compute_full(&m, &c, &[], &annotations).is_err());
     }
 
     #[test]
@@ -4013,25 +4594,28 @@ mod tests {
     fn unsupported_derivations_are_named_with_their_reason_and_tracking_ticket() {
         // An absent metric has to be legible as absent, in machine output as
         // well as human output, or a reader fills the gap with a zero.
+        // Author-exit and delivery cost are DERIVED as of evaluator version 3;
+        // what remains genuinely underived is named here instead.
         let report = compute(&manifest(vec![]), &capture(vec![], Order::Unknown), &[]).unwrap();
         let named: Vec<&str> = report
             .unsupported
             .iter()
             .map(|u| u.derivation.as_str())
             .collect();
-        assert_eq!(named, vec!["author_exit", "delivery_cost_and_duration"]);
+        assert_eq!(named, vec!["active_work_ms", "total_operator_interventions"]);
         for u in &report.unsupported {
-            assert_eq!(u.status, "unsupported");
-            assert_eq!(u.tracked_by, "TKT-bonik-vuruv-mivuh");
             assert!(!u.reason.is_empty());
+            assert!(!u.tracked_by.is_empty());
         }
+        assert_eq!(report.unsupported[0].status, "unknown");
+        assert_eq!(report.unsupported[1].status, "lower_bound");
         let text = render(&report);
-        assert!(text.contains("UNSUPPORTED author_exit"), "{text}");
+        assert!(text.contains("UNSUPPORTED active_work_ms"), "{text}");
         assert!(
-            text.contains("UNSUPPORTED delivery_cost_and_duration"),
+            text.contains("UNSUPPORTED total_operator_interventions"),
             "{text}"
         );
-        assert!(text.contains("cost_usd=unknown") || report.deliveries.is_empty());
+        assert!(report.deliveries.is_empty());
     }
 
     #[test]
@@ -4366,6 +4950,129 @@ mod tests {
         assert!(r.capture.observations_out_of_window >= 1);
     }
 
+    /// `build_index` validates a REUSE/ASSESSMENT record's shape but must also
+    /// apply the SAME frozen window used for every other native observation
+    /// (exposure/open/launch events) — otherwise a receipt or verdict from
+    /// outside the batch window is silently admitted as a valid claim
+    /// (review 01M2CS8FMFPCPZKFPM65VGV5BH, TKT-figil-fobud-niluk).
+    #[test]
+    fn reuse_created_before_the_frozen_window_does_not_count_as_a_claim() {
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some("2026-01-02T00:00:00Z".parse().unwrap()),
+            until: None,
+        };
+        // The reuse itself is dated BEFORE the frozen window opened.
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-01T12:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let before = c.tuples.len();
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(before, c.tuples.len(), "sanity: capture untouched");
+        assert_eq!(r.claimed, 0, "the out-of-window reuse must not be a claim");
+        assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, 0);
+        assert_eq!(only(&r).claimed_outcome, None);
+        assert!(r.capture.observations_out_of_window >= 1);
+        // The eligible opportunity itself is untouched — only the bad claim is
+        // dropped, matching the excluded/rejected_claims split elsewhere.
+        assert_eq!(r.eligible, 1);
+    }
+
+    #[test]
+    fn reuse_created_after_the_frozen_window_does_not_count_as_a_claim() {
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: None,
+            until: Some("2026-01-01T18:00:00Z".parse().unwrap()),
+        };
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-01T12:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.claimed, 0);
+        assert_eq!(only(&r).claimed_outcome, None);
+        assert!(r.capture.observations_out_of_window >= 1);
+        assert_eq!(r.eligible, 1);
+    }
+
+    #[test]
+    fn assessment_outside_the_frozen_window_does_not_certify_a_verdict() {
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some("2026-01-02T12:00:00Z".parse().unwrap()),
+            until: None,
+        };
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            // The reuse is inside the window; only the assessment is not.
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T13:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-02T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.claimed, 1, "the reuse itself is a valid, in-window claim");
+        assert_eq!(
+            r.assessed, 0,
+            "the out-of-window assessment must not certify a verdict"
+        );
+        assert_eq!(only(&r).assessed_verdict, None);
+        assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, 0);
+        assert!(r.capture.observations_out_of_window >= 1);
+    }
+
+    #[test]
+    fn an_undated_reuse_or_assessment_is_unresolved_not_silently_admitted() {
+        // Undated only differs from Inside once a window is actually
+        // declared — an undeclared window treats everything as Inside, same
+        // as every other native observation.
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            until: None,
+        };
+        let mut r1 = reuse(
+            "r1",
+            "src-1",
+            "TKT-1",
+            "gen-1",
+            "used",
+            "2026-01-02T00:00:00Z",
+        );
+        r1.as_object_mut().unwrap().remove("created_at");
+        let tuples = vec![finding("src-1", "author-gen", "2026-01-01T00:00:00Z"), r1];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.claimed, 0);
+        assert_eq!(r.capture.observations_undated, 1);
+    }
+
     #[test]
     fn an_operator_bound_exposure_is_not_agent_exposure() {
         let mut tuples = verified_tuples();
@@ -4559,7 +5266,7 @@ mod tests {
         assert_eq!(r.verified_reuse.rate, None);
         let text = render(&r);
         assert!(text.contains("unknown (no denominator)"), "{text}");
-        assert!(text.contains("evaluator_version=2"), "{text}");
+        assert!(text.contains("evaluator_version=3"), "{text}");
     }
 
     #[test]
