@@ -44,6 +44,26 @@ the daemon's running priced total is the successor's and does not, so a stale
 result with no provider figure is `cost_basis: unknown`, not a daemon-priced
 final cost.
 
+The same fence also gates `handle_event`'s effects on the LIVE `AgentRecord`
+and adjacent supervisor state, not just what these two observations report.
+Session-fenced telemetry had previously shipped decoupled from unfenced
+lifecycle mutation: a stale predecessor's `Started`/`Usage`/`Completed`/
+`Exited` could still resume a paused successor, overwrite its
+`session_id`/`transport_outage`/`recovery`, add to its `usage`/`cost_usd` and
+consume its budget floor, claim or route a completion on its behalf, fail it
+outright, cancel its in-flight managed verification (the generation-stable
+`spawn` id a respawn keeps cannot tell the two launches apart; only the
+session token can), or falsely flush/route its withheld turn. The chattier
+events (`AssistantText`/`ToolUse`/`Retry`/`Stderr`) and the two side-channel
+ones (`TransportFailure`/`ControlDelivered`) had the same gap against the
+successor's liveness fingerprint, `stderr_tail`, `transport_outage`, and
+durable control acknowledgement. All of the above are now gated on the same
+per-call `live` check (current session token for `name` == this event's own
+token; an unclaimed name with no registered token yet is treated as live, not
+stale, so this never engages before a first launch's `track_session` call)
+while per-launch telemetry and the generation-bound transcript log — both
+already keyed on the event's own launch — are unaffected.
+
 ## `agent_final_usage` (identity `bbs-agent-final-usage`)
 
 Authored from the fenced `Completed` handler at **every** result path,
