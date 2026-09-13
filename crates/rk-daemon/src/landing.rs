@@ -502,6 +502,17 @@ struct CheckVerificationSpan<'a> {
     /// (TKT-01M0QRZ7QT8CQD74GHRN81XFT5) rather than actually executing the
     /// command in the gate worktree.
     proof_reused: bool,
+    /// `verification_proof_key(repo, candidate, check)` — the SAME digest
+    /// over repo/candidate/check-name/command/toolchain/environment-policy
+    /// `reusable_verification_proof`'s exact-key cache already keys on.
+    /// Recorded as the span's `occurrence_key` (`span.rs` module doc) so a
+    /// check whose PLAN changed — a different command, toolchain or
+    /// environment policy at the exact same candidate and plan position
+    /// (`landing_gate_replay_reruns_verify_when_its_command_changed` and
+    /// its toolchain/environment-policy siblings) — is never treated as the
+    /// same occurrence as whatever ran there before, even though `attempt`,
+    /// `candidate` and `lane` (the check's bare name) all stayed the same.
+    occurrence_key: Option<String>,
 }
 
 fn required_payload_str<'a>(
@@ -6684,13 +6695,24 @@ impl LandingPipeline {
             // This check's position in the plan, not a rework-round counter:
             // stable across a crash-resume re-run of this same plan (so a
             // repeated earlier check dedupes against the span it already
-            // wrote), but collides with a later landing round's plan over
-            // the same task the same way the single aggregate span this
-            // replaces always did (both default to the same low attempts) —
-            // no regression, just decomposed to one span per check.
+            // wrote). A LATER round over the same task reuses this same
+            // small ordinal for its own checks, but never collides with — or
+            // shadows — an earlier round's span for it: `record_phase_span`
+            // additionally fences its `(task, phase, attempt)` idempotency
+            // key on `candidate`/`lane`/`occurrence_key` (`span.rs` module
+            // doc) whenever a producer sets them, and every per-check span
+            // below does, via `tested_sha`/`check.name`/`occurrence_key`.
             let check_attempt = u32::try_from(check_index)
                 .unwrap_or(u32::MAX)
                 .saturating_add(1);
+            // Same digest `reusable_verification_proof`'s exact-key cache
+            // keys on (repo/candidate/check-name/command/toolchain/env);
+            // reused here as the span's own `occurrence_key` so a check
+            // whose PLAN changed at this exact candidate and plan position —
+            // a different command, toolchain or environment policy, never a
+            // fresh random value minted per replay — is never folded into an
+            // earlier occurrence's dedup key.
+            let occurrence_key = verification_proof_key(&entry.repo_name, tested_sha, &check);
             let resolved = ResolvedRun {
                 command: check.command.clone(),
                 cwd: check.cwd.clone(),
@@ -6709,7 +6731,6 @@ impl LandingPipeline {
                 shared_cargo_target: check.shared_cargo_target,
             };
             let progress = Arc::new(Mutex::new(RunProgress::default()));
-            let check_started = Instant::now();
 
             // Resuming after a crash landed between spending the retry
             // budget and the retry attempt completing (`gate_infra_retry_check`'s
@@ -6763,6 +6784,7 @@ impl LandingPipeline {
                             queue_wait_ms: None,
                             duration_ms: None,
                             proof_reused: false,
+                            occurrence_key: occurrence_key.clone(),
                         },
                     );
                     queue_wait_ms.push((check.name.clone(), None));
@@ -6807,7 +6829,22 @@ impl LandingPipeline {
                 {
                     return Ok(GateRunOutcome::InfraRetryExhausted);
                 }
-                let check_queue_wait_ms = progress.lock().unwrap().queue_wait_ms();
+                // Execution-only duration, measured from when this check
+                // actually started running (after admission settled) rather
+                // than from before the admission wait — the two are recorded
+                // as distinct, non-overlapping fields (`queue_wait_ms` is
+                // admission wait, this is execution) so a consumer that adds
+                // them for a total never double-counts the wait the way a
+                // single elapsed-since-before-admission timer would.
+                let (check_queue_wait_ms, check_duration_ms) = {
+                    let p = progress.lock().unwrap();
+                    (
+                        p.queue_wait_ms(),
+                        p.execution_started_at.map(|started| {
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        }),
+                    )
+                };
                 self.record_check_verification_span(
                     entry,
                     CheckVerificationSpan {
@@ -6816,15 +6853,13 @@ impl LandingPipeline {
                         candidate: tested_sha,
                         full_check_required,
                         queue_wait_ms: check_queue_wait_ms,
-                        duration_ms: u64::try_from(check_started.elapsed().as_millis()).ok(),
+                        duration_ms: check_duration_ms,
                         proof_reused: false,
+                        occurrence_key: occurrence_key.clone(),
                     },
                 );
                 queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
-                check_proof_keys.push((
-                    check.name.clone(),
-                    verification_proof_key(&entry.repo_name, tested_sha, &check),
-                ));
+                check_proof_keys.push((check.name.clone(), occurrence_key.clone()));
                 passed_checks.push(check.name.clone());
                 continue;
             }
@@ -6867,13 +6902,11 @@ impl LandingPipeline {
                             queue_wait_ms: None,
                             duration_ms: None,
                             proof_reused: true,
+                            occurrence_key: occurrence_key.clone(),
                         },
                     );
                     queue_wait_ms.push((check.name.clone(), None));
-                    check_proof_keys.push((
-                        check.name.clone(),
-                        verification_proof_key(&entry.repo_name, tested_sha, &check),
-                    ));
+                    check_proof_keys.push((check.name.clone(), occurrence_key.clone()));
                     passed_checks.push(check.name.clone());
                     continue;
                 }
@@ -6993,7 +7026,17 @@ impl LandingPipeline {
                     return Ok(GateRunOutcome::Fail);
                 }
             }
-            let check_queue_wait_ms = progress.lock().unwrap().queue_wait_ms();
+            // See the infra-retry branch above for why this is measured from
+            // `execution_started_at`, not from before admission.
+            let (check_queue_wait_ms, check_duration_ms) = {
+                let p = progress.lock().unwrap();
+                (
+                    p.queue_wait_ms(),
+                    p.execution_started_at.map(|started| {
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                    }),
+                )
+            };
             self.record_check_verification_span(
                 entry,
                 CheckVerificationSpan {
@@ -7002,15 +7045,13 @@ impl LandingPipeline {
                     candidate: tested_sha,
                     full_check_required,
                     queue_wait_ms: check_queue_wait_ms,
-                    duration_ms: u64::try_from(check_started.elapsed().as_millis()).ok(),
+                    duration_ms: check_duration_ms,
                     proof_reused: false,
+                    occurrence_key: occurrence_key.clone(),
                 },
             );
             queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
-            check_proof_keys.push((
-                check.name.clone(),
-                verification_proof_key(&entry.repo_name, tested_sha, &check),
-            ));
+            check_proof_keys.push((check.name.clone(), occurrence_key));
             passed_checks.push(check.name);
         }
         self.space.out(
@@ -7183,30 +7224,30 @@ impl LandingPipeline {
             queue_wait_ms,
             duration_ms,
             proof_reused,
+            occurrence_key,
         } = occurrence;
-        let _ = crate::span::record_phase_span(
-            &self.space,
-            &entry.repo_name,
-            "daemon",
-            &crate::span::PhaseSpan::from_durations(
-                &entry.task,
-                crate::span::Phase::VerificationQueued,
-                queue_wait_ms,
-                duration_ms,
-                Utc::now(),
-            )
-            .attempt(attempt)
-            .repo(&entry.repo_name)
-            .target(&entry.target)
-            .candidate(candidate)
-            .lane(check_name)
-            .proof_kind(if full_check_required {
-                "full-final"
-            } else {
-                "focused-inner"
-            })
-            .proof_reused(proof_reused),
-        );
+        let mut span = crate::span::PhaseSpan::from_durations(
+            &entry.task,
+            crate::span::Phase::VerificationQueued,
+            queue_wait_ms,
+            duration_ms,
+            Utc::now(),
+        )
+        .attempt(attempt)
+        .repo(&entry.repo_name)
+        .target(&entry.target)
+        .candidate(candidate)
+        .lane(check_name)
+        .proof_kind(if full_check_required {
+            "full-final"
+        } else {
+            "focused-inner"
+        })
+        .proof_reused(proof_reused);
+        if let Some(key) = occurrence_key {
+            span = span.occurrence_key(key);
+        }
+        let _ = crate::span::record_phase_span(&self.space, &entry.repo_name, "daemon", &span);
     }
 
     /// Settle a gate-infrastructure-death retry's outcome — the ordinal-2
@@ -16724,6 +16765,273 @@ checks: [
         );
     }
 
+    /// A check that genuinely waits behind a held admission permit must
+    /// record that wait as `queue_wait_ms`, NOT fold it into `duration_ms` —
+    /// otherwise a consumer that adds the two together (a sound thing to do
+    /// under the additive contract) double-counts the wait. Reuses the same
+    /// held-permit fixture as `healthy_admission_wait_does_not_spend_execution_or_retry_budget`.
+    #[tokio::test]
+    async fn check_duration_excludes_admission_wait_and_is_tagged_additive() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+        let mut permit = pipeline
+            .supervisor
+            .acquire_verification_admission("code-repo", 1)
+            .await;
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "duration contract".into(),
+            ..Default::default()
+        };
+        let plan = pipeline
+            .resolve_gate_plan_at(&entry, &git_repo, &GateConfig::default(), &head_sha)
+            .await
+            .unwrap();
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            drop(permit.take());
+        };
+        let (outcome, ()) = tokio::join!(
+            pipeline.execute_gate_plan_at(&mut entry, &git_repo, plan, &head_sha),
+            release
+        );
+        assert_eq!(outcome.unwrap(), GateRunOutcome::Pass);
+
+        let spans = crate::span::spans_for_task(&space, "code-repo", "duration contract").unwrap();
+        let held_check = spans
+            .iter()
+            .find(|s| {
+                s["phase"] == "verification" && s["queue_wait_ms"].as_i64().unwrap_or(0) > 200
+            })
+            .expect("the first check must have actually waited on the held admission permit");
+        let wait = held_check["queue_wait_ms"].as_i64().unwrap();
+        let duration = held_check["duration_ms"].as_i64().unwrap();
+        assert!(wait >= 400, "{held_check:?}");
+        assert!(
+            duration < 300,
+            "execution duration must not absorb the admission wait: {held_check:?}"
+        );
+        assert_eq!(held_check["duration_semantic"], "additive");
+    }
+
+    /// A candidate that advances the same task through a second landing
+    /// round (a rework/conflict-correction round preparing a new merge
+    /// object) must get its own check spans, never silently shadowed by the
+    /// first round's plan-position ordinals even though both rounds reuse
+    /// the exact same small ordinals — the actual capture history this
+    /// reproduces: only an original candidate's spans existed even though a
+    /// later candidate progressed through the same checks. Also covers exact
+    /// replay staying idempotent.
+    #[tokio::test]
+    async fn a_new_candidate_gets_its_own_check_spans_without_colliding_with_an_earlier_round() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: a"]);
+        let candidate_a = rev_parse(repo_dir.path(), "feature");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let mut entry = LandingQueueEntry {
+            repo_name: "round-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: candidate_a.clone(),
+            diff_class: "doc-only".into(),
+            task: "advance through two rounds".into(),
+            ..Default::default()
+        };
+        let plan_a = pipeline
+            .resolve_gate_plan_at(&entry, &git_repo, &GateConfig::default(), &candidate_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            pipeline
+                .execute_gate_plan_at(&mut entry, &git_repo, plan_a, &candidate_a)
+                .await
+                .unwrap(),
+            GateRunOutcome::Pass
+        );
+
+        // A second, genuinely new candidate for the SAME task — never
+        // previously tested.
+        std::fs::write(repo_dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: b"]);
+        let candidate_b = rev_parse(repo_dir.path(), "feature");
+        entry.admission = None;
+        let plan_b = pipeline
+            .resolve_gate_plan_at(&entry, &git_repo, &GateConfig::default(), &candidate_b)
+            .await
+            .unwrap();
+        assert_eq!(
+            pipeline
+                .execute_gate_plan_at(&mut entry, &git_repo, plan_b, &candidate_b)
+                .await
+                .unwrap(),
+            GateRunOutcome::Pass
+        );
+
+        let spans = crate::span::spans_for_task(&space, "round-repo", "advance through two rounds")
+            .unwrap();
+        let verification_spans: Vec<&Value> = spans
+            .iter()
+            .filter(|s| s["phase"] == "verification")
+            .collect();
+        assert_eq!(
+            verification_spans.len(),
+            6,
+            "both rounds' checks must be recorded, not shadowed by the earlier round's \
+             ordinals: {verification_spans:?}"
+        );
+        let candidates: std::collections::BTreeSet<&str> = verification_spans
+            .iter()
+            .map(|s| s["candidate"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            candidates,
+            std::collections::BTreeSet::from([candidate_a.as_str(), candidate_b.as_str()])
+        );
+        // Each round numbers its own checks 1, 2, 3 by plan position — the
+        // SAME small ordinals reused across rounds — so it is the
+        // `(candidate, attempt)` pair, not `attempt` alone, that must be
+        // unique across all six occurrences.
+        let attempts: std::collections::BTreeSet<u64> = verification_spans
+            .iter()
+            .map(|s| s["attempt"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            attempts,
+            std::collections::BTreeSet::from([1, 2, 3]),
+            "each round numbers its checks 1, 2, 3 by plan position: {attempts:?}"
+        );
+        let occurrences: std::collections::BTreeSet<(&str, u64)> = verification_spans
+            .iter()
+            .map(|s| {
+                (
+                    s["candidate"].as_str().unwrap(),
+                    s["attempt"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            occurrences.len(),
+            6,
+            "no two occurrences may share both candidate and attempt: {verification_spans:?}"
+        );
+
+        // Exact replay of the second round (e.g. a crash-resume re-run
+        // against the identical candidate) must stay idempotent, not mint a
+        // third round.
+        let plan_b_again = pipeline
+            .resolve_gate_plan_at(&entry, &git_repo, &GateConfig::default(), &candidate_b)
+            .await
+            .unwrap();
+        assert_eq!(
+            pipeline
+                .execute_gate_plan_at(&mut entry, &git_repo, plan_b_again, &candidate_b)
+                .await
+                .unwrap(),
+            GateRunOutcome::Pass
+        );
+        let spans_after_replay =
+            crate::span::spans_for_task(&space, "round-repo", "advance through two rounds")
+                .unwrap();
+        assert_eq!(
+            spans_after_replay
+                .iter()
+                .filter(|s| s["phase"] == "verification")
+                .count(),
+            6,
+            "an exact replay of the same candidate must be idempotent, not a third round"
+        );
+    }
+
+    /// Two repos landing the same task id independently must each number
+    /// their own checks 1, 2, 3 from a clean slate — `record_phase_span`
+    /// scopes every scan to the writer's own `entry.repo_name`, so one
+    /// repo's landing history must never perturb another's numbering.
+    #[tokio::test]
+    async fn gate_round_numbering_is_scoped_per_repo() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_a = tempfile::tempdir().unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+        for repo_dir in [&repo_a, &repo_b] {
+            init_repo(repo_dir.path());
+            write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+            git(repo_dir.path(), &["checkout", "-b", "feature"]);
+            std::fs::write(repo_dir.path().join("x.rs"), "fn x() {}\n").unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(repo_dir.path(), &["commit", "-m", "feat: x"]);
+        }
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+
+        for (repo_name, repo_dir) in [("repo-a", &repo_a), ("repo-b", &repo_b)] {
+            let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+            let head_sha = rev_parse(repo_dir.path(), "feature");
+            let mut entry = LandingQueueEntry {
+                repo_name: repo_name.into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha: head_sha.clone(),
+                diff_class: "doc-only".into(),
+                task: "shared task id".into(),
+                ..Default::default()
+            };
+            let plan = pipeline
+                .resolve_gate_plan_at(&entry, &git_repo, &GateConfig::default(), &head_sha)
+                .await
+                .unwrap();
+            assert_eq!(
+                pipeline
+                    .execute_gate_plan_at(&mut entry, &git_repo, plan, &head_sha)
+                    .await
+                    .unwrap(),
+                GateRunOutcome::Pass
+            );
+            let spans = crate::span::spans_for_task(&space, repo_name, "shared task id").unwrap();
+            let attempts: std::collections::BTreeSet<u64> = spans
+                .iter()
+                .filter(|s| s["phase"] == "verification")
+                .map(|s| s["attempt"].as_u64().unwrap())
+                .collect();
+            assert_eq!(
+                attempts,
+                std::collections::BTreeSet::from([1, 2, 3]),
+                "{repo_name}'s first landing round must number its checks 1, 2, 3 \
+                 independently of any other repo's history for the same task id"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn protected_path_touch_holds_an_inner_edge_the_same_as_a_final_one() {
         let home = tempfile::tempdir().unwrap();
@@ -17771,6 +18079,33 @@ checks: [
             reuse_events.len(),
             0,
             "the two target-dependent policy checks must never be credited as reused: {reuse_events:?}"
+        );
+
+        // The re-execution above is a genuinely distinct occurrence at the
+        // SAME candidate and the SAME plan position — attempt and candidate
+        // are unchanged, only the command (and so `occurrence_key`) differ —
+        // so it must be recorded as its own span, never shadowed by the
+        // first run's.
+        let verify_spans: Vec<Value> = space
+            .scan(&Pattern::category(Category::Event).identity(crate::span::SPAN_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.payload["lane"] == "verify")
+            .map(|t| t.payload)
+            .collect();
+        assert_eq!(
+            verify_spans.len(),
+            2,
+            "a changed command at the same candidate must still get its own span: {verify_spans:?}"
+        );
+        let occurrence_keys: std::collections::BTreeSet<&str> = verify_spans
+            .iter()
+            .map(|s| s["occurrence_key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            occurrence_keys.len(),
+            2,
+            "the two occurrences' commands differ, so their digests must too: {verify_spans:?}"
         );
     }
 
