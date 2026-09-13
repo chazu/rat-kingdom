@@ -142,8 +142,8 @@ task or requires a named peer.
   including after you exit. At least one `--area` and one `--evidence` \
   artifact are required; repeat either flag for more than one.
 - Before crediting a peer's finding or artifact as reused, record it: \
-  `rk bbs reuse <source-id> --outcome used|adapted|confirmed|rejected \"<text>\" \
-  --evidence <artifact-id>`. SOURCE is an ordinary artifact or a peer's \
+  `rk bbs reuse <source-id> --outcome used|adapted|confirmed|rejected \
+  --text \"<text>\" --evidence <artifact-id>`. SOURCE is an ordinary artifact or a peer's \
   finding/answer in your repository — not another receipt or assessment. \
   Record actual use, not a courtesy acknowledgement; this is separate from \
   question acceptance and does not require one.

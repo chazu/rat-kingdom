@@ -75,6 +75,7 @@ pub enum BbsCommand {
         task: String,
         #[arg(long, value_parser = ["used", "adapted", "confirmed", "rejected"])]
         outcome: String,
+        #[arg(long)]
         text: String,
         /// Existing artifact evidencing this receipt (repeatable; at least one required).
         #[arg(long = "evidence", required = true)]

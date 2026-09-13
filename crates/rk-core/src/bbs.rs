@@ -25,6 +25,13 @@ pub fn is_finding(tuple: &Tuple) -> bool {
         && tuple.payload["bbs_kind"] == "finding"
 }
 
+/// A daemon-mediated answer to a BBS question (see [`is_question`]).
+pub fn is_answer(tuple: &Tuple) -> bool {
+    tuple.category == Category::Artifact
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "answer"
+}
+
 /// A consumer's receipt recording use of an ordinary artifact or finding/answer.
 pub fn is_reuse(tuple: &Tuple) -> bool {
     tuple.category == Category::Artifact

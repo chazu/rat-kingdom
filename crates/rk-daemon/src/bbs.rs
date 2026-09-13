@@ -599,9 +599,14 @@ pub fn write(
             )
         }
         // A finding's identity binds the exact generation that published it —
-        // unlike ask/answer/accept above, a respawned agent's byte-identical
-        // republish must not silently inherit a predecessor's tuple, since
-        // author-generation is load-bearing evidence for the reuse trial.
+        // unlike ask/answer/accept above, a byte-identical republish from a
+        // REPLACEMENT generation (a new `SpawnId`, e.g. a fresh `agent.spawn`
+        // after the original was abandoned) must not silently inherit a
+        // predecessor's tuple, since author-generation is load-bearing
+        // evidence for the reuse trial. This is NOT triggered by `rk
+        // respawn`/`agent.respawn`, which deliberately continues the SAME
+        // `SpawnId` (`Supervisor::respawn_mode` reads `record.spawn_id()`
+        // unchanged) — that case is and must remain an idempotent retry.
         "bbs.publish" => {
             let p: PublishParams = parse(params)?;
             check_text(&p.text)?;
@@ -668,35 +673,49 @@ pub fn write(
                 return Err(invalid("task is required"));
             }
             let source = get_post(space, &p.source)?;
-            // An ordinary artifact (no `bbs_kind` at all) is reusable
-            // regardless of lifecycle — a daemon/operator-authored Furniture
-            // artifact (e.g. a gate result) can carry useful reproduction
-            // evidence just as much as a Session-lifecycle one. Only a BBS
-            // record that is itself a receipt/assessment/telemetry kind (or
-            // a question, rejected already by the category check) is barred;
-            // `finding`/`answer` are explicitly allowed BBS kinds.
-            if source.category != Category::Artifact
-                || matches!(source.payload["bbs_kind"].as_str(), Some(k) if !matches!(k, "finding" | "answer"))
-            {
+            // An ordinary artifact is reusable regardless of lifecycle only
+            // when `bbs_kind` is genuinely ABSENT — a daemon/operator-authored
+            // Furniture artifact (e.g. a gate result) carries useful
+            // reproduction evidence just as much as a Session-lifecycle one.
+            // A record that CARRIES a `bbs_kind` must satisfy the real
+            // `is_finding`/`is_answer` predicates (category + Furniture
+            // lifecycle + exact string), not merely have that string
+            // somewhere in its payload — otherwise a forged Session-lifecycle
+            // artifact claiming `"bbs_kind":"finding"`, or a non-string
+            // `bbs_kind`, would pass as a legitimate typed record it is not.
+            let bbs_kind_present = source.payload.get("bbs_kind").is_some();
+            let ok = source.category == Category::Artifact
+                && (!bbs_kind_present
+                    || rk_core::bbs::is_finding(&source)
+                    || rk_core::bbs::is_answer(&source));
+            if !ok {
                 return Err(invalid(
                     "reuse source must be an ordinary artifact or a finding/answer, not a receipt, assessment, or telemetry record",
                 ));
             }
             check_repo(record, &source.scope)?;
             check_evidence(space, &p.evidence, &source.scope)?;
-            let task = tickets.resolve(&p.task)?;
-            let task = task.map_or(p.task.clone(), |t| t.identity);
+            let task_ticket = tickets.resolve(&p.task)?;
+            if task_ticket.as_ref().is_some_and(|t| t.scope != source.scope) {
+                return Err(invalid("task belongs to a different repository"));
+            }
+            let task = task_ticket.map_or(p.task.clone(), |t| t.identity);
             if let Some(record) = record {
                 let owned = record.task.as_deref().unwrap_or("");
                 if !tickets.id_spellings(owned)?.contains(&task) {
                     return Err(forbidden("reuse must reference your own assigned task"));
                 }
             }
+            // The consuming TASK is part of the receipt's logical identity,
+            // not just its payload: two different tasks genuinely reusing the
+            // same source the same way (same outcome/text/evidence/key) must
+            // get two distinct receipts, never collide into one retry.
             let key = rk_core::action::canonical_digest(&json!([
                 caller,
                 spawn,
                 "reuse",
                 source.id,
+                task,
                 p.outcome,
                 p.key.as_deref().unwrap_or(&p.text),
                 p.evidence
@@ -1061,6 +1080,63 @@ mod tests {
     }
 
     #[test]
+    fn reuse_rejects_forged_typed_sources_and_binds_identity_to_task() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        let ev = evidence_artifact(&space, "repo", "ev1");
+        // A Session-lifecycle artifact merely CLAIMING `"bbs_kind":"finding"`
+        // is not what `bbs.publish` ever produces (always Furniture) — it
+        // must be rejected exactly like a non-string `bbs_kind`, not waved
+        // through because the string happens to read "finding".
+        let forged_finding = Tuple::new(
+            Category::Artifact, "repo", "forged", "someone",
+            json!({"bbs_kind":"finding","text":"not a real finding"}),
+        );
+        space.out(forged_finding.clone()).unwrap();
+        let non_string_kind = Tuple::new(
+            Category::Artifact, "repo", "non-string-kind", "someone",
+            json!({"bbs_kind":123}),
+        );
+        space.out(non_string_kind.clone()).unwrap();
+        let reuse = |source: &str, task: &str| {
+            write(&space, &tickets, "operator", None, "bbs.reuse",
+                &json!({"source":source,"task":task,"outcome":"used","text":"x","evidence":[ev]}))
+        };
+        assert!(
+            reuse(&forged_finding.id.to_string(), "task-a").is_err(),
+            "a forged Session-lifecycle 'finding' must not pass as a typed source"
+        );
+        assert!(
+            reuse(&non_string_kind.id.to_string(), "task-a").is_err(),
+            "a non-string bbs_kind must not pass as an ordinary artifact"
+        );
+
+        // Cross-repo task: a task ticket that actually resolves, but to a
+        // DIFFERENT repository than the source, must be rejected — not just
+        // an unresolvable string (which harmlessly falls back to itself).
+        let ordinary = evidence_artifact(&space, "repo", "ordinary");
+        let foreign_task = Tuple::new(Category::Task, "otherrepo", "OTHER-1", "operator", json!({"title":"x"}));
+        space.out(foreign_task.clone()).unwrap();
+        let cross_repo = reuse(&ordinary, "OTHER-1").unwrap_err();
+        assert!(cross_repo.message.contains("different repository"), "{}", cross_repo.message);
+
+        // The consuming TASK is part of the receipt's logical identity: two
+        // different tasks reusing the same source the same way (identical
+        // outcome/text/evidence/key) must get two DISTINCT receipts, and an
+        // exact retry under the SAME task must still collapse.
+        let for_task_a = reuse(&ordinary, "task-a").unwrap();
+        let retry_task_a = reuse(&ordinary, "task-a").unwrap();
+        assert_eq!(retry_task_a["id"], for_task_a["id"], "same task, same content: idempotent");
+        assert_eq!(retry_task_a["written"], false);
+        let for_task_b = reuse(&ordinary, "task-b").unwrap();
+        assert_ne!(
+            for_task_b["id"], for_task_a["id"],
+            "a different consuming task must not receive the first task's receipt"
+        );
+        assert_eq!(for_task_b["written"], true);
+    }
+
+    #[test]
     fn assess_is_operator_only_and_retains_prior_assessments_by_persistence_order() {
         let space = Space::open_in_memory().unwrap();
         let tickets = Tickets::new(space.clone(), "castle".into());
@@ -1120,32 +1196,43 @@ mod tests {
     }
 
     #[test]
-    fn publish_and_reuse_identity_is_generation_bound_but_ask_semantics_are_unchanged() {
+    fn publish_identity_is_bound_to_a_replacement_generation_but_ask_semantics_are_unchanged() {
         let space = Space::open_in_memory().unwrap();
         let tickets = Tickets::new(space.clone(), "castle".into());
         let ev = evidence_artifact(&space, "repo", "ev1");
-        let gen1 = agent_record("alice", "parser");
-        let gen2 = agent_record("alice", "parser");
-        assert_ne!(gen1.spawn, gen2.spawn, "test fixture must use distinct generations");
+        // Two distinct `SpawnId`s model a REPLACEMENT generation (a fresh
+        // `agent.spawn` after the original was abandoned/lost) — not `rk
+        // respawn`/`agent.respawn`, which deliberately continues the SAME
+        // `SpawnId` (`Supervisor::respawn_mode` reads `record.spawn_id()`
+        // unchanged) and is exactly the same-generation retry case asserted
+        // via `retry_same_gen` below.
+        let original_generation = agent_record("alice", "parser");
+        let replacement_generation = agent_record("alice", "parser");
+        assert_ne!(
+            original_generation.spawn, replacement_generation.spawn,
+            "test fixture must use distinct generations"
+        );
 
-        let first = write(&space, &tickets, "alice", Some(&gen1), "bbs.publish", &publish_params(&ev)).unwrap();
-        let retry_same_gen = write(&space, &tickets, "alice", Some(&gen1), "bbs.publish", &publish_params(&ev)).unwrap();
-        assert_eq!(retry_same_gen["id"], first["id"], "a retry from the same generation is idempotent");
+        let first = write(&space, &tickets, "alice", Some(&original_generation), "bbs.publish", &publish_params(&ev)).unwrap();
+        let retry_same_gen = write(&space, &tickets, "alice", Some(&original_generation), "bbs.publish", &publish_params(&ev)).unwrap();
+        assert_eq!(retry_same_gen["id"], first["id"], "a retry from the same generation (incl. after `rk respawn`) is idempotent");
         assert_eq!(retry_same_gen["written"], false);
-        let other_gen = write(&space, &tickets, "alice", Some(&gen2), "bbs.publish", &publish_params(&ev)).unwrap();
+        let other_gen = write(&space, &tickets, "alice", Some(&replacement_generation), "bbs.publish", &publish_params(&ev)).unwrap();
         assert_ne!(
             other_gen["id"], first["id"],
-            "a byte-identical publish from a DIFFERENT generation must not inherit the predecessor's tuple"
+            "a byte-identical publish from a REPLACEMENT generation must not inherit the predecessor's tuple"
         );
         assert_eq!(other_gen["written"], true);
 
         // Historical `ask` semantics must not change: a content-identical
         // retry from a different generation still collapses into the same
-        // durable question (this is what lets a respawned agent's retry
-        // survive a restart without creating a duplicate question).
+        // durable question (this is what lets a REPLACEMENT generation's
+        // retry — a fresh `agent.spawn` after the original was lost, not a
+        // same-`SpawnId` `rk respawn` — survive without creating a duplicate
+        // question).
         let ask_params = json!({"repo":"repo","task":"parser","text":"Which grammar?"});
-        let q1 = write(&space, &tickets, "alice", Some(&gen1), "bbs.ask", &ask_params).unwrap();
-        let q2 = write(&space, &tickets, "alice", Some(&gen2), "bbs.ask", &ask_params).unwrap();
+        let q1 = write(&space, &tickets, "alice", Some(&original_generation), "bbs.ask", &ask_params).unwrap();
+        let q2 = write(&space, &tickets, "alice", Some(&replacement_generation), "bbs.ask", &ask_params).unwrap();
         assert_eq!(q1["id"], q2["id"], "ask must still collapse across generations");
         assert_eq!(q2["written"], false);
     }
