@@ -39,14 +39,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// `schema_version`, when diffing two reports across a rebuild.
 ///
 /// * 1 — initial S3 evaluator (`TKT-tavik-kifos-lozuf`).
-/// * 2 — `TKT-buruk-parut-zisoh` (slice A): native record identity binding,
-///   evidence resolution, repo/window scope, and opportunity-denominator
-///   retention. Author-exit and per-delivery cost were reported as UNSUPPORTED.
-/// * 3 — `TKT-bonik-vuruv-mivuh` (slice B): author-exit derived from a physical
-///   exit observation bound to an exact `(spawn, session)`, and per-delivery
-///   cost derived per proven provider segment with explicit finality. The two
-///   derivations slice A withheld are now real, so a version-2 and a version-3
-///   report of the same inputs are NOT comparable on those fields.
+/// * 2 — `TKT-buruk-parut-zisoh`: identity, evidence, scope and denominator validation.
+/// * 3 — `TKT-bonik-vuruv-mivuh`: physical author exits and final provider-segment cost.
+///   These fields are not comparable between version 2 and version 3 reports.
 pub const EVALUATOR_VERSION: u32 = 3;
 
 /// Frozen per the design doc: "three verified used/adapted effects across at
@@ -197,11 +192,9 @@ fn identity_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     None
 }
 
-/// `rk_daemon::span::SPAN_IDENTITY`: the identity every phase-span Event is
-/// written under.
+/// Native phase-span identity (`rk_daemon::span::SPAN_IDENTITY`).
 const SPAN_IDENTITY: &str = "task_span";
-/// Every `rk_daemon::span::Phase::as_str()` value, in declaration order. A
-/// span naming anything else was not written by that enum.
+/// Closed producer values from `rk_daemon::span::Phase::as_str()`.
 const SPAN_PHASES: [&str; 12] = [
     "ticket_ready",
     "claimed",
@@ -216,9 +209,7 @@ const SPAN_PHASES: [&str; 12] = [
     "delivery_closure",
     "attention_hold",
 ];
-/// The only `duration_semantic` any producer stamps
-/// (`rk_daemon::span::PhaseSpan::from_durations`): `queue_wait_ms` and
-/// `duration_ms` are disjoint, so summing both is sound.
+/// `PhaseSpan::from_durations` declares queue wait and duration disjoint.
 const ADDITIVE_DURATION: &str = "additive";
 
 /// Native events that prove an agent generation actually started a process, so
@@ -226,9 +217,7 @@ const ADDITIVE_DURATION: &str = "additive";
 /// counted for a spawn that never ran. `spawn` is additive on these events
 /// (S2's `48fb2da`); a `harness_result` also proves the generation ran.
 const LAUNCH_EVENT_IDENTITIES: [&str; 2] = ["agent_spawned", "agent_respawned"];
-/// `LaunchRow.kind` for a record that observes a physical launch ATTEMPT,
-/// as opposed to one that merely proves the generation ran. Only these are
-/// counted as attempts a session was never observed for.
+/// Physical launch attempts without observed sessions; authored records do not count.
 const LAUNCH_EVENT_KIND: &str = "launch_event";
 
 /// `AgentState` values that mean this launch produced its *last* provider result.
@@ -239,9 +228,7 @@ const FINAL_COST_COVERAGE: &str = "final";
 /// The non-final values the producer emits: `partial_unknown` (more model work ran past the last result), `none` (no result was ever reported), `unknown` (no watch survived).
 const NON_FINAL_COST_COVERAGE: [&str; 3] = ["partial_unknown", "none", "unknown"];
 
-/// The only `cost_basis` a *provider-reported* total may carry. The daemon's
-/// own priced-increment fallback is an estimate of an estimate: it is reported
-/// in its own field and never pooled with this one.
+/// Provider-reported totals; keep the daemon-priced fallback in a separate field.
 const PROVIDER_COST_BASIS: &str = "provider_reported_segment_total";
 const DAEMON_COST_BASIS: &str = "daemon_priced_increments";
 
@@ -816,8 +803,7 @@ fn unknown_coverage() -> Coverage {
     }
 }
 
-/// One occurrence bound to real evidence already in the capture — never a
-/// bare assertion — plus the operator's stated reason it counts.
+/// A captured evidence occurrence and the operator's reason it counts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnnotatedEvidence {
@@ -1161,9 +1147,7 @@ pub struct MechanismResult {
     pub effect_pairs: Vec<String>,
 }
 
-/// Phase durations, bucketed. Deliberately NOT one "active" number: a phase
-/// duration is wall-clock time a phase span covered, which is not the same
-/// thing as model-active work.
+/// Wall-clock phase durations, kept separate from unknown model-active work.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PhaseDurations {
     /// Every phase that is neither verification admission nor a human wait.
@@ -1193,16 +1177,12 @@ pub struct CostSegment {
     pub finality_reason: String,
 }
 
-/// One physical process launch of one generation: the `(spawn, session)` pair
-/// S2's contract names as the only safe aggregation key.
+/// One physical launch, keyed by S2's `(spawn, session)` contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct LaunchObservation {
-    /// `None` for an attempt observed only through a launch EVENT
-    /// (`agent_spawned`/`agent_respawned`), which names no session.
+    /// `None` for sessionless `agent_spawned`/`agent_respawned` observations.
     pub session: Option<String>,
-    /// What observed this attempt: `agent_exit`, `agent_final_usage` (the
-    /// process reported usage but no exit was captured — live, or its exit
-    /// is outside the capture), or `launch_event`.
+    /// Observation source: `agent_exit`, `agent_final_usage`, or `launch_event`.
     pub observed_via: String,
     pub launched_at: Option<String>,
     pub exited_at: Option<String>,
@@ -1210,15 +1190,11 @@ pub struct LaunchObservation {
     pub exit_code: Option<i64>,
     pub crashed: Option<bool>,
     pub prior_state: Option<String>,
-    /// `exited_at - launched_at`. PROCESS LIFETIME, not measured active model
-    /// work: a Claude process can sit paused awaiting verification or the
-    /// operator for most of it.
+    /// `exited_at - launched_at`: process lifetime includes paused time.
     pub process_lifetime_ms: Option<i64>,
 }
 
-/// One completion (`harness_result`) for a generation. Task-completion
-/// evidence only: it is emitted at `rk done`, before terminal provider usage
-/// and while the OS process is still alive, so its cost is provisional.
+/// `harness_result` at `rk done`: task completion with provisional cost, before exit.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionObservation {
     pub record: String,
@@ -1228,8 +1204,7 @@ pub struct CompletionObservation {
     pub failed: bool,
 }
 
-/// Everything observed for one agent generation on one task. Every attempt,
-/// including every failure, is retained.
+/// Every observation and attempt for a task generation, including failures.
 #[derive(Debug, Clone, Serialize)]
 pub struct GenerationObservation {
     pub spawn: String,
@@ -1252,45 +1227,28 @@ pub struct DeliveryCost {
     pub generations: Vec<GenerationObservation>,
     pub completions: usize,
     pub failed_completions: usize,
-    /// Every observed launch ATTEMPT, not every observed exit: a live
-    /// generation, or one whose exit fell outside the capture, still
-    /// launched. See `observed_attempts`.
+    /// All launch attempts, including those without a captured exit.
     pub launches: usize,
     pub exits: usize,
-    /// Sum of the last provider-reported total per proven segment. `None`
-    /// whenever any observed segment's cost is unknown or only partial —
-    /// never a silent zero and never a partial sum presented as a total.
+    /// Sum final provider-segment totals; `None` if any segment is partial or unknown.
     pub reported_cost_estimate_usd: Option<f64>,
     pub reported_cost_basis: Option<String>,
-    /// `complete` (every segment final), `partial` (some segment reported an
-    /// amount that is not final), `missing` (no final-usage observation at
-    /// all), `none_observed` (no native generation observed for this task).
+    /// `complete`, `partial`, `missing` usage, or `none_observed` generations.
     pub cost_coverage: String,
-    /// Amounts that were reported but are NOT final, kept separate so a
-    /// partial figure is never read as spend.
+    /// Nonfinal reported amounts, kept separate from final spend.
     pub partial_reported_usd: Option<f64>,
-    /// The supervisor's own priced-increment fallback for harnesses that do
-    /// not self-report USD. An estimate of an estimate: reported separately
-    /// and never pooled with a provider-reported total.
+    /// Daemon-priced fallback estimates, never pooled with provider-reported totals.
     pub daemon_priced_estimate_usd: Option<f64>,
-    /// `harness_result.cost_usd`, summed per generation. PROVISIONAL: emitted
-    /// at `rk done`, before terminal provider usage. Never a final spend and
-    /// never merged into `reported_cost_estimate_usd`.
+    /// Provisional `harness_result.cost_usd` per generation, separate from final spend.
     pub provisional_completion_cost_usd: Option<f64>,
     pub unknown_cost: Vec<String>,
-    /// Sum of `exited_at - launched_at` over observed launches. Labelled
-    /// process lifetime deliberately.
+    /// Sum process lifetimes (`exited_at - launched_at`) over observed launches.
     pub process_lifetime_ms: Option<i64>,
-    /// Always `None`. No native observation distinguishes model-active time
-    /// from a process paused awaiting verification or the operator, so this
-    /// stays an explicit unknown rather than being aliased to process
-    /// lifetime or to a phase-duration sum.
+    /// Always `None`: native observations cannot separate active work from paused time.
     pub active_work_ms: Option<i64>,
     pub active_work_coverage: String,
     pub phase_ms: PhaseDurations,
-    /// `Some(true)` only on an actual `delivery_closure` span in this repo and
-    /// window. A `merge` span alone is not proof (a merge can be reverted);
-    /// absence is unknown, not a negative.
+    /// `Some(true)` requires an in-scope `delivery_closure`; merge alone is insufficient.
     pub accepted: Option<bool>,
     pub acceptance_evidence: Option<String>,
     /// Resolved evidence ids from `ReviewedAnnotation` for this task.
@@ -1301,18 +1259,14 @@ pub struct DeliveryCost {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QualitySummary {
-    /// `attention_hold` phase spans in this repo and window. A LOWER BOUND on
-    /// operator interventions: one that left no span is not counted.
+    /// In-scope `attention_hold` spans: a lower bound on operator interventions.
     pub attention_hold_spans: usize,
     pub interventions_known: usize,
     pub interventions_coverage: String,
     pub rework_spans: usize,
     pub incorrect_reuse: usize,
     pub regressions: Vec<String>,
-    /// Resolved `ReviewedAnnotation` counts across every delivery, kept
-    /// SEPARATE from the daemon-observed span counts above: a reviewer's
-    /// bounded, evidenced judgment answers a different question than a
-    /// telemetry lower bound, and summing them would misstate both.
+    /// Evidenced review judgments, separate from telemetry counts to avoid double counting.
     pub reviewed_repeated_investigations: usize,
     pub reviewed_rework: usize,
     pub reviewed_interventions: usize,
@@ -1533,8 +1487,7 @@ fn task_span_defect(t: &Value) -> Option<String> {
              it, never by the worker it describes"
         ));
     }
-    // Repo binding: the span is written into the ticket's own repo scope, and
-    // `payload.repo`, where a producer set it, is that same repo.
+    // A present payload.repo must match the ticket's tuple scope.
     let scope = str_field(t, &["scope"]);
     if scope.is_empty() {
         return Some("tuple scope is absent; a phase span is scoped to its repo".into());
@@ -1586,8 +1539,7 @@ fn task_span_defect(t: &Value) -> Option<String> {
             w[0].0, w[1].0
         ));
     }
-    // Durations are derived by the producer as non-negative millisecond
-    // differences over exactly those timestamps.
+    // Producer durations are nonnegative differences between their timestamps.
     for field in ["queue_wait_ms", "duration_ms"] {
         match &t["payload"][field] {
             Value::Null => {}
@@ -1623,9 +1575,7 @@ fn task_span_defect(t: &Value) -> Option<String> {
             ));
         }
     }
-    // `duration_semantic` is stamped by exactly one constructor with exactly
-    // one value; anything else is a claim the producer never makes, and
-    // `"additive"` is what unlocks summing a wait into `verification_ms`.
+    // Only the producer's additive semantic permits summing queue wait into verification.
     match &t["payload"]["duration_semantic"] {
         Value::Null => {}
         Value::String(v) if v == ADDITIVE_DURATION => {}
@@ -1646,9 +1596,7 @@ fn task_span_defect(t: &Value) -> Option<String> {
             t["payload"]["proof_reused"]
         ));
     }
-    // The occurrence fence. Each is optional, but a present one must be a
-    // usable non-empty string: an empty `occurrence_key` claims a fence it
-    // cannot provide.
+    // Optional occurrence fences must be nonempty strings when present.
     for field in [
         "terminal_reason",
         "target",
@@ -1863,9 +1811,7 @@ fn created_at(t: &Value) -> Option<DateTime<Utc>> {
     t["created_at"].as_str().and_then(parse_rfc3339)
 }
 
-/// A native observation's OWN timestamp field (`exited_at`, `observed_at`),
-/// which is what the window must be applied to — `created_at` is when the
-/// tuple was written, not when the thing happened.
+/// Window by producer time (`exited_at`/`observed_at`), not tuple persistence time.
 fn payload_time(t: &Value, field: &str) -> Option<DateTime<Utc>> {
     t["payload"][field].as_str().and_then(parse_rfc3339)
 }
@@ -1926,14 +1872,10 @@ struct CompletionRow {
 /// between the exit and the consuming decision.
 struct LaunchRow {
     repo: String,
-    /// The task this launch was observed under, retained so a frozen task
-    /// whose ONLY native record is a launch event still owns a delivery.
-    /// Empty when the observing record names no task.
+    /// Observed task (or empty): enroll even tasks witnessed only by a launch event.
     task: String,
     spawn: String,
-    /// Present only for records that identify a physical launch. An
-    /// `agent_spawned`/`agent_respawned` event and an authored record do not,
-    /// so a relaunch is detected by time, not by session identity alone.
+    /// Physical-launch session, if known; sessionless relaunches require time ordering.
     session: Option<String>,
     at: Option<DateTime<Utc>>,
     record: String,
@@ -1991,9 +1933,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     let in_scope = |repo: &str| repos.is_empty() || repos.contains(repo);
     let window = &manifest.window;
 
-    // The export page and its evidence closure are ONE record set. Indexing
-    // only `tuples` makes a referenced finding/receipt that the daemon
-    // resolved into `references` read as though it were never captured.
+    // Index both export tuples and referenced evidence as one captured record set.
     let merged = capture.merged();
 
     let mut idx = Index {
@@ -2321,9 +2261,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if spawn.is_empty() {
-                // Pre-C1 completions carry no generation id. Legacy and
-                // unattributed, so retained as an explicit unknown rather
-                // than attributed to whoever shares the agent name.
+                // Legacy completions without generation IDs remain unattributed.
                 idx.unresolved.push(InvalidRecord {
                     record: record_id(t),
                     kind: "harness_result".into(),
@@ -2360,8 +2298,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
-            // `spawn` is additive on these events (S2 `48fb2da`); older rows
-            // omit it and cannot prove which generation launched.
+            // Older launch events lack spawn and cannot establish generation identity.
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if spawn.is_empty() {
                 idx.unresolved.push(InvalidRecord {
@@ -2377,8 +2314,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 repo: scope.clone(),
                 task: str_field(t, &["payload", "task"]).to_string(),
                 spawn,
-                // A launch event names no session; it is still proof of a
-                // physical launch attempt, including one that has not exited.
+                // A sessionless launch event still proves an attempt, even without exit.
                 session: None,
                 at: created_at(t),
                 record: record_id(t),
@@ -2495,9 +2431,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                     session: None,
                     at: created_at(t),
                     record: record_id(t),
-                    // An authored finding proves the generation RAN; it is
-                    // not a launch event and must not be counted as a
-                    // separate launch attempt.
+                    // An authored finding proves execution, not an additional launch attempt.
                     kind: "authored_record",
                 });
             }
@@ -2603,8 +2537,7 @@ fn resolve_author_exit(
             "{evidence_id} records an exit at {exited_at} which is AFTER the reuse at {claim_at}"
         ));
     }
-    // A manual respawn continues the same SpawnId, so an earlier exit is not
-    // proof the author was gone when the consumer decided.
+    // Respawn keeps SpawnId: an earlier exit cannot prove absence after relaunch.
     if let Some(relaunch) =
         idx.relaunch_between(repo, source_spawn, &exit.session, exited_at, claim_at)
     {
@@ -2622,9 +2555,7 @@ fn resolve_author_exit(
     Ok(evidence_id.to_string())
 }
 
-// ---------------------------------------------------------------------
-// Delivery derivation: frozen task scope, NOT surviving pairs.
-// ---------------------------------------------------------------------
+// Derive deliveries from frozen task scope, including pairs that failed evaluation.
 
 struct TaskScope {
     task: String,
@@ -2647,9 +2578,7 @@ fn frozen_task_scope(manifest: &Manifest) -> Vec<TaskScope> {
         e.batches.insert(c.batch.clone());
         e.enrollment = "frozen_consumer_task";
     }
-    // Supported fixture enrollment: a predeclared pair's consumer task is in
-    // scope for delivery accounting even when the manifest lists no
-    // `consumer_tasks` (the deterministic fixture/replay shape).
+    // Fixture pairs enroll their tasks even when consumer_tasks is omitted.
     for p in &manifest.eligible_pairs {
         let e = scopes
             .entry((p.consumer_task.clone(), p.repo.clone()))
@@ -2800,8 +2729,7 @@ pub fn compute_full(
     let mut author_exit_unsupported: Vec<AuthorExitUnsupported> = Vec::new();
     let mut pairs_out: Vec<PairResult> = Vec::new();
 
-    // Reviewed task-scoped annotations: resolved once, up front, then looked
-    // up per task in the delivery loop below.
+    // Resolve reviewed annotations once, then attach them by task.
     let mut invalid_records: Vec<InvalidRecord> = idx.invalid.clone();
     #[allow(clippy::type_complexity)]
     let mut reviewed_by_task: BTreeMap<
@@ -3337,10 +3265,7 @@ pub fn compute_full(
         .collect();
     author_exit_reuse.sort();
     let author_exit_effects = author_exit_reuse.len();
-    // A capture that does not cover its own evidence still cannot certify the
-    // goal. Truncation is one way to fall short; an incomplete reference
-    // closure is another, and the export states both. An unresolved reference
-    // could be the very receipt or assessment that changes a count.
+    // Truncated capture or incomplete references cannot certify the mechanism goal.
     let goal_blocked_reason = if capture.truncated {
         Some(
             "the tuple capture is truncated: a reuse or assessment outside the truncation window \
@@ -3388,10 +3313,7 @@ pub fn compute_full(
     let mut reviewed_rework_total = 0usize;
     let mut reviewed_interventions_total = 0usize;
     for scope in frozen_task_scope(manifest) {
-        // Spans are pre-filtered by repo and window here because
-        // `build_critical_path` dedups on `(phase, attempt)` across whatever
-        // it is handed and does not filter by scope: two repos' same-named
-        // task ids would silently merge.
+        // Filter scope before build_critical_path: its phase/attempt dedup is scope-blind.
         let task_spans: Vec<Value> = idx
             .spans
             .iter()
@@ -3427,8 +3349,7 @@ pub fn compute_full(
                             rework_spans += 1;
                         }
                         opt_sum(&mut phase_ms.work_phases_ms, dur);
-                        // Generic pre-phase queueing is a wait, not work, even
-                        // for an otherwise-active phase.
+                        // Pre-phase queueing remains wait time, even for active phases.
                         opt_sum(&mut phase_ms.queue_wait_ms, wait);
                     }
                 }
@@ -3493,9 +3414,7 @@ pub fn compute_full(
                 .filter(|c| c.repo == scope.repo && c.task == scope.task && c.spawn == spawn)
             {
                 completions_total += 1;
-                // TKT-175: an undeclared generation is also an error, but the
-                // two are recorded separately so "the rat said it was done"
-                // stays distinguishable from "nothing went wrong".
+                // TKT-175: declaration and success are independent observations.
                 let failed = c.is_error || !c.declared_done;
                 if failed {
                     failed_completions += 1;
@@ -3554,8 +3473,7 @@ pub fn compute_full(
                     process_lifetime_ms: ms,
                 });
             }
-            // A session that reported usage but never an exit: a real launch
-            // whose termination this capture does not witness.
+            // Usage proves a launch even when its exit was not captured.
             let mut usage_only: BTreeSet<&str> = BTreeSet::new();
             for u in idx
                 .usage
@@ -3614,9 +3532,7 @@ pub fn compute_full(
                 ))
             });
 
-            // Group usage by (session, provider_session): the provider reports
-            // a CUMULATIVE total within one segment, so only the last result
-            // per segment is that segment's amount.
+            // Provider totals are cumulative per (session, provider_session); take the last.
             let mut by_segment: BTreeMap<(String, Option<String>), Vec<&UsageRow>> =
                 BTreeMap::new();
             for u in idx
@@ -3649,8 +3565,7 @@ pub fn compute_full(
                         && e.spawn == spawn
                         && e.session == session
                 });
-                // One row IS its own last, whatever the order; only a
-                // multi-row segment needs persistence order to resolve.
+                // A single row needs no ordering proof; multiple rows do.
                 let (final_cost, finality_reason) = if rows.len() > 1 && !ordered {
                     (
                         false,
@@ -3693,10 +3608,7 @@ pub fn compute_full(
                         ));
                     }
                     (true, Some(_), other) => {
-                        // A final result carrying a figure under neither known
-                        // basis (e.g. the producer's own `unknown` basis for a
-                        // stale/mixed-basis segment). Never pooled with either
-                        // total and never silently dropped.
+                        // Unknown/mixed cost bases remain visible but cannot join either total.
                         unknown_cost.push(format!(
                             "{spawn}/{session}/{}: reported cost has unrecognized cost_basis={other:?}, \
                              not pooled",
@@ -3752,10 +3664,7 @@ pub fn compute_full(
         } else {
             "partial"
         };
-        // A provider total is only reported when EVERY observed segment is a
-        // final, provider-reported total. A partial segment, a null cost, or a
-        // daemon-priced segment all leave the task total unknown rather than
-        // pooling bases or presenting a partial sum as a total.
+        // Report a provider total only when every observed segment has a final provider total.
         let reported_cost_estimate_usd = (cost_coverage == "complete")
             .then_some(provider_total)
             .flatten();
@@ -3851,9 +3760,7 @@ pub fn compute_full(
         capture: idx.capture.clone(),
         invalid_records,
         unresolved_records: unresolved,
-        // Author-exit and per-delivery cost are DERIVED as of evaluator version
-        // 3. What remains genuinely underived is named here, so its absence
-        // still cannot be read as a measured zero.
+        // Version 3 derives exits and costs; remaining unsupported fields stay explicit.
         unsupported: vec![
             UnsupportedDerivation {
                 derivation: "active_work_ms".into(),
@@ -4157,6 +4064,17 @@ pub fn to_json(report: &Report) -> Value {
 
 #[cfg(test)]
 mod tests {
+    // Shared fixture timeline: hours after 2026-01-01T00:00:00Z.
+    const T0: &str = "2026-01-01T00:00:00Z";
+    const T1: &str = "2026-01-01T01:00:00Z";
+    const T2: &str = "2026-01-01T02:00:00Z";
+    const T3: &str = "2026-01-01T03:00:00Z";
+    const T10: &str = "2026-01-01T10:00:00Z";
+    const T11: &str = "2026-01-01T11:00:00Z";
+    const T12: &str = "2026-01-01T12:00:00Z";
+    const T24: &str = "2026-01-02T00:00:00Z";
+    const T48: &str = "2026-01-03T00:00:00Z";
+
     use super::*;
 
     fn manifest(pairs: Vec<EligiblePair>) -> Manifest {
@@ -4382,8 +4300,7 @@ mod tests {
         })
     }
 
-    /// Restate one payload field of a fixture, so a test states only what it
-    /// is about.
+    /// Replace one fixture payload field.
     fn field(mut t: Value, key: &str, v: Value) -> Value {
         t["payload"][key] = v;
         t
@@ -4411,9 +4328,7 @@ mod tests {
         })
     }
 
-    /// `record_phase_span`'s exact envelope (crates/rk-daemon/src/span.rs):
-    /// a castle-authored `Furniture` Event under `task_span`, scoped to the
-    /// ticket's repo, carrying `PhaseSpan::to_payload()`.
+    /// Native castle-authored Furniture `task_span`, from `PhaseSpan::to_payload()`.
     fn span_full(id: &str, payload: Value) -> Value {
         json!({
             "id": id,
@@ -5136,16 +5051,13 @@ mod tests {
         assert_eq!(c.coverage.complete, None, "a scan makes no closure claim");
     }
 
-    /// A generation observed ONLY through its launch event — spawned and
-    /// still running, or crashed before any completion, exit or usage was
-    /// recorded — is a real enrolled attempt. Seeding deliveries from
-    /// completions/exits/usage alone dropped it entirely.
+    /// Launch-only generations count as attempts even without completion, exit, or usage.
     #[test]
     fn a_generation_with_only_a_launch_event_is_still_an_enrolled_attempt() {
         let m = task_manifest("TKT-live");
         let spawned = json!({
             "id": "e1", "category": "event", "scope": "repo", "identity": "agent_spawned",
-            "instance": CASTLE, "created_at": "2026-01-01T00:00:00Z",
+            "instance": CASTLE, "created_at": T0,
             "payload": {"agent": "Live-1", "spawn": "gen-live", "task": "TKT-live"}
         });
         let r = compute(&m, &capture(vec![spawned], Order::Unknown), &[]).unwrap();
@@ -5162,9 +5074,7 @@ mod tests {
         );
     }
 
-    /// Two launches, one exited and one still live. Counting exits reported
-    /// one attempt; the second launch event is the excess over the sessions
-    /// already accounted for and is counted as the attempt it is.
+    /// Count an unexited second launch alongside the observed exited session.
     #[test]
     fn a_relaunch_with_no_exit_yet_is_counted_as_a_further_attempt() {
         let m = task_manifest("TKT-relaunch");
@@ -5176,16 +5086,9 @@ mod tests {
             })
         };
         let tuples = vec![
-            event("e1", "agent_spawned", "2026-01-01T00:00:00Z"),
-            event("e2", "agent_respawned", "2026-01-01T02:00:00Z"),
-            exit_rec(
-                "x1",
-                "TKT-relaunch",
-                "R-1",
-                "gen-r",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T01:00:00Z",
-            ),
+            event("e1", "agent_spawned", T0),
+            event("e2", "agent_respawned", T2),
+            exit_rec("x1", "TKT-relaunch", "R-1", "gen-r", T0, T1),
         ];
         let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
         let d = &r.deliveries[0];
@@ -5199,42 +5102,31 @@ mod tests {
         assert_eq!(sessions, vec![None, Some("sess-1".into())]);
     }
 
-    /// Within one provider segment the reported cost is CUMULATIVE, so the
-    /// segment's total is whichever record persisted last. `observed_at` is
-    /// stamped by the producer and can disagree with persistence order; under
-    /// a validated capture the position decides.
+    /// Cumulative cost follows persistence order even when producer timestamps disagree.
     #[test]
     fn cumulative_segment_total_comes_from_persistence_position_not_observed_at() {
         let m = task_manifest("TKT-cost");
         let usage = |id: &str, cost: f64, observed: &str| {
-            usage_rec(
-                id,
-                "TKT-cost",
-                "gen-c",
-                Some("completed"),
-                Some(cost),
-                observed,
+            field(
+                usage_rec(
+                    id,
+                    "TKT-cost",
+                    "gen-c",
+                    Some("completed"),
+                    Some(cost),
+                    observed,
+                ),
+                "agent",
+                json!("C-1"),
             )
         };
         let exit = field(
-            exit_rec(
-                "x1",
-                "TKT-cost",
-                "C-1",
-                "gen-c",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T03:00:00Z",
-            ),
+            exit_rec("x1", "TKT-cost", "C-1", "gen-c", T0, T3),
             "prior_state",
             json!("completed"),
         );
-        // Page order (= persistence order) puts the 2.00 total LAST, while
-        // its observed_at is EARLIER than the 1.00 row's.
-        let page = vec![
-            usage("u1", 1.00, "2026-01-01T02:00:00Z"),
-            usage("u2", 2.00, "2026-01-01T01:00:00Z"),
-            exit,
-        ];
+        // The $2 total persisted last despite its earlier observed_at.
+        let page = vec![usage("u1", 1.00, T2), usage("u2", 2.00, T1), exit];
         let c = parse_tuple_capture(&export_envelope(page.clone(), vec![], vec![])).unwrap();
         assert_eq!(c.order, Order::PersistenceSequence);
         let r = compute(&m, &c, &[]).unwrap();
@@ -5246,9 +5138,7 @@ mod tests {
             "the last PERSISTED cumulative total, not the latest observed_at"
         );
 
-        // The same records with no order claim: the last row is genuinely
-        // unidentifiable, so the segment is refused finality instead of
-        // being resolved by a field that cannot answer the question.
+        // Without persistence order, neither timestamp can establish the final total.
         let unordered = compute(&m, &capture(page, Order::Unknown), &[]).unwrap();
         let d = &unordered.deliveries[0];
         assert_eq!(d.cost_coverage, "partial");
@@ -5262,29 +5152,18 @@ mod tests {
         );
     }
 
-    /// A single-row segment IS its own last record whatever the order, so an
-    /// unordered capture must not manufacture a finality gap for it.
+    /// A single-row segment needs no persistence ordering claim.
     #[test]
     fn a_single_row_segment_stays_final_under_unknown_order() {
         let m = task_manifest("TKT-one");
         let tuples = vec![
-            usage_rec(
-                "u1",
-                "TKT-one",
-                "gen-o",
-                Some("completed"),
-                Some(0.75),
-                "2026-01-01T01:00:00Z",
+            field(
+                usage_rec("u1", "TKT-one", "gen-o", Some("completed"), Some(0.75), T1),
+                "agent",
+                json!("O-1"),
             ),
             field(
-                exit_rec(
-                    "x1",
-                    "TKT-one",
-                    "O-1",
-                    "gen-o",
-                    "2026-01-01T00:00:00Z",
-                    "2026-01-01T02:00:00Z",
-                ),
+                exit_rec("x1", "TKT-one", "O-1", "gen-o", T0, T2),
                 "prior_state",
                 json!("completed"),
             ),
@@ -5392,8 +5271,7 @@ mod tests {
         assert_eq!(d.task, "TKT-lonely");
         assert_eq!(d.repo, "repo");
         assert_eq!(d.enrollment, "frozen_consumer_task");
-        // No native record at all for this task: every figure is an explicit
-        // unknown, never a manufactured zero.
+        // No native observations means unknown figures, never manufactured zeroes.
         assert_eq!(d.reported_cost_estimate_usd, None);
         assert_eq!(d.cost_coverage, "none_observed");
         assert_eq!(d.active_work_ms, None);
@@ -5413,28 +5291,24 @@ mod tests {
     #[test]
     fn verification_ms_sums_only_additive_tagged_spans_and_counts_the_rest_as_legacy() {
         let m = task_manifest("TKT-verify");
-        // `from_durations` anchors `ended_at` at now and derives the two
-        // earlier stamps, so a real additive span carries all three.
+        // Native from_durations spans carry all three derived timestamps.
         let additive_span = span_full(
             "span-additive",
             json!({
                 "task": "TKT-verify", "phase": "verification", "attempt": 1,
-                "queued_at": "2026-01-01T00:00:00Z",
+                "queued_at": T0,
                 "started_at": "2026-01-01T00:00:00.500Z",
                 "ended_at": "2026-01-01T00:00:00.550Z",
                 "queue_wait_ms": 500, "duration_ms": 50,
                 "duration_semantic": ADDITIVE_DURATION, "repo": "repo"
             }),
         );
-        // A span recorded before the tag existed. The legacy dimension is the
-        // MISSING `duration_semantic`, not missing timestamps: `to_payload`
-        // has always derived both durations from the stamps, so a real legacy
-        // span still carries them.
+        // Legacy spans lack duration_semantic, but still carry the producer's timestamps.
         let legacy_span = span_full(
             "span-legacy",
             json!({
                 "task": "TKT-verify", "phase": "verification", "attempt": 2,
-                "queued_at": "2026-01-01T00:00:00Z",
+                "queued_at": T0,
                 "started_at": "2026-01-01T00:00:00.800Z",
                 "ended_at": "2026-01-01T00:00:01.700Z",
                 "queue_wait_ms": 800, "duration_ms": 900, "repo": "repo"
@@ -5489,7 +5363,7 @@ mod tests {
                     "TKT-1",
                     "C-1",
                     "gen-1",
-                    "2026-01-01T00:00:00Z",
+                    T0,
                     "2026-01-02T03:00:00Z",
                 ),
                 "prior_state",
@@ -5531,8 +5405,7 @@ mod tests {
             d.reported_cost_estimate_usd, None,
             "a forged bbs-agent-final-usage is not a provider total"
         );
-        // The generation is still known from its completion; what is absent is
-        // any cost SEGMENT, because the forged usage row never became one.
+        // Completion identifies the generation; forged usage cannot supply its cost segment.
         assert_eq!(d.cost_coverage, "missing");
         assert!(d.generations[0].cost_segments.is_empty());
     }
@@ -5589,7 +5462,7 @@ mod tests {
     fn malformed_or_forged_spans_are_rejected_without_erasing_the_selected_task() {
         let base = json!({
             "task": "TKT-span", "phase": "verification", "attempt": 1,
-            "queued_at": "2026-01-01T00:00:00Z", "started_at": "2026-01-01T00:00:00.500Z",
+            "queued_at": T0, "started_at": "2026-01-01T00:00:00.500Z",
             "ended_at": "2026-01-01T00:00:00.550Z", "queue_wait_ms": 500, "duration_ms": 50,
             "duration_semantic": ADDITIVE_DURATION, "repo": "repo"
         });
@@ -5598,8 +5471,7 @@ mod tests {
             f(&mut payload);
             span_full(id, payload)
         };
-        // A worker generation cannot author a span about itself, however well
-        // formed the rest of it is: `record_phase_span` names the castle.
+        // Native spans are castle-authored, never authored by the described worker.
         let mut worker_authored = span_full("s-worker", base.clone());
         worker_authored["instance"] = json!("Scritch-15");
         let mut ephemeral = span_full("s-ephemeral", base.clone());
@@ -5626,8 +5498,7 @@ mod tests {
                 }),
                 "not a non-negative duration",
             ),
-            // A fabricated duration with no endpoints to derive it from. The
-            // producer cannot state one without both stamps.
+            // Producer durations require both endpoints.
             (
                 mutate("s-unanchored", &|p| {
                     p["duration_ms"] = json!(9_000_000);
@@ -5691,25 +5562,14 @@ mod tests {
     fn a_matching_exit_state_is_not_a_final_cost_unless_coverage_says_final() {
         let m = task_manifest("TKT-cost");
         let delivery_for = |coverage: &Value| -> DeliveryCost {
-            // Exactly the state-only condition the old check accepted:
-            // terminal result, observed exit, prior_state agreeing.
-            let exit = exit_rec(
-                "x1",
-                "TKT-cost",
-                "C-1",
-                "gen-c",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T03:00:00Z",
-            );
+            // The old state-only check accepted this without cost coverage.
+            let exit = exit_rec("x1", "TKT-cost", "C-1", "gen-c", T0, T3);
             let exit = field(exit, "prior_state", json!("completed"));
             let exit = field(exit, "cost_coverage", coverage.clone());
-            let usage = usage_rec(
-                "u1",
-                "TKT-cost",
-                "gen-c",
-                Some("completed"),
-                Some(2.00),
-                "2026-01-01T02:00:00Z",
+            let usage = field(
+                usage_rec("u1", "TKT-cost", "gen-c", Some("completed"), Some(2.00), T2),
+                "agent",
+                json!("C-1"),
             );
             let mut r = compute(&m, &capture(vec![usage, exit], Order::Unknown), &[]).unwrap();
             r.deliveries.remove(0)
@@ -5743,8 +5603,7 @@ mod tests {
                 1,
                 "coverage={coverage}: the uncertainty is named, not silent"
             );
-            // Cost uncertainty is not exit uncertainty: the same record is
-            // still the launch's physical-exit evidence.
+            // Unknown cost does not retract physical-exit evidence.
             assert_eq!(
                 d.exits, 1,
                 "coverage={coverage}: a non-final cost does not retract the physical exit"
@@ -5757,24 +5616,10 @@ mod tests {
     fn author_exit_is_credited_from_a_valid_agent_exit_observation() {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
-            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse(
-                "r1",
-                "src-1",
-                "TKT-1",
-                "gen-1",
-                "used",
-                "2026-01-02T00:00:00Z",
-            ),
-            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
-            exit_rec(
-                "ax1",
-                "TKT-source",
-                "author",
-                "author-gen",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T12:00:00Z",
-            ),
+            finding("src-1", "author-gen", T0),
+            reuse("r1", "src-1", "TKT-1", "gen-1", "used", T24),
+            assessment("a1", "r1", "verified", T48),
+            exit_rec("ax1", "TKT-source", "author", "author-gen", T0, T12),
         ];
         let c = capture(tuples, Order::Unknown);
         let reviews = vec![review_with_exit("p1", "ax1", false)];
@@ -5788,30 +5633,14 @@ mod tests {
 
     #[test]
     fn author_exit_is_not_credited_from_a_stale_session_exit() {
-        // stale_session: true means a LATER launch of this same generation
-        // already existed when this exit was recorded; prior_state/crashed are
-        // nulled at the source rather than describing this launch.
+        // A stale exit belongs to a superseded launch; its lifecycle fields are unknown.
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
-            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse(
-                "r1",
-                "src-1",
-                "TKT-1",
-                "gen-1",
-                "used",
-                "2026-01-02T00:00:00Z",
-            ),
-            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+            finding("src-1", "author-gen", T0),
+            reuse("r1", "src-1", "TKT-1", "gen-1", "used", T24),
+            assessment("a1", "r1", "verified", T48),
             field(
-                exit_rec(
-                    "ax1",
-                    "TKT-source",
-                    "author",
-                    "author-gen",
-                    "2026-01-01T00:00:00Z",
-                    "2026-01-01T12:00:00Z",
-                ),
+                exit_rec("ax1", "TKT-source", "author", "author-gen", T0, T12),
                 "stale_session",
                 json!(true),
             ),
@@ -5831,26 +5660,12 @@ mod tests {
         let m = task_manifest("TKT-1");
         let tuples = vec![
             field(
-                usage_rec(
-                    "u1",
-                    "TKT-1",
-                    "gen-1",
-                    Some("completed"),
-                    Some(1.5),
-                    "2026-01-01T11:00:00Z",
-                ),
+                usage_rec("u1", "TKT-1", "gen-1", Some("completed"), Some(1.5), T11),
                 "provider_session",
                 json!("prov-1"),
             ),
             field(
-                exit_rec(
-                    "ax1",
-                    "TKT-1",
-                    "gen-1",
-                    "gen-1",
-                    "2026-01-01T10:00:00Z",
-                    "2026-01-01T12:00:00Z",
-                ),
+                exit_rec("ax1", "TKT-1", "gen-1", "gen-1", T10, T12),
                 "prior_state",
                 json!("completed"),
             ),
@@ -5867,32 +5682,16 @@ mod tests {
 
     #[test]
     fn cost_stays_partial_when_more_work_followed_the_last_result() {
-        // The last usage result said `paused`, but the exit's prior_state was
-        // `running`: work happened after that result, so the reported amount
-        // is partial, not final.
+        // Running after the paused result means its reported cost is partial.
         let m = task_manifest("TKT-1");
         let tuples = vec![
             field(
-                usage_rec(
-                    "u1",
-                    "TKT-1",
-                    "gen-1",
-                    Some("paused"),
-                    Some(3.0),
-                    "2026-01-01T11:00:00Z",
-                ),
+                usage_rec("u1", "TKT-1", "gen-1", Some("paused"), Some(3.0), T11),
                 "provider_session",
                 json!("prov-1"),
             ),
             field(
-                exit_rec(
-                    "ax1",
-                    "TKT-1",
-                    "gen-1",
-                    "gen-1",
-                    "2026-01-01T10:00:00Z",
-                    "2026-01-01T12:00:00Z",
-                ),
+                exit_rec("ax1", "TKT-1", "gen-1", "gen-1", T10, T12),
                 "prior_state",
                 json!("running"),
             ),
@@ -5911,23 +5710,9 @@ mod tests {
         // Healthy otherwise: only prior_state is absent, so agreement is unmet.
         let m = task_manifest("TKT-1");
         let tuples = vec![
-            usage_rec(
-                "u1",
-                "TKT-1",
-                "gen-1",
-                Some("completed"),
-                Some(4.25),
-                "2026-01-01T11:00:00Z",
-            ),
+            usage_rec("u1", "TKT-1", "gen-1", Some("completed"), Some(4.25), T11),
             field(
-                exit_rec(
-                    "ax1",
-                    "TKT-1",
-                    "gen-1",
-                    "gen-1",
-                    "2026-01-01T10:00:00Z",
-                    "2026-01-01T12:00:00Z",
-                ),
+                exit_rec("ax1", "TKT-1", "gen-1", "gen-1", T10, T12),
                 "prior_state",
                 Value::Null,
             ),
@@ -5956,12 +5741,7 @@ mod tests {
     #[test]
     fn cost_is_missing_when_no_final_usage_observation_exists() {
         let m = task_manifest("TKT-1");
-        let tuples = vec![harness_result(
-            "h1",
-            "gen-1",
-            "TKT-1",
-            "2026-01-01T12:00:00Z",
-        )];
+        let tuples = vec![harness_result("h1", "gen-1", "TKT-1", T12)];
         let c = capture(tuples, Order::Unknown);
         let r = compute(&m, &c, &[]).unwrap();
         let d = &r.deliveries[0];
@@ -6036,8 +5816,7 @@ mod tests {
     fn unsupported_derivations_are_named_with_their_reason_and_tracking_ticket() {
         // An absent metric has to be legible as absent, in machine output as
         // well as human output, or a reader fills the gap with a zero.
-        // Author-exit and delivery cost are DERIVED as of evaluator version 3;
-        // what remains genuinely underived is named here instead.
+        // Version 3 derives exits and costs; remaining unsupported fields stay explicit.
         let report = compute(&manifest(vec![]), &capture(vec![], Order::Unknown), &[]).unwrap();
         let named: Vec<&str> = report
             .unsupported
@@ -6522,8 +6301,8 @@ mod tests {
     fn assessment_window_cases_preserve_the_opportunity_and_only_credit_in_window() {
         let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         m.window = Window {
-            since: Some("2026-01-02T00:00:00Z".parse().unwrap()),
-            until: Some("2026-01-03T00:00:00Z".parse().unwrap()),
+            since: Some(T24.parse().unwrap()),
+            until: Some(T48.parse().unwrap()),
         };
         for (timestamp, expected) in [
             (Some("2026-01-02T14:00:00Z"), 1),
@@ -6542,7 +6321,7 @@ mod tests {
             }
             let c = capture(
                 vec![
-                    finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+                    finding("src-1", "author-gen", T0),
                     exposure("x1", "src-1", "gen-1", "2026-01-02T12:00:00Z"),
                     reuse(
                         "r1",
@@ -6917,23 +6696,9 @@ mod tests {
     #[test]
     fn clover_cost_exit_requires_matching_task_and_agent() {
         let m = task_manifest("TKT-1");
-        let usage = usage_rec(
-            "u",
-            "TKT-1",
-            "gen-1",
-            Some("completed"),
-            Some(4.25),
-            "2026-01-01T11:00:00Z",
-        );
+        let usage = usage_rec("u", "TKT-1", "gen-1", Some("completed"), Some(4.25), T11);
         let exit = field(
-            exit_rec(
-                "x",
-                "TKT-1",
-                "gen-1",
-                "gen-1",
-                "2026-01-01T10:00:00Z",
-                "2026-01-01T12:00:00Z",
-            ),
+            exit_rec("x", "TKT-1", "gen-1", "gen-1", T10, T12),
             "prior_state",
             json!("completed"),
         );
@@ -6962,14 +6727,7 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         for task in ["TKT-source", "TKT-other", ""] {
             let mut tuples = verified_tuples();
-            tuples.push(exit_rec(
-                "x",
-                task,
-                "author",
-                "author-gen",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T12:00:00Z",
-            ));
+            tuples.push(exit_rec("x", task, "author", "author-gen", T0, T12));
             let report = compute(
                 &m,
                 &capture(tuples, Order::Unknown),
@@ -6988,23 +6746,9 @@ mod tests {
     #[test]
     fn clover_native_cost_requires_binding_and_producer_time() {
         let m = task_manifest("TKT-1");
-        let usage = usage_rec(
-            "u",
-            "TKT-1",
-            "gen-1",
-            Some("completed"),
-            Some(4.25),
-            "2026-01-01T11:00:00Z",
-        );
+        let usage = usage_rec("u", "TKT-1", "gen-1", Some("completed"), Some(4.25), T11);
         let exit = field(
-            exit_rec(
-                "x",
-                "TKT-1",
-                "gen-1",
-                "gen-1",
-                "2026-01-01T10:00:00Z",
-                "2026-01-01T12:00:00Z",
-            ),
+            exit_rec("x", "TKT-1", "gen-1", "gen-1", T10, T12),
             "prior_state",
             json!("completed"),
         );
@@ -7041,9 +6785,9 @@ mod tests {
     #[test]
     fn clover_rejected_artifacts_cannot_certify_effects_or_annotations() {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
-        let mut forged = finding("ev-2", "author-gen", "2026-01-01T00:00:00Z");
+        let mut forged = finding("ev-2", "author-gen", T0);
         forged["identity"] = json!("forged-finding");
-        let missing_receipt = assessment("ev-2", "", "verified", "2026-01-01T00:00:00Z");
+        let missing_receipt = assessment("ev-2", "", "verified", T0);
         for bad in [forged, missing_receipt] {
             let mut tuples = verified_tuples();
             tuples.push(bad);

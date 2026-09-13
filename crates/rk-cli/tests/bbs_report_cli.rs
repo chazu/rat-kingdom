@@ -495,22 +495,11 @@ fn native_tuples_envelope() -> Value {
     })
 }
 
-#[test]
-fn native_record_shapes_replay_author_exit_and_cost_end_to_end() {
+fn report_from_files(manifest: Value, tuples: Value, reviews: Value) -> Value {
     let dir = tempfile::tempdir().unwrap();
-    let manifest_path = write_json(dir.path(), "manifest.json", &native_manifest());
-    let tuples_path = write_json(dir.path(), "tuples.json", &native_tuples_envelope());
-    let reviews_path = write_json(
-        dir.path(),
-        "reviews.json",
-        &json!([{
-            "pair": "p1",
-            "coverage": {"status": "prepared", "evidence": "x1"},
-            "author_terminal_evidence": "ax-author",
-            "relayed_by_operator": false
-        }]),
-    );
-
+    let manifest_path = write_json(dir.path(), "manifest.json", &manifest);
+    let tuples_path = write_json(dir.path(), "tuples.json", &tuples);
+    let reviews_path = write_json(dir.path(), "reviews.json", &reviews);
     let out = cli(&[
         "--json",
         "bbs",
@@ -527,7 +516,21 @@ fn native_record_shapes_replay_author_exit_and_cost_end_to_end() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn native_record_shapes_replay_author_exit_and_cost_end_to_end() {
+    let report = report_from_files(
+        native_manifest(),
+        native_tuples_envelope(),
+        json!([{
+            "pair": "p1",
+            "coverage": {"status": "prepared", "evidence": "x1"},
+            "author_terminal_evidence": "ax-author",
+            "relayed_by_operator": false
+        }]),
+    );
     assert_eq!(report["evaluator_version"], 3);
     assert_eq!(
         report["author_exit_unsupported"].as_array().unwrap().len(),
@@ -544,13 +547,10 @@ fn native_record_shapes_replay_author_exit_and_cost_end_to_end() {
 
 #[test]
 fn reviewed_annotations_are_accepted_through_the_object_shaped_reviews_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let manifest_path = write_json(dir.path(), "manifest.json", &manifest());
-    let tuples_path = write_json(dir.path(), "tuples.json", &tuples_envelope());
-    let reviews_path = write_json(
-        dir.path(),
-        "reviews.json",
-        &json!({
+    let report = report_from_files(
+        manifest(),
+        tuples_envelope(),
+        json!({
             "reviews": reviews(),
             "reviewed_annotations": [{
                 "task": "TKT-1",
@@ -565,23 +565,6 @@ fn reviewed_annotations_are_accepted_through_the_object_shaped_reviews_file() {
         }),
     );
 
-    let out = cli(&[
-        "--json",
-        "bbs",
-        "report",
-        "--manifest",
-        manifest_path.to_str().unwrap(),
-        "--tuples",
-        tuples_path.to_str().unwrap(),
-        "--reviews",
-        reviews_path.to_str().unwrap(),
-    ]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["quality"]["reviewed_repeated_investigations"], 1);
     assert_eq!(
         report["deliveries"][0]["reviewed_repeated_investigations"],
