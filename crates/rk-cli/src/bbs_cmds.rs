@@ -83,6 +83,14 @@ pub struct BriefArgs {
 }
 
 pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<()> {
+    // `bbs report` is settled before any client exists: it must run with no
+    // daemon connection, worker credentials, model call or network (design
+    // doc, S3). Connecting first would both fail outright when no daemon is
+    // reachable and, worse, silently spawn one as a side effect of a pure
+    // offline aggregation, so the connect stays strictly below this return.
+    if let BbsCommand::Report(args) = command {
+        return run_report(args, as_json);
+    }
     let mut client = Client::connect_or_spawn(layout).await?;
     match command {
         BbsCommand::Brief(args) => {
@@ -159,11 +167,8 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
         } => {
             write(&mut client, "bbs.accept", json!({"question":question,"answer":answer,"text":text,"contribution":contribution}), as_json).await?;
         }
-        BbsCommand::Report(args) => {
-            // Deliberately does not touch `client`/the daemon: this command
-            // must run with no daemon connection, worker credentials, model
-            // call or network (design doc, S3).
-            run_report(args, as_json)?;
+        BbsCommand::Report(_) => {
+            unreachable!("`bbs report` returns above, before the daemon connection")
         }
     }
     Ok(())
