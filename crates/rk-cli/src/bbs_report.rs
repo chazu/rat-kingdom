@@ -69,35 +69,30 @@ const OPEN: &str = "open";
 const AGENT_EXIT: &str = "agent_exit";
 const AGENT_FINAL_USAGE: &str = "agent_final_usage";
 
-/// A `canonical_digest` is a lowercase hex SHA-256
-/// (`rk_core::action::canonical_digest`), so every digest-keyed identity
-/// suffix is exactly this many lowercase hex characters.
+/// `rk_core::action::canonical_digest` is a lowercase hex SHA-256, so every
+/// digest-keyed identity suffix is exactly this many lowercase hex characters.
 const DIGEST_HEX_LEN: usize = 64;
-/// Every `rk_daemon::bbs::ExposureSurface::as_str()` value. An exposure's
-/// identity suffix is one of these and nothing else.
+/// Every `rk_daemon::bbs::ExposureSurface::as_str()` value.
 const EXPOSURE_SURFACES: [&str; 4] = ["spawn", "resume", "recovery", "brief"];
-/// The literal author `record_phase_span`'s non-supervisor call sites pass.
-const DAEMON_AUTHOR: &str = "daemon";
 /// A castle's wire author id is `castle-<first 16 hex of its Ed25519 key>`
-/// (`rk_core::identity::actor_from_pubkey`). A configured `castle_name` is a
-/// presentation-only alias that `server.rs` deliberately never lets become the
-/// wire id, so the actor shape is the one an exported record carries.
+/// (`rk_core::identity::actor_from_pubkey`); a configured `castle_name` is a
+/// presentation-only alias `server.rs` never lets become the wire id.
+/// `"daemon"` is the literal author every non-supervisor span call site passes.
+const DAEMON_AUTHOR: &str = "daemon";
 const CASTLE_ACTOR_PREFIX: &str = "castle-";
 const CASTLE_ACTOR_HEX_LEN: usize = 16;
 
 fn is_lower_hex(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Whether `instance` has the shape of a daemon-side author: the literal
-/// `"daemon"`, or a castle actor id.
-///
-/// This is a SHAPE check over a string in an offline export, not cryptographic
-/// proof — this module verifies no signature and cannot. What it does buy is
-/// real: an ordinary worker generation (`Scritch-15`, `rat-28`) can never be
-/// mistaken for the castle that is the only legitimate author of these
-/// records, which is the forged-authority case, and a record whose author is
-/// unrecognized stays an explicit reported finding rather than silent input.
+/// Whether `instance` has the shape of a daemon-side author. A SHAPE check
+/// over an offline export, NOT cryptographic proof — this module verifies no
+/// signature and cannot say so. What it does buy: a worker generation
+/// (`Scritch-15`) can never be mistaken for the castle that is the only
+/// legitimate author, and an unrecognized author stays a reported finding.
 fn is_castle_author(instance: &str) -> bool {
     instance == DAEMON_AUTHOR
         || instance
@@ -106,37 +101,28 @@ fn is_castle_author(instance: &str) -> bool {
 }
 
 /// How a BBS record kind's identity is actually MINTED by
-/// `crates/rk-daemon/src/bbs.rs`. Three distinct contracts, and flattening
-/// them into one `starts_with` is what let forged records in.
+/// `crates/rk-daemon/src/bbs.rs`. Flattening these three contracts into one
+/// `starts_with` is what let forged records in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeIdentity {
-    /// `format!("{prefix}{key}")` where `key` is
-    /// `rk_core::action::canonical_digest(..)` over the record's own content:
-    /// `bbs-finding-`, `bbs-answer-`, `bbs-reuse-`, `bbs-assessment-`. The
-    /// suffix is therefore exactly [`DIGEST_HEX_LEN`] lowercase hex
-    /// characters — never a short readable token.
+    /// `format!("{prefix}{key}")` with `key` a `canonical_digest` over the
+    /// record's content, so the suffix is exactly [`DIGEST_HEX_LEN`] lowercase
+    /// hex characters — never a short readable token.
     Digest(&'static str),
-    /// `format!("bbs-exposure-{}", surface.as_str())`. A closed four-value
-    /// suffix, and the SAME value the producer writes to `payload.surface`
-    /// from that one `ExposureSurface`.
+    /// `format!("bbs-exposure-{}", surface.as_str())`: a closed four-value
+    /// suffix, and the SAME value the producer writes to `payload.surface`.
     Surface(&'static str),
-    /// One FIXED identity, written bare and complete: `record_open` writes
-    /// `"bbs-open"`, `record_exit` writes `"bbs-agent-exit"`, and the final
-    /// usage producer writes `"bbs-agent-final-usage"`. No producer appends
+    /// One FIXED identity, written bare and complete (`bbs-open`,
+    /// `bbs-agent-exit`, `bbs-agent-final-usage`). No producer appends
     /// anything, so any longer string is forged authority, not a variant.
     Exact(&'static str),
 }
 
-/// The identity each BBS record kind is actually minted with by
-/// `crates/rk-daemon/src/bbs.rs`. A record whose identity does not match its
-/// kind's minting rule was not written by the BBS write path.
-///
-/// Read off the producers rather than off
-/// `rk_core::bbs::RESERVED_IDENTITY_PREFIXES`: that list is a `starts_with`
-/// DENY list for the agent write path, where matching too much is safe. It is
-/// not an ACCEPT rule, and reusing it as one is the defect this enum fixes —
-/// `bbs-agent-exit-forged` is correctly refused a write by the deny list and
-/// was then wrongly admitted here as an `agent_exit`.
+/// Read off the producers, not off `rk_core::bbs::RESERVED_IDENTITY_PREFIXES`:
+/// that list is a `starts_with` DENY list for the agent write path, where
+/// matching too much is safe. Reusing it as an ACCEPT rule is the defect this
+/// fixes — `bbs-agent-exit-forged` is correctly refused a write by the deny
+/// list and was then wrongly admitted here as an `agent_exit`.
 fn native_identity(bbs_kind: &str) -> Option<NativeIdentity> {
     use NativeIdentity::{Digest, Exact, Surface};
     match bbs_kind {
@@ -152,18 +138,13 @@ fn native_identity(bbs_kind: &str) -> Option<NativeIdentity> {
     }
 }
 
-/// Why `t`'s identity is not one this `bbs_kind`'s producer could have minted,
-/// or `None` when it is. Each family keeps exactly the contract its own
-/// producer guarantees, so no real exported record is rejected:
-///
-/// - `Digest`: the full variable-identity contract is preserved — any digest
-///   is accepted, but it must actually BE one. A readable suffix
-///   (`bbs-finding-x`) is not something `canonical_digest` can return.
-/// - `Surface`: one of four `ExposureSurface` values, and the same value the
-///   producer independently wrote to `payload.surface`. Both come from one
-///   `as_str()` call, so requiring agreement can never reject a real record
-///   while it refuses `bbs-exposure-forged` even with a matching payload.
-/// - `Exact`: byte equality. This kind has no variants to preserve.
+/// Why `t`'s identity is not one this `bbs_kind`'s producer could have minted.
+/// Each family keeps exactly its own producer's contract, so no real exported
+/// record is rejected: `Digest` still accepts ANY digest, but it must actually
+/// be one (`bbs-finding-x` is not something `canonical_digest` can return);
+/// `Surface` requires agreement between suffix and `payload.surface`, which
+/// one `as_str()` call makes unconditional, so it can only ever refuse a
+/// forgery; `Exact` is byte equality, having no variants to preserve.
 fn identity_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     let identity = str_field(t, &["identity"]);
     let strip = |prefix: &str| -> Result<&str, String> {
@@ -261,12 +242,10 @@ const TERMINAL_USAGE_STATES: [&str; 3] = ["completed", "failed", "stopped"];
 /// last reported total actually covers the launch
 /// (`rk_daemon::supervisor::CostCoverage::Final`).
 const FINAL_COST_COVERAGE: &str = "final";
-/// The non-final `cost_coverage` values the producer emits, each of which
-/// leaves an amount that is not this launch's total: `partial_unknown` (more
-/// model work ran past the last result), `none` (no result was ever reported),
-/// `unknown` (no watch survived, so finality is not knowable at all).
-/// Enumerated so an UNRECOGNIZED value is reported as its own finding rather
-/// than being quietly folded in with a known one.
+/// The non-final values the producer emits: `partial_unknown` (more model work
+/// ran past the last result), `none` (no result was ever reported), `unknown`
+/// (no watch survived). Enumerated so an UNRECOGNIZED value is reported as its
+/// own finding rather than folded in with a known one.
 const NON_FINAL_COST_COVERAGE: [&str; 3] = ["partial_unknown", "none", "unknown"];
 
 /// The only `cost_basis` a *provider-reported* total may carry. The daemon's
@@ -1572,28 +1551,22 @@ fn is_task_span(t: &Value) -> bool {
 /// path and every phase total are built from. Returns the reason it is NOT a
 /// span its producer could have written, or `None` when it is.
 ///
-/// These are the invariants `crates/rk-daemon/src/span.rs` makes unconditional
-/// at write time: `record_phase_span` writes a `Furniture` Event under
-/// `SPAN_IDENTITY` authored by the CASTLE (every call site passes `"daemon"`
-/// or `&self.castle`, never an agent), into the ticket's repo scope, carrying
-/// `PhaseSpan::to_payload()` — `task`, a `Phase::as_str()` phase, a `u32`
-/// `attempt`, and the rest optional-but-typed.
+/// The invariants `crates/rk-daemon/src/span.rs` makes unconditional at write
+/// time: `record_phase_span` writes a `Furniture` Event under `SPAN_IDENTITY`
+/// authored by the CASTLE (every call site passes `"daemon"` or
+/// `&self.castle`, never an agent), into the ticket's repo scope, carrying
+/// `PhaseSpan::to_payload()`. Admitting a span on category+identity alone let
+/// a forged row name an unknown phase (pooled into `work_phases_ms` by the
+/// catch-all arm), an absurd `duration_ms`, or a second repo's task, and move
+/// `verification_ms`, the critical path and delivery acceptance with it.
 ///
-/// Admitting a span on category+identity alone, as this module previously did,
-/// let a forged row name an unknown phase (summed into `work_phases_ms` by the
-/// catch-all arm), a negative or absurd `duration_ms`, or a second repo's
-/// task, and move `verification_ms`, the critical path and delivery
-/// acceptance with it.
-///
-/// Deliberately NOT required, because the producer genuinely omits them:
-/// `queued_at`/`started_at`/`ended_at` (a phase settled from durations alone
-/// has no wall-clock `queued_at`), `repo`/`target`/`candidate`/`lane`/
-/// `occurrence_key`/`proof_kind`/`proof_reused`/`authority` (set only where
-/// the calling producer has them), and `duration_semantic` (absent on every
-/// span recorded before that tag existed). Those legacy spans stay supported
-/// exactly where their weaker evidence is already made explicit — an untagged
-/// `verification` span is counted under `verification_ms_legacy_spans` rather
-/// than summed.
+/// NOT required, because the producer genuinely omits them: every timestamp,
+/// `repo`/`target`/`candidate`/`lane`/`occurrence_key`/`proof_kind`/
+/// `proof_reused`/`authority` (set only where the caller has them), and
+/// `duration_semantic` (absent before that tag existed). Those legacy spans
+/// stay supported where their weaker evidence is already explicit — an
+/// untagged `verification` span is counted under
+/// `verification_ms_legacy_spans` rather than summed.
 fn task_span_defect(t: &Value) -> Option<String> {
     if t["lifecycle"] != "furniture" {
         return Some(format!(
@@ -1601,15 +1574,14 @@ fn task_span_defect(t: &Value) -> Option<String> {
             t["lifecycle"].as_str().unwrap_or("absent")
         ));
     }
-    // Producer authorship. `record_phase_span` names the castle as caller, so
-    // `instance` is `"daemon"` (every `landing.rs`/`managed_verification.rs`
-    // call site) or the castle actor id (`supervisor.rs`/`tickets.rs` pass
-    // `&self.castle`) — both shapes appear verbatim in the captured native
-    // records. It is NEVER the worker generation the span describes, so a
-    // worker-authored span is forged authority even when every other field is
-    // well formed. The `Furniture` lifecycle above is not sufficient on its
-    // own here: it is what the daemon refuses from an agent at WRITE time, but
-    // this module reads an offline export that never went through that path.
+    // `record_phase_span` names the castle as caller: `"daemon"` (every
+    // `landing.rs`/`managed_verification.rs` site) or the castle actor id
+    // (`supervisor.rs`/`tickets.rs`), both of which appear verbatim in the
+    // captured native records. NEVER the worker the span describes, so a
+    // worker-authored span is forged even when every other field is well
+    // formed. The `Furniture` check above is not sufficient alone: that is what
+    // the daemon refuses from an agent at WRITE time, and this module reads an
+    // offline export that never went through that path.
     let instance = str_field(t, &["instance"]);
     if !is_castle_author(instance) {
         return Some(format!(
@@ -1678,25 +1650,40 @@ fn task_span_defect(t: &Value) -> Option<String> {
             Value::Null => {}
             v => match v.as_i64() {
                 Some(ms) if ms >= 0 => {}
-                _ => return Some(format!("payload.{field} {v} is not a non-negative duration")),
+                _ => {
+                    return Some(format!(
+                        "payload.{field} {v} is not a non-negative duration"
+                    ))
+                }
             },
         }
     }
-    let stamped = |field: &str| -> Option<DateTime<Utc>> { payload_time(t, field) };
+    // `to_payload` does not carry durations as independent data: it writes
+    // `queue_wait_ms()`/`duration_ms()`, each `Some` ONLY when both of its own
+    // endpoints are set and then exactly their millisecond difference. So a
+    // stated duration must have its endpoints and equal them; `null` durations
+    // are normal and stay supported. Checking agreement only when all three
+    // happened to be present let a forged duration with NO endpoints
+    // contribute fabricated time.
     for (field, from, to) in [
         ("queue_wait_ms", "queued_at", "started_at"),
         ("duration_ms", "started_at", "ended_at"),
     ] {
-        if let (Some(ms), Some(from_at), Some(to_at)) =
-            (t["payload"][field].as_i64(), stamped(from), stamped(to))
-        {
-            let derived = (to_at - from_at).num_milliseconds();
-            if ms != derived {
-                return Some(format!(
-                    "payload.{field} is {ms} but {from}..{to} is {derived}ms; the producer \
-                     derives one from the other"
-                ));
-            }
+        let Some(ms) = t["payload"][field].as_i64() else {
+            continue;
+        };
+        let (Some(from_at), Some(to_at)) = (payload_time(t, from), payload_time(t, to)) else {
+            return Some(format!(
+                "payload.{field} is {ms} but payload.{from}/payload.{to} are not both present; \
+                 the producer derives this duration from them and cannot state one without them"
+            ));
+        };
+        let derived = (to_at - from_at).num_milliseconds();
+        if ms != derived {
+            return Some(format!(
+                "payload.{field} is {ms} but {from}..{to} is {derived}ms; the producer derives \
+                 one from the other"
+            ));
         }
     }
     // `duration_semantic` is stamped by exactly one constructor with exactly
@@ -2301,9 +2288,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 crashed: t["payload"]["crashed"].as_bool(),
                 prior_state: t["payload"]["prior_state"].as_str().map(str::to_string),
                 stale_session: t["payload"]["stale_session"].as_bool(),
-                cost_coverage: t["payload"]["cost_coverage"]
-                    .as_str()
-                    .map(str::to_string),
+                cost_coverage: t["payload"]["cost_coverage"].as_str().map(str::to_string),
                 record: record_id(t),
             });
             continue;
@@ -2782,14 +2767,13 @@ fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
             ),
         );
     }
-    // Cost coverage is measured by the producer, not inferred here. A terminal
-    // last result and an agreeing `prior_state` say the launch's lifecycle
-    // state matched; they do NOT say no further model usage ran past that
-    // result, which is exactly what `CostCoverage` tracks and what the
-    // state-only check got wrong. Everything but `final` fails closed: the
-    // amount is preserved as a partial/unknown figure and never reaches a
-    // provider total. This bounds COST only — the exit itself remains valid
-    // physical-exit evidence for author exit and lifetime.
+    // Coverage is measured by the producer, not inferred here. A terminal
+    // result and an agreeing `prior_state` say the lifecycle state matched;
+    // they do NOT say no further model usage ran past that result, which is
+    // what `CostCoverage` tracks and what the state-only check got wrong.
+    // Everything but `final` fails closed, preserving the amount as a
+    // partial/unknown figure. Bounds COST only — the exit stays valid
+    // physical-exit evidence.
     match exit.cost_coverage.as_deref() {
         Some(FINAL_COST_COVERAGE) => {}
         None => {
@@ -4463,85 +4447,66 @@ mod tests {
     }
 
     /// `agent_exit` (S2 contract, identity `bbs-agent-exit`): castle-authored
-    /// physical-exit evidence, never `harness_result`. `stale_session: Some(true)`
-    /// models a delayed exit for a launch already superseded by a later one
-    /// under the same `spawn`; its `prior_state`/`crashed` are nulled at the
-    /// source (`TKT-tulir-kotah-gisub`), not because nothing happened.
-    #[allow(clippy::too_many_arguments)]
-    fn agent_exit(
+    /// physical-exit evidence, never `harness_result`. Repo `"repo"`, session
+    /// `"sess-1"`, exit code 0, not crashed, not stale, `created_at` =
+    /// `exited` and `cost_coverage: "final"` are defaulted; `field` restates
+    /// whichever one a test is actually about. `stale_session: true` models a
+    /// delayed exit for a launch already superseded under the same `spawn`,
+    /// whose `prior_state`/`crashed` are nulled at the source
+    /// (`TKT-tulir-kotah-gisub`), not because nothing happened.
+    fn exit_rec(
         id: &str,
-        repo: &str,
         task: &str,
         agent: &str,
         spawn: &str,
-        session: &str,
-        launched_at: Option<&str>,
-        exited_at: Option<&str>,
-        prior_state: Option<&str>,
-        crashed: bool,
-        stale_session: Option<bool>,
-        created: &str,
+        launched: &str,
+        exited: &str,
     ) -> Value {
         json!({
-            "id": id,
-            "category": "event",
-            "scope": repo,
-            "identity": "bbs-agent-exit",
-            "instance": CASTLE,
-            "lifecycle": "furniture",
-            "created_at": created,
+            "id": id, "category": "event", "scope": "repo",
+            "identity": "bbs-agent-exit", "instance": CASTLE,
+            "lifecycle": "furniture", "created_at": exited,
             "payload": {
-                "schema_version": 1, "bbs_kind": AGENT_EXIT, "repo": repo, "task": task,
-                "agent": agent, "spawn": spawn, "session": session,
-                "launched_at": launched_at, "exited_at": exited_at,
-                "prior_state": prior_state, "crashed": crashed, "exit_code": 0,
-                "stale_session": stale_session,
-                // The producer always states coverage; `final` is the shape of
-                // a launch whose last result did cover it. Override with
-                // `with_cost_coverage` to model the other outcomes.
+                "schema_version": 1, "bbs_kind": AGENT_EXIT, "repo": "repo", "task": task,
+                "agent": agent, "spawn": spawn, "session": "sess-1",
+                "launched_at": launched, "exited_at": exited, "prior_state": null,
+                "crashed": false, "exit_code": 0, "stale_session": null,
                 "cost_coverage": FINAL_COST_COVERAGE
             }
         })
     }
 
-    /// Restate an `agent_exit` fixture's `cost_coverage`. `Value::Null` models
-    /// a record predating the field.
-    fn with_cost_coverage(mut exit: Value, coverage: Value) -> Value {
-        exit["payload"]["cost_coverage"] = coverage;
-        exit
+    /// Restate one payload field of a fixture, so a test states only what it
+    /// is about.
+    fn field(mut t: Value, key: &str, v: Value) -> Value {
+        t["payload"][key] = v;
+        t
     }
 
     /// `agent_final_usage` (S2 contract, identity `bbs-agent-final-usage`):
     /// castle-authored provider-cost evidence, keyed with `agent_exit` on
-    /// `(spawn, session)`. `cost_basis` is the ONLY field that gates whether a
-    /// figure may be pooled as a provider-reported total.
-    #[allow(clippy::too_many_arguments)]
-    fn agent_final_usage(
+    /// `(spawn, session)`. Repo `"repo"`, session `"sess-1"`, provider session
+    /// `"ps-1"`, `created_at` = `observed` and `cost_basis` are defaulted —
+    /// `cost_basis` is the ONLY field that gates whether a figure may be
+    /// pooled as a provider-reported total, so a test varying it says so with
+    /// `field`.
+    fn usage_rec(
         id: &str,
-        repo: &str,
         task: &str,
         spawn: &str,
-        session: &str,
-        provider_session: Option<&str>,
         state: Option<&str>,
         cost_usd: Option<f64>,
-        cost_basis: &str,
-        observed_at: &str,
-        created: &str,
+        observed: &str,
     ) -> Value {
         json!({
-            "id": id,
-            "category": "event",
-            "scope": repo,
-            "identity": "bbs-agent-final-usage",
-            "instance": CASTLE,
-            "lifecycle": "furniture",
-            "created_at": created,
+            "id": id, "category": "event", "scope": "repo",
+            "identity": "bbs-agent-final-usage", "instance": CASTLE,
+            "lifecycle": "furniture", "created_at": observed,
             "payload": {
-                "schema_version": 1, "bbs_kind": AGENT_FINAL_USAGE, "repo": repo, "task": task,
-                "spawn": spawn, "session": session, "provider_session": provider_session,
-                "state": state, "cost_usd": cost_usd, "cost_basis": cost_basis,
-                "observed_at": observed_at
+                "schema_version": 1, "bbs_kind": AGENT_FINAL_USAGE, "repo": "repo",
+                "task": task, "spawn": spawn, "session": "sess-1",
+                "provider_session": "ps-1", "state": state, "cost_usd": cost_usd,
+                "cost_basis": PROVIDER_COST_BASIS, "observed_at": observed
             }
         })
     }
@@ -5327,18 +5292,12 @@ mod tests {
         let tuples = vec![
             event("e1", "agent_spawned", "2026-01-01T00:00:00Z"),
             event("e2", "agent_respawned", "2026-01-01T02:00:00Z"),
-            agent_exit(
+            exit_rec(
                 "x1",
-                "repo",
                 "TKT-relaunch",
                 "R-1",
                 "gen-r",
-                "sess-1",
-                Some("2026-01-01T00:00:00Z"),
-                Some("2026-01-01T01:00:00Z"),
-                None,
-                false,
-                None,
+                "2026-01-01T00:00:00Z",
                 "2026-01-01T01:00:00Z",
             ),
         ];
@@ -5369,33 +5328,26 @@ mod tests {
             ..manifest(vec![])
         };
         let usage = |id: &str, cost: f64, observed: &str| {
-            agent_final_usage(
+            usage_rec(
                 id,
-                "repo",
                 "TKT-cost",
                 "gen-c",
-                "sess-1",
-                Some("ps-1"),
                 Some("completed"),
                 Some(cost),
-                PROVIDER_COST_BASIS,
-                observed,
                 observed,
             )
         };
-        let exit = agent_exit(
-            "x1",
-            "repo",
-            "TKT-cost",
-            "C-1",
-            "gen-c",
-            "sess-1",
-            Some("2026-01-01T00:00:00Z"),
-            Some("2026-01-01T03:00:00Z"),
-            Some("completed"),
-            false,
-            None,
-            "2026-01-01T03:00:00Z",
+        let exit = field(
+            exit_rec(
+                "x1",
+                "TKT-cost",
+                "C-1",
+                "gen-c",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T03:00:00Z",
+            ),
+            "prior_state",
+            json!("completed"),
         );
         // Page order (= persistence order) puts the 2.00 total LAST, while
         // its observed_at is EARLIER than the 1.00 row's.
@@ -5444,32 +5396,25 @@ mod tests {
             ..manifest(vec![])
         };
         let tuples = vec![
-            agent_final_usage(
+            usage_rec(
                 "u1",
-                "repo",
                 "TKT-one",
                 "gen-o",
-                "sess-1",
-                Some("ps-1"),
                 Some("completed"),
                 Some(0.75),
-                PROVIDER_COST_BASIS,
-                "2026-01-01T01:00:00Z",
                 "2026-01-01T01:00:00Z",
             ),
-            agent_exit(
-                "x1",
-                "repo",
-                "TKT-one",
-                "O-1",
-                "gen-o",
-                "sess-1",
-                Some("2026-01-01T00:00:00Z"),
-                Some("2026-01-01T02:00:00Z"),
-                Some("completed"),
-                false,
-                None,
-                "2026-01-01T02:00:00Z",
+            field(
+                exit_rec(
+                    "x1",
+                    "TKT-one",
+                    "O-1",
+                    "gen-o",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T02:00:00Z",
+                ),
+                "prior_state",
+                json!("completed"),
             ),
         ];
         let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
@@ -5631,13 +5576,18 @@ mod tests {
                 "duration_semantic": ADDITIVE_DURATION, "repo": "repo"
             }),
         );
-        // A span recorded before the tag existed: durations only, no
-        // `duration_semantic`. Still a supported shape.
+        // A span recorded before the tag existed. The legacy dimension is the
+        // MISSING `duration_semantic`, not missing timestamps: `to_payload`
+        // has always derived both durations from the stamps, so a real legacy
+        // span still carries them.
         let legacy_span = span_full(
             "span-legacy",
             json!({
                 "task": "TKT-verify", "phase": "verification", "attempt": 2,
-                "queue_wait_ms": 800, "duration_ms": 900
+                "queued_at": "2026-01-01T00:00:00Z",
+                "started_at": "2026-01-01T00:00:00.800Z",
+                "ended_at": "2026-01-01T00:00:01.700Z",
+                "queue_wait_ms": 800, "duration_ms": 900, "repo": "repo"
             }),
         );
         let c = capture(vec![additive_span, legacy_span], Order::Unknown);
@@ -5656,6 +5606,411 @@ mod tests {
         );
     }
 
+    /// A task scope whose native records are all rejected. Used by the
+    /// malformed-record regressions to prove rejection is honest rather than
+    /// lossy.
+    fn cost_manifest(task: &str) -> Manifest {
+        Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: task.into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        }
+    }
+
+    fn invalid_reason<'a>(r: &'a Report, record: &str) -> &'a str {
+        r.invalid_records
+            .iter()
+            .find(|i| i.record == record)
+            .map_or_else(
+                || {
+                    panic!(
+                        "{record} was not retained as invalid: {:?}",
+                        r.invalid_records
+                    )
+                },
+                |i| i.reason.as_str(),
+            )
+    }
+
+    /// DEFECT 1. `reserved_prefix` matched EVERY kind with `starts_with`, but
+    /// `bbs-open`, `bbs-agent-exit` and `bbs-agent-final-usage` are minted as
+    /// fixed, bare identities. Appending anything to one produced a record
+    /// this module accepted as native. Each forged row must be retained as
+    /// invalid WITH a reason, and must not contribute the effect its kind
+    /// carries: a false open, a false author exit, or a false final cost.
+    #[test]
+    fn forged_suffixes_on_fixed_native_identities_are_invalid_and_derive_nothing() {
+        let forge = |mut t: Value, id: &str| -> Value {
+            t["id"] = json!(id);
+            let forged = format!("{}-forged", str_field(&t, &["identity"]));
+            t["identity"] = json!(forged);
+            t
+        };
+        let mut tuples = verified_tuples();
+        tuples.push(forge(
+            open_record("o-forged", "src-1", "gen-1", "2026-01-01T13:00:00Z"),
+            "o-forged",
+        ));
+        tuples.push(forge(
+            field(
+                exit_rec(
+                    "x-forged",
+                    "TKT-1",
+                    "C-1",
+                    "gen-1",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-02T03:00:00Z",
+                ),
+                "prior_state",
+                json!("completed"),
+            ),
+            "x-forged",
+        ));
+        tuples.push(forge(
+            usage_rec(
+                "u-forged",
+                "TKT-1",
+                "gen-1",
+                Some("completed"),
+                Some(9.99),
+                "2026-01-02T02:00:00Z",
+            ),
+            "u-forged",
+        ));
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.consumer_tasks = vec![ConsumerTaskScope {
+            task: "TKT-1".into(),
+            repo: "repo".into(),
+            batch: "batch-1".into(),
+        }];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+
+        for id in ["o-forged", "x-forged", "u-forged"] {
+            assert!(
+                invalid_reason(&r, id).contains("fixed daemon-minted identity"),
+                "{id}: {}",
+                invalid_reason(&r, id)
+            );
+        }
+        assert!(!only(&r).opened, "a forged bbs-open is not an open");
+        assert_eq!(r.opened, 0);
+        let d = &r.deliveries[0];
+        assert_eq!(d.exits, 0, "a forged bbs-agent-exit is not an author exit");
+        assert_eq!(
+            d.reported_cost_estimate_usd, None,
+            "a forged bbs-agent-final-usage is not a provider total"
+        );
+        // The generation is still known from its completion; what is absent is
+        // any cost SEGMENT, because the forged usage row never became one.
+        assert_eq!(d.cost_coverage, "missing");
+        assert!(d.generations[0].cost_segments.is_empty());
+    }
+
+    /// DEFECT 1, variable identities. Their contract is preserved — any
+    /// genuine key is accepted — but it must actually BE the key the producer
+    /// mints. `canonical_digest` returns a 64-character lowercase hex SHA-256,
+    /// so a short readable suffix is not something a real export can carry;
+    /// and an exposure's suffix is one of four `ExposureSurface` values, so a
+    /// forged surface is refused even when the payload agrees with it.
+    #[test]
+    fn variable_native_identities_must_carry_a_real_digest_or_a_real_surface() {
+        let mut short_digest = finding("src-2", "author-gen", "2026-01-01T00:00:00Z");
+        short_digest["identity"] = json!("bbs-finding-x");
+        let mut uppercase_digest = finding("src-3", "author-gen", "2026-01-01T00:00:00Z");
+        uppercase_digest["identity"] =
+            json!(format!("bbs-finding-{}", digest_key("s").to_uppercase()));
+        let mut forged_surface = exposure("x-forged", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+        forged_surface["identity"] = json!("bbs-exposure-forged");
+        forged_surface["payload"]["surface"] = json!("forged");
+        let mut mismatched = exposure("x-mismatch", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+        mismatched["identity"] = json!("bbs-exposure-brief");
+
+        let mut tuples = verified_tuples();
+        tuples.extend([short_digest, uppercase_digest, forged_surface, mismatched]);
+        let r = compute(
+            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+            &capture(tuples, Order::Unknown),
+            &[],
+        )
+        .unwrap();
+
+        for id in ["src-2", "src-3"] {
+            assert!(
+                invalid_reason(&r, id).contains("canonical_digest"),
+                "{id}: {}",
+                invalid_reason(&r, id)
+            );
+        }
+        assert!(invalid_reason(&r, "x-forged").contains("not an exposure surface"));
+        assert!(invalid_reason(&r, "x-mismatch").contains("payload.surface"));
+        // The real records alongside them are untouched.
+        assert_eq!(
+            only(&r).coverage_status,
+            "prepared",
+            "the genuine spawn exposure still establishes native coverage"
+        );
+    }
+
+    /// DEFECT 1, positive baseline. Every real `ExposureSurface` must stay
+    /// admissible: the rule is "the suffix is the surface the payload names",
+    /// not a hardcoded preference for `spawn`.
+    #[test]
+    fn every_real_exposure_surface_is_still_native_coverage() {
+        for surface in EXPOSURE_SURFACES {
+            let mut x = exposure("x1", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+            x["identity"] = json!(format!("bbs-exposure-{surface}"));
+            x["payload"]["surface"] = json!(surface);
+            let mut tuples = verified_tuples();
+            tuples[3] = x;
+            let r = compute(
+                &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+                &capture(tuples, Order::Unknown),
+                &[],
+            )
+            .unwrap();
+            assert!(
+                r.invalid_records.is_empty(),
+                "surface={surface}: {:?}",
+                r.invalid_records
+            );
+            assert_eq!(only(&r).coverage_status, "prepared", "surface={surface}");
+        }
+    }
+
+    /// DEFECT 2, positive baseline: spans shaped exactly as the captured
+    /// native records are, including the two real author forms (`"daemon"`
+    /// and a `castle-<hex>` actor) and a `delivery_closure` whose
+    /// `payload.repo` is `null` — that one is bound to its repo through the
+    /// tuple SCOPE and must stay supported.
+    #[test]
+    fn real_producer_shaped_spans_are_admitted_including_a_null_repo() {
+        let m = cost_manifest("TKT-dorod-sival-fumid");
+        let ready = span_full(
+            "s-ready",
+            json!({
+                "attempt": 1, "authority": null, "candidate": null, "duration_ms": null,
+                "ended_at": null, "lane": null, "phase": "ticket_ready", "proof_kind": null,
+                "proof_reused": null, "queue_wait_ms": null,
+                "queued_at": "2026-01-01T03:55:39.748988Z", "repo": null, "started_at": null,
+                "target": null, "task": "TKT-dorod-sival-fumid", "terminal_reason": null
+            }),
+        );
+        let mut launched = span_full(
+            "s-launched",
+            json!({
+                "attempt": 1, "authority": null, "candidate": null, "duration_ms": 1054,
+                "ended_at": "2026-01-01T04:02:49.900316Z", "lane": null,
+                "phase": "agent_launched", "proof_kind": null, "proof_reused": null,
+                "queue_wait_ms": null, "queued_at": null, "repo": "repo",
+                "started_at": "2026-01-01T04:02:48.846316Z", "target": "rat/x/tkt-y",
+                "task": "TKT-dorod-sival-fumid", "terminal_reason": null
+            }),
+        );
+        launched["instance"] = json!(CASTLE);
+        let closure = span_full(
+            "s-closure",
+            json!({
+                "attempt": 1, "phase": "delivery_closure", "repo": null,
+                "task": "TKT-dorod-sival-fumid", "ended_at": "2026-01-01T05:00:00Z",
+                "terminal_reason": "delivered"
+            }),
+        );
+        let r = compute(
+            &m,
+            &capture(vec![ready, launched, closure], Order::Unknown),
+            &[],
+        )
+        .unwrap();
+        assert!(r.invalid_records.is_empty(), "{:?}", r.invalid_records);
+        assert!(
+            r.tasks_without_native_records.is_empty(),
+            "all three spans are usable native evidence"
+        );
+    }
+
+    /// DEFECT 2. `task_span` was admitted on category+identity alone. Each of
+    /// these rows is otherwise well formed and would have been indexed, where
+    /// it could move the critical path, the phase totals and delivery
+    /// acceptance. Rejecting them must be HONEST rather than lossy: the
+    /// selected task keeps its row in the denominator and simply reports no
+    /// usable native record.
+    #[test]
+    fn malformed_or_forged_spans_are_rejected_without_erasing_the_selected_task() {
+        let base = json!({
+            "task": "TKT-span", "phase": "verification", "attempt": 1,
+            "queued_at": "2026-01-01T00:00:00Z", "started_at": "2026-01-01T00:00:00.500Z",
+            "ended_at": "2026-01-01T00:00:00.550Z", "queue_wait_ms": 500, "duration_ms": 50,
+            "duration_semantic": ADDITIVE_DURATION, "repo": "repo"
+        });
+        let mutate = |id: &str, f: &dyn Fn(&mut Value)| -> Value {
+            let mut payload = base.clone();
+            f(&mut payload);
+            span_full(id, payload)
+        };
+        // A worker generation cannot author a span about itself, however well
+        // formed the rest of it is: `record_phase_span` names the castle.
+        let mut worker_authored = span_full("s-worker", base.clone());
+        worker_authored["instance"] = json!("Scritch-15");
+        let mut ephemeral = span_full("s-ephemeral", base.clone());
+        ephemeral["lifecycle"] = json!("ephemeral");
+
+        let cases: Vec<(Value, &str)> = vec![
+            (worker_authored, "is not a castle author"),
+            (ephemeral, "not furniture"),
+            (
+                mutate("s-phase", &|p| p["phase"] = json!("verification_extra")),
+                "is not a phase this daemon records",
+            ),
+            (
+                mutate("s-attempt", &|p| p["attempt"] = json!(0)),
+                "positive integer occurrence number",
+            ),
+            (
+                mutate("s-repo", &|p| p["repo"] = json!("other-repo")),
+                "disagrees with tuple scope",
+            ),
+            (
+                mutate("s-negative", &|p| {
+                    p["duration_ms"] = json!(-50);
+                }),
+                "not a non-negative duration",
+            ),
+            // A fabricated duration with no endpoints to derive it from. The
+            // producer cannot state one without both stamps.
+            (
+                mutate("s-unanchored", &|p| {
+                    p["duration_ms"] = json!(9_000_000);
+                    p["started_at"] = Value::Null;
+                    p["ended_at"] = Value::Null;
+                }),
+                "are not both present",
+            ),
+            (
+                mutate("s-disagree", &|p| p["duration_ms"] = json!(9_000_000)),
+                "the producer derives one from the other",
+            ),
+            (
+                mutate("s-backwards", &|p| {
+                    p["ended_at"] = json!("2025-01-01T00:00:00Z");
+                }),
+                "cannot run backwards",
+            ),
+            (
+                mutate("s-semantic", &|p| p["duration_semantic"] = json!("total")),
+                "duration_semantic",
+            ),
+            (
+                mutate("s-authority", &|p| p["authority"] = json!("king")),
+                "not human or llm",
+            ),
+            (
+                mutate("s-fence", &|p| p["occurrence_key"] = json!("")),
+                "not a non-empty string",
+            ),
+        ];
+
+        let m = cost_manifest("TKT-span");
+        for (span, expected) in cases {
+            let id = span["id"].as_str().unwrap().to_string();
+            let r = compute(&m, &capture(vec![span], Order::Unknown), &[]).unwrap();
+            assert!(
+                invalid_reason(&r, &id).contains(expected),
+                "{id}: expected {expected:?}, got {:?}",
+                invalid_reason(&r, &id)
+            );
+            assert_eq!(
+                r.deliveries.len(),
+                1,
+                "{id}: a malformed span must not erase the selected task from the denominator"
+            );
+            assert_eq!(
+                r.deliveries[0].phase_ms.verification_ms, None,
+                "{id}: a rejected span contributes no verification time"
+            );
+            assert_eq!(
+                r.tasks_without_native_records,
+                vec!["repo/TKT-span".to_string()],
+                "{id}: the task is reported as having no usable native record, not dropped"
+            );
+        }
+    }
+
+    /// DEFECT 3. The old check called a segment final on lifecycle state
+    /// alone: a terminal last result, an observed exit, and a `prior_state`
+    /// AGREEING with it. That says the launch's state matched — not that no
+    /// further model usage ran past the result, which is precisely what the
+    /// producer measures and states as `cost_coverage`. Every non-`final`
+    /// coverage must fail closed, and the reported amount must survive as a
+    /// PARTIAL rather than being pooled into a provider total or discarded.
+    #[test]
+    fn a_matching_exit_state_is_not_a_final_cost_unless_coverage_says_final() {
+        let m = cost_manifest("TKT-cost");
+        let delivery_for = |coverage: &Value| -> DeliveryCost {
+            // Exactly the state-only condition the old check accepted:
+            // terminal result, observed exit, prior_state agreeing.
+            let exit = exit_rec(
+                "x1",
+                "TKT-cost",
+                "C-1",
+                "gen-c",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T03:00:00Z",
+            );
+            let exit = field(exit, "prior_state", json!("completed"));
+            let exit = field(exit, "cost_coverage", coverage.clone());
+            let usage = usage_rec(
+                "u1",
+                "TKT-cost",
+                "gen-c",
+                Some("completed"),
+                Some(2.00),
+                "2026-01-01T02:00:00Z",
+            );
+            let mut r = compute(&m, &capture(vec![usage, exit], Order::Unknown), &[]).unwrap();
+            r.deliveries.remove(0)
+        };
+
+        let d = delivery_for(&json!(FINAL_COST_COVERAGE));
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(d.reported_cost_estimate_usd, Some(2.00));
+        assert!(d.generations[0].cost_segments[0].final_cost);
+
+        for coverage in [
+            json!("partial_unknown"),
+            json!("none"),
+            json!("unknown"),
+            Value::Null,
+            json!("mostly"),
+        ] {
+            let d = delivery_for(&coverage);
+            assert_eq!(d.cost_coverage, "partial", "coverage={coverage}");
+            assert_eq!(
+                d.reported_cost_estimate_usd, None,
+                "coverage={coverage}: must never reach a provider total"
+            );
+            assert_eq!(
+                d.partial_reported_usd,
+                Some(2.00),
+                "coverage={coverage}: the supported partial amount is preserved"
+            );
+            assert_eq!(
+                d.unknown_cost.len(),
+                1,
+                "coverage={coverage}: the uncertainty is named, not silent"
+            );
+            // Cost uncertainty is not exit uncertainty: the same record is
+            // still the launch's physical-exit evidence.
+            assert_eq!(
+                d.exits, 1,
+                "coverage={coverage}: a non-final cost does not retract the physical exit"
+            );
+            assert_eq!(d.launches, 1, "coverage={coverage}");
+        }
+    }
+
     #[test]
     fn author_exit_is_credited_from_a_valid_agent_exit_observation() {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
@@ -5670,18 +6025,12 @@ mod tests {
                 "2026-01-02T00:00:00Z",
             ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
-            agent_exit(
+            exit_rec(
                 "ax1",
-                "repo",
                 "TKT-source",
                 "author",
                 "author-gen",
-                "sess-1",
-                Some("2026-01-01T00:00:00Z"),
-                Some("2026-01-01T12:00:00Z"),
-                None,
-                false,
-                None,
+                "2026-01-01T00:00:00Z",
                 "2026-01-01T12:00:00Z",
             ),
         ];
@@ -5712,19 +6061,17 @@ mod tests {
                 "2026-01-02T00:00:00Z",
             ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
-            agent_exit(
-                "ax1",
-                "repo",
-                "TKT-source",
-                "author",
-                "author-gen",
-                "sess-1",
-                Some("2026-01-01T00:00:00Z"),
-                Some("2026-01-01T12:00:00Z"),
-                None,
-                false,
-                Some(true),
-                "2026-01-01T12:00:00Z",
+            field(
+                exit_rec(
+                    "ax1",
+                    "TKT-source",
+                    "author",
+                    "author-gen",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T12:00:00Z",
+                ),
+                "stale_session",
+                json!(true),
             ),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -5748,32 +6095,29 @@ mod tests {
             ..manifest(vec![])
         };
         let tuples = vec![
-            agent_final_usage(
-                "u1",
-                "repo",
-                "TKT-1",
-                "gen-1",
-                "sess-1",
-                Some("prov-1"),
-                Some("completed"),
-                Some(1.5),
-                PROVIDER_COST_BASIS,
-                "2026-01-01T11:00:00Z",
-                "2026-01-01T11:00:00Z",
+            field(
+                usage_rec(
+                    "u1",
+                    "TKT-1",
+                    "gen-1",
+                    Some("completed"),
+                    Some(1.5),
+                    "2026-01-01T11:00:00Z",
+                ),
+                "provider_session",
+                json!("prov-1"),
             ),
-            agent_exit(
-                "ax1",
-                "repo",
-                "TKT-1",
-                "gen-1",
-                "gen-1",
-                "sess-1",
-                Some("2026-01-01T10:00:00Z"),
-                Some("2026-01-01T12:00:00Z"),
-                Some("completed"),
-                false,
-                None,
-                "2026-01-01T12:00:00Z",
+            field(
+                exit_rec(
+                    "ax1",
+                    "TKT-1",
+                    "gen-1",
+                    "gen-1",
+                    "2026-01-01T10:00:00Z",
+                    "2026-01-01T12:00:00Z",
+                ),
+                "prior_state",
+                json!("completed"),
             ),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -5800,32 +6144,29 @@ mod tests {
             ..manifest(vec![])
         };
         let tuples = vec![
-            agent_final_usage(
-                "u1",
-                "repo",
-                "TKT-1",
-                "gen-1",
-                "sess-1",
-                Some("prov-1"),
-                Some("paused"),
-                Some(3.0),
-                PROVIDER_COST_BASIS,
-                "2026-01-01T11:00:00Z",
-                "2026-01-01T11:00:00Z",
+            field(
+                usage_rec(
+                    "u1",
+                    "TKT-1",
+                    "gen-1",
+                    Some("paused"),
+                    Some(3.0),
+                    "2026-01-01T11:00:00Z",
+                ),
+                "provider_session",
+                json!("prov-1"),
             ),
-            agent_exit(
-                "ax1",
-                "repo",
-                "TKT-1",
-                "gen-1",
-                "gen-1",
-                "sess-1",
-                Some("2026-01-01T10:00:00Z"),
-                Some("2026-01-01T12:00:00Z"),
-                Some("running"),
-                false,
-                None,
-                "2026-01-01T12:00:00Z",
+            field(
+                exit_rec(
+                    "ax1",
+                    "TKT-1",
+                    "gen-1",
+                    "gen-1",
+                    "2026-01-01T10:00:00Z",
+                    "2026-01-01T12:00:00Z",
+                ),
+                "prior_state",
+                json!("running"),
             ),
         ];
         let c = capture(tuples, Order::Unknown);

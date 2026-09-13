@@ -7,6 +7,12 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Command, Output};
 
+/// A castle's wire author id is `castle-<first 16 hex of its Ed25519 key>`
+/// (`rk_core::identity::actor_from_pubkey`); the configured `castle_name` is a
+/// presentation-only alias that never becomes the wire id. The report checks
+/// this shape, so fixtures carry a real one.
+const CASTLE: &str = "castle-48451de05dc5e21a";
+
 fn write_json(dir: &std::path::Path, name: &str, value: &Value) -> std::path::PathBuf {
     let path = dir.join(name);
     let mut f = std::fs::File::create(&path).unwrap();
@@ -58,7 +64,7 @@ fn tuples_envelope() -> Value {
         "tuples": [
             {
                 "id": "src-1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-finding-cli1", "instance": "author", "lifecycle": "furniture",
+                "identity": "bbs-finding-4f1fd45761705a77932c7643150dd7efbdbc75c4e1e507d8677959ad55d3ecff", "instance": "author", "lifecycle": "furniture",
                 "created_at": "2026-01-01T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "finding", "agent": "author",
@@ -74,7 +80,7 @@ fn tuples_envelope() -> Value {
             },
             {
                 "id": "r1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-reuse-cli1", "instance": "consumer", "lifecycle": "furniture",
+                "identity": "bbs-reuse-dc2a31d9f2da9860dd0938c863e5347227ce5fd9fffbad918afec5074dabae85", "instance": "consumer", "lifecycle": "furniture",
                 "created_at": "2026-01-02T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "reuse", "agent": "consumer",
@@ -89,7 +95,7 @@ fn tuples_envelope() -> Value {
             },
             {
                 "id": "a1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-assessment-cli1", "instance": "operator", "lifecycle": "furniture",
+                "identity": "bbs-assessment-e44925af124527d7f084a8fbec41d8e81b7b01a8f85fd2144b86287d8f46f351", "instance": "operator", "lifecycle": "furniture",
                 "created_at": "2026-01-03T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "assessment", "agent": "operator",
@@ -381,7 +387,7 @@ fn native_tuples_envelope() -> Value {
         "tuples": [
             {
                 "id": "src-1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-finding-native1", "instance": "author", "lifecycle": "furniture",
+                "identity": "bbs-finding-6262e67c9da27d4e06fb3853872b851d9546c5f31b0127e37b37fd2b79fdde3e", "instance": "author", "lifecycle": "furniture",
                 "created_at": "2026-01-01T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "finding", "agent": "author",
@@ -397,7 +403,7 @@ fn native_tuples_envelope() -> Value {
             },
             {
                 "id": "r1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-reuse-native1", "instance": "consumer", "lifecycle": "furniture",
+                "identity": "bbs-reuse-4cabe67a25dbf9d2c33119978603dbc5e905a56c4518aacc55f4395622a7bcb1", "instance": "consumer", "lifecycle": "furniture",
                 "created_at": "2026-01-02T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "reuse", "agent": "consumer",
@@ -412,7 +418,7 @@ fn native_tuples_envelope() -> Value {
             },
             {
                 "id": "a1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-assessment-native1", "instance": "operator", "lifecycle": "furniture",
+                "identity": "bbs-assessment-8a764d687abca3db772aeb55e98f197447508422261333491aa9c787336263dd", "instance": "operator", "lifecycle": "furniture",
                 "created_at": "2026-01-03T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "assessment", "agent": "operator",
@@ -428,7 +434,7 @@ fn native_tuples_envelope() -> Value {
             },
             {
                 "id": "x1", "category": "event", "scope": "repo",
-                "identity": "bbs-exposure-spawn", "instance": "castle-1", "lifecycle": "furniture",
+                "identity": "bbs-exposure-spawn", "instance": CASTLE, "lifecycle": "furniture",
                 "created_at": "2026-01-01T12:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "exposure", "surface": "spawn", "repo": "repo",
@@ -441,7 +447,7 @@ fn native_tuples_envelope() -> Value {
             },
             {
                 "id": "u1", "category": "event", "scope": "repo",
-                "identity": "bbs-agent-final-usage", "instance": "castle-1", "lifecycle": "furniture",
+                "identity": "bbs-agent-final-usage", "instance": CASTLE, "lifecycle": "furniture",
                 "created_at": "2026-01-01T11:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "agent_final_usage", "repo": "repo",
@@ -456,7 +462,7 @@ fn native_tuples_envelope() -> Value {
             },
             {
                 "id": "ax1", "category": "event", "scope": "repo",
-                "identity": "bbs-agent-exit", "instance": "castle-1", "lifecycle": "furniture",
+                "identity": "bbs-agent-exit", "instance": CASTLE, "lifecycle": "furniture",
                 "created_at": "2026-01-01T12:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "agent_exit", "repo": "repo",
@@ -471,7 +477,7 @@ fn native_tuples_envelope() -> Value {
             },
             {
                 "id": "ax-author", "category": "event", "scope": "repo",
-                "identity": "bbs-agent-exit", "instance": "castle-1", "lifecycle": "furniture",
+                "identity": "bbs-agent-exit", "instance": CASTLE, "lifecycle": "furniture",
                 "created_at": "2026-01-01T10:30:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "agent_exit", "repo": "repo",
