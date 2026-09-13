@@ -8371,7 +8371,10 @@ impl Supervisor {
         self.lock_completions().remove(name);
         let token = match control {
             Some(control) => self.track_session(&mut tokens, name, control),
-            None => self.fence_unobservable_session(&mut tokens, name),
+            None => {
+                self.lock_controls().remove(name);
+                self.fence_unobservable_session(&mut tokens, name)
+            }
         };
         Ok((record, token))
     }
@@ -13446,8 +13449,8 @@ mod native_observation_tests {
     /// every late event the dead headless process still emitted counted as
     /// owning the name. The launch itself needs a live herdr server, so this
     /// drives the two production helpers it composes.
-    #[test]
-    fn an_attach_respawn_publishes_no_session_and_evicts_the_headless_one() {
+    #[tokio::test]
+    async fn an_attach_respawn_publishes_no_session_and_evicts_the_headless_one() {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -13460,9 +13463,45 @@ mod native_observation_tests {
             "the headless launch is observable and publishes its own token"
         );
 
-        // Exactly what `respawn_attached` now calls.
-        sup.publish_launch("Nibble", None, |r| r.state = AgentState::Running)
+        // Keep the predecessor's real control handle after its process exits.
+        // The attach takeover must retire it without waiting for an old event.
+        let mut prior = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                env: HashMap::from([("RK_FAKE_HARNESS_CMD".into(), "exit 0".into())]),
+                ..Default::default()
+            })
             .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = prior.events.recv().await {
+                if matches!(event, HarnessEvent::Exited { .. }) {
+                    return;
+                }
+            }
+            panic!("the predecessor fixture must report its exit");
+        })
+        .await
+        .unwrap();
+        sup.lock_controls().insert("Nibble".into(), prior.control);
+
+        // Exactly what `respawn_attached` now calls.
+        sup.publish_launch("Nibble", None, |r| {
+            r.state = AgentState::Running;
+            r.attach_target = Some("fixture-attach-pane".into());
+        })
+        .unwrap();
+        assert!(
+            !sup.lock_controls().contains_key("Nibble"),
+            "attach takeover must retire the predecessor's headless control"
+        );
+        let error = sup
+            .steer_envelope("Nibble", &ControlEnvelope::system("Nibble", "guidance"))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("attached harness has no authenticated control envelope channel"));
 
         assert_eq!(
             sup.launch_identity("Nibble"),
