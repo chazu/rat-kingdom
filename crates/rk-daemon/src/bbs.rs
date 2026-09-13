@@ -2300,12 +2300,20 @@ mod tests {
                 repo: "repo".into(),
                 after: None,
                 limit: 500,
+                boundary: None,
             },
         )
         .unwrap();
         assert_eq!(
-            full["order"], "tuple_persistence_events.commit_sequence ascending",
+            // The accepted S3 capture contract's enum, NOT the SQL detail:
+            // a consumer keys on this exact value to decide whether it may
+            // trust persistence order at all.
+            full["order"], "persistence_sequence",
             "the envelope makes its ordering claim explicit"
+        );
+        assert_eq!(
+            full["order_provenance"], "tuple_persistence_events.commit_sequence ascending",
+            "implementation provenance stays readable but out of the wire enum"
         );
         assert_eq!(full["truncated"], false);
         assert_eq!(full["coverage"]["complete"], true);
@@ -2331,6 +2339,7 @@ mod tests {
                 repo: "repo".into(),
                 after: None,
                 limit: 1,
+                boundary: None,
             },
         )
         .unwrap();
@@ -2344,6 +2353,7 @@ mod tests {
                 repo: "repo".into(),
                 after: Some(next),
                 limit: 1,
+                boundary: None,
             },
         )
         .unwrap();
@@ -2357,6 +2367,7 @@ mod tests {
                 repo: "repo".into(),
                 after: Some(next),
                 limit: 500,
+                boundary: None,
             },
         )
         .unwrap();
@@ -2386,6 +2397,7 @@ mod tests {
                 repo: "repo".into(),
                 after: None,
                 limit: 500,
+                boundary: None,
             },
         )
         .unwrap();
@@ -2404,8 +2416,295 @@ mod tests {
                 repo: "repo".into(),
                 after: None,
                 limit: 0,
+                boundary: None,
             },
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod export_snapshot_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn artifact(space: &Space, scope: &str, name: &str, payload: serde_json::Value) -> Tuple {
+        let tuple = Tuple::new(Category::Artifact, scope, name, "peer", payload);
+        space.out(tuple.clone()).unwrap();
+        tuple
+    }
+
+    fn params(repo: &str, limit: usize) -> ExportParams {
+        ExportParams {
+            repo: repo.to_string(),
+            after: None,
+            limit,
+            boundary: None,
+        }
+    }
+
+    /// The ordering claim is the entire reason this surface exists: a consumer
+    /// keys on `order`, so the wire value must be the contract's enum and the
+    /// SQL detail must live somewhere it cannot be mistaken for it.
+    #[test]
+    fn order_is_the_contract_enum_with_provenance_held_separately() {
+        let space = Space::open_in_memory().unwrap();
+        artifact(&space, "repo", "a", json!({"summary":"one"}));
+        let out = export(&space, &params("repo", 10)).unwrap();
+        assert_eq!(out["order"], "persistence_sequence");
+        assert_eq!(
+            out["order_provenance"],
+            "tuple_persistence_events.commit_sequence ascending"
+        );
+        assert_eq!(out["source"], "space.persistence_page");
+    }
+
+    /// Paging without a pinned boundary silently spans two different states.
+    /// With one, a row written between pages must NOT appear in page two.
+    #[test]
+    fn pinned_boundary_excludes_writes_made_between_pages() {
+        let space = Space::open_in_memory().unwrap();
+        artifact(&space, "repo", "first", json!({"summary":"1"}));
+        artifact(&space, "repo", "second", json!({"summary":"2"}));
+
+        let page1 = export(&space, &params("repo", 1)).unwrap();
+        assert_eq!(page1["truncated"], true);
+        let boundary = page1["boundary"].as_u64().unwrap();
+        let cursor = page1["next_cursor"].as_u64().unwrap();
+
+        // A concurrent writer lands a row AFTER the snapshot was frozen.
+        let intruder = artifact(&space, "repo", "intruder", json!({"summary":"late"}));
+
+        let page2 = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(cursor),
+                limit: 10,
+                boundary: Some(boundary),
+            },
+        )
+        .unwrap();
+        let ids: Vec<String> = page2["tuples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !ids.contains(&intruder.id.to_string()),
+            "a row written after the pinned boundary leaked into a later page: {ids:?}"
+        );
+
+        // Control: without the pin, the same second page DOES see it — which
+        // is precisely the defect the pin exists to close.
+        let unpinned = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(cursor),
+                limit: 10,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        let unpinned_ids: Vec<String> = unpinned["tuples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(unpinned_ids.contains(&intruder.id.to_string()));
+    }
+
+    /// Clamping a future boundary would hand back a different snapshot than
+    /// the caller asked for while calling it the same one.
+    #[test]
+    fn boundary_ahead_of_the_store_is_refused_not_clamped() {
+        let space = Space::open_in_memory().unwrap();
+        artifact(&space, "repo", "a", json!({"summary":"one"}));
+        let live = space.latest_persistence_sequence().unwrap();
+        let error = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 10,
+                boundary: Some(live + 5_000),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("ahead of the store"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Resolving a reference through the LIVE row lets a tuple that did not
+    /// exist at the boundary appear inside a snapshot of that boundary.
+    #[test]
+    fn references_are_fenced_to_the_frozen_boundary() {
+        let space = Space::open_in_memory().unwrap();
+        // Mint the evidence id first, but persist it only AFTER the boundary.
+        let future_evidence = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "evidence",
+            "peer",
+            json!({"summary":"written later"}),
+        );
+        let finding = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-finding-x",
+            "peer",
+            json!({
+                "bbs_kind":"finding",
+                "text":"t",
+                "areas":["a"],
+                "revision":"abc",
+                "evidence":[future_evidence.id.to_string()],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(finding.clone()).unwrap();
+        let boundary = space.latest_persistence_sequence().unwrap();
+        space.out(future_evidence.clone()).unwrap();
+
+        let out = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 50,
+                boundary: Some(boundary),
+            },
+        )
+        .unwrap();
+        let refs: Vec<String> = out["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !refs.contains(&future_evidence.id.to_string()),
+            "a post-boundary row leaked in as a reference"
+        );
+        let missing: Vec<String> = out["coverage"]["missing_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(missing.contains(&future_evidence.id.to_string()));
+        assert_eq!(out["coverage"]["complete"], false);
+    }
+
+    /// A receipt names a finding; that finding names evidence of its own. A
+    /// single-hop closure resolves the finding, misses the evidence, and still
+    /// reports `complete` — which is the failure this guards.
+    #[test]
+    fn nested_evidence_is_followed_and_never_silently_dropped() {
+        let space = Space::open_in_memory().unwrap();
+        let evidence = artifact(&space, "repo", "deep-evidence", json!({"summary":"deep"}));
+        let finding = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-finding-y",
+            "peer",
+            json!({
+                "bbs_kind":"finding",
+                "text":"t",
+                "areas":["a"],
+                "revision":"abc",
+                "evidence":[evidence.id.to_string()],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(finding.clone()).unwrap();
+        let receipt = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-reuse-z",
+            "consumer",
+            json!({
+                "bbs_kind":"reuse",
+                "source": finding.id.to_string(),
+                "outcome":"used",
+                "text":"t",
+                "evidence":[],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(receipt.clone()).unwrap();
+
+        // Page holding ONLY the receipt, so both hops must be traversed.
+        let receipt_seq = space
+            .commit_sequences(&[receipt.id])
+            .unwrap()
+            .get(&receipt.id)
+            .copied()
+            .unwrap();
+        let out = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(receipt_seq - 1),
+                limit: 1,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        let refs: Vec<String> = out["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            refs.contains(&finding.id.to_string()),
+            "first hop missing: {refs:?}"
+        );
+        assert!(
+            refs.contains(&evidence.id.to_string()),
+            "SECOND hop missing — coverage.complete would be a lie: {refs:?}"
+        );
+    }
+
+    /// A bounded per-repo capture must not leak a foreign scope, and must say
+    /// that it did not rather than dropping the reference.
+    #[test]
+    fn foreign_scope_reference_is_reported_never_exported() {
+        let space = Space::open_in_memory().unwrap();
+        let foreign = artifact(&space, "other-repo", "foreign", json!({"summary":"x"}));
+        let finding = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-finding-f",
+            "peer",
+            json!({
+                "bbs_kind":"finding",
+                "text":"t",
+                "areas":["a"],
+                "revision":"abc",
+                "evidence":[foreign.id.to_string()],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(finding).unwrap();
+        let out = export(&space, &params("repo", 50)).unwrap();
+        for tuple in out["references"].as_array().unwrap() {
+            assert_ne!(tuple["scope"], "other-repo");
+        }
+        let missing: Vec<String> = out["coverage"]["missing_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(missing.contains(&foreign.id.to_string()));
+        assert_eq!(out["coverage"]["complete"], false);
     }
 }

@@ -25,6 +25,12 @@ pub enum BbsCommand {
         /// Maximum records per page (1..2000). Truncation is always reported.
         #[arg(long, default_value_t = 500)]
         limit: usize,
+        /// Pin the snapshot boundary from a prior page's `boundary`, so later
+        /// pages read ONE snapshot. Without it each page captures a fresh
+        /// boundary and a concurrent write can appear mid-paging. A boundary
+        /// ahead of the store is refused, never clamped.
+        #[arg(long)]
+        boundary: Option<u64>,
     },
     /// Ask a durable question for peers working in this repository.
     Ask {
@@ -178,11 +184,16 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
                 );
             }
         }
-        BbsCommand::Export { repo, after, limit } => {
+        BbsCommand::Export {
+            repo,
+            after,
+            limit,
+            boundary,
+        } => {
             let result = client
                 .call(
                     "bbs.export",
-                    json!({"repo":repo,"after":after,"limit":limit}),
+                    json!({"repo":repo,"after":after,"limit":limit,"boundary":boundary}),
                 )
                 .await?;
             if as_json {
