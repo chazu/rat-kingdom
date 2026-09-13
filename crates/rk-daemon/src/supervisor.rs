@@ -1898,7 +1898,16 @@ impl Supervisor {
             base: Some(instruction_base.clone()),
             review: params.review.clone(),
             parent: params.parent.clone(),
-            briefing: self.bbs_briefing(&repo_name, Some(&params.task)),
+            briefing: self.bbs_briefing(
+                &repo_name,
+                Some(&params.task),
+                rk_core::bbs::ExposureSurface::Spawn,
+                &crate::bbs::ConsumerBinding::agent(
+                    &name,
+                    &spawn.to_string(),
+                    Some(&params.task),
+                ),
+            ),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
             verification_checks: self.scan_verification_checks(&worktree),
@@ -1980,10 +1989,20 @@ impl Supervisor {
             "agent_spawned",
             json!({
                 "agent": name,
+                // Exact generation identity, additive alongside the existing
+                // fields: without it a launch event cannot be joined to the
+                // `harness_result`/exposure records that already carry `spawn`,
+                // and a namesake predecessor's launch is indistinguishable
+                // from this one. Measurement plumbing only — no behavior here
+                // reads it.
+                "spawn": record.spawn_id().to_string(),
                 "task": params.task,
                 "role": params.role,
                 "parent": params.parent,
                 "workflow_instance": params.workflow_instance,
+                // Real launch time, so active execution can later be measured
+                // apart from queue and check phases.
+                "launched_at": chrono::Utc::now().to_rfc3339(),
             }),
         );
         self.emit_coordinator_event(
@@ -1997,6 +2016,12 @@ impl Supervisor {
                 "coordinator": record.coordinator,
                 "workflow_instance": record.workflow_instance,
                 "agent": record.name,
+                // `generation` stays a `created_at` timestamp for existing
+                // consumers; `spawn`/`task` are added beside it so lifecycle
+                // rows join to `harness_result` and exposure records on the
+                // same exact key those already use.
+                "spawn": record.spawn_id().to_string(),
+                "task": record.task,
                 "generation": record.created_at,
             }),
         );
@@ -2080,10 +2105,12 @@ impl Supervisor {
             "agent_spawned",
             json!({
                 "agent": name,
+                "spawn": record.spawn_id().to_string(),
                 "task": params.task,
                 "role": params.role,
                 "attached": true,
                 "workflow_instance": params.workflow_instance,
+                "launched_at": chrono::Utc::now().to_rfc3339(),
             }),
         );
         self.emit_coordinator_event(
@@ -2097,6 +2124,12 @@ impl Supervisor {
                 "coordinator": record.coordinator,
                 "workflow_instance": record.workflow_instance,
                 "agent": record.name,
+                // `generation` stays a `created_at` timestamp for existing
+                // consumers; `spawn`/`task` are added beside it so lifecycle
+                // rows join to `harness_result` and exposure records on the
+                // same exact key those already use.
+                "spawn": record.spawn_id().to_string(),
+                "task": record.task,
                 "generation": record.created_at,
             }),
         );
@@ -2294,7 +2327,18 @@ impl Supervisor {
             base: Some(instruction_base),
             review: record.review.clone(),
             parent: record.parent.clone(),
-            briefing: self.bbs_briefing(&record.repo_name, record.task.as_deref()),
+            // A respawn deliberately continues the SAME `SpawnId`, so this
+            // exposure binds to the generation that is resuming, not a new one.
+            briefing: self.bbs_briefing(
+                &record.repo_name,
+                record.task.as_deref(),
+                rk_core::bbs::ExposureSurface::Resume,
+                &crate::bbs::ConsumerBinding::agent(
+                    &record.name,
+                    &record.spawn_id().to_string(),
+                    record.task.as_deref(),
+                ),
+            ),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
             verification_checks: self.scan_verification_checks(&worktree),
@@ -2372,8 +2416,14 @@ impl Supervisor {
             "agent_respawned",
             json!({
                 "agent": name,
+                // A respawn CONTINUES the same generation, so this is the same
+                // `SpawnId` the original launch carried — that sameness is the
+                // fact a report needs, not a new identity.
+                "spawn": updated.spawn_id().to_string(),
                 "task": updated.task,
+                "role": updated.role,
                 "workflow_instance": updated.workflow_instance,
+                "launched_at": chrono::Utc::now().to_rfc3339(),
             }),
         );
         self.emit_coordinator_event(
@@ -2387,6 +2437,8 @@ impl Supervisor {
                 "coordinator": updated.coordinator,
                 "workflow_instance": updated.workflow_instance,
                 "agent": updated.name,
+                "spawn": updated.spawn_id().to_string(),
+                "task": updated.task,
                 "generation": updated.created_at,
             }),
         );
@@ -2493,9 +2545,12 @@ impl Supervisor {
             "agent_respawned",
             json!({
                 "agent": updated.name,
+                "spawn": updated.spawn_id().to_string(),
                 "task": updated.task,
+                "role": updated.role,
                 "attached": true,
                 "workflow_instance": updated.workflow_instance,
+                "launched_at": chrono::Utc::now().to_rfc3339(),
             }),
         );
         self.forget_completion(&updated.name);
@@ -3178,14 +3233,50 @@ impl Supervisor {
         }
     }
 
-    fn bbs_briefing(&self, repo: &str, task: Option<&str>) -> Option<rk_core::bbs::Briefing> {
+    /// The bounded selection prepared for one agent context, captured as a
+    /// daemon-authored exposure record bound to that exact generation.
+    ///
+    /// Capture never gates the launch: a briefing that cannot be computed
+    /// degrades to no briefing (as before), and a briefing that cannot be
+    /// CAPTURED is still returned and still primed — the gap is recorded as
+    /// missing coverage instead. An exposure here means the selection was
+    /// prepared for this context, not that the agent launched, read it, or
+    /// benefited; a spawn that later fails leaves this record standing, so a
+    /// report must join native lifecycle evidence before counting an active
+    /// consumer.
+    fn bbs_briefing(
+        &self,
+        repo: &str,
+        task: Option<&str>,
+        surface: rk_core::bbs::ExposureSurface,
+        binding: &crate::bbs::ConsumerBinding,
+    ) -> Option<rk_core::bbs::Briefing> {
         let task = task?;
         match crate::bbs::brief(
             &self.space,
             &self.tickets,
             &crate::bbs::BriefParams::for_task(repo, task),
         ) {
-            Ok(briefing) => Some(briefing),
+            Ok(mut briefing) => {
+                let capture = crate::bbs::record_exposure(
+                    &self.space,
+                    &self.castle,
+                    surface,
+                    binding,
+                    &briefing,
+                );
+                if capture.is_failed() {
+                    warn!(
+                        repo,
+                        task,
+                        surface = surface.as_str(),
+                        "BBS exposure capture failed; the agent is primed anyway and coverage is reported missing"
+                    );
+                }
+                briefing.telemetry = Some(capture.status);
+                briefing.exposure = capture.record;
+                Some(briefing)
+            }
             Err(error) => {
                 warn!(%error, repo, task, "BBS briefing unavailable; worker can retry rk bbs brief");
                 None
@@ -4502,7 +4593,16 @@ impl Supervisor {
             base: Some(instruction_base),
             review: record.review.clone(),
             parent: record.parent.clone(),
-            briefing: self.bbs_briefing(&record.repo_name, record.task.as_deref()),
+            briefing: self.bbs_briefing(
+                &record.repo_name,
+                record.task.as_deref(),
+                rk_core::bbs::ExposureSurface::Recovery,
+                &crate::bbs::ConsumerBinding::agent(
+                    &record.name,
+                    &record.spawn_id().to_string(),
+                    record.task.as_deref(),
+                ),
+            ),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
             verification_checks: self.scan_verification_checks(&worktree),
@@ -5431,6 +5531,12 @@ impl Supervisor {
                 "coordinator": record.coordinator,
                 "workflow_instance": record.workflow_instance,
                 "agent": record.name,
+                // `generation` stays a `created_at` timestamp for existing
+                // consumers; `spawn`/`task` are added beside it so lifecycle
+                // rows join to `harness_result` and exposure records on the
+                // same exact key those already use.
+                "spawn": record.spawn_id().to_string(),
+                "task": record.task,
                 "generation": record.created_at,
                 "declared_done": declared_done,
             }),
@@ -6990,6 +7096,8 @@ impl Supervisor {
                 "coordinator": updated.coordinator,
                 "workflow_instance": updated.workflow_instance,
                 "agent": updated.name,
+                "spawn": updated.spawn_id().to_string(),
+                "task": updated.task,
                 "generation": updated.created_at,
                 "revision": updated.progress.as_ref().map(|p| p.revision),
                 "summary": summary,

@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS tuple_persistence_events (
     expires_at      TEXT,
     strength        REAL
 );
+CREATE INDEX IF NOT EXISTS idx_tuple_persistence_scope
+    ON tuple_persistence_events (scope, commit_sequence);
 CREATE TABLE IF NOT EXISTS rk_store_migrations (
     version TEXT PRIMARY KEY
 );
@@ -168,6 +170,20 @@ pub struct SdlcTransitionRecord {
 pub struct PersistenceDelta {
     pub boundary: u64,
     pub tuples: Vec<Tuple>,
+}
+
+/// One bounded page of the immutable persistence journal for a single scope.
+///
+/// `entries` pairs each tuple with its actual SQLite commit sequence, so a
+/// consumer can order records by persistence rather than by `RecordId`/ULID
+/// mint order, which a delayed writer can invert. `more` is true when further
+/// rows remain at or below `boundary`: truncation is reported, never implied.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistencePage {
+    pub boundary: u64,
+    pub next_cursor: u64,
+    pub more: bool,
+    pub entries: Vec<(u64, Tuple)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1030,6 +1046,83 @@ impl Store {
         Ok(PersistenceDelta { boundary, tuples })
     }
 
+    /// One bounded, scope-filtered page of the immutable persistence journal,
+    /// ordered by actual SQLite commit sequence.
+    ///
+    /// Unlike [`Store::persistence_delta`], which materializes every event
+    /// after a cursor, this pushes scope, cursor and limit into SQL before any
+    /// payload is deserialized, so a castle with a 371k-event journal pays for
+    /// `limit` rows, not for the whole history. `idx_tuple_persistence_scope`
+    /// makes the scan seek straight to `(scope, after]`.
+    ///
+    /// `boundary` is captured before the rows are read, exactly as
+    /// `persistence_delta` does, so a caller can page to a stable snapshot
+    /// while concurrent writes continue past it. `more` reports whether
+    /// further rows remain at or below that same boundary — truncation is
+    /// always visible rather than inferred from a short page.
+    pub fn persistence_page(
+        &self,
+        scope: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> rk_core::Result<PersistencePage> {
+        let boundary = self.latest_persistence_sequence()?;
+        let after = i64::try_from(after.unwrap_or(0))
+            .map_err(|_| Error::Other("tuple persistence cursor exceeds SQLite range".into()))?;
+        let boundary_sql = i64::try_from(boundary)
+            .map_err(|_| Error::Other("tuple persistence boundary exceeds SQLite range".into()))?;
+        if after > boundary_sql {
+            return Err(Error::Other(
+                "tuple persistence cursor is ahead of the captured boundary".into(),
+            ));
+        }
+        // Read one extra row to learn whether the page truncated the snapshot
+        // without running a second COUNT over the journal.
+        let probe = i64::try_from(limit.saturating_add(1))
+            .map_err(|_| Error::Other("tuple persistence limit exceeds SQLite range".into()))?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT commit_sequence, id, category, scope, identity, instance, lifecycle,
+                        payload, created_at, expires_at, strength
+                 FROM tuple_persistence_events
+                 WHERE scope = ?1 AND commit_sequence > ?2 AND commit_sequence <= ?3
+                 ORDER BY commit_sequence ASC
+                 LIMIT ?4",
+            )
+            .map_err(sql_err)?;
+        let rows = statement
+            .query_map(
+                params_from_iter::<[&dyn rusqlite::ToSql; 4]>([
+                    &scope, &after, &boundary_sql, &probe,
+                ]),
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    // `row_to_tuple` indexes from zero; re-read without the
+                    // leading sequence column by offsetting the projection.
+                    Ok((sequence, row_to_tuple_offset(row, 1)?))
+                },
+            )
+            .map_err(sql_err)?;
+        let mut entries: Vec<(u64, Tuple)> = Vec::new();
+        for row in rows {
+            let (sequence, tuple) = row.map_err(sql_err)?;
+            entries.push((sequence.max(0) as u64, tuple));
+        }
+        let more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_cursor = entries
+            .last()
+            .map(|(sequence, _)| *sequence)
+            .unwrap_or(u64::try_from(after).unwrap_or(0));
+        Ok(PersistencePage {
+            boundary,
+            next_cursor,
+            more,
+            entries,
+        })
+    }
+
     pub fn has_persistence_event(&self, id: RecordId) -> rk_core::Result<bool> {
         self.conn
             .query_row(
@@ -1850,41 +1943,48 @@ fn parse_lifecycle(s: &str) -> Result<Lifecycle, Error> {
 }
 
 fn row_to_tuple(row: &Row<'_>) -> rusqlite::Result<Tuple> {
-    let id: String = row.get(0)?;
-    let category: String = row.get(1)?;
-    let lifecycle: String = row.get(5)?;
-    let payload: String = row.get(6)?;
-    let created_at: String = row.get(7)?;
-    let expires_at: Option<String> = row.get(8)?;
-    let strength: Option<f64> = row.get(9)?;
+    row_to_tuple_offset(row, 0)
+}
+
+/// Read a tuple from the standard ten-column projection starting at `base`.
+/// Callers that prepend a column (e.g. the journal's `commit_sequence`) pass a
+/// nonzero `base` instead of duplicating the whole conversion.
+fn row_to_tuple_offset(row: &Row<'_>, base: usize) -> rusqlite::Result<Tuple> {
+    let id: String = row.get(base)?;
+    let category: String = row.get(base + 1)?;
+    let lifecycle: String = row.get(base + 5)?;
+    let payload: String = row.get(base + 6)?;
+    let created_at: String = row.get(base + 7)?;
+    let expires_at: Option<String> = row.get(base + 8)?;
+    let strength: Option<f64> = row.get(base + 9)?;
 
     let id = id
         .parse()
-        .map_err(|e| conversion_error(0, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base, rusqlite::types::Type::Text, e))?;
     let category = category
         .parse::<Category>()
-        .map_err(|e| conversion_error(1, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base + 1, rusqlite::types::Type::Text, e))?;
     let lifecycle = parse_lifecycle(&lifecycle)
-        .map_err(|e| conversion_error(5, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base + 5, rusqlite::types::Type::Text, e))?;
     let payload = serde_json::from_str(&payload)
-        .map_err(|e| conversion_error(6, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base + 6, rusqlite::types::Type::Text, e))?;
     let created_at = DateTime::parse_from_rfc3339(&created_at)
         .map(|t| t.with_timezone(&Utc))
-        .map_err(|e| conversion_error(7, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base + 7, rusqlite::types::Type::Text, e))?;
     let expires_at = expires_at
         .map(|s| {
             DateTime::parse_from_rfc3339(&s)
                 .map(|t| t.with_timezone(&Utc))
-                .map_err(|e| conversion_error(8, rusqlite::types::Type::Text, e))
+                .map_err(|e| conversion_error(base + 8, rusqlite::types::Type::Text, e))
         })
         .transpose()?;
 
     Ok(Tuple {
         id,
         category,
-        scope: row.get(2)?,
-        identity: row.get(3)?,
-        instance: row.get(4)?,
+        scope: row.get(base + 2)?,
+        identity: row.get(base + 3)?,
+        instance: row.get(base + 4)?,
         lifecycle,
         payload,
         created_at,

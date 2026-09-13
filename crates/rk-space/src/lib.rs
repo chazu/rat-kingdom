@@ -15,7 +15,7 @@
 
 mod store;
 
-pub use store::{PersistenceDelta, SdlcTransitionRecord};
+pub use store::{PersistenceDelta, PersistencePage, SdlcTransitionRecord};
 
 use rk_core::sdlc::{ConfiguredSourceName, SignalEnvelope, SignalReceipt, SignalSourcePrincipal};
 use rk_core::tuple::{Lifecycle, Pattern, Tuple};
@@ -197,6 +197,21 @@ impl Space {
     /// consumers. A later take or delete does not remove the event snapshot.
     pub fn persistence_delta(&self, after: Option<u64>) -> rk_core::Result<PersistenceDelta> {
         self.lock().store.persistence_delta(after)
+    }
+
+    /// One bounded, scope-filtered, persistence-ordered page of the immutable
+    /// journal. Scope, cursor and limit are pushed into SQL before any payload
+    /// is deserialized, so the cost is the page, not the journal. Prefer this
+    /// over [`Space::persistence_delta`] for any capture surface that must stay
+    /// bounded on a production-sized store, and read `more` to report
+    /// truncation explicitly.
+    pub fn persistence_page(
+        &self,
+        scope: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> rk_core::Result<PersistencePage> {
+        self.lock().store.persistence_page(scope, after, limit)
     }
 
     /// Whether this local store ever persisted the tuple id, even if the live row

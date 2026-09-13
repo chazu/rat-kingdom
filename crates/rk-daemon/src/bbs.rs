@@ -217,7 +217,250 @@ pub fn brief(space: &Space, tickets: &Tickets, params: &BriefParams) -> rk_core:
         since: params.since,
         entries,
         omitted,
+        // `brief` computes the selection; capture is the caller's decision,
+        // because only the caller knows which surface and which generation
+        // this selection was prepared for.
+        telemetry: None,
+        exposure: None,
     })
+}
+
+/// Who a prepared selection or explicit read was prepared FOR.
+///
+/// The daemon derives this from its own authenticated view of the caller — an
+/// agent process never supplies it. When an exact agent generation cannot be
+/// established the binding is recorded explicitly as operator/unbound rather
+/// than guessed, so a report can exclude it from agent exposure rates instead
+/// of silently attributing it to someone.
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerBinding {
+    pub agent: Option<String>,
+    pub spawn: Option<String>,
+    pub task: Option<String>,
+}
+
+impl ConsumerBinding {
+    pub fn operator() -> Self {
+        Self::default()
+    }
+
+    pub fn agent(name: &str, spawn: &str, task: Option<&str>) -> Self {
+        Self {
+            agent: Some(name.to_string()),
+            spawn: Some(spawn.to_string()),
+            task: task.map(str::to_string),
+        }
+    }
+
+    /// `agent` only when BOTH a name and an exact generation are known. A name
+    /// without a `SpawnId` cannot distinguish a namesake predecessor from this
+    /// generation, so it is deliberately not agent-bound.
+    fn bound(&self) -> &'static str {
+        match (&self.agent, &self.spawn) {
+            (Some(_), Some(_)) => "agent",
+            (Some(_), None) => "unbound",
+            (None, _) => "operator",
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent": self.agent,
+            "spawn": self.spawn,
+            "bound": self.bound(),
+        })
+    }
+}
+
+/// The outcome of a telemetry capture. A failure NEVER propagates into the
+/// read or launch it describes; it is reported so the gap is known-missing
+/// rather than mistaken for a known-negative.
+#[derive(Debug, Clone)]
+pub struct Capture {
+    pub status: rk_core::bbs::TelemetryStatus,
+    pub record: Option<String>,
+}
+
+impl Capture {
+    fn recorded(id: rk_core::id::RecordId) -> Self {
+        Self {
+            status: rk_core::bbs::TelemetryStatus::Recorded,
+            record: Some(id.to_string()),
+        }
+    }
+
+    pub fn failed() -> Self {
+        Self {
+            status: rk_core::bbs::TelemetryStatus::Failed,
+            record: None,
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.status == rk_core::bbs::TelemetryStatus::Failed
+    }
+}
+
+/// Record that this exact bounded selection was PREPARED for `binding` at
+/// `surface`. Returns a capture outcome; it never returns an error, because no
+/// telemetry failure may turn a successful briefing or launch into a failure.
+///
+/// An empty selection is recorded as an exposure with zero entries, which is
+/// what makes "nothing relevant was available" distinguishable from "no record
+/// was ever written" — the first is an empty `entries` array, the second is
+/// the absence of any exposure tuple (or, when capture itself failed, a
+/// `telemetry_gap`).
+pub fn record_exposure(
+    space: &Space,
+    castle: &str,
+    surface: rk_core::bbs::ExposureSurface,
+    binding: &ConsumerBinding,
+    briefing: &Briefing,
+) -> Capture {
+    let entries: Vec<_> = briefing
+        .entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "source": entry.id,
+                "reason": entry.reason,
+                "kind": entry.kind,
+                "category": entry.category,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "bbs_kind": "exposure",
+        "surface": surface.as_str(),
+        "repo": briefing.repo,
+        "task": briefing.task,
+        "agent": binding.agent,
+        "spawn": binding.spawn,
+        "bound": binding.bound(),
+        "entries": entries,
+        "prepared": briefing.entries.len(),
+        "omitted": briefing.omitted,
+        "cursor": briefing.cursor,
+        "since": briefing.since,
+        // Stated in the record itself so no consumer has to rediscover it:
+        // preparing a selection is not delivering it to a model.
+        "semantics": "prepared",
+    });
+    write_telemetry(
+        space,
+        castle,
+        &briefing.repo,
+        &format!("bbs-exposure-{}", surface.as_str()),
+        payload,
+        serde_json::json!({
+            "surface": surface.as_str(),
+            "repo": briefing.repo,
+            "task": briefing.task,
+            "binding": binding.json(),
+        }),
+    )
+}
+
+/// Record that an authenticated caller's explicit `bbs show` request for
+/// `source` was served. Requested/prepared, never comprehended.
+///
+/// `dedup_key` pairs the source with the consumer GENERATION, which is exactly
+/// the pair the report deduplicates on: a generation that opens the same source
+/// five times leaves five retained records carrying one dedup key.
+pub fn record_open(
+    space: &Space,
+    castle: &str,
+    binding: &ConsumerBinding,
+    source: &Tuple,
+) -> Capture {
+    let dedup_key = format!(
+        "{}:{}",
+        source.id,
+        binding
+            .spawn
+            .clone()
+            .unwrap_or_else(|| format!("unbound:{}", binding.agent.as_deref().unwrap_or("operator")))
+    );
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "bbs_kind": "open",
+        "source": source.id.to_string(),
+        "source_kind": source.payload["bbs_kind"],
+        "repo": source.scope,
+        "agent": binding.agent,
+        "spawn": binding.spawn,
+        "task": binding.task,
+        "bound": binding.bound(),
+        "dedup_key": dedup_key,
+        "semantics": "requested",
+    });
+    write_telemetry(
+        space,
+        castle,
+        &source.scope,
+        "bbs-open",
+        payload,
+        serde_json::json!({
+            "surface": "show",
+            "repo": source.scope,
+            "source": source.id.to_string(),
+            "binding": binding.json(),
+        }),
+    )
+}
+
+/// Commit one daemon-authored telemetry record, falling back to a durable
+/// `telemetry_gap` when the record itself cannot be written.
+///
+/// Records are immutable `Furniture` Events authored by the castle, never by
+/// the agent whose context they describe, and each write mints a fresh tuple:
+/// repeats are RETAINED (the report deduplicates on source/generation) rather
+/// than collapsed into one, so a re-read is visible as a re-read.
+fn write_telemetry(
+    space: &Space,
+    castle: &str,
+    scope: &str,
+    identity: &str,
+    payload: serde_json::Value,
+    gap_context: serde_json::Value,
+) -> Capture {
+    let tuple = Tuple::new(
+        rk_core::tuple::Category::Event,
+        scope.to_string(),
+        identity.to_string(),
+        castle.to_string(),
+        payload,
+    )
+    .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+    let id = tuple.id;
+    match space.out(tuple) {
+        Ok(()) => Capture::recorded(id),
+        Err(error) => {
+            tracing::warn!(%error, identity, "BBS telemetry capture failed; work is unaffected");
+            let gap = Tuple::new(
+                rk_core::tuple::Category::Event,
+                scope.to_string(),
+                "bbs-telemetry-gap",
+                castle.to_string(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "bbs_kind": "telemetry_gap",
+                    "missing": identity,
+                    "error": error.to_string(),
+                    "context": gap_context,
+                }),
+            )
+            .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+            // The store that just refused the record will usually refuse this
+            // too; the in-process return value is the reliable signal and the
+            // gap tuple is the durable one when it survives.
+            if let Err(error) = space.out(gap) {
+                tracing::warn!(%error, "BBS telemetry gap record could not be persisted either");
+            }
+            Capture::failed()
+        }
+    }
 }
 
 fn refers_to(tuple: &Tuple, ids: &HashSet<String>) -> bool {
@@ -331,6 +574,171 @@ fn get_post(space: &Space, id: &str) -> rk_core::Result<Tuple> {
     space
         .get(id)?
         .ok_or_else(|| rk_core::Error::other("BBS post not found"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportParams {
+    pub repo: String,
+    /// Resume point: the last `commit_sequence` a prior page returned.
+    #[serde(default)]
+    pub after: Option<u64>,
+    #[serde(default = "default_export_limit")]
+    pub limit: usize,
+}
+
+fn default_export_limit() -> usize {
+    500
+}
+
+const MAX_EXPORT_LIMIT: usize = 2000;
+/// References are resolved with bounded, indexed `get`s. The cap keeps a page
+/// of densely cross-linked records from turning into an unbounded fan-out.
+const MAX_EXPORT_REFERENCES: usize = 4000;
+
+/// Payload keys that name another tuple in the same repository. Every one of
+/// these must either appear in the exported page, be resolved and appended as
+/// a reference, or be reported under `missing_references` — a reference is
+/// never silently dropped.
+const REFERENCE_KEYS: &[&str] = &[
+    "source",
+    "receipt",
+    "question",
+    "answer",
+    "contribution",
+    "source_artifact",
+];
+
+/// A bounded, read-only capture of one repository's records in ACTUAL
+/// persistence order, for the offline evidence report.
+///
+/// Why this exists rather than `rk scan`: a scan returns `{"tuples": [...]}`
+/// in `RecordId`/ULID order, which a delayed writer can invert, so it cannot
+/// establish which of two assessments was persisted last. This reads the
+/// immutable journal's `commit_sequence` and says so in the envelope. The
+/// historical `tuples` array is retained as the record list so an existing
+/// consumer keeps working; `order` is what makes the ordering claim
+/// authoritative, and a consumer must not infer persistence order from a plain
+/// scan that lacks it.
+///
+/// Bounded by construction: scope, cursor and limit are pushed into SQL before
+/// any payload is deserialized (see [`Space::persistence_page`]), so a 371k
+/// event journal costs a page, not a journal. Truncation is always reported.
+pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_json::Value> {
+    if params.repo.trim().is_empty() || !(1..=MAX_EXPORT_LIMIT).contains(&params.limit) {
+        return Err(rk_core::Error::other(format!(
+            "repo is required and limit must be 1..{MAX_EXPORT_LIMIT}"
+        )));
+    }
+    let page = space.persistence_page(&params.repo, params.after, params.limit)?;
+    let present: HashSet<_> = page.entries.iter().map(|(_, t)| t.id).collect();
+    let mut wanted: Vec<rk_core::id::RecordId> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut unresolvable: Vec<String> = Vec::new();
+    let mut reference_budget_exhausted = false;
+    for (_, tuple) in &page.entries {
+        if !is_bbs_record(tuple) {
+            continue;
+        }
+        let mut raw: Vec<String> = REFERENCE_KEYS
+            .iter()
+            .filter_map(|key| tuple.payload[*key].as_str().map(str::to_string))
+            .collect();
+        if let Some(evidence) = tuple.payload["evidence"].as_array() {
+            raw.extend(evidence.iter().filter_map(|v| v.as_str().map(str::to_string)));
+        }
+        for id in raw {
+            match id.parse::<rk_core::id::RecordId>() {
+                Ok(parsed) if present.contains(&parsed) => {}
+                Ok(parsed) => {
+                    if !seen.insert(parsed) {
+                        continue;
+                    }
+                    if wanted.len() >= MAX_EXPORT_REFERENCES {
+                        reference_budget_exhausted = true;
+                        unresolvable.push(id);
+                        continue;
+                    }
+                    wanted.push(parsed);
+                }
+                // A malformed reference cannot be resolved; report it rather
+                // than dropping it or failing the whole export.
+                Err(_) => unresolvable.push(id),
+            }
+        }
+    }
+    let mut references = Vec::new();
+    let mut missing = unresolvable;
+    for id in wanted {
+        match space.get(id)? {
+            // A reference into another repository is reported, never exported:
+            // a bounded per-repo capture must not leak a foreign scope.
+            Some(tuple) if tuple.scope == params.repo => references.push(tuple),
+            Some(_) | None => missing.push(id.to_string()),
+        }
+    }
+    let sequences = space.commit_sequences(
+        &references.iter().map(|t| t.id).collect::<Vec<_>>(),
+    )?;
+    let records: Vec<serde_json::Value> = page
+        .entries
+        .iter()
+        .map(|(sequence, tuple)| {
+            let mut value = serde_json::to_value(tuple).unwrap_or(serde_json::Value::Null);
+            value["commit_sequence"] = serde_json::json!(sequence);
+            value
+        })
+        .collect();
+    let reference_records: Vec<serde_json::Value> = references
+        .iter()
+        .map(|tuple| {
+            let mut value = serde_json::to_value(tuple).unwrap_or(serde_json::Value::Null);
+            // A live row a reference resolved to always has a commit sequence;
+            // `null` means the row exists but its order is unknown, which a
+            // consumer must treat as unordered rather than as sequence zero.
+            value["commit_sequence"] = serde_json::json!(sequences.get(&tuple.id));
+            value
+        })
+        .collect();
+    missing.sort();
+    missing.dedup();
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "bbs.export",
+        "repo": params.repo,
+        "build": rk_core::version::BUILD_VERSION,
+        "captured_at": chrono::Utc::now().to_rfc3339(),
+        // The ordering claim this surface exists to make. A consumer that does
+        // not see exactly this string must not assume persistence order.
+        "order": "tuple_persistence_events.commit_sequence ascending",
+        "boundary": page.boundary,
+        "after": params.after.unwrap_or(0),
+        "next_cursor": page.next_cursor,
+        "limit": params.limit,
+        "truncated": page.more,
+        // Historical `rk scan` shape: an object carrying a `tuples` array.
+        "tuples": records,
+        "references": reference_records,
+        "coverage": {
+            "tuples": records.len(),
+            "references": reference_records.len(),
+            "missing_references": missing,
+            "complete": !page.more && missing.is_empty() && !reference_budget_exhausted,
+            "reference_budget_exhausted": reference_budget_exhausted,
+            "scope": params.repo,
+        },
+    }))
+}
+
+/// Whether a tuple is one of the BBS record kinds whose payload may name other
+/// tuples that the export must carry or report.
+fn is_bbs_record(tuple: &Tuple) -> bool {
+    rk_core::bbs::is_question(tuple)
+        || rk_core::bbs::is_answer(tuple)
+        || rk_core::bbs::is_acceptance(tuple)
+        || rk_core::bbs::is_finding(tuple)
+        || rk_core::bbs::is_reuse(tuple)
+        || rk_core::bbs::is_assessment(tuple)
 }
 
 #[derive(Debug)]
