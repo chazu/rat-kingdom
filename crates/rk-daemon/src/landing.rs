@@ -18130,7 +18130,12 @@ checks: [
 
         // Round 1: a generous budget this 3-line diff comfortably fits.
         let outcome = pipeline
-            .run_gates_at(&mut entry, &git_repo, &GateConfig::default(), &candidate.commit)
+            .run_gates_at(
+                &mut entry,
+                &git_repo,
+                &GateConfig::default(),
+                &candidate.commit,
+            )
             .await
             .unwrap();
         assert_eq!(outcome, GateRunOutcome::Pass);
@@ -18171,6 +18176,147 @@ checks: [
                 .iter()
                 .all(|t| t.payload["check"] != "landing-diff-scope"),
             "the diff-scope check must never be credited as reused: {reuse_events:?}"
+        );
+    }
+
+    /// THE TICKET'S OTHER SCENARIO, the actual mechanism behind the
+    /// Munch62f425e/Remy/Scurry incident: an INNER-target contribution
+    /// records a passing proof at the exact source head (`head_sha`), and
+    /// that source head is LATER resubmitted against a DIFFERENT
+    /// (protected-final) target whose tip is an ancestor of `head_sha` — the
+    /// "content-equivalent merge" case `reusable_verification_proof`'s
+    /// second branch exists for. The `GateConfig` (protected-paths pattern,
+    /// diff budget) is IDENTICAL in both rounds, so `verification_proof_key`
+    /// digests identically too — but the new target's diff against `main`
+    /// is larger than the inner target's diff ever was, and genuinely
+    /// exceeds the (unchanged) budget. Before the fix, `reusable_verification_proof`
+    /// hits the exact-key proof recorded for `head_sha` in round 1 and
+    /// reuses it for round 2's `landing-diff-scope`, silently waving through
+    /// an outer diff the same policy would otherwise hold. This test fails
+    /// before the guard (`GateRunOutcome::Pass`, counter stays at 1) and
+    /// passes after it (`GateRunOutcome::Fail`, counter reaches 2).
+    #[tokio::test]
+    async fn landing_gate_never_reuses_a_diff_scope_proof_via_source_head_ancestor_for_a_different_target(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let counter = home.path().join("diff-scope-runs");
+        let diff_scope_command = format!(
+            r#"echo x >> '{counter}'; target=$RK_CHECK_TARGET; files=$(git diff --name-only \"$target\"...HEAD | wc -l | tr -d ' '); lines=$(git diff --numstat \"$target\"...HEAD | awk '{{a=$1;b=$2;if(a==\"-\")a=0;if(b==\"-\")b=0;s+=a+b}} END{{print s+0}}'); {{ [ \"$RK_CHECK_MAX_DIFF_FILES\" -eq 0 ] || [ \"$files\" -le \"$RK_CHECK_MAX_DIFF_FILES\" ]; }} && {{ [ \"$RK_CHECK_MAX_DIFF_LINES\" -eq 0 ] || [ \"$lines\" -le \"$RK_CHECK_MAX_DIFF_LINES\" ]; }}"#,
+            counter = counter.display()
+        );
+        write_checks(
+            repo_dir.path(),
+            &checks_cue_with_policy_logic(
+                "landing-protected-paths",
+                "true",
+                "landing-diff-scope",
+                &diff_scope_command,
+            ),
+        );
+
+        // "inner" is main plus one shared-infra commit; "feature" branches
+        // from "inner" and adds one small commit of its own. `main` is a
+        // strict ancestor of `feature` throughout — the property
+        // `reusable_verification_proof`'s ancestor check requires.
+        git(repo_dir.path(), &["checkout", "-b", "inner"]);
+        std::fs::write(repo_dir.path().join("infra.txt"), "infra\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "infra: shared piece"]);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "one\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        // ONE unchanged gates config for both rounds (the ticket's "no
+        // policy/budget changes" requirement): a 1-line diff budget the
+        // inner contribution's own commit fits and the outer resubmission's
+        // larger diff (infra + src) does not.
+        let gates = GateConfig {
+            max_diff_lines: 1,
+            ..GateConfig::default()
+        };
+
+        // Round 1: an inner-target contribution, gated directly against its
+        // own head (no merge candidate) — landing's own path for a target
+        // that needs no merge validation. Diff against "inner" is just this
+        // one small commit: passes, and durably records a proof keyed to
+        // `head_sha` itself.
+        let mut inner_entry = LandingQueueEntry {
+            repo_name: "ancestor-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "inner".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+        let passed = pipeline
+            .run_gates(&mut inner_entry, &git_repo, &gates)
+            .await
+            .unwrap();
+        assert!(passed, "the inner-target contribution must pass");
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1,
+            "the inner contribution must execute the diff-scope check once"
+        );
+
+        // Round 2: the SAME source head, resubmitted against `main` — a
+        // DIFFERENT, less-advanced target whose tip (an ancestor of
+        // `head_sha`) makes the merge content-equivalent. Its diff against
+        // `main` includes the infra commit too, exceeding the same 1-line
+        // budget that already passed in round 1.
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        let mut outer_entry = LandingQueueEntry {
+            repo_name: "ancestor-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+        let outcome = pipeline
+            .run_gates_at(&mut outer_entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GateRunOutcome::Fail,
+            "the outer target's larger diff must be held by the check's own fresh execution, \
+             never waved through by the inner contribution's source-head proof"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            2,
+            "the source-head ancestor proof from a different target must never suppress this \
+             check's fresh execution against the new candidate"
+        );
+
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert!(
+            reuse_events
+                .iter()
+                .all(|t| t.payload["check"] != "landing-diff-scope"),
+            "the diff-scope check must never be credited as reused via source-head ancestor \
+             either: {reuse_events:?}"
         );
     }
 
