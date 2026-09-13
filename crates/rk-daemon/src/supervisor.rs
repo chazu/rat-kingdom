@@ -2682,6 +2682,11 @@ impl Supervisor {
         }
         match event {
             HarnessEvent::Started { session_id } => {
+                // Learned per LAUNCH, so a delayed event from an older launch
+                // keeps its own provider session instead of the successor's.
+                if let Some(watch) = self.lock_attempts().get_mut(&session) {
+                    watch.provider_session = session_id.clone();
+                }
                 let had_outage = self
                     .lock_registry()
                     .get(name)
@@ -3438,6 +3443,31 @@ impl Supervisor {
                 *usage = floor_usage;
             }
         }
+    }
+
+    /// Freeze one launch's attribution under its own session token.
+    ///
+    /// Shared by the real launch path and by tests, so a test can never prove
+    /// a behaviour the production path does not actually take.
+    fn begin_launch(&self, name: &str, token: rk_core::id::SpawnId) {
+        let found = self.lock_registry().get(name).cloned();
+        let Some(record) = found else {
+            return;
+        };
+        self.lock_attempts().insert(
+            token,
+            AttemptWatch {
+                name: name.to_string(),
+                repo: record.repo_name.clone(),
+                task: record.task.clone(),
+                spawn: record.spawn_id().to_string(),
+                launched_at: Utc::now(),
+                provider_session: None,
+                saw_result: false,
+                usage_since_result: false,
+                saw_provider_cost: false,
+            },
+        );
     }
 
     /// This agent's live launch identity: the native session token and the ONE
@@ -8022,23 +8052,7 @@ impl Supervisor {
         // Real launch time for this physical process, so an exit can report
         // process lifetime against it. Overwrites any previous launch's watch:
         // a respawn is a NEW launch even though it keeps the same `SpawnId`.
-        let launched_at = Utc::now();
-        if let Some(record) = self.lock_registry().get(name) {
-            self.lock_attempts().insert(
-                token,
-                AttemptWatch {
-                    name: name.to_string(),
-                    repo: record.repo_name.clone(),
-                    task: record.task.clone(),
-                    spawn: record.spawn_id().to_string(),
-                    launched_at,
-                    provider_session: None,
-                    saw_result: false,
-                    usage_since_result: false,
-                    saw_provider_cost: false,
-                },
-            );
-        }
+        self.begin_launch(name, token);
         // A daemon restart can leave a durable steer request without its
         // delivery acknowledgement. Replay it exactly once per new live
         // session; an existing ack makes `pending` omit it permanently.
@@ -8292,7 +8306,7 @@ mod respawn_tests {
         );
     }
 
-    fn init_repo(dir: &Path) {
+    pub(super) fn init_repo(dir: &Path) {
         git(dir, &["init", "-b", "main"]);
         git(dir, &["config", "user.email", "r@x"]);
         git(dir, &["config", "user.name", "R"]);
@@ -8301,7 +8315,7 @@ mod respawn_tests {
         git(dir, &["commit", "-m", "init"]);
     }
 
-    fn supervisor(home: &Path) -> Arc<Supervisor> {
+    pub(super) fn supervisor(home: &Path) -> Arc<Supervisor> {
         let layout = Layout::at(home);
         let tickets = Arc::new(crate::tickets::Tickets::new(
             Space::open_in_memory().unwrap(),
@@ -9051,7 +9065,7 @@ mod respawn_tests {
         );
     }
 
-    fn record(repo: &Path, branch: Option<&str>) -> AgentRecord {
+    pub(super) fn record(repo: &Path, branch: Option<&str>) -> AgentRecord {
         let now = Utc::now();
         AgentRecord {
             name: "Nibble".into(),
@@ -11983,6 +11997,367 @@ mod stuck_liveness_tests {
             matches!(past_original_grace, SweepAction::Hard { kind: "stuck", .. }),
             "the post-restart sweep must escalate on the PRE-restart clock, \
              proving the ceiling was never reset by the restart"
+        );
+    }
+}
+
+/// Executing acceptance for the native cost/exit producers.
+///
+/// Every case drives the REAL `handle_event` path — nothing asserts against a
+/// hand-built record — because the defects these cover were all in how the
+/// handler resolves a launch, not in the record shape.
+#[cfg(test)]
+mod native_observation_tests {
+    use super::respawn_tests::{init_repo, record, supervisor};
+    use super::*;
+    use crate::agents::AgentState;
+    use std::path::Path;
+
+    /// One launched agent, ready to receive events under `session`.
+    fn launched(
+        sup: &Arc<Supervisor>,
+        repo: &Path,
+        name: &str,
+    ) -> (AgentRecord, rk_core::id::SpawnId) {
+        let mut rec = record(repo, Some("b"));
+        rec.name = name.to_string();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec.clone()).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.to_string(), session);
+        sup.begin_launch(name, session);
+        (rec, session)
+    }
+
+    fn observations(sup: &Supervisor, kind: &str) -> Vec<serde_json::Value> {
+        sup.space
+            .scan(&rk_core::tuple::Pattern {
+                category: Some(rk_core::tuple::Category::Event),
+                scope: Some("repo".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.payload["bbs_kind"] == kind)
+            .map(|t| t.payload)
+            .collect()
+    }
+
+    fn completed(cost: Option<f64>, provider_session: Option<&str>) -> HarnessEvent {
+        HarnessEvent::Completed {
+            result: "r".into(),
+            is_error: false,
+            usage: TokenUsage {
+                input: 10,
+                output: 5,
+                ..Default::default()
+            },
+            cost_usd: cost,
+            session_id: provider_session.map(str::to_string),
+        }
+    }
+
+    /// A respawn keeps the same `SpawnId`, so the generation alone cannot tell
+    /// two launches apart. Each launch must carry a distinct session token and
+    /// own its final_usage/exit records.
+    #[test]
+    fn same_spawn_relaunch_gets_a_distinct_token_and_its_own_records() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, first) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            completed(Some(1.0), Some("p1")),
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            HarnessEvent::Exited { code: Some(0) },
+        );
+
+        // Same record, same SpawnId, genuinely new launch.
+        sup.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Running)
+            .unwrap();
+        let second = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), second);
+        sup.begin_launch("Nibble", second);
+        assert_ne!(
+            first, second,
+            "a relaunch must mint a distinct session token"
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            completed(Some(2.0), Some("p2")),
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            HarnessEvent::Exited { code: Some(0) },
+        );
+
+        let usage = observations(&sup, "agent_final_usage");
+        assert_eq!(usage.len(), 2);
+        for u in &usage {
+            assert_eq!(
+                u["spawn"],
+                spawn.to_string(),
+                "both launches share the generation"
+            );
+        }
+        let sessions: Vec<&str> = usage
+            .iter()
+            .map(|u| u["session"].as_str().unwrap())
+            .collect();
+        assert_eq!(sessions, vec![first.to_string(), second.to_string()]);
+        // Each launch reports its OWN provider segment, never the other's.
+        assert_eq!(usage[0]["cost_usd"], 1.0);
+        assert_eq!(usage[1]["cost_usd"], 2.0);
+
+        let exits = observations(&sup, "agent_exit");
+        assert_eq!(exits.len(), 2);
+        assert_eq!(exits[0]["session"], first.to_string());
+        assert_eq!(exits[1]["session"], second.to_string());
+    }
+
+    /// The defect: the watch was keyed by NAME, so a resume overwrote it and a
+    /// delayed predecessor event resolved against the successor's record,
+    /// borrowing its provider session and launch time.
+    #[test]
+    fn a_delayed_predecessor_event_keeps_its_own_launch_attribution() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, old) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::Started {
+                session_id: Some("provider-OLD".into()),
+            },
+        );
+
+        // A successor launch takes over the name and learns its own provider id.
+        let new = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), new);
+        sup.begin_launch("Nibble", new);
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            new,
+            HarnessEvent::Started {
+                session_id: Some("provider-NEW".into()),
+            },
+        );
+
+        // Only NOW does the predecessor's exit arrive.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+
+        let exits = observations(&sup, "agent_exit");
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0]["session"], old.to_string());
+        assert_eq!(
+            exits[0]["provider_session"], "provider-OLD",
+            "a late exit must not borrow the successor's provider session"
+        );
+        assert_eq!(
+            exits[0]["stale_session"], true,
+            "the exit belongs to a launch that is no longer the live one"
+        );
+        // The successor's watch survives: a stale exit must not retire it.
+        assert!(sup.attempt_watch(new).is_some());
+    }
+
+    /// A provider total reported earlier, then a result with none, leaves a
+    /// MIXED running figure. Naming that a final daemon-priced launch cost
+    /// would be inventing a number the evidence does not support.
+    #[test]
+    fn a_mixed_total_is_unknown_not_a_daemon_priced_final_cost() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, session) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            completed(Some(3.5), Some("p")),
+        );
+        sup.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Running)
+            .unwrap();
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            completed(None, Some("p")),
+        );
+
+        let usage = observations(&sup, "agent_final_usage");
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0]["cost_basis"], "provider_reported_segment_total");
+        assert_eq!(usage[0]["cost_usd"], 3.5);
+        assert_eq!(
+            usage[1]["cost_basis"], "unknown",
+            "a result with no provider total, after one that had it, is not provable"
+        );
+        assert!(
+            usage[1]["cost_usd"].is_null(),
+            "an unprovable total stays null rather than being manufactured"
+        );
+    }
+
+    /// `rk done` routes a completion while the provider may still report a
+    /// different, later total. Both observations must survive.
+    #[test]
+    fn done_before_final_result_records_the_later_total_too() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, session) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        // `reconcile_task_done` already settled this generation.
+        sup.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Completed)
+            .unwrap();
+        // The provider's own, later, authoritative total arrives afterwards.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            completed(Some(7.33), Some("p")),
+        );
+
+        let usage = observations(&sup, "agent_final_usage");
+        assert_eq!(
+            usage.len(),
+            1,
+            "the early-return path must still observe the later total"
+        );
+        assert_eq!(usage[0]["cost_usd"], 7.33);
+        assert_eq!(usage[0]["state"], "completed");
+    }
+
+    /// A paused result followed by more model usage and then a kill with no
+    /// later result: the known total is a PARTIAL amount for the launch.
+    #[test]
+    fn paused_then_more_usage_then_kill_is_partial_not_final() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, session) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        // A clean turn with no `rk done` parks the record as Paused.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            completed(Some(4.0), Some("p")),
+        );
+        assert_eq!(sup.status("Nibble").unwrap().state, AgentState::Paused);
+
+        // More model work runs past that result...
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            HarnessEvent::Usage {
+                usage: TokenUsage {
+                    input: 500,
+                    output: 200,
+                    ..Default::default()
+                },
+            },
+        );
+        // ...and the launch dies without reporting again.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: None },
+        );
+
+        let exits = observations(&sup, "agent_exit");
+        assert_eq!(exits.len(), 1);
+        assert_eq!(
+            exits[0]["cost_coverage"], "partial_unknown",
+            "finality must not be inferred from merely finding a result before the exit"
+        );
+        assert!(
+            exits[0]["exit_code"].is_null(),
+            "a signal-terminated launch is not exit 0"
+        );
+        assert_eq!(
+            exits[0]["duration_semantics"],
+            "process_lifetime_not_active_work"
+        );
+    }
+
+    /// Capture failure must never turn a lifecycle event into a failure.
+    #[test]
+    fn an_exit_without_launch_attribution_reports_unknown_and_still_terminalizes() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, session) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+        // Drop the attribution, as a daemon restart mid-launch would.
+        sup.lock_attempts().remove(&session);
+
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(2) },
+        );
+
+        assert!(
+            observations(&sup, "agent_exit").is_empty(),
+            "better no record than one bound to the wrong launch"
+        );
+        assert!(
+            !sup.status("Nibble").unwrap().state.is_live(),
+            "the lifecycle still terminalizes even when the observation is skipped"
         );
     }
 }
