@@ -400,34 +400,159 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
 /// export — its array position must never be read as supersession order,
 /// and neither may a tuple's id (ULID) or `created_at`: scan order is not
 /// necessarily persistence order, and a ULID/wall-clock sort is not either.
-/// Only an explicit capture envelope built from `Space::persistence_delta`
-/// (a bounded, sequence-ordered bbs export; S2's to supply, not this
-/// module's) may claim `PersistenceSequence`.
+/// Only a `bbs.export` envelope built from `Space::persistence_page` may
+/// claim `PersistenceSequence`, and the claim alone is not enough: it is
+/// accepted only when the records themselves carry the ascending
+/// `commit_sequence` positions that substantiate it (see
+/// `persistence_order_defect`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
     PersistenceSequence,
     Unknown,
 }
 
+/// The `coverage` block of a `bbs.export` envelope: the daemon's own
+/// statement about whether the evidence closure it shipped is complete.
+/// A bare array or a raw `rk --json scan` object makes no closure claim at
+/// all, and must never be read as one.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureCoverage {
+    /// `None` when the capture shape makes no closure claim at all. That is
+    /// NOT a claim of completeness.
+    pub complete: Option<bool>,
+    pub missing_references: Vec<String>,
+    pub reference_budget_exhausted: bool,
+}
+
 pub struct TupleCapture {
     pub order: Order,
+    /// Why a declared `order: "persistence_sequence"` was REFUSED and the
+    /// capture downgraded to `Order::Unknown`. A claim is only a claim: it is
+    /// accepted solely when the records themselves carry the persistence
+    /// positions that back it.
+    pub order_claim_rejected: Option<String>,
+    /// The export PAGE: the bounded, sequence-ordered window this capture
+    /// covers.
     pub tuples: Vec<Value>,
+    /// The evidence CLOSURE: tuples referenced by a page record that were not
+    /// themselves on the page, resolved AS-OF the page's frozen boundary.
+    /// These are real tuples and must be merged, or linked evidence reads as
+    /// absent — but they are sorted by id, not by persistence position, so
+    /// only their own `commit_sequence` can order them.
+    pub references: Vec<Value>,
     pub truncated: bool,
+    pub coverage: CaptureCoverage,
     #[allow(dead_code)]
     pub source: Option<String>,
 }
 
+/// Page and closure as one deduped record list, in persistence order when the
+/// records carry the positions to establish it.
+pub struct MergedRecords<'a> {
+    pub records: Vec<&'a Value>,
+    /// Closure records actually added (i.e. not already on the page).
+    pub references_merged: usize,
+    /// Closure records dropped because the page already carried that id. The
+    /// daemon never emits these; a hand-built capture can, and silently
+    /// double-counting the same observation would inflate every metric.
+    pub duplicate_references: usize,
+}
+
+fn commit_sequence(t: &Value) -> Option<u64> {
+    t.get("commit_sequence").and_then(Value::as_u64)
+}
+
+impl TupleCapture {
+    /// Merges the closure into the page. Ordering: when EVERY merged record
+    /// carries a `commit_sequence`, the merged list is sorted by it, so a
+    /// closure record takes its true persistence position rather than being
+    /// appended after the page. Otherwise the page keeps its array order and
+    /// the closure follows — a merged list that `Order::Unknown` already
+    /// forbids anyone from reading as supersession order.
+    pub fn merged(&self) -> MergedRecords<'_> {
+        let page_ids: BTreeSet<&str> = self
+            .tuples
+            .iter()
+            .filter_map(|t| t.get("id").and_then(Value::as_str))
+            .collect();
+        let mut records: Vec<&Value> = self.tuples.iter().collect();
+        let mut references_merged = 0usize;
+        let mut duplicate_references = 0usize;
+        for r in &self.references {
+            match r.get("id").and_then(Value::as_str) {
+                Some(id) if page_ids.contains(id) => duplicate_references += 1,
+                _ => {
+                    records.push(r);
+                    references_merged += 1;
+                }
+            }
+        }
+        if records.iter().all(|t| commit_sequence(t).is_some()) {
+            records.sort_by_key(|t| (commit_sequence(t), t["id"].as_str().unwrap_or("")));
+        }
+        MergedRecords {
+            records,
+            references_merged,
+            duplicate_references,
+        }
+    }
+}
+
+/// Validates a declared `order: "persistence_sequence"` against the records
+/// that are supposed to back it. The claim is a string in an envelope anyone
+/// can write; what makes it true is that every record carries its own
+/// `commit_sequence` and the page's are strictly ascending in array order.
+/// Returns the refusal reason when the claim cannot be substantiated.
+fn persistence_order_defect(tuples: &[Value], references: &[Value]) -> Option<String> {
+    let mut previous: Option<u64> = None;
+    for (i, t) in tuples.iter().enumerate() {
+        let Some(seq) = commit_sequence(t) else {
+            return Some(format!(
+                "the capture declares order=persistence_sequence but page record {} (index {i}) \
+                 carries no numeric commit_sequence, so the claim cannot be checked",
+                t["id"].as_str().unwrap_or("<no id>")
+            ));
+        };
+        if let Some(prev) = previous {
+            if seq <= prev {
+                return Some(format!(
+                    "the capture declares order=persistence_sequence but page record {} (index \
+                     {i}) has commit_sequence {seq} after {prev}: the array is not in ascending \
+                     persistence order",
+                    t["id"].as_str().unwrap_or("<no id>")
+                ));
+            }
+        }
+        previous = Some(seq);
+    }
+    for r in references {
+        if commit_sequence(r).is_none() {
+            return Some(format!(
+                "the capture declares order=persistence_sequence but reference record {} carries \
+                 no numeric commit_sequence, so its position among the page records is unknown",
+                r["id"].as_str().unwrap_or("<no id>")
+            ));
+        }
+    }
+    None
+}
+
 /// Parses either shape: a bare tuple array, the raw `rk --json scan` object
-/// (`{"tuples":[...], "truncated":bool, ...}`), or the forward-looking
-/// capture envelope (`{"schema_version":1,"order":"persistence_sequence",
-/// "tuples":[...],...}`). Legacy/raw input is always `Order::Unknown` —
-/// never inferred from tuple id (ULID) or `created_at`.
+/// (`{"tuples":[...], "truncated":bool, ...}`), or the real `bbs.export`
+/// envelope (`{"schema_version":1,"kind":"bbs.export","order":
+/// "persistence_sequence","tuples":[...],"references":[...],"coverage":{...}}`).
+/// Legacy/raw input is always `Order::Unknown` — never inferred from tuple id
+/// (ULID) or `created_at` — and a declared persistence-sequence order is
+/// accepted only when `persistence_order_defect` can substantiate it.
 pub fn parse_tuple_capture(raw: &Value) -> Result<TupleCapture> {
     if let Some(arr) = raw.as_array() {
         return Ok(TupleCapture {
             order: Order::Unknown,
+            order_claim_rejected: None,
             tuples: arr.clone(),
+            references: Vec::new(),
             truncated: false,
+            coverage: CaptureCoverage::default(),
             source: None,
         });
     }
@@ -436,25 +561,59 @@ pub fn parse_tuple_capture(raw: &Value) -> Result<TupleCapture> {
         .and_then(Value::as_array)
         .context(
             "tuples input must be a JSON array, or an object with a `tuples` array \
-             (the shape `rk --json scan` and the capture envelope both produce)",
+             (the shape `rk --json scan` and the bbs.export envelope both produce)",
         )?
         .clone();
+    let references = raw
+        .get("references")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut order_claim_rejected = None;
     let order = match raw.get("order").and_then(Value::as_str) {
-        Some("persistence_sequence") => Order::PersistenceSequence,
+        Some("persistence_sequence") => match persistence_order_defect(&tuples, &references) {
+            None => Order::PersistenceSequence,
+            Some(reason) => {
+                order_claim_rejected = Some(reason);
+                Order::Unknown
+            }
+        },
         _ => Order::Unknown,
     };
     let truncated = raw
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let raw_coverage = raw.get("coverage");
+    let coverage = CaptureCoverage {
+        complete: raw_coverage
+            .and_then(|c| c.get("complete"))
+            .and_then(Value::as_bool),
+        missing_references: raw_coverage
+            .and_then(|c| c.get("missing_references"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        reference_budget_exhausted: raw_coverage
+            .and_then(|c| c.get("reference_budget_exhausted"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
     let source = raw
         .get("source")
         .and_then(Value::as_str)
         .map(str::to_string);
     Ok(TupleCapture {
         order,
+        order_claim_rejected,
         tuples,
+        references,
         truncated,
+        coverage,
         source,
     })
 }
@@ -637,6 +796,26 @@ pub struct CaptureSummary {
     pub observations_out_of_window: usize,
     pub observations_undated: usize,
     pub observations_out_of_scope_repo: usize,
+    /// Closure records the export shipped alongside the page.
+    pub references: usize,
+    /// Closure records actually merged into the index (the rest were already
+    /// on the page). Evidence lives here as often as on the page; a report
+    /// that indexes only `tuples` reads linked evidence as absent.
+    pub references_merged: usize,
+    /// Closure records dropped as duplicates of a page record.
+    pub duplicate_references: usize,
+    /// `coverage.missing_references`: referenced tuples the daemon could not
+    /// resolve at the frozen boundary. Each is also surfaced as an
+    /// unresolved record, never as an absent one.
+    pub missing_references: Vec<String>,
+    /// `coverage.complete`. `None` when the capture shape makes no closure
+    /// claim at all (a bare array or a raw `rk --json scan` object) — which
+    /// is NOT the same as a claim of completeness.
+    pub closure_complete: Option<bool>,
+    pub reference_budget_exhausted: bool,
+    /// Set when a declared `order: "persistence_sequence"` was refused and
+    /// the capture downgraded to unknown order.
+    pub order_claim_rejected: Option<String>,
 }
 
 /// The discovery denominator, reported explicitly rather than left implicit in
@@ -1153,11 +1332,14 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     let in_scope = |repo: &str| repos.is_empty() || repos.contains(repo);
     let window = &manifest.window;
 
+    // Index the native page and its resolved evidence closure together.
+    let merged = capture.merged();
+
     let mut idx = Index {
-        by_id: capture
-            .tuples
+        by_id: merged
+            .records
             .iter()
-            .filter_map(|t| t.get("id").and_then(Value::as_str).map(|id| (id, t)))
+            .filter_map(|t| t.get("id").and_then(Value::as_str).map(|id| (id, *t)))
             .collect(),
         prepared: BTreeMap::new(),
         opened: BTreeSet::new(),
@@ -1168,9 +1350,28 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
         unresolved: Vec::new(),
         capture: CaptureSummary {
             tuples: capture.tuples.len(),
+            references: capture.references.len(),
+            references_merged: merged.references_merged,
+            duplicate_references: merged.duplicate_references,
+            missing_references: capture.coverage.missing_references.clone(),
+            closure_complete: capture.coverage.complete,
+            reference_budget_exhausted: capture.coverage.reference_budget_exhausted,
+            order_claim_rejected: capture.order_claim_rejected.clone(),
             ..CaptureSummary::default()
         },
     };
+
+    // A reference the daemon could NOT resolve is a hole in the evidence
+    // closure, not an absent tuple: record it so an evidence check that fails
+    // against this capture is attributable to the capture, not to the author.
+    for id in &capture.coverage.missing_references {
+        idx.unresolved.push(InvalidRecord {
+            record: id.clone(),
+            kind: "missing_reference".into(),
+            reason: "named by a captured record but absent from the export's evidence closure                      (coverage.missing_references): unresolvable in this capture, not proven                      absent"
+                .into(),
+        });
+    }
 
     // An observation is accepted only when it is in a manifest repo AND inside
     // the frozen window. Both rejections are COUNTED, so a scoping or window
@@ -1203,7 +1404,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
         }
     };
 
-    for (pos, t) in capture.tuples.iter().enumerate() {
+    for (pos, t) in merged.records.iter().copied().enumerate() {
         let scope = str_field(t, &["scope"]).to_string();
 
         if claims_kind(t, EXPOSURE) {
@@ -1953,6 +2154,20 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
              could change any of these counts"
                 .to_string(),
         )
+    } else if capture.coverage.complete == Some(false) {
+        Some(format!(
+            "the capture declares an incomplete evidence closure (coverage.complete=false, \
+             {} unresolved reference(s), reference_budget_exhausted={}): a reuse or assessment \
+             outside the closure could change any of these counts",
+            capture.coverage.missing_references.len(),
+            capture.coverage.reference_budget_exhausted
+        ))
+    } else if !capture.coverage.missing_references.is_empty() {
+        Some(format!(
+            "the capture reports {} unresolved reference(s) in its evidence closure: a reuse or \
+             assessment among them could change any of these counts",
+            capture.coverage.missing_references.len()
+        ))
     } else {
         Some(AUTHOR_EXIT_UNSUPPORTED.to_string())
     };
@@ -2081,6 +2296,25 @@ pub fn render(report: &Report) -> String {
         report.capture.observations_undated,
         report.capture.observations_out_of_scope_repo
     );
+    let _ = writeln!(
+        out,
+        "closure: complete={} references={} merged={} duplicates={} missing={}",
+        match report.capture.closure_complete {
+            Some(true) => "yes".to_string(),
+            Some(false) => format!(
+                "no (budget_exhausted={})",
+                report.capture.reference_budget_exhausted
+            ),
+            None => "undeclared".to_string(),
+        },
+        report.capture.references,
+        report.capture.references_merged,
+        report.capture.duplicate_references,
+        report.capture.missing_references.len()
+    );
+    if let Some(reason) = &report.capture.order_claim_rejected {
+        let _ = writeln!(out, "order claim REFUSED: {reason}");
+    }
     let _ = writeln!(
         out,
         "discovery: prepared {}/{} known-coverage pairs ({}); native={} reviewed={} \
@@ -2423,8 +2657,11 @@ mod tests {
         }
         TupleCapture {
             order,
+            order_claim_rejected: None,
             tuples,
+            references: Vec::new(),
             truncated: false,
+            coverage: CaptureCoverage::default(),
             source: None,
         }
     }
@@ -2945,6 +3182,176 @@ mod tests {
         });
         let parsed = parse_tuple_capture(&envelope).unwrap();
         assert_eq!(parsed.order, Order::PersistenceSequence);
+    }
+
+    /// Stamps `commit_sequence` the way the daemon does, so an `order`
+    /// claim has something to be checked against.
+    fn sequenced(records: Vec<Value>, start: u64) -> Vec<Value> {
+        records
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r["commit_sequence"] = json!(start + i as u64);
+                r
+            })
+            .collect()
+    }
+
+    /// A real `bbs.export` envelope, shaped as `rk-daemon`'s `bbs.rs`
+    /// emits it: the page in `tuples`, the resolved evidence closure in
+    /// `references` (id-sorted, each carrying its own AS-OF sequence), and a
+    /// `coverage` block stating whether that closure is complete.
+    fn export_envelope(page: Vec<Value>, references: Vec<Value>, missing: Vec<&str>) -> Value {
+        let complete = missing.is_empty();
+        json!({
+            "schema_version": 1,
+            "kind": "bbs.export",
+            "repo": "repo",
+            "order": "persistence_sequence",
+            "order_provenance": "tuple_persistence_events.commit_sequence ascending",
+            "source": "space.persistence_page",
+            "truncated": false,
+            "tuples": sequenced(page, 1),
+            "references": sequenced(references, 1_000),
+            "coverage": {
+                "missing_references": missing,
+                "complete": complete,
+                "reference_budget_exhausted": false,
+                "scope": "repo",
+            },
+        })
+    }
+
+    /// The evidence a receipt and a verdict name does not have to be on the
+    /// page: the daemon resolves it into `references`. A reporter that reads
+    /// only `tuples` treats that evidence as ABSENT and throws the verdict
+    /// away — the whole point of shipping the closure.
+    #[test]
+    fn export_references_are_merged_so_linked_evidence_resolves() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let evidence: Vec<Value> = ["ev-1", "ev-2", "ev-3"]
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id, "category": "artifact", "scope": "repo", "identity": id,
+                    "instance": "x", "created_at": "2026-01-01T00:00:00Z", "payload": {}
+                })
+            })
+            .collect();
+        let envelope = export_envelope(verified_tuples(), evidence, vec![]);
+        let c = parse_tuple_capture(&envelope).unwrap();
+        assert_eq!(c.order, Order::PersistenceSequence);
+        assert_eq!(c.references.len(), 3);
+
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(c.tuples.len(), 5, "the evidence is NOT on the page");
+        assert_eq!(r.capture.references_merged, 3);
+        assert_eq!(r.capture.duplicate_references, 0);
+        assert_eq!(r.capture.closure_complete, Some(true));
+        assert_eq!(
+            r.pairs[0].assessed_verdict.as_deref(),
+            Some("verified"),
+            "the verdict's evidence resolved out of the closure, not the page"
+        );
+        assert_eq!(r.outcome_classes.verified, 1);
+        assert!(
+            !r.mechanism.goal_met,
+            "full author-exit evaluation is a later slice"
+        );
+    }
+
+    /// The same envelope with the closure UNRESOLVED. An unresolvable
+    /// reference is a hole in the capture, not proof the evidence never
+    /// existed: the verdict drops to unresolved, the hole is named, and the
+    /// mechanism goal is blocked exactly as truncation blocks it.
+    #[test]
+    fn incomplete_closure_is_reported_and_blocks_the_mechanism_goal() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let envelope = export_envelope(verified_tuples(), vec![], vec!["ev-2"]);
+        let c = parse_tuple_capture(&envelope).unwrap();
+        let r = compute(&m, &c, &[]).unwrap();
+
+        assert_eq!(r.capture.closure_complete, Some(false));
+        assert_eq!(r.capture.missing_references, vec!["ev-2".to_string()]);
+        assert!(
+            r.unresolved_records
+                .iter()
+                .any(|u| u.record == "ev-2" && u.kind == "missing_reference"),
+            "the hole is named: {:?}",
+            r.unresolved_records
+        );
+        let blocked = r
+            .mechanism
+            .goal_blocked_reason
+            .expect("an incomplete closure cannot certify the goal");
+        assert!(blocked.contains("incomplete evidence closure"), "{blocked}");
+        assert!(!r.mechanism.goal_met);
+    }
+
+    /// `order: "persistence_sequence"` is a string anyone can write into an
+    /// envelope. It is accepted only when the records carry the ascending
+    /// `commit_sequence` positions that make it true — otherwise the capture
+    /// is downgraded to unknown order WITH the refusal reason, rather than
+    /// silently resolving supersession off an unproven claim.
+    #[test]
+    fn unsubstantiated_persistence_order_claim_is_refused() {
+        let bare = json!({
+            "order": "persistence_sequence",
+            "tuples": [finding("src-1", "author-gen", "2026-01-01T00:00:00Z")],
+        });
+        let c = parse_tuple_capture(&bare).unwrap();
+        assert_eq!(c.order, Order::Unknown, "no commit_sequence to check");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("no numeric commit_sequence")));
+
+        let mut out_of_order = export_envelope(
+            vec![
+                finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+                finding("src-2", "author-gen", "2026-01-01T00:00:00Z"),
+            ],
+            vec![],
+            vec![],
+        );
+        out_of_order["tuples"][1]["commit_sequence"] = json!(1);
+        let c = parse_tuple_capture(&out_of_order).unwrap();
+        assert_eq!(c.order, Order::Unknown, "not ascending");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("not in ascending persistence order")));
+
+        let mut unplaced = export_envelope(
+            vec![finding("src-1", "author-gen", "2026-01-01T00:00:00Z")],
+            vec![json!({
+                "id": "ev-1", "category": "artifact", "scope": "repo", "identity": "ev-1",
+                "instance": "x", "created_at": "2026-01-01T00:00:00Z", "payload": {}
+            })],
+            vec![],
+        );
+        unplaced["references"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("commit_sequence");
+        let c = parse_tuple_capture(&unplaced).unwrap();
+        assert_eq!(c.order, Order::Unknown, "a reference has no position");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("reference record")));
+    }
+
+    /// A legacy raw `rk --json scan` object still parses, still reports
+    /// unknown order, and is NOT refused: compatibility without inventing a
+    /// persistence order the shape cannot supply.
+    #[test]
+    fn legacy_raw_scan_is_unknown_order_without_a_refusal() {
+        let scan = json!({"tuples": [], "truncated": false});
+        let c = parse_tuple_capture(&scan).unwrap();
+        assert_eq!(c.order, Order::Unknown);
+        assert_eq!(c.order_claim_rejected, None);
+        assert_eq!(c.coverage.complete, None, "a scan makes no closure claim");
     }
 
     #[test]
