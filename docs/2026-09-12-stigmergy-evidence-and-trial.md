@@ -171,6 +171,26 @@ active-work duration.
 
 ## Trial design
 
+Before dispatch, freeze the selected tasks, build/configuration, eligibility and
+scoring rules, UTC start, and a prospective stopping rule in an immutable run
+plan. For the first real batch, the observation window ends at the earlier of
+six hours after that start or the first recorded observation that all selected
+work has settled. Settlement requires actual delivery or an explicit terminal
+failure disposition for every selected task, terminal enrolled launches, and no
+selected checks, reviews, queued landings or automatic continuations remaining.
+Record the native evidence establishing settlement; missing exit or usage
+observations remain unknown. A paused process or task-completion claim alone
+does not establish settlement.
+
+Materialize the evaluator manifest's end time mechanically from that frozen
+rule and endpoint evidence. Retain the plan, derivation, capture timestamp and
+pinned persistence boundary separately. Reaching the maximum leaves unfinished
+work incomplete/censored in this report; authorized recovery continues outside
+the window. It neither authorizes killing workers nor completes this program.
+The six-hour maximum is an operational bound, not a delivery SLA. The separate
+landing allowance is 120 minutes: the existing 60-minute gate and 45-minute
+review bounds plus 15 minutes margin. Keep actual durations and every failure.
+
 First deploy and verify the new product path. Use the same Claude/Sonnet worker
 configuration, existing two-worker implementation lane, repository gates and
 spend policy. Keep the host awake for measured windows and use a landing allowance
@@ -204,11 +224,25 @@ statistical productivity claim. A null/negative result is an honest completed
 experiment and must be retained, investigated and reported, not relabeled green.
 
 For this comparison, both arms run the same installed candidate. An isolated,
-operator-owned harness wrapper removes only the distinctly headed `Reusable
-findings` guidance fragment for the baseline arm; treatment preserves it. The
-wrapper must match exactly one fragment, preserve every authority/task/BBS
-instruction outside it, retain argv and stdin/stdout, and record prompt/fragment
-hashes. It is never installed as the production harness. This measures the
+operator-owned adapter (`bbs-arm-harness.py`) removes only the distinctly headed
+`Reusable findings` role fragment for the baseline arm; treatment retains it.
+It covers BOTH providers — `RK_CLAUDE_BIN` and `RK_CODEX_BIN` point at it —
+because the reviewer role actually runs on Codex, and a Claude-only wrapper
+would have left reviewer guidance unchanged in the baseline despite the
+both-role comparison contract. Claude transforms only its
+`--append-system-prompt` argument; Codex transforms only the role fragment
+before the role/task separator in its final exec prompt argument. Authenticated
+Codex control-resume payloads pass through unchanged. An initial role prompt
+must carry exactly one fragment — missing or duplicate fragments refuse the
+provider launch. Task text, matching task-local headings, argv, stdin/stdout
+and stderr are preserved, prompt/fragment hashes are recorded, and wrapper
+control variables are removed from the provider environment. Models,
+permissions, budgets, admission, checks and caps are identical across arms, and
+it is never installed as the production harness. Acceptance: ten executable
+cases and four malformed refusals
+(`wrapper-both-harness-acceptance-02/proof.json`) plus eight native routing
+cases (`native-wrapper-routing-03/proof.json`), all passed; evidence under
+`/Users/chazu/.codex/artifacts/rk-stigmergy-20260913T022353Z`. This measures the
 incremental effect of early-publication/reuse guidance with identical product
 capabilities, not the total effect of having any shared memory.
 

@@ -58,7 +58,7 @@ fn tuples_envelope() -> Value {
         "tuples": [
             {
                 "id": "src-1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-finding-cli1", "instance": "author", "lifecycle": "furniture",
+                "identity": "bbs-finding-4f1fd45761705a77932c7643150dd7efbdbc75c4e1e507d8677959ad55d3ecff", "instance": "author", "lifecycle": "furniture",
                 "created_at": "2026-01-01T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "finding", "agent": "author",
@@ -74,7 +74,7 @@ fn tuples_envelope() -> Value {
             },
             {
                 "id": "r1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-reuse-cli1", "instance": "consumer", "lifecycle": "furniture",
+                "identity": "bbs-reuse-dc2a31d9f2da9860dd0938c863e5347227ce5fd9fffbad918afec5074dabae85", "instance": "consumer", "lifecycle": "furniture",
                 "created_at": "2026-01-02T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "reuse", "agent": "consumer",
@@ -89,7 +89,7 @@ fn tuples_envelope() -> Value {
             },
             {
                 "id": "a1", "category": "artifact", "scope": "repo",
-                "identity": "bbs-assessment-cli1", "instance": "operator", "lifecycle": "furniture",
+                "identity": "bbs-assessment-e44925af124527d7f084a8fbec41d8e81b7b01a8f85fd2144b86287d8f46f351", "instance": "operator", "lifecycle": "furniture",
                 "created_at": "2026-01-03T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "assessment", "agent": "operator",
