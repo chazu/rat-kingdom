@@ -2657,12 +2657,15 @@ fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
             )
         }
     }
+    // The contract requires prior_state to AGREE with the terminal state; an
+    // absent one states nothing to agree with, so it fails closed like any unknown.
     match exit.prior_state.as_deref() {
         None => (
-            true,
+            false,
             format!(
-                "terminal result (state={state}) followed by observed exit {} with \
-                 cost_coverage={FINAL_COST_COVERAGE}",
+                "exit {} records no prior_state, so there is nothing to agree with the last \
+                 result (state={state:?}): the launch's position at exit is unknown and the \
+                 reported amount cannot be confirmed to cover it",
                 exit.record
             ),
         ),
@@ -5807,6 +5810,54 @@ mod tests {
         assert_eq!(d.reported_cost_estimate_usd, None);
         assert_eq!(d.partial_reported_usd, Some(3.0));
         assert_eq!(d.unknown_cost.len(), 1);
+    }
+
+    #[test]
+    fn an_exit_without_a_prior_state_cannot_confirm_a_final_cost() {
+        // Otherwise the healthy shape: terminal result, cost_coverage=final.
+        // Only prior_state is absent, so agreement is unmet, not vacuous.
+        let m = task_manifest("TKT-1");
+        let tuples = vec![
+            usage_rec(
+                "u1",
+                "TKT-1",
+                "gen-1",
+                Some("completed"),
+                Some(4.25),
+                "2026-01-01T11:00:00Z",
+            ),
+            field(
+                exit_rec(
+                    "ax1",
+                    "TKT-1",
+                    "gen-1",
+                    "gen-1",
+                    "2026-01-01T10:00:00Z",
+                    "2026-01-01T12:00:00Z",
+                ),
+                "prior_state",
+                Value::Null,
+            ),
+        ];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "partial");
+        assert_eq!(d.reported_cost_estimate_usd, None, "never a provider total");
+        assert_eq!(
+            d.partial_reported_usd,
+            Some(4.25),
+            "partial amount preserved"
+        );
+        assert_eq!(d.unknown_cost.len(), 1, "the uncertainty is named");
+        assert!(
+            d.unknown_cost[0].contains("no prior_state"),
+            "got {:?}",
+            d.unknown_cost[0]
+        );
+        // Bounding the cost does not retract the physical exit evidence.
+        assert_eq!(d.exits, 1);
+        assert_eq!(d.launches, 1);
+        assert_eq!(d.process_lifetime_ms, Some(2 * 60 * 60 * 1000));
     }
 
     #[test]
