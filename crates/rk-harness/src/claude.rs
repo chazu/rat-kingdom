@@ -130,12 +130,24 @@ fn control_message_line(envelope: &ControlEnvelope) -> String {
     .to_string()
 }
 
+/// The Anthropic API reports total cache-write tokens flat
+/// (`cache_creation_input_tokens`) AND, alongside it, the TTL split that made
+/// up that total (`cache_creation.ephemeral_{5m,1h}_input_tokens`). Older
+/// server versions and fixtures may only carry the flat field — those `.as_u64()`
+/// calls fall back to `0`, leaving the split unknown and the flat total priced
+/// at the legacy/unknown rate (see `ModelPrice::cost`), not silently dropped.
 fn usage_from(value: &Value) -> TokenUsage {
     TokenUsage {
         input: value["input_tokens"].as_u64().unwrap_or(0),
         output: value["output_tokens"].as_u64().unwrap_or(0),
         cache_read: value["cache_read_input_tokens"].as_u64().unwrap_or(0),
         cache_creation: value["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        cache_creation_5m: value["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_u64()
+            .unwrap_or(0),
+        cache_creation_1h: value["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .unwrap_or(0),
     }
 }
 
@@ -413,6 +425,54 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
             &events[2],
             HarnessEvent::Usage { usage } if usage.cache_read == 5000 && usage.total() == 5130
         ));
+    }
+
+    #[test]
+    fn assistant_line_splits_cache_creation_by_ttl() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":53704}}}}"#;
+        let events = parse_event_line(line);
+        let [HarnessEvent::AssistantText { .. }, HarnessEvent::Usage { usage }] = &events[..]
+        else {
+            panic!("expected text + usage, got {events:?}");
+        };
+        assert_eq!(usage.cache_creation, 54704, "flat total unchanged");
+        assert_eq!(usage.cache_creation_5m, 1000);
+        assert_eq!(usage.cache_creation_1h, 53704);
+        // The TTL split is a decomposition of cache_creation, not additional
+        // tokens: total() must not double-count it.
+        assert_eq!(usage.total(), 2 + 183 + 10019 + 54704);
+    }
+
+    /// Real-world shape observed from live Claude Code 2.1.270 streams: every
+    /// cache write lands in the 1h bucket, none in 5m. The flat total must
+    /// still equal the (5m + 1h) split exactly, so `ModelPrice::cost` treats
+    /// none of it as TTL-unknown.
+    #[test]
+    fn assistant_line_handles_cache_creation_exclusively_1h() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":2059,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2059}}}}"#;
+        let events = parse_event_line(line);
+        let [_, HarnessEvent::Usage { usage }] = &events[..] else {
+            panic!("expected text + usage, got {events:?}");
+        };
+        assert_eq!(usage.cache_creation_5m, 0);
+        assert_eq!(usage.cache_creation_1h, 2059);
+        assert_eq!(usage.cache_creation, 2059);
+    }
+
+    /// A line with only the legacy flat field (no `cache_creation` object at
+    /// all — older CLI versions, or any fixture predating the TTL split) must
+    /// still parse: the split stays at its zero default and the full amount
+    /// is treated as TTL-unknown by pricing, never dropped.
+    #[test]
+    fn assistant_line_without_ttl_split_leaves_it_zero() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":5000,"cache_creation_input_tokens":10}}}"#;
+        let events = parse_event_line(line);
+        let [_, HarnessEvent::Usage { usage }] = &events[..] else {
+            panic!("expected text + usage, got {events:?}");
+        };
+        assert_eq!(usage.cache_creation, 10);
+        assert_eq!(usage.cache_creation_5m, 0);
+        assert_eq!(usage.cache_creation_1h, 0);
     }
 
     #[test]

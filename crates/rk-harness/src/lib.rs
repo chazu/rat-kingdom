@@ -84,12 +84,27 @@ impl ControlEnvelope {
 }
 
 /// Token counts for one API call or one session, by class.
+///
+/// `cache_creation` is the full cache-write count, exactly as `total()`
+/// always summed it. `cache_creation_5m`/`cache_creation_1h` are a TTL
+/// *decomposition* of that same total, not additional tokens — a provider
+/// that reports which cache-write bucket each token landed in (Claude's
+/// `cache_creation.ephemeral_{5m,1h}_input_tokens`) fills them in alongside
+/// the flat sum; one that does not (codex, jcode, maki, or any record
+/// persisted before this field existed) leaves them at their `#[serde(default)]`
+/// zero, and the full `cache_creation` count is priced as TTL-unknown/legacy.
+/// Consumers must never add these to `cache_creation` again — see
+/// [`Self::total`] and `ModelPrice::cost`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    #[serde(default)]
+    pub cache_creation_5m: u64,
+    #[serde(default)]
+    pub cache_creation_1h: u64,
 }
 
 impl TokenUsage {
@@ -98,8 +113,12 @@ impl TokenUsage {
         self.output += other.output;
         self.cache_read += other.cache_read;
         self.cache_creation += other.cache_creation;
+        self.cache_creation_5m += other.cache_creation_5m;
+        self.cache_creation_1h += other.cache_creation_1h;
     }
 
+    /// `cache_creation_5m`/`cache_creation_1h` are a subset breakdown of
+    /// `cache_creation`, not extra tokens — do not add them here too.
     pub fn total(&self) -> u64 {
         self.input + self.output + self.cache_read + self.cache_creation
     }
