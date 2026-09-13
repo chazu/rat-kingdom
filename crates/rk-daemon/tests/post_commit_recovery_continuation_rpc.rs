@@ -585,8 +585,8 @@ async fn continue_recovery_resumes_the_same_provider_across_a_restart_with_budge
     )
     .await;
     assert_eq!(marker_count(&marker), 1);
-    // sonnet pricing (vendored table): $3e-6/input token, $15e-6/output token.
-    let expected_cost = 10_000.0 * 3e-6 + 5_000.0 * 15e-6;
+    // sonnet pricing (vendored table): $2e-6/input token, $10e-6/output token.
+    let expected_cost = 10_000.0 * 2e-6 + 5_000.0 * 10e-6;
     assert_eq!(
         parked["agent"]["cost_usd"].as_f64().unwrap(),
         expected_cost,

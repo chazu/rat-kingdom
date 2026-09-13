@@ -178,6 +178,7 @@ fn post_process(mut session: HarnessSession) -> HarnessSession {
                             output: cumulative.output.saturating_sub(prev.output),
                             cache_read: cumulative.cache_read.saturating_sub(prev.cache_read),
                             cache_creation: 0,
+                            ..Default::default()
                         },
                         _ => cumulative,
                     };
@@ -226,6 +227,7 @@ fn usage_from(value: &Value) -> TokenUsage {
             + value["reasoning_output_tokens"].as_u64().unwrap_or(0),
         cache_read: value["cached_input_tokens"].as_u64().unwrap_or(0),
         cache_creation: 0,
+        ..Default::default()
     }
 }
 

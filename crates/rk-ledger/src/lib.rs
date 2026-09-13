@@ -19,19 +19,51 @@ pub struct ModelPrice {
     pub output_cost_per_token: f64,
     #[serde(default)]
     pub cache_read_input_token_cost: f64,
+    /// Fallback cache-creation rate, applied to cache-write tokens whose TTL
+    /// bucket is unknown: a record persisted before TTL-aware accounting
+    /// existed, or a provider that never reports the 5m/1h split at all.
     #[serde(default)]
     pub cache_creation_input_token_cost: f64,
+    /// TTL-specific creation rates. `None` — the field's absence from both
+    /// the vendored table's untouched entries and any pre-existing
+    /// `pricing.json` override — means "use `cache_creation_input_token_cost`
+    /// for this bucket too", so a JSON override written before this field
+    /// existed keeps pricing every write at its one flat rate exactly as
+    /// before.
+    #[serde(default)]
+    pub cache_creation_5m_input_token_cost: Option<f64>,
+    #[serde(default)]
+    pub cache_creation_1h_input_token_cost: Option<f64>,
 }
 
 impl ModelPrice {
+    fn cache_creation_5m_rate(&self) -> f64 {
+        self.cache_creation_5m_input_token_cost
+            .unwrap_or(self.cache_creation_input_token_cost)
+    }
+
+    fn cache_creation_1h_rate(&self) -> f64 {
+        self.cache_creation_1h_input_token_cost
+            .unwrap_or(self.cache_creation_input_token_cost)
+    }
+
     /// ccusage/LiteLLM convention: cached reads bill at the cache-read rate,
     /// uncached input at the input rate, reasoning tokens count as output
-    /// (already folded into `output` by the adapters).
+    /// (already folded into `output` by the adapters). Cache-creation tokens
+    /// with a known TTL bucket (`usage.cache_creation_5m`/`_1h`) bill at that
+    /// bucket's own rate; whatever part of the flat `cache_creation` total is
+    /// NOT accounted for by the known buckets (TTL-unknown, e.g. a legacy
+    /// record) bills at the fallback rate. The known buckets are a
+    /// decomposition of the flat total, never added on top of it.
     pub fn cost(&self, usage: &TokenUsage) -> f64 {
+        let known_creation = usage.cache_creation_5m + usage.cache_creation_1h;
+        let unknown_creation = usage.cache_creation.saturating_sub(known_creation);
         usage.input as f64 * self.input_cost_per_token
             + usage.output as f64 * self.output_cost_per_token
             + usage.cache_read as f64 * self.cache_read_input_token_cost
-            + usage.cache_creation as f64 * self.cache_creation_input_token_cost
+            + usage.cache_creation_5m as f64 * self.cache_creation_5m_rate()
+            + usage.cache_creation_1h as f64 * self.cache_creation_1h_rate()
+            + unknown_creation as f64 * self.cache_creation_input_token_cost
     }
 }
 
@@ -216,20 +248,78 @@ mod tests {
             output,
             cache_read,
             cache_creation: 0,
+            ..Default::default()
+        }
+    }
+
+    fn price(input: f64, output: f64, cache_read: f64, cache_creation: f64) -> ModelPrice {
+        ModelPrice {
+            input_cost_per_token: input,
+            output_cost_per_token: output,
+            cache_read_input_token_cost: cache_read,
+            cache_creation_input_token_cost: cache_creation,
+            cache_creation_5m_input_token_cost: None,
+            cache_creation_1h_input_token_cost: None,
         }
     }
 
     #[test]
     fn cost_formula_matches_convention() {
-        let price = ModelPrice {
-            input_cost_per_token: 3e-6,
-            output_cost_per_token: 15e-6,
-            cache_read_input_token_cost: 0.3e-6,
-            cache_creation_input_token_cost: 3.75e-6,
-        };
+        let price = price(3e-6, 15e-6, 0.3e-6, 3.75e-6);
         let cost = price.cost(&usage(1000, 100, 10_000));
         // 1000*3e-6 + 100*15e-6 + 10000*0.3e-6 = 0.003 + 0.0015 + 0.003
         assert!((cost - 0.0075).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ttl_unknown_creation_uses_the_fallback_rate() {
+        // No TTL split reported (legacy record / non-Claude provider): the
+        // whole flat cache_creation total prices at the one fallback rate,
+        // same as before TTL-aware accounting existed.
+        let price = price(3e-6, 15e-6, 0.3e-6, 3.75e-6);
+        let usage = TokenUsage {
+            cache_creation: 1000,
+            ..Default::default()
+        };
+        assert!((price.cost(&usage) - 1000.0 * 3.75e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mixed_5m_and_1h_creation_bills_each_bucket_at_its_own_rate() {
+        let mut price = price(5e-6, 25e-6, 0.5e-6, 6.25e-6);
+        price.cache_creation_5m_input_token_cost = Some(6.25e-6);
+        price.cache_creation_1h_input_token_cost = Some(10e-6);
+        let usage = TokenUsage {
+            cache_creation: 1500,
+            cache_creation_5m: 1000,
+            cache_creation_1h: 500,
+            ..Default::default()
+        };
+        let cost = price.cost(&usage);
+        let expected = 1000.0 * 6.25e-6 + 500.0 * 10e-6;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn known_ttl_buckets_are_never_double_counted_against_the_flat_total() {
+        // known(5m+1h) == flat cache_creation exactly (the real-world Claude
+        // shape): the unknown remainder must be zero, so the fallback rate
+        // never fires and total() (still just the flat sum) matches cost's
+        // own accounting of tokens billed.
+        let mut price = price(5e-6, 25e-6, 0.5e-6, 999e-6 /* must not be used */);
+        price.cache_creation_5m_input_token_cost = Some(6.25e-6);
+        price.cache_creation_1h_input_token_cost = Some(10e-6);
+        let usage = TokenUsage {
+            cache_creation: 2059,
+            cache_creation_5m: 0,
+            cache_creation_1h: 2059,
+            ..Default::default()
+        };
+        assert!((price.cost(&usage) - 2059.0 * 10e-6).abs() < 1e-12);
+        assert_eq!(
+            usage.total(),
+            usage.input + usage.output + usage.cache_read + 2059
+        );
     }
 
     #[test]
