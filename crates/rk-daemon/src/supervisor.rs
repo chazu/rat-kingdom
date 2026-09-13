@@ -1985,20 +1985,10 @@ impl Supervisor {
             "agent_spawned",
             json!({
                 "agent": name,
-                // Exact generation identity, additive alongside the existing
-                // fields: without it a launch event cannot be joined to the
-                // `harness_result`/exposure records that already carry `spawn`,
-                // and a namesake predecessor's launch is indistinguishable
-                // from this one. Measurement plumbing only — no behavior here
-                // reads it.
-                "spawn": record.spawn_id().to_string(),
                 "task": params.task,
                 "role": params.role,
                 "parent": params.parent,
                 "workflow_instance": params.workflow_instance,
-                // Real launch time, so active execution can later be measured
-                // apart from queue and check phases.
-                "launched_at": chrono::Utc::now().to_rfc3339(),
             }),
         );
         self.emit_coordinator_event(
@@ -2012,12 +2002,6 @@ impl Supervisor {
                 "coordinator": record.coordinator,
                 "workflow_instance": record.workflow_instance,
                 "agent": record.name,
-                // `generation` stays a `created_at` timestamp for existing
-                // consumers; `spawn`/`task` are added beside it so lifecycle
-                // rows join to `harness_result` and exposure records on the
-                // same exact key those already use.
-                "spawn": record.spawn_id().to_string(),
-                "task": record.task,
                 "generation": record.created_at,
             }),
         );
@@ -2101,12 +2085,10 @@ impl Supervisor {
             "agent_spawned",
             json!({
                 "agent": name,
-                "spawn": record.spawn_id().to_string(),
                 "task": params.task,
                 "role": params.role,
                 "attached": true,
                 "workflow_instance": params.workflow_instance,
-                "launched_at": chrono::Utc::now().to_rfc3339(),
             }),
         );
         self.emit_coordinator_event(
@@ -2120,12 +2102,6 @@ impl Supervisor {
                 "coordinator": record.coordinator,
                 "workflow_instance": record.workflow_instance,
                 "agent": record.name,
-                // `generation` stays a `created_at` timestamp for existing
-                // consumers; `spawn`/`task` are added beside it so lifecycle
-                // rows join to `harness_result` and exposure records on the
-                // same exact key those already use.
-                "spawn": record.spawn_id().to_string(),
-                "task": record.task,
                 "generation": record.created_at,
             }),
         );
@@ -2323,8 +2299,6 @@ impl Supervisor {
             base: Some(instruction_base),
             review: record.review.clone(),
             parent: record.parent.clone(),
-            // A respawn deliberately continues the SAME `SpawnId`, so this
-            // exposure binds to the generation that is resuming, not a new one.
             briefing: self.bbs_briefing(
                 &record.repo_name,
                 record.task.as_deref(),
@@ -2412,14 +2386,8 @@ impl Supervisor {
             "agent_respawned",
             json!({
                 "agent": name,
-                // A respawn CONTINUES the same generation, so this is the same
-                // `SpawnId` the original launch carried — that sameness is the
-                // fact a report needs, not a new identity.
-                "spawn": updated.spawn_id().to_string(),
                 "task": updated.task,
-                "role": updated.role,
                 "workflow_instance": updated.workflow_instance,
-                "launched_at": chrono::Utc::now().to_rfc3339(),
             }),
         );
         self.emit_coordinator_event(
@@ -2433,8 +2401,6 @@ impl Supervisor {
                 "coordinator": updated.coordinator,
                 "workflow_instance": updated.workflow_instance,
                 "agent": updated.name,
-                "spawn": updated.spawn_id().to_string(),
-                "task": updated.task,
                 "generation": updated.created_at,
             }),
         );
@@ -2541,12 +2507,9 @@ impl Supervisor {
             "agent_respawned",
             json!({
                 "agent": updated.name,
-                "spawn": updated.spawn_id().to_string(),
                 "task": updated.task,
-                "role": updated.role,
                 "attached": true,
                 "workflow_instance": updated.workflow_instance,
-                "launched_at": chrono::Utc::now().to_rfc3339(),
             }),
         );
         self.forget_completion(&updated.name);
@@ -5527,12 +5490,6 @@ impl Supervisor {
                 "coordinator": record.coordinator,
                 "workflow_instance": record.workflow_instance,
                 "agent": record.name,
-                // `generation` stays a `created_at` timestamp for existing
-                // consumers; `spawn`/`task` are added beside it so lifecycle
-                // rows join to `harness_result` and exposure records on the
-                // same exact key those already use.
-                "spawn": record.spawn_id().to_string(),
-                "task": record.task,
                 "generation": record.created_at,
                 "declared_done": declared_done,
             }),
@@ -7092,8 +7049,6 @@ impl Supervisor {
                 "coordinator": updated.coordinator,
                 "workflow_instance": updated.workflow_instance,
                 "agent": updated.name,
-                "spawn": updated.spawn_id().to_string(),
-                "task": updated.task,
                 "generation": updated.created_at,
                 "revision": updated.progress.as_ref().map(|p| p.revision),
                 "summary": summary,
@@ -10114,6 +10069,93 @@ mod respawn_tests {
         assert!(text.contains("$20.25 / $20.00 cap"));
         assert!(text.contains("100001 / 100000 token cap"));
         assert!(!is_auto_respawn_candidate(&stopped));
+    }
+
+    /// TKT-hakir-zuraj-sovun regression: a live `claude-opus-5` stream's
+    /// incremental `Usage` events must accumulate `cost_usd` at the
+    /// corrected standard $5/$25 rate, not the obsolete $15/$75 the vendored
+    /// "opus" alias used to carry (Opus 4's rate, which live Opus 5 streams
+    /// never actually bill at). A $0.50 cap is unchanged throughout; only
+    /// the price used to measure spend against it changes.
+    #[test]
+    fn native_claude_opus5_usage_crosses_the_unchanged_cap_at_the_corrected_price() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        let sup = Arc::new(
+            Supervisor::new(
+                Layout::at(home.path()),
+                "castle".into(),
+                "claude".into(),
+                Budget {
+                    max_usd: 0.50,
+                    max_tokens: 0,
+                    warn_at: 0.8,
+                },
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        );
+        let mut rec = record(repo.path(), Some("main"));
+        rec.harness = "claude".into();
+        rec.model = Some("claude-opus-5".into());
+        rec.state = AgentState::Running;
+        let generation = rec.created_at;
+        let spawn = rec.spawn_id();
+        sup.lock_registry().insert(rec.clone()).unwrap();
+
+        // 8,000 output tokens. At the corrected $25/M rate that is $0.20 —
+        // comfortably under the $0.50 cap. At the obsolete $75/M rate the
+        // same usage would already be $0.60, past the cap: this is the
+        // "premature warning" the ticket reports, and it must not happen.
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Usage {
+                usage: TokenUsage {
+                    output: 8_000,
+                    ..Default::default()
+                },
+            },
+        );
+        let mid = sup.status("Nibble").unwrap();
+        assert!(
+            (mid.cost_usd - 0.20).abs() < 1e-9,
+            "corrected opus-5 output rate: {}",
+            mid.cost_usd
+        );
+        assert_eq!(
+            mid.state,
+            AgentState::Running,
+            "must not stop under the real cap just because the obsolete rate would have"
+        );
+
+        // A further 12,000 output tokens brings the corrected total to
+        // exactly the $0.50 cap: the cap itself is unchanged and still
+        // fires, just measured at the right price.
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Usage {
+                usage: TokenUsage {
+                    output: 12_000,
+                    ..Default::default()
+                },
+            },
+        );
+        let stopped = sup.status("Nibble").unwrap();
+        assert!((stopped.cost_usd - 0.50).abs() < 1e-9);
+        assert_eq!(stopped.state, AgentState::Stopped);
     }
 
     /// A reviewer is checked against the distinct reviewer cap, NOT the

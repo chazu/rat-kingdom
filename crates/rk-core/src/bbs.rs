@@ -77,12 +77,70 @@ pub fn is_telemetry_gap(tuple: &Tuple) -> bool {
         && tuple.payload["bbs_kind"] == "telemetry_gap"
 }
 
+/// A daemon-authored observation of the FINAL provider-reported usage/cost for
+/// one `(spawn, session)` attempt.
+///
+/// Distinct from the `harness_result` a generation's `rk done` routes: that is
+/// task-completion evidence and may carry a provisional cost, because a
+/// provider can report a different total for the same query afterwards. Never
+/// sum these across results of one query — see `cost_basis`.
+pub fn is_agent_final_usage(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "agent_final_usage"
+}
+
+/// A daemon-authored observation that the harness PROCESS for one
+/// `(spawn, session)` attempt actually exited.
+///
+/// Completion is not exit: the `Completed` handler returns while the OS
+/// process is still alive. Author-terminal claims must join this, never a
+/// `harness_result`.
+pub fn is_agent_exit(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "agent_exit"
+}
+
+/// How a `cost_usd` on an [`is_agent_final_usage`] record was arrived at.
+///
+/// These are REPORTED ESTIMATES, not billed charges, and the variants must
+/// never be pooled into one total: a provider segment total and a daemon-side
+/// price multiplication are different measurements of different things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostBasis {
+    /// The provider's own last reported total for one proven session segment.
+    /// Cumulative WITHIN a query: take the last, never the sum.
+    ProviderReportedSegmentTotal,
+    /// The daemon priced `TokenUsage` increments itself because the harness
+    /// does not self-report USD. An estimate of an estimate.
+    DaemonPricedIncrements,
+    /// No final usage was supplied. `cost_usd` is null and stays null — an
+    /// unknown total is reported as unknown, never manufactured as zero.
+    Unknown,
+}
+
+impl CostBasis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderReportedSegmentTotal => "provider_reported_segment_total",
+            Self::DaemonPricedIncrements => "daemon_priced_increments",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Every `bbs_kind` the daemon authors as measurement metadata rather than as
 /// peer-visible content. These are observations ABOUT collaboration, never
 /// collaboration: they must not reach a briefing, a `bbs show` thread, or any
 /// surface a peer or the King reads as a useful finding.
 pub fn is_telemetry(tuple: &Tuple) -> bool {
-    is_exposure(tuple) || is_open(tuple) || is_telemetry_gap(tuple)
+    is_exposure(tuple)
+        || is_open(tuple)
+        || is_telemetry_gap(tuple)
+        || is_agent_final_usage(tuple)
+        || is_agent_exit(tuple)
 }
 
 /// Identity prefixes reserved for daemon-authored records. An agent caller
@@ -98,6 +156,10 @@ pub const RESERVED_IDENTITY_PREFIXES: &[&str] = &[
     "bbs-exposure-",
     "bbs-open-",
     "bbs-telemetry-gap-",
+    // No trailing dash: these identities are written bare, and `starts_with`
+    // must refuse the bare form as well as any future suffixed variant.
+    "bbs-agent-final-usage",
+    "bbs-agent-exit",
 ];
 
 /// The four contexts in which a bounded selection of sources is prepared.

@@ -9,6 +9,116 @@ connection, worker credentials, model call or network. It has no dispatch,
 landing, repair or approval authority; it only renders evidence that
 already exists.
 
+## Evaluator version 2: what it validates, and what it refuses to estimate
+
+`evaluator_version` is `2` (`TKT-buruk-parut-zisoh`). Compare it, not just
+`schema_version`, when diffing two reports: a version-1 report of the same
+inputs is not comparable.
+
+Version 2 tightened record acceptance and denominator handling, and it
+deliberately **stopped** producing two numbers version 1 produced from evidence
+that could not support them. Those are reported as unsupported, with a reason,
+under `report.unsupported` and in the human render — never as a zero:
+
+- **`author_exit`.** Version 1 credited it from a `harness_result` or an
+  `agent_lifecycle` event. Neither can establish a physical exit: the supervisor
+  emits `harness_result` when the agent routes `rk done`, while the OS process is
+  still alive and the provider may still report a later total, and
+  `agent_lifecycle` carries no `spawn` binding at all and its `change` may be
+  `started`. Version 2 credits nothing, `author_exit_effects` is `0`, and
+  `mechanism.goal_met` is forced `false` with `goal_blocked_reason` set.
+- **`delivery_cost_and_duration`.** Version 1 summed a provisional
+  `harness_result` cost as a measured total, read a `merge` span as an accepted
+  delivery, and labelled a phase-duration sum as active work. Version 2 reports
+  the frozen delivery SCOPE with every figure `null`.
+
+Both return with the real derivation in `TKT-bonik-vuruv-mivuh`. A version-2
+report is therefore usable for discovery and reuse evidence, and **not** usable
+for cost, duration or author-exit claims.
+
+## Native record contract version 2 enforces
+
+Read off the producers, not off the design doc. A record that does not match is
+rejected with a reason in `invalid_records`.
+
+The invariant that catches forgery: `Tuple::new(category, scope, identity,
+caller, payload)` sets `instance = caller`, and every S1 BBS write passes the
+authenticated caller as both `instance` and `payload.agent`. For a
+`finding`/`answer`/`reuse`/`assessment`, `instance == payload.agent` is
+unconditional.
+
+Telemetry is the opposite case, and the one most easily misread:
+`exposure`/`open` are authored by the **castle**, so `instance` is the castle
+and the consumer identity lives only in
+`payload.agent`/`payload.spawn`/`payload.bound`. Telemetry is checked with
+`tuple.scope == payload.repo` instead.
+
+| kind | category | lifecycle | identity | schema_version |
+| --- | --- | --- | --- | --- |
+| `finding` | artifact | furniture | `bbs-finding-<digest>` | 1 |
+| `answer` | artifact | furniture | `bbs-answer-<digest>` | absent (predates it) |
+| `reuse` | artifact | furniture | `bbs-reuse-<digest>` | 1 |
+| `assessment` | artifact | furniture | `bbs-assessment-<digest>` | 1, author `operator` |
+| `exposure` | event | furniture | `bbs-exposure-<surface>` | 1 |
+| `open` | event | furniture | `bbs-open` (no trailing dash) | 1 |
+
+A pair's `source` must be what the daemon lets `bbs.reuse` name: an ordinary
+artifact with **no** `bbs_kind` at all (reusable regardless of lifecycle), or a
+genuine `finding`/`answer`. A receipt, assessment or telemetry row is never a
+source. An ordinary artifact has no authoring generation, recorded as
+`source_attributed: false`: it can neither be excluded as self-use nor support an
+author-exit claim.
+
+Each id in an `evidence` array must name an **artifact** in the pair's repo. A
+non-string member (`["ev-1", 7]`) is a defect, not something to filter out
+silently. An id absent from the capture is UNKNOWN, not a negative: the record
+survives, `source_evidence` reads `unknown`, and it can no longer certify an
+effect.
+
+`repos` and `window` are **enforced**. Every native observation outside them is
+excluded and counted under `capture` (`observations_out_of_scope_repo`,
+`observations_out_of_window`, `observations_undated`), so a mis-set window shows
+up as visible coverage loss rather than silently shrinking every metric. Source
+findings are deliberately *not* window-filtered: an older source a batch consumer
+reused is exactly what the experiment is looking for. Unknown manifest fields are
+rejected, so a misspelled `"windwo"` is an error rather than an ignored key, and
+a fixture `eligible_pairs` entry must declare the **same repo as its batch**.
+
+Only `bound == "agent"` exposures count; `operator`/`unbound` rows go to
+`unresolved_records`. An exposure whose consumer generation has **no** native
+launch evidence is reported as `prepared_not_launched` and kept out of BOTH sides
+of the discovery rate: a selection prepared for a spawn that never ran is neither
+a discovery success nor a failure. Launch evidence is an
+`agent_spawned`/`agent_respawned` carrying `spawn`, a `harness_result`, or a
+record the generation authored itself.
+
+## A bad claim removes the claim, not the opportunity
+
+Two separate lists, and the distinction is the point:
+
+- `excluded` — never a distinct valid opportunity: `duplicate`,
+  `source_not_captured`, `invalid_source`, `invalid_source_evidence`, `self`.
+- `rejected_claims` — the opportunity stands, the receipt does not:
+  `wrong_repo`, `wrong_generation`, `invalid_evidence`, `unresolved_evidence`,
+  `undated`, `future_source`. The pair stays in `eligible` with no claimed
+  outcome, so a malformed or foreign receipt cannot erase a real opportunity from
+  a denominator.
+
+`discovery` reports the denominator explicitly, and `discovery.rate` /
+`verified_reuse.rate` are `null` — not `0.0` — when there is no denominator.
+`verified_reuse` uses the same `verified_effect` gate the mechanism goal counts,
+so the two cannot disagree: outcome `used`/`adapted`, an operator verdict of
+`verified`, known temporal order, `coverage_status == "prepared"`, a launched
+consumer, resolved source evidence and a surviving receipt. `counts_as_effect`
+additionally requires that the operator did not relay the pointer.
+
+Operator-supplied coverage is reported as `prepared_reviewed` with
+`coverage_provenance: "reviewed"` and a `coverage_reference_resolved` flag. It is
+never merged into native prepared coverage.
+
+`quality.interventions` is `null`: an `attention_hold` span count is a lower
+bound on operator interventions, not a total.
+
 ## What the manifest can and cannot freeze
 
 A source tuple id and a consumer's exact agent generation do not exist
@@ -110,7 +220,8 @@ certify the mechanism goal over a capture it knows is incomplete
 }
 ```
 
-`eligible_pairs` stays empty for a live batch — pairs arrive via reviews
+`repos` and `window` are enforced (see above). `eligible_pairs` stays empty for
+a live batch — pairs arrive via reviews
 (next section). Fill it directly only for a fixture/replay run where the
 pairs are already known.
 
@@ -130,8 +241,8 @@ or minting a new one bound to frozen `consumer_tasks` scope via `declares`:
       "repo": "rat-kingdom",
       "batch": "batch-1"
     },
-    "coverage": {"status": "prepared", "evidence": "<exposure-event-id-or-note>"},
-    "author_terminal_evidence": "<harness_result-or-agent_lifecycle-tuple-id, or omit>",
+    "coverage": {"status": "prepared", "evidence": "<tuple-id or operator reference>"},
+    "author_terminal_evidence": "<omit: not evaluated in evaluator_version 2>",
     "relayed_by_operator": false,
     "regression": false,
     "notes": "..."
@@ -146,25 +257,31 @@ documented):
   already names a manifest `eligible_pairs[].id`, omit `declares`; if it
   does not, `declares` is required and its `batch`/`consumer_task`/`repo`
   must already appear in `manifest.consumer_tasks`.
-- **`author_terminal_evidence` must be a real tuple, not an assertion.** A
-  reviewer boolean alone cannot establish that a source's author had
-  already exited before the reuse. The id must resolve to an actual
-  `harness_result`/`agent_lifecycle` event for the source's own authoring
-  generation (`payload.spawn`), timestamped no later than the reuse. If it
-  doesn't resolve that way, the report lists it under
-  `author_exit_unsupported` with the reason and does not credit it.
+- **`author_terminal_evidence` is not evaluated in `evaluator_version` 2.**
+  Anything supplied is listed under `author_exit_unsupported` with the reason and
+  credits nothing — see the version-2 section above for why a `harness_result`
+  and an `agent_lifecycle` both fail to establish a physical exit. Crediting it
+  needs an exit observation bound to the source author's exact generation and
+  launch, with no intervening resume before the consuming decision; that
+  derivation is `TKT-bonik-vuruv-mivuh`.
+
+  The observation it will consume is contracted in
+  `docs/2026-09-13-s2-native-observation-and-export-contract.md`. Producers for
+  it exist on S2's continuation branch but are **not delivered or verified**, so
+  no capture can supply one yet.
 
 ## Reading the report
 
 Every count the design doc requires is a top-level field: `eligible`,
 `excluded` (with `pair`/`reason`/`detail` — duplicate, self, future_source,
 wrong_generation, wrong_repo, missing_evidence, source_not_captured),
-`presented`, `opened`, `claimed`, `assessed`, `outcome_classes`,
-`unknown_coverage`, `ambiguous_assessments`, `author_exit_unsupported`,
-`verified_reuse`, `author_exit_reuse`, `mechanism` (the frozen
-3-effects/2-batches/1-author-exit threshold), `deliveries` (cost/duration
-per task, each field an explicit `null` rather than a manufactured zero
-when the underlying tuple wasn't captured), and `quality`.
+`rejected_claims`, `discovery`, `presented_native`, `presented_reviewed`,
+`opened`, `claimed`, `assessed`, `outcome_classes`, `unknown_coverage`,
+`ambiguous_assessments`, `author_exit_unsupported`, `verified_reuse`,
+`author_exit_reuse`, `mechanism` (the frozen 3-effects/2-batches/1-author-exit
+threshold, plus `goal_blocked_reason`), `deliveries` (scope only in
+`evaluator_version` 2), `invalid_records`, `unresolved_records`, `unsupported`,
+`capture`, and `quality`.
 
 Run it twice over the same three files and expect byte-identical JSON —
 that determinism is covered by
