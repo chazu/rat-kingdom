@@ -265,9 +265,9 @@ async fn a_respawn_is_a_second_launch_of_one_generation_with_its_own_cost_and_ex
 
     // --- Surface 2 of 4: `resume`. A respawn CONTINUES the generation. ---
     for _ in 0..200 {
-        if !status(&mut client, &name).await["agent"]["state"]
+        if status(&mut client, &name).await["agent"]["state"]
             .as_str()
-            .is_some_and(|s| s == "running")
+            .is_none_or(|s| s != "running")
         {
             break;
         }
