@@ -562,10 +562,12 @@ pub fn record_final_usage(
 
 /// Record that the harness PROCESS for one `(spawn, session)` attempt exited.
 ///
-/// `launched_at` is echoed from this session's launch event so a report can
-/// compute active execution duration as `exited_at - launched_at` for one
-/// attempt, without joining across event kinds and without mistaking queue or
-/// verification-admission time for execution.
+/// `launched_at` is this launch's own start time, so a report can bound the
+/// PROCESS against it. That span is process lifetime, not active model work: a
+/// harness can sit paused waiting on a verification run or on the operator,
+/// and this record makes no claim about how much of the span was productive.
+/// Active/paused phase attribution and verification-admission waits are
+/// deliberately left to evidence that can actually establish them.
 #[allow(clippy::too_many_arguments)]
 pub fn record_exit(
     space: &Space,
