@@ -12,6 +12,26 @@ pub enum BbsCommand {
     Brief(BriefArgs),
     /// Read an original post by its tuple ID.
     Show { id: String },
+    /// Bounded, read-only capture of this repository's records in actual
+    /// persistence order, for the offline evidence report. Unlike `rk scan`,
+    /// the envelope states its order, snapshot boundary and truncation, so a
+    /// consumer can establish which of two assessments persisted last.
+    Export {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+        /// Resume from a prior page's `next_cursor`.
+        #[arg(long)]
+        after: Option<u64>,
+        /// Maximum records per page (1..2000). Truncation is always reported.
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+        /// Pin the snapshot boundary from a prior page's `boundary`, so later
+        /// pages read ONE snapshot. Without it each page captures a fresh
+        /// boundary and a concurrent write can appear mid-paging. A boundary
+        /// ahead of the store is refused, never clamped.
+        #[arg(long)]
+        boundary: Option<u64>,
+    },
     /// Ask a durable question for peers working in this repository.
     Ask {
         text: String,
@@ -162,6 +182,28 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
                         .context("invalid BBS briefing")?
                         .render()
                 );
+            }
+        }
+        BbsCommand::Export {
+            repo,
+            after,
+            limit,
+            boundary,
+        } => {
+            let result = client
+                .call(
+                    "bbs.export",
+                    json!({"repo":repo,"after":after,"limit":limit,"boundary":boundary}),
+                )
+                .await?;
+            if as_json {
+                println!("{result}");
+            } else {
+                // The human form still prints the envelope: its order,
+                // boundary and coverage fields are the point of the surface,
+                // and summarizing them away would invite exactly the
+                // unqualified ordering claim this command exists to prevent.
+                println!("{}", serde_json::to_string_pretty(&result)?);
             }
         }
         BbsCommand::Show { id } => {

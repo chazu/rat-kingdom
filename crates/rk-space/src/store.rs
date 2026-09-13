@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS tuple_persistence_events (
     expires_at      TEXT,
     strength        REAL
 );
+CREATE INDEX IF NOT EXISTS idx_tuple_persistence_scope
+    ON tuple_persistence_events (scope, commit_sequence);
+CREATE INDEX IF NOT EXISTS idx_tuple_persistence_scope_id
+    ON tuple_persistence_events (scope, id, commit_sequence);
 CREATE TABLE IF NOT EXISTS rk_store_migrations (
     version TEXT PRIMARY KEY
 );
@@ -168,6 +172,20 @@ pub struct SdlcTransitionRecord {
 pub struct PersistenceDelta {
     pub boundary: u64,
     pub tuples: Vec<Tuple>,
+}
+
+/// One bounded page of the immutable persistence journal for a single scope.
+///
+/// `entries` pairs each tuple with its actual SQLite commit sequence, so a
+/// consumer can order records by persistence rather than by `RecordId`/ULID
+/// mint order, which a delayed writer can invert. `more` is true when further
+/// rows remain at or below `boundary`: truncation is reported, never implied.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistencePage {
+    pub boundary: u64,
+    pub next_cursor: u64,
+    pub more: bool,
+    pub entries: Vec<(u64, Tuple)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1030,6 +1048,103 @@ impl Store {
         Ok(PersistenceDelta { boundary, tuples })
     }
 
+    /// One bounded, scope-filtered page of the immutable persistence journal,
+    /// ordered by actual SQLite commit sequence.
+    ///
+    /// Unlike [`Store::persistence_delta`], which materializes every event
+    /// after a cursor, this pushes scope, cursor and limit into SQL before any
+    /// payload is deserialized, so a castle with a 371k-event journal pays for
+    /// `limit` rows, not for the whole history. `idx_tuple_persistence_scope`
+    /// makes the scan seek straight to `(scope, after]`.
+    ///
+    /// `boundary` is captured before the rows are read, exactly as
+    /// `persistence_delta` does, so a caller can page to a stable snapshot
+    /// while concurrent writes continue past it. `more` reports whether
+    /// further rows remain at or below that same boundary — truncation is
+    /// always visible rather than inferred from a short page.
+    /// `pin` freezes the snapshot boundary across pages. `None` captures a
+    /// fresh boundary (first page); `Some(b)` pages against exactly `b`, so a
+    /// row written between page 1 and page 2 CANNOT appear in page 2. A pin
+    /// ahead of the store's current sequence is refused rather than clamped:
+    /// silently clamping would hand back a different snapshot than the caller
+    /// asked for and call it the same one.
+    pub fn persistence_page(
+        &self,
+        scope: &str,
+        after: Option<u64>,
+        limit: usize,
+        pin: Option<u64>,
+    ) -> rk_core::Result<PersistencePage> {
+        let live = self.latest_persistence_sequence()?;
+        let boundary = match pin {
+            None => live,
+            Some(pinned) if pinned <= live => pinned,
+            Some(pinned) => {
+                return Err(Error::Other(format!(
+                    "pinned export boundary {pinned} is ahead of the store's current \
+                     persistence sequence {live}"
+                )))
+            }
+        };
+        let after = i64::try_from(after.unwrap_or(0))
+            .map_err(|_| Error::Other("tuple persistence cursor exceeds SQLite range".into()))?;
+        let boundary_sql = i64::try_from(boundary)
+            .map_err(|_| Error::Other("tuple persistence boundary exceeds SQLite range".into()))?;
+        if after > boundary_sql {
+            return Err(Error::Other(
+                "tuple persistence cursor is ahead of the captured boundary".into(),
+            ));
+        }
+        // Read one extra row to learn whether the page truncated the snapshot
+        // without running a second COUNT over the journal.
+        let probe = i64::try_from(limit.saturating_add(1))
+            .map_err(|_| Error::Other("tuple persistence limit exceeds SQLite range".into()))?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT commit_sequence, id, category, scope, identity, instance, lifecycle,
+                        payload, created_at, expires_at, strength
+                 FROM tuple_persistence_events
+                 WHERE scope = ?1 AND commit_sequence > ?2 AND commit_sequence <= ?3
+                 ORDER BY commit_sequence ASC
+                 LIMIT ?4",
+            )
+            .map_err(sql_err)?;
+        let rows = statement
+            .query_map(
+                params_from_iter::<[&dyn rusqlite::ToSql; 4]>([
+                    &scope,
+                    &after,
+                    &boundary_sql,
+                    &probe,
+                ]),
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    // `row_to_tuple` indexes from zero; re-read without the
+                    // leading sequence column by offsetting the projection.
+                    Ok((sequence, row_to_tuple_offset(row, 1)?))
+                },
+            )
+            .map_err(sql_err)?;
+        let mut entries: Vec<(u64, Tuple)> = Vec::new();
+        for row in rows {
+            let (sequence, tuple) = row.map_err(sql_err)?;
+            entries.push((sequence.max(0) as u64, tuple));
+        }
+        let more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_cursor = entries
+            .last()
+            .map(|(sequence, _)| *sequence)
+            .unwrap_or(u64::try_from(after).unwrap_or(0));
+        Ok(PersistencePage {
+            boundary,
+            next_cursor,
+            more,
+            entries,
+        })
+    }
+
     pub fn has_persistence_event(&self, id: RecordId) -> rk_core::Result<bool> {
         self.conn
             .query_row(
@@ -1160,6 +1275,61 @@ impl Store {
                  FROM tuples WHERE id = ?1",
                 [id.to_string()],
                 row_to_tuple,
+            )
+            .optional()
+            .map_err(sql_err)
+    }
+
+    /// Resolve one tuple AS OF a frozen persistence boundary, fenced to the
+    /// caller's own scope.
+    ///
+    /// `Space::get` reads the CURRENT row, so a reference resolved through it
+    /// can pull a row persisted after the export's boundary into what claims
+    /// to be a snapshot of that boundary. This reads the immutable journal
+    /// instead and returns the newest version of `id` at or below `boundary`,
+    /// or `None` when the tuple did not yet exist there, or existed only
+    /// under a different scope — in which case the caller reports it as
+    /// missing/unknown rather than exporting a post-boundary or foreign-scope
+    /// row.
+    ///
+    /// Bounded and indexed: `scope`, `id` and the sequence predicate are all
+    /// pushed into SQL against `idx_tuple_persistence_scope_id (scope, id,
+    /// commit_sequence)`, so this is a bounded index seek regardless of
+    /// journal size, and a foreign-scope row is never even read off disk,
+    /// let alone deserialized.
+    ///
+    /// Returns the MATCHED journal row's own `commit_sequence` alongside the
+    /// tuple. That historical sequence — not the live `tuples` row's, which
+    /// can be `NULL` after a deletion or a NEWER number after a reinforcement
+    /// — is the only value that can honestly be called this reference's
+    /// as-of order; a caller must never substitute the live row's sequence
+    /// for it.
+    pub fn get_as_of(
+        &self,
+        id: RecordId,
+        boundary: u64,
+        scope: &str,
+    ) -> rk_core::Result<Option<(u64, Tuple)>> {
+        let boundary = i64::try_from(boundary)
+            .map_err(|_| Error::Other("export boundary exceeds SQLite range".into()))?;
+        self.conn
+            .query_row(
+                "SELECT commit_sequence, id, category, scope, identity, instance, lifecycle,
+                        payload, created_at, expires_at, strength
+                 FROM tuple_persistence_events
+                 WHERE scope = ?1 AND id = ?2 AND commit_sequence <= ?3
+                 ORDER BY commit_sequence DESC
+                 LIMIT 1",
+                params_from_iter::<[&dyn rusqlite::ToSql; 3]>([
+                    &scope.to_string(),
+                    &id.to_string(),
+                    &boundary,
+                ]),
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let tuple = row_to_tuple_offset(row, 1)?;
+                    Ok((sequence as u64, tuple))
+                },
             )
             .optional()
             .map_err(sql_err)
@@ -1850,41 +2020,48 @@ fn parse_lifecycle(s: &str) -> Result<Lifecycle, Error> {
 }
 
 fn row_to_tuple(row: &Row<'_>) -> rusqlite::Result<Tuple> {
-    let id: String = row.get(0)?;
-    let category: String = row.get(1)?;
-    let lifecycle: String = row.get(5)?;
-    let payload: String = row.get(6)?;
-    let created_at: String = row.get(7)?;
-    let expires_at: Option<String> = row.get(8)?;
-    let strength: Option<f64> = row.get(9)?;
+    row_to_tuple_offset(row, 0)
+}
+
+/// Read a tuple from the standard ten-column projection starting at `base`.
+/// Callers that prepend a column (e.g. the journal's `commit_sequence`) pass a
+/// nonzero `base` instead of duplicating the whole conversion.
+fn row_to_tuple_offset(row: &Row<'_>, base: usize) -> rusqlite::Result<Tuple> {
+    let id: String = row.get(base)?;
+    let category: String = row.get(base + 1)?;
+    let lifecycle: String = row.get(base + 5)?;
+    let payload: String = row.get(base + 6)?;
+    let created_at: String = row.get(base + 7)?;
+    let expires_at: Option<String> = row.get(base + 8)?;
+    let strength: Option<f64> = row.get(base + 9)?;
 
     let id = id
         .parse()
-        .map_err(|e| conversion_error(0, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base, rusqlite::types::Type::Text, e))?;
     let category = category
         .parse::<Category>()
-        .map_err(|e| conversion_error(1, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base + 1, rusqlite::types::Type::Text, e))?;
     let lifecycle = parse_lifecycle(&lifecycle)
-        .map_err(|e| conversion_error(5, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base + 5, rusqlite::types::Type::Text, e))?;
     let payload = serde_json::from_str(&payload)
-        .map_err(|e| conversion_error(6, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base + 6, rusqlite::types::Type::Text, e))?;
     let created_at = DateTime::parse_from_rfc3339(&created_at)
         .map(|t| t.with_timezone(&Utc))
-        .map_err(|e| conversion_error(7, rusqlite::types::Type::Text, e))?;
+        .map_err(|e| conversion_error(base + 7, rusqlite::types::Type::Text, e))?;
     let expires_at = expires_at
         .map(|s| {
             DateTime::parse_from_rfc3339(&s)
                 .map(|t| t.with_timezone(&Utc))
-                .map_err(|e| conversion_error(8, rusqlite::types::Type::Text, e))
+                .map_err(|e| conversion_error(base + 8, rusqlite::types::Type::Text, e))
         })
         .transpose()?;
 
     Ok(Tuple {
         id,
         category,
-        scope: row.get(2)?,
-        identity: row.get(3)?,
-        instance: row.get(4)?,
+        scope: row.get(base + 2)?,
+        identity: row.get(base + 3)?,
+        instance: row.get(base + 4)?,
         lifecycle,
         payload,
         created_at,
@@ -2002,6 +2179,61 @@ mod tests {
 
         assert!(store.delete(t.id).unwrap());
         assert_eq!(store.count().unwrap(), 0);
+    }
+
+    /// `get_as_of` claims to be a bounded index seek, not a scan of the
+    /// immutable journal. Proves it against a real (if small) query planner
+    /// decision rather than trusting the doc comment: a regression that drops
+    /// `idx_tuple_persistence_scope_id` or stops binding all three predicate
+    /// columns would silently degrade this back to `SCAN
+    /// tuple_persistence_events` over the whole table.
+    #[test]
+    fn get_as_of_lookup_plan_uses_the_scope_id_index_not_a_full_journal_scan() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..50 {
+            store
+                .insert(&tuple(&format!("noise-{i}"), json!({})))
+                .unwrap();
+        }
+        let target = tuple("target", json!({"v": 1}));
+        store.insert(&target).unwrap();
+
+        // Mirrors the exact predicate `Store::get_as_of` runs.
+        let mut stmt = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT commit_sequence, id, category, scope, identity, instance, lifecycle,
+                        payload, created_at, expires_at, strength
+                 FROM tuple_persistence_events
+                 WHERE scope = ?1 AND id = ?2 AND commit_sequence <= ?3
+                 ORDER BY commit_sequence DESC
+                 LIMIT 1",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(
+                params_from_iter::<[&dyn rusqlite::ToSql; 3]>([
+                    &"repo".to_string(),
+                    &target.id.to_string(),
+                    &1_000_000_i64,
+                ]),
+                |row| row.get::<_, String>(row.as_ref().column_count() - 1),
+            )
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let detail = plan.join(" | ");
+        assert!(
+            detail.contains("idx_tuple_persistence_scope_id"),
+            "expected the scope/id/commit_sequence index to drive this lookup: {detail}"
+        );
+        assert!(
+            !detail
+                .to_uppercase()
+                .contains("SCAN TUPLE_PERSISTENCE_EVENTS"),
+            "must not fall back to a full journal scan: {detail}"
+        );
     }
 
     #[test]
