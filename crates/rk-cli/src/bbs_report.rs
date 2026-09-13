@@ -96,6 +96,10 @@ fn reserved_prefix(bbs_kind: &str) -> Option<&'static str> {
 /// counted for a spawn that never ran. `spawn` is additive on these events
 /// (S2's `48fb2da`); a `harness_result` also proves the generation ran.
 const LAUNCH_EVENT_IDENTITIES: [&str; 2] = ["agent_spawned", "agent_respawned"];
+/// `LaunchRow.kind` for a record that observes a physical launch ATTEMPT,
+/// as opposed to one that merely proves the generation ran. Only these are
+/// counted as attempts a session was never observed for.
+const LAUNCH_EVENT_KIND: &str = "launch_event";
 
 /// `AgentState` values that mean this launch produced its *last* provider
 /// result. A `paused` result may be followed by more model usage and then a
@@ -413,34 +417,159 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
 /// export — its array position must never be read as supersession order,
 /// and neither may a tuple's id (ULID) or `created_at`: scan order is not
 /// necessarily persistence order, and a ULID/wall-clock sort is not either.
-/// Only an explicit capture envelope built from `Space::persistence_delta`
-/// (a bounded, sequence-ordered bbs export; S2's to supply, not this
-/// module's) may claim `PersistenceSequence`.
+/// Only a `bbs.export` envelope built from `Space::persistence_page` may
+/// claim `PersistenceSequence`, and the claim alone is not enough: it is
+/// accepted only when the records themselves carry the ascending
+/// `commit_sequence` positions that substantiate it (see
+/// `persistence_order_defect`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
     PersistenceSequence,
     Unknown,
 }
 
+/// The `coverage` block of a `bbs.export` envelope: the daemon's own
+/// statement about whether the evidence closure it shipped is complete.
+/// A bare array or a raw `rk --json scan` object makes no closure claim at
+/// all, and must never be read as one.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureCoverage {
+    /// `None` when the capture shape makes no closure claim at all. That is
+    /// NOT a claim of completeness.
+    pub complete: Option<bool>,
+    pub missing_references: Vec<String>,
+    pub reference_budget_exhausted: bool,
+}
+
 pub struct TupleCapture {
     pub order: Order,
+    /// Why a declared `order: "persistence_sequence"` was REFUSED and the
+    /// capture downgraded to `Order::Unknown`. A claim is only a claim: it is
+    /// accepted solely when the records themselves carry the persistence
+    /// positions that back it.
+    pub order_claim_rejected: Option<String>,
+    /// The export PAGE: the bounded, sequence-ordered window this capture
+    /// covers.
     pub tuples: Vec<Value>,
+    /// The evidence CLOSURE: tuples referenced by a page record that were not
+    /// themselves on the page, resolved AS-OF the page's frozen boundary.
+    /// These are real tuples and must be merged, or linked evidence reads as
+    /// absent — but they are sorted by id, not by persistence position, so
+    /// only their own `commit_sequence` can order them.
+    pub references: Vec<Value>,
     pub truncated: bool,
+    pub coverage: CaptureCoverage,
     #[allow(dead_code)]
     pub source: Option<String>,
 }
 
+/// Page and closure as one deduped record list, in persistence order when the
+/// records carry the positions to establish it.
+pub struct MergedRecords<'a> {
+    pub records: Vec<&'a Value>,
+    /// Closure records actually added (i.e. not already on the page).
+    pub references_merged: usize,
+    /// Closure records dropped because the page already carried that id. The
+    /// daemon never emits these; a hand-built capture can, and silently
+    /// double-counting the same observation would inflate every metric.
+    pub duplicate_references: usize,
+}
+
+fn commit_sequence(t: &Value) -> Option<u64> {
+    t.get("commit_sequence").and_then(Value::as_u64)
+}
+
+impl TupleCapture {
+    /// Merges the closure into the page. Ordering: when EVERY merged record
+    /// carries a `commit_sequence`, the merged list is sorted by it, so a
+    /// closure record takes its true persistence position rather than being
+    /// appended after the page. Otherwise the page keeps its array order and
+    /// the closure follows — a merged list that `Order::Unknown` already
+    /// forbids anyone from reading as supersession order.
+    pub fn merged(&self) -> MergedRecords<'_> {
+        let page_ids: BTreeSet<&str> = self
+            .tuples
+            .iter()
+            .filter_map(|t| t.get("id").and_then(Value::as_str))
+            .collect();
+        let mut records: Vec<&Value> = self.tuples.iter().collect();
+        let mut references_merged = 0usize;
+        let mut duplicate_references = 0usize;
+        for r in &self.references {
+            match r.get("id").and_then(Value::as_str) {
+                Some(id) if page_ids.contains(id) => duplicate_references += 1,
+                _ => {
+                    records.push(r);
+                    references_merged += 1;
+                }
+            }
+        }
+        if records.iter().all(|t| commit_sequence(t).is_some()) {
+            records.sort_by_key(|t| (commit_sequence(t), t["id"].as_str().unwrap_or("")));
+        }
+        MergedRecords {
+            records,
+            references_merged,
+            duplicate_references,
+        }
+    }
+}
+
+/// Validates a declared `order: "persistence_sequence"` against the records
+/// that are supposed to back it. The claim is a string in an envelope anyone
+/// can write; what makes it true is that every record carries its own
+/// `commit_sequence` and the page's are strictly ascending in array order.
+/// Returns the refusal reason when the claim cannot be substantiated.
+fn persistence_order_defect(tuples: &[Value], references: &[Value]) -> Option<String> {
+    let mut previous: Option<u64> = None;
+    for (i, t) in tuples.iter().enumerate() {
+        let Some(seq) = commit_sequence(t) else {
+            return Some(format!(
+                "the capture declares order=persistence_sequence but page record {} (index {i}) \
+                 carries no numeric commit_sequence, so the claim cannot be checked",
+                t["id"].as_str().unwrap_or("<no id>")
+            ));
+        };
+        if let Some(prev) = previous {
+            if seq <= prev {
+                return Some(format!(
+                    "the capture declares order=persistence_sequence but page record {} (index \
+                     {i}) has commit_sequence {seq} after {prev}: the array is not in ascending \
+                     persistence order",
+                    t["id"].as_str().unwrap_or("<no id>")
+                ));
+            }
+        }
+        previous = Some(seq);
+    }
+    for r in references {
+        if commit_sequence(r).is_none() {
+            return Some(format!(
+                "the capture declares order=persistence_sequence but reference record {} carries \
+                 no numeric commit_sequence, so its position among the page records is unknown",
+                r["id"].as_str().unwrap_or("<no id>")
+            ));
+        }
+    }
+    None
+}
+
 /// Parses either shape: a bare tuple array, the raw `rk --json scan` object
-/// (`{"tuples":[...], "truncated":bool, ...}`), or the forward-looking
-/// capture envelope (`{"schema_version":1,"order":"persistence_sequence",
-/// "tuples":[...],...}`). Legacy/raw input is always `Order::Unknown` —
-/// never inferred from tuple id (ULID) or `created_at`.
+/// (`{"tuples":[...], "truncated":bool, ...}`), or the real `bbs.export`
+/// envelope (`{"schema_version":1,"kind":"bbs.export","order":
+/// "persistence_sequence","tuples":[...],"references":[...],"coverage":{...}}`).
+/// Legacy/raw input is always `Order::Unknown` — never inferred from tuple id
+/// (ULID) or `created_at` — and a declared persistence-sequence order is
+/// accepted only when `persistence_order_defect` can substantiate it.
 pub fn parse_tuple_capture(raw: &Value) -> Result<TupleCapture> {
     if let Some(arr) = raw.as_array() {
         return Ok(TupleCapture {
             order: Order::Unknown,
+            order_claim_rejected: None,
             tuples: arr.clone(),
+            references: Vec::new(),
             truncated: false,
+            coverage: CaptureCoverage::default(),
             source: None,
         });
     }
@@ -449,25 +578,59 @@ pub fn parse_tuple_capture(raw: &Value) -> Result<TupleCapture> {
         .and_then(Value::as_array)
         .context(
             "tuples input must be a JSON array, or an object with a `tuples` array \
-             (the shape `rk --json scan` and the capture envelope both produce)",
+             (the shape `rk --json scan` and the bbs.export envelope both produce)",
         )?
         .clone();
+    let references = raw
+        .get("references")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut order_claim_rejected = None;
     let order = match raw.get("order").and_then(Value::as_str) {
-        Some("persistence_sequence") => Order::PersistenceSequence,
+        Some("persistence_sequence") => match persistence_order_defect(&tuples, &references) {
+            None => Order::PersistenceSequence,
+            Some(reason) => {
+                order_claim_rejected = Some(reason);
+                Order::Unknown
+            }
+        },
         _ => Order::Unknown,
     };
     let truncated = raw
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let raw_coverage = raw.get("coverage");
+    let coverage = CaptureCoverage {
+        complete: raw_coverage
+            .and_then(|c| c.get("complete"))
+            .and_then(Value::as_bool),
+        missing_references: raw_coverage
+            .and_then(|c| c.get("missing_references"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        reference_budget_exhausted: raw_coverage
+            .and_then(|c| c.get("reference_budget_exhausted"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
     let source = raw
         .get("source")
         .and_then(Value::as_str)
         .map(str::to_string);
     Ok(TupleCapture {
         order,
+        order_claim_rejected,
         tuples,
+        references,
         truncated,
+        coverage,
         source,
     })
 }
@@ -749,6 +912,26 @@ pub struct CaptureSummary {
     pub observations_out_of_window: usize,
     pub observations_undated: usize,
     pub observations_out_of_scope_repo: usize,
+    /// Closure records the export shipped alongside the page.
+    pub references: usize,
+    /// Closure records actually merged into the index (the rest were already
+    /// on the page). Evidence lives here as often as on the page; a report
+    /// that indexes only `tuples` reads linked evidence as absent.
+    pub references_merged: usize,
+    /// Closure records dropped as duplicates of a page record.
+    pub duplicate_references: usize,
+    /// `coverage.missing_references`: referenced tuples the daemon could not
+    /// resolve at the frozen boundary. Each is also surfaced as an
+    /// unresolved record, never as an absent one.
+    pub missing_references: Vec<String>,
+    /// `coverage.complete`. `None` when the capture shape makes no closure
+    /// claim at all (a bare array or a raw `rk --json scan` object) — which
+    /// is NOT the same as a claim of completeness.
+    pub closure_complete: Option<bool>,
+    pub reference_budget_exhausted: bool,
+    /// Set when a declared `order: "persistence_sequence"` was refused and
+    /// the capture downgraded to unknown order.
+    pub order_claim_rejected: Option<String>,
 }
 
 /// The discovery denominator, reported explicitly rather than left implicit in
@@ -922,7 +1105,13 @@ pub struct CostSegment {
 /// S2's contract names as the only safe aggregation key.
 #[derive(Debug, Clone, Serialize)]
 pub struct LaunchObservation {
-    pub session: String,
+    /// `None` for an attempt observed only through a launch EVENT
+    /// (`agent_spawned`/`agent_respawned`), which names no session.
+    pub session: Option<String>,
+    /// What observed this attempt: `agent_exit`, `agent_final_usage` (the
+    /// process reported usage but no exit was captured — live, or its exit
+    /// is outside the capture), or `launch_event`.
+    pub observed_via: String,
     pub launched_at: Option<String>,
     pub exited_at: Option<String>,
     pub exit_record: Option<String>,
@@ -971,6 +1160,9 @@ pub struct DeliveryCost {
     pub generations: Vec<GenerationObservation>,
     pub completions: usize,
     pub failed_completions: usize,
+    /// Every observed launch ATTEMPT, not every observed exit: a live
+    /// generation, or one whose exit fell outside the capture, still
+    /// launched. See `observed_attempts`.
     pub launches: usize,
     pub exits: usize,
     /// Sum of the last provider-reported total per proven segment. `None`
@@ -1434,6 +1626,12 @@ struct UsageRow {
     cost_usd: Option<f64>,
     cost_basis: String,
     observed_at: Option<DateTime<Utc>>,
+    /// Position in the merged capture. Meaningful as persistence position
+    /// ONLY when the capture's order claim was validated; a provider reports
+    /// a CUMULATIVE total per segment, so picking the segment's last record
+    /// by `observed_at` is picking it by a field the producer stamps, not by
+    /// the order the daemon persisted them in.
+    position: usize,
     record: String,
 }
 
@@ -1455,6 +1653,10 @@ struct CompletionRow {
 /// between the exit and the consuming decision.
 struct LaunchRow {
     repo: String,
+    /// The task this launch was observed under, retained so a frozen task
+    /// whose ONLY native record is a launch event still owns a delivery.
+    /// Empty when the observing record names no task.
+    task: String,
     spawn: String,
     /// Present only for records that identify a physical launch. An
     /// `agent_spawned`/`agent_respawned` event and an authored record do not,
@@ -1521,11 +1723,16 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     let in_scope = |repo: &str| repos.is_empty() || repos.contains(repo);
     let window = &manifest.window;
 
+    // The export page and its evidence closure are ONE record set. Indexing
+    // only `tuples` makes a referenced finding/receipt that the daemon
+    // resolved into `references` read as though it were never captured.
+    let merged = capture.merged();
+
     let mut idx = Index {
-        by_id: capture
-            .tuples
+        by_id: merged
+            .records
             .iter()
-            .filter_map(|t| t.get("id").and_then(Value::as_str).map(|id| (id, t)))
+            .filter_map(|t| t.get("id").and_then(Value::as_str).map(|id| (id, *t)))
             .collect(),
         prepared: BTreeMap::new(),
         opened: BTreeSet::new(),
@@ -1540,9 +1747,30 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
         unresolved: Vec::new(),
         capture: CaptureSummary {
             tuples: capture.tuples.len(),
+            references: capture.references.len(),
+            references_merged: merged.references_merged,
+            duplicate_references: merged.duplicate_references,
+            missing_references: capture.coverage.missing_references.clone(),
+            closure_complete: capture.coverage.complete,
+            reference_budget_exhausted: capture.coverage.reference_budget_exhausted,
+            order_claim_rejected: capture.order_claim_rejected.clone(),
             ..CaptureSummary::default()
         },
     };
+
+    // A reference the daemon could NOT resolve is a hole in the evidence
+    // closure, not an absent tuple: record it so an evidence check that fails
+    // against this capture is attributable to the capture, not to the author.
+    for id in &capture.coverage.missing_references {
+        idx.unresolved.push(InvalidRecord {
+            record: id.clone(),
+            kind: "missing_reference".into(),
+            reason: "named by a captured record but absent from the export's evidence closure \
+                     (coverage.missing_references): unresolvable in this capture, not proven \
+                     absent"
+                .into(),
+        });
+    }
 
     // An observation is accepted only when it is in a manifest repo AND inside
     // the frozen window. Both rejections are COUNTED, so a scoping or window
@@ -1575,7 +1803,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
         }
     };
 
-    for (pos, t) in capture.tuples.iter().enumerate() {
+    for (pos, t) in merged.records.iter().copied().enumerate() {
         let scope = str_field(t, &["scope"]).to_string();
 
         if claims_kind(t, EXPOSURE) {
@@ -1710,6 +1938,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             let launched_at = payload_time(t, "launched_at");
             idx.launches.push(LaunchRow {
                 repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
                 spawn: spawn.clone(),
                 session: Some(session.clone()),
                 at: launched_at,
@@ -1772,6 +2001,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             }
             idx.launches.push(LaunchRow {
                 repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
                 spawn: spawn.clone(),
                 session: Some(session.clone()),
                 at: observed_at,
@@ -1790,6 +2020,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 cost_usd: t["payload"]["cost_usd"].as_f64(),
                 cost_basis,
                 observed_at,
+                position: pos,
                 record: record_id(t),
             });
             continue;
@@ -1816,6 +2047,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             }
             idx.launches.push(LaunchRow {
                 repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
                 spawn: spawn.clone(),
                 session: None,
                 at: created_at(t),
@@ -1855,11 +2087,14 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             }
             idx.launches.push(LaunchRow {
                 repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
                 spawn,
+                // A launch event names no session; it is still proof of a
+                // physical launch attempt, including one that has not exited.
                 session: None,
                 at: created_at(t),
                 record: record_id(t),
-                kind: "launch_event",
+                kind: LAUNCH_EVENT_KIND,
             });
             continue;
         }
@@ -1896,6 +2131,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             if !spawn.is_empty() {
                 idx.launches.push(LaunchRow {
                     repo: scope.clone(),
+                    task: str_field(t, &["payload", "task"]).to_string(),
                     spawn,
                     session: None,
                     at: created_at(t),
@@ -1957,11 +2193,15 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             if !spawn.is_empty() {
                 idx.launches.push(LaunchRow {
                     repo: scope,
+                    task: str_field(t, &["payload", "task"]).to_string(),
                     spawn,
                     session: None,
                     at: created_at(t),
                     record: record_id(t),
-                    kind: "launch_event",
+                    // An authored finding proves the generation RAN; it is
+                    // not a launch event and must not be counted as a
+                    // separate launch attempt.
+                    kind: "authored_record",
                 });
             }
         }
@@ -2771,13 +3011,33 @@ pub fn compute_full(
         .collect();
     author_exit_reuse.sort();
     let author_exit_effects = author_exit_reuse.len();
-    // A truncated capture still cannot certify the goal: a reuse or assessment
-    // outside the truncation window could change any of these counts.
-    let goal_blocked_reason = capture.truncated.then(|| {
-        "the tuple capture is truncated: a reuse or assessment outside the truncation window \
-         could change any of these counts"
-            .to_string()
-    });
+    // A capture that does not cover its own evidence still cannot certify the
+    // goal. Truncation is one way to fall short; an incomplete reference
+    // closure is another, and the export states both. An unresolved reference
+    // could be the very receipt or assessment that changes a count.
+    let goal_blocked_reason = if capture.truncated {
+        Some(
+            "the tuple capture is truncated: a reuse or assessment outside the truncation window \
+             could change any of these counts"
+                .to_string(),
+        )
+    } else if capture.coverage.complete == Some(false) {
+        Some(format!(
+            "the capture declares an incomplete evidence closure (coverage.complete=false, \
+             {} unresolved reference(s), reference_budget_exhausted={}): a reuse or assessment \
+             outside the closure could change any of these counts",
+            capture.coverage.missing_references.len(),
+            capture.coverage.reference_budget_exhausted
+        ))
+    } else if !capture.coverage.missing_references.is_empty() {
+        Some(format!(
+            "the capture reports {} unresolved reference(s) in its evidence closure: a reuse or \
+             assessment among them could change any of these counts",
+            capture.coverage.missing_references.len()
+        ))
+    } else {
+        None
+    };
     let mechanism = MechanismResult {
         effects: effect_pairs.len(),
         batches: effect_batches.len(),
@@ -2868,7 +3128,11 @@ pub fn compute_full(
         let accepted = acceptance_evidence.as_ref().map(|_| true);
 
         // Every native generation observed for this task, whether or not it
-        // ever produced an eligible pair or a receipt.
+        // ever produced an eligible pair or a receipt. Launch rows are
+        // included, not just completions/exits/usage: a generation that was
+        // spawned and is still running — or crashed before any of the other
+        // three were emitted — has only a launch event, and omitting it drops
+        // the whole delivery.
         let mut spawns: BTreeSet<&str> = BTreeSet::new();
         for c in &idx.completions {
             if c.repo == scope.repo && c.task == scope.task {
@@ -2883,6 +3147,11 @@ pub fn compute_full(
         for u in &idx.usage {
             if u.repo == scope.repo && u.task == scope.task {
                 spawns.insert(u.spawn.as_str());
+            }
+        }
+        for l in &idx.launches {
+            if l.repo == scope.repo && l.task == scope.task {
+                spawns.insert(l.spawn.as_str());
             }
         }
 
@@ -2944,21 +3213,28 @@ pub fn compute_full(
                     .map(|e| e.agent.clone());
             }
 
+            // ATTEMPTS, not exits. An exit is the richest evidence of a
+            // launch but not the only one: a live generation reports usage
+            // with no exit, and one whose exit fell outside the capture has
+            // only its launch event. Counting exits alone undercounts every
+            // generation that is still running or crashed unobserved.
             let mut launches = Vec::new();
+            let mut sessioned: BTreeSet<&str> = BTreeSet::new();
             for e in idx
                 .exits
                 .iter()
                 .filter(|e| e.repo == scope.repo && e.task == scope.task && e.spawn == spawn)
             {
                 exits_total += 1;
-                launches_total += 1;
+                sessioned.insert(e.session.as_str());
                 let ms = match (e.launched_at, e.exited_at) {
                     (Some(l), Some(x)) => Some((x - l).num_milliseconds()),
                     _ => None,
                 };
                 opt_sum(&mut lifetime, ms);
                 launches.push(LaunchObservation {
-                    session: e.session.clone(),
+                    session: Some(e.session.clone()),
+                    observed_via: AGENT_EXIT.into(),
                     launched_at: e.launched_at.map(|t| t.to_rfc3339()),
                     exited_at: e.exited_at.map(|t| t.to_rfc3339()),
                     exit_record: Some(e.record.clone()),
@@ -2968,7 +3244,69 @@ pub fn compute_full(
                     process_lifetime_ms: ms,
                 });
             }
-            launches.sort_by(|a, b| a.session.cmp(&b.session));
+            // A session that reported usage but never an exit: a real launch
+            // whose termination this capture does not witness.
+            let mut usage_only: BTreeSet<&str> = BTreeSet::new();
+            for u in idx
+                .usage
+                .iter()
+                .filter(|u| u.repo == scope.repo && u.task == scope.task && u.spawn == spawn)
+            {
+                if !sessioned.contains(u.session.as_str()) {
+                    usage_only.insert(u.session.as_str());
+                }
+            }
+            for session in &usage_only {
+                launches.push(LaunchObservation {
+                    session: Some((*session).to_string()),
+                    observed_via: AGENT_FINAL_USAGE.into(),
+                    launched_at: None,
+                    exited_at: None,
+                    exit_record: None,
+                    exit_code: None,
+                    crashed: None,
+                    prior_state: None,
+                    process_lifetime_ms: None,
+                });
+            }
+            // Launch events carry no session, so they cannot be matched to
+            // the attempts above one-for-one. Only the EXCESS over the
+            // sessions already accounted for is counted as further attempts:
+            // treating each event as its own would double-count the ordinary
+            // case where a spawn both emitted an event and later exited.
+            let mut launch_events: Vec<&LaunchRow> = idx
+                .launches
+                .iter()
+                .filter(|l| {
+                    l.repo == scope.repo
+                        && l.task == scope.task
+                        && l.spawn == spawn
+                        && l.kind == LAUNCH_EVENT_KIND
+                })
+                .collect();
+            launch_events.sort_by(|a, b| (a.at, &a.record).cmp(&(b.at, &b.record)));
+            let accounted = sessioned.len() + usage_only.len();
+            for l in launch_events.iter().skip(accounted) {
+                launches.push(LaunchObservation {
+                    session: None,
+                    observed_via: LAUNCH_EVENT_KIND.into(),
+                    launched_at: l.at.map(|t| t.to_rfc3339()),
+                    exited_at: None,
+                    exit_record: None,
+                    exit_code: None,
+                    crashed: None,
+                    prior_state: None,
+                    process_lifetime_ms: None,
+                });
+            }
+            launches_total += launches.len();
+            launches.sort_by(|a, b| {
+                (&a.session, &a.launched_at, &a.exit_record).cmp(&(
+                    &b.session,
+                    &b.launched_at,
+                    &b.exit_record,
+                ))
+            });
 
             // Group usage by (session, provider_session): the provider reports
             // a CUMULATIVE total within one segment, so only the last result
@@ -2986,15 +3324,43 @@ pub fn compute_full(
                     .push(u);
             }
             let mut cost_segments = Vec::new();
+            let ordered = capture.order == Order::PersistenceSequence;
             for ((session, provider_session), mut rows) in by_segment {
                 any_segment = true;
-                rows.sort_by(|a, b| (a.observed_at, &a.record).cmp(&(b.observed_at, &b.record)));
+                // WHICH record is the segment's last is a persistence-order
+                // question, and `observed_at` is a producer-stamped field,
+                // not persistence order. Sort by capture position when the
+                // capture's order claim was validated; otherwise the pick
+                // below is presentational only and the segment is refused
+                // finality rather than resolved by a field that cannot
+                // answer it.
+                if ordered {
+                    rows.sort_by(|a, b| (a.position, &a.record).cmp(&(b.position, &b.record)));
+                } else {
+                    rows.sort_by(|a, b| {
+                        (a.observed_at, &a.record).cmp(&(b.observed_at, &b.record))
+                    });
+                }
                 let last = rows.last().copied().expect("segment has at least one row");
                 let exit = idx
                     .exits
                     .iter()
                     .find(|e| e.repo == scope.repo && e.spawn == spawn && e.session == session);
-                let (final_cost, finality_reason) = segment_finality(last, exit);
+                // One row IS its own last, whatever the order; only a
+                // multi-row segment needs persistence order to resolve.
+                let (final_cost, finality_reason) = if rows.len() > 1 && !ordered {
+                    (
+                        false,
+                        format!(
+                            "{} cumulative usage results in this segment but the capture declares \
+                             no validated persistence order, so the last one — the \
+                             segment's actual total — cannot be identified",
+                            rows.len()
+                        ),
+                    )
+                } else {
+                    segment_finality(last, exit)
+                };
                 if !final_cost {
                     all_final = false;
                     unknown_cost.push(format!(
@@ -3267,6 +3633,25 @@ pub fn render(report: &Report) -> String {
         report.capture.observations_undated,
         report.capture.observations_out_of_scope_repo
     );
+    let _ = writeln!(
+        out,
+        "closure: complete={} references={} merged={} duplicates={} missing={}",
+        match report.capture.closure_complete {
+            Some(true) => "yes".to_string(),
+            Some(false) => format!(
+                "no (budget_exhausted={})",
+                report.capture.reference_budget_exhausted
+            ),
+            None => "undeclared".to_string(),
+        },
+        report.capture.references,
+        report.capture.references_merged,
+        report.capture.duplicate_references,
+        report.capture.missing_references.len()
+    );
+    if let Some(reason) = &report.capture.order_claim_rejected {
+        let _ = writeln!(out, "order claim REFUSED: {reason}");
+    }
     let _ = writeln!(
         out,
         "discovery: prepared {}/{} known-coverage pairs ({}); native={} reviewed={} \
@@ -3744,8 +4129,11 @@ mod tests {
         }
         TupleCapture {
             order,
+            order_claim_rejected: None,
             tuples,
+            references: Vec::new(),
             truncated: false,
+            coverage: CaptureCoverage::default(),
             source: None,
         }
     }
@@ -4264,6 +4652,380 @@ mod tests {
         });
         let parsed = parse_tuple_capture(&envelope).unwrap();
         assert_eq!(parsed.order, Order::PersistenceSequence);
+    }
+
+    /// Stamps `commit_sequence` the way the daemon does, so an `order`
+    /// claim has something to be checked against.
+    fn sequenced(records: Vec<Value>, start: u64) -> Vec<Value> {
+        records
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r["commit_sequence"] = json!(start + i as u64);
+                r
+            })
+            .collect()
+    }
+
+    /// A real `bbs.export` envelope, shaped as `rk-daemon`'s `bbs.rs`
+    /// emits it: the page in `tuples`, the resolved evidence closure in
+    /// `references` (id-sorted, each carrying its own AS-OF sequence), and a
+    /// `coverage` block stating whether that closure is complete.
+    fn export_envelope(page: Vec<Value>, references: Vec<Value>, missing: Vec<&str>) -> Value {
+        let complete = missing.is_empty();
+        json!({
+            "schema_version": 1,
+            "kind": "bbs.export",
+            "repo": "repo",
+            "order": "persistence_sequence",
+            "order_provenance": "tuple_persistence_events.commit_sequence ascending",
+            "source": "space.persistence_page",
+            "truncated": false,
+            "tuples": sequenced(page, 1),
+            "references": sequenced(references, 1_000),
+            "coverage": {
+                "missing_references": missing,
+                "complete": complete,
+                "reference_budget_exhausted": false,
+                "scope": "repo",
+            },
+        })
+    }
+
+    /// The evidence a receipt and a verdict name does not have to be on the
+    /// page: the daemon resolves it into `references`. A reporter that reads
+    /// only `tuples` treats that evidence as ABSENT and throws the verdict
+    /// away — the whole point of shipping the closure.
+    #[test]
+    fn export_references_are_merged_so_linked_evidence_resolves() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let evidence: Vec<Value> = ["ev-1", "ev-2", "ev-3"]
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id, "category": "artifact", "scope": "repo", "identity": id,
+                    "instance": "x", "created_at": "2026-01-01T00:00:00Z", "payload": {}
+                })
+            })
+            .collect();
+        let envelope = export_envelope(verified_tuples(), evidence, vec![]);
+        let c = parse_tuple_capture(&envelope).unwrap();
+        assert_eq!(c.order, Order::PersistenceSequence);
+        assert_eq!(c.references.len(), 3);
+
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(c.tuples.len(), 5, "the evidence is NOT on the page");
+        assert_eq!(r.capture.references_merged, 3);
+        assert_eq!(r.capture.duplicate_references, 0);
+        assert_eq!(r.capture.closure_complete, Some(true));
+        assert_eq!(
+            r.pairs[0].assessed_verdict.as_deref(),
+            Some("verified"),
+            "the verdict's evidence resolved out of the closure, not the page"
+        );
+        assert_eq!(r.outcome_classes.verified, 1);
+        assert!(r.mechanism.goal_blocked_reason.is_none());
+    }
+
+    /// The same envelope with the closure UNRESOLVED. An unresolvable
+    /// reference is a hole in the capture, not proof the evidence never
+    /// existed: the verdict drops to unresolved, the hole is named, and the
+    /// mechanism goal is blocked exactly as truncation blocks it.
+    #[test]
+    fn incomplete_closure_is_reported_and_blocks_the_mechanism_goal() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let envelope = export_envelope(verified_tuples(), vec![], vec!["ev-2"]);
+        let c = parse_tuple_capture(&envelope).unwrap();
+        let r = compute(&m, &c, &[]).unwrap();
+
+        assert_eq!(r.capture.closure_complete, Some(false));
+        assert_eq!(r.capture.missing_references, vec!["ev-2".to_string()]);
+        assert!(
+            r.unresolved_records
+                .iter()
+                .any(|u| u.record == "ev-2" && u.kind == "missing_reference"),
+            "the hole is named: {:?}",
+            r.unresolved_records
+        );
+        let blocked = r
+            .mechanism
+            .goal_blocked_reason
+            .expect("an incomplete closure cannot certify the goal");
+        assert!(blocked.contains("incomplete evidence closure"), "{blocked}");
+        assert!(!r.mechanism.goal_met);
+    }
+
+    /// `order: "persistence_sequence"` is a string anyone can write into an
+    /// envelope. It is accepted only when the records carry the ascending
+    /// `commit_sequence` positions that make it true — otherwise the capture
+    /// is downgraded to unknown order WITH the refusal reason, rather than
+    /// silently resolving supersession off an unproven claim.
+    #[test]
+    fn unsubstantiated_persistence_order_claim_is_refused() {
+        let bare = json!({
+            "order": "persistence_sequence",
+            "tuples": [finding("src-1", "author-gen", "2026-01-01T00:00:00Z")],
+        });
+        let c = parse_tuple_capture(&bare).unwrap();
+        assert_eq!(c.order, Order::Unknown, "no commit_sequence to check");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("no numeric commit_sequence")));
+
+        let mut out_of_order = export_envelope(
+            vec![
+                finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+                finding("src-2", "author-gen", "2026-01-01T00:00:00Z"),
+            ],
+            vec![],
+            vec![],
+        );
+        out_of_order["tuples"][1]["commit_sequence"] = json!(1);
+        let c = parse_tuple_capture(&out_of_order).unwrap();
+        assert_eq!(c.order, Order::Unknown, "not ascending");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("not in ascending persistence order")));
+
+        let mut unplaced = export_envelope(
+            vec![finding("src-1", "author-gen", "2026-01-01T00:00:00Z")],
+            vec![json!({
+                "id": "ev-1", "category": "artifact", "scope": "repo", "identity": "ev-1",
+                "instance": "x", "created_at": "2026-01-01T00:00:00Z", "payload": {}
+            })],
+            vec![],
+        );
+        unplaced["references"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("commit_sequence");
+        let c = parse_tuple_capture(&unplaced).unwrap();
+        assert_eq!(c.order, Order::Unknown, "a reference has no position");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("reference record")));
+    }
+
+    /// A legacy raw `rk --json scan` object still parses, still reports
+    /// unknown order, and is NOT refused: compatibility without inventing a
+    /// persistence order the shape cannot supply.
+    #[test]
+    fn legacy_raw_scan_is_unknown_order_without_a_refusal() {
+        let scan = json!({"tuples": [], "truncated": false});
+        let c = parse_tuple_capture(&scan).unwrap();
+        assert_eq!(c.order, Order::Unknown);
+        assert_eq!(c.order_claim_rejected, None);
+        assert_eq!(c.coverage.complete, None, "a scan makes no closure claim");
+    }
+
+    /// A generation observed ONLY through its launch event — spawned and
+    /// still running, or crashed before any completion, exit or usage was
+    /// recorded — is a real enrolled attempt. Seeding deliveries from
+    /// completions/exits/usage alone dropped it entirely.
+    #[test]
+    fn a_generation_with_only_a_launch_event_is_still_an_enrolled_attempt() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-live".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let spawned = json!({
+            "id": "e1", "category": "event", "scope": "repo", "identity": "agent_spawned",
+            "instance": CASTLE, "created_at": "2026-01-01T00:00:00Z",
+            "payload": {"agent": "Live-1", "spawn": "gen-live", "task": "TKT-live"}
+        });
+        let r = compute(&m, &capture(vec![spawned], Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.generations.len(), 1, "the live generation is retained");
+        assert_eq!(d.generations[0].spawn, "gen-live");
+        assert_eq!(d.launches, 1, "a launch with no exit is still an attempt");
+        assert_eq!(d.exits, 0);
+        assert_eq!(d.generations[0].launches[0].session, None);
+        assert_eq!(d.generations[0].launches[0].observed_via, "launch_event");
+        assert!(
+            r.tasks_without_native_records.is_empty(),
+            "the task DOES have a native record"
+        );
+    }
+
+    /// Two launches, one exited and one still live. Counting exits reported
+    /// one attempt; the second launch event is the excess over the sessions
+    /// already accounted for and is counted as the attempt it is.
+    #[test]
+    fn a_relaunch_with_no_exit_yet_is_counted_as_a_further_attempt() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-relaunch".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let event = |id: &str, identity: &str, at: &str| {
+            json!({
+                "id": id, "category": "event", "scope": "repo", "identity": identity,
+                "instance": CASTLE, "created_at": at,
+                "payload": {"agent": "R-1", "spawn": "gen-r", "task": "TKT-relaunch"}
+            })
+        };
+        let tuples = vec![
+            event("e1", "agent_spawned", "2026-01-01T00:00:00Z"),
+            event("e2", "agent_respawned", "2026-01-01T02:00:00Z"),
+            agent_exit(
+                "x1",
+                "repo",
+                "TKT-relaunch",
+                "R-1",
+                "gen-r",
+                "sess-1",
+                Some("2026-01-01T00:00:00Z"),
+                Some("2026-01-01T01:00:00Z"),
+                None,
+                false,
+                None,
+                "2026-01-01T01:00:00Z",
+            ),
+        ];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.exits, 1);
+        assert_eq!(d.launches, 2, "the un-exited relaunch is not dropped");
+        let sessions: Vec<Option<String>> = d.generations[0]
+            .launches
+            .iter()
+            .map(|l| l.session.clone())
+            .collect();
+        assert_eq!(sessions, vec![None, Some("sess-1".into())]);
+    }
+
+    /// Within one provider segment the reported cost is CUMULATIVE, so the
+    /// segment's total is whichever record persisted last. `observed_at` is
+    /// stamped by the producer and can disagree with persistence order; under
+    /// a validated capture the position decides.
+    #[test]
+    fn cumulative_segment_total_comes_from_persistence_position_not_observed_at() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-cost".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let usage = |id: &str, cost: f64, observed: &str| {
+            agent_final_usage(
+                id,
+                "repo",
+                "TKT-cost",
+                "gen-c",
+                "sess-1",
+                Some("ps-1"),
+                Some("completed"),
+                Some(cost),
+                PROVIDER_COST_BASIS,
+                observed,
+                observed,
+            )
+        };
+        let exit = agent_exit(
+            "x1",
+            "repo",
+            "TKT-cost",
+            "C-1",
+            "gen-c",
+            "sess-1",
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-01T03:00:00Z"),
+            Some("completed"),
+            false,
+            None,
+            "2026-01-01T03:00:00Z",
+        );
+        // Page order (= persistence order) puts the 2.00 total LAST, while
+        // its observed_at is EARLIER than the 1.00 row's.
+        let page = vec![
+            usage("u1", 1.00, "2026-01-01T02:00:00Z"),
+            usage("u2", 2.00, "2026-01-01T01:00:00Z"),
+            exit,
+        ];
+        let c = parse_tuple_capture(&export_envelope(page.clone(), vec![], vec![])).unwrap();
+        assert_eq!(c.order, Order::PersistenceSequence);
+        let r = compute(&m, &c, &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(
+            d.reported_cost_estimate_usd,
+            Some(2.00),
+            "the last PERSISTED cumulative total, not the latest observed_at"
+        );
+
+        // The same records with no order claim: the last row is genuinely
+        // unidentifiable, so the segment is refused finality instead of
+        // being resolved by a field that cannot answer the question.
+        let unordered = compute(&m, &capture(page, Order::Unknown), &[]).unwrap();
+        let d = &unordered.deliveries[0];
+        assert_eq!(d.cost_coverage, "partial");
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert!(
+            d.unknown_cost
+                .iter()
+                .any(|u| u.contains("no validated persistence order")),
+            "{:?}",
+            d.unknown_cost
+        );
+    }
+
+    /// A single-row segment IS its own last record whatever the order, so an
+    /// unordered capture must not manufacture a finality gap for it.
+    #[test]
+    fn a_single_row_segment_stays_final_under_unknown_order() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-one".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let tuples = vec![
+            agent_final_usage(
+                "u1",
+                "repo",
+                "TKT-one",
+                "gen-o",
+                "sess-1",
+                Some("ps-1"),
+                Some("completed"),
+                Some(0.75),
+                PROVIDER_COST_BASIS,
+                "2026-01-01T01:00:00Z",
+                "2026-01-01T01:00:00Z",
+            ),
+            agent_exit(
+                "x1",
+                "repo",
+                "TKT-one",
+                "O-1",
+                "gen-o",
+                "sess-1",
+                Some("2026-01-01T00:00:00Z"),
+                Some("2026-01-01T02:00:00Z"),
+                Some("completed"),
+                false,
+                None,
+                "2026-01-01T02:00:00Z",
+            ),
+        ];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(d.reported_cost_estimate_usd, Some(0.75));
     }
 
     #[test]

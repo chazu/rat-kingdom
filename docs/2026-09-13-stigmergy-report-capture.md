@@ -272,7 +272,8 @@ how the module's own unit tests work).
 1. A bare JSON array of tuples.
 2. The raw object `rk --json scan <category> <scope>` already produces:
    `{"tuples": [...], "truncated": bool, ...}`.
-3. The capture envelope below, which additionally declares `order`.
+3. The real `bbs.export` envelope below, which additionally ships the
+   evidence closure, a coverage statement and an `order` claim.
 
 Shapes 1 and 2 are always treated as `order: "unknown"` — **never** inferred
 from a tuple's id (ULID) or `created_at`. `rk --json scan` returns a query
@@ -284,33 +285,90 @@ assessment came last in real SQLite persistence order. Without that order,
 the report cannot silently guess — it reports the pair under
 `ambiguous_assessments` instead of manufacturing a verdict.
 
-### Capture envelope (forward-looking contract)
+### The `bbs.export` envelope
 
 ```json
 {
   "schema_version": 1,
+  "kind": "bbs.export",
   "order": "persistence_sequence",
+  "order_provenance": "tuple_persistence_events.commit_sequence ascending",
+  "source": "space.persistence_page",
   "cursor": 12345,
   "since": 12000,
   "captured_at": "2026-09-13T00:00:00Z",
-  "source": "space.persistence_delta",
   "truncated": false,
-  "tuples": [ /* native wire tuples, in true persistence order */ ]
+  "tuples":     [ /* the PAGE: wire tuples in persistence order, each with commit_sequence */ ],
+  "references": [ /* the CLOSURE: tuples named by a page record, resolved AS-OF the
+                     page boundary, id-sorted, each with its own AS-OF commit_sequence */ ],
+  "coverage": {
+    "missing_references": ["<tuple-id>"],
+    "complete": false,
+    "reference_budget_exhausted": false,
+    "scope": "rat-kingdom"
+  }
 }
 ```
 
-Only a capture built from `Space::persistence_delta` (a bounded,
-sequence-ordered read — see `crates/rk-space/src/store.rs`,
-`latest_persistence_sequence`/`persistence_delta`) may claim
-`"order": "persistence_sequence"`. That RPC is daemon-internal today
-(used by `bbs.brief`, the reactor and cross-castle sync); a bounded,
-CLI-exposed `rk bbs export` built on the same path is S2's to supply
-(`TKT-tapip-puhot-sitih`), not this ticket's. Until it lands, capture with
-`rk --json scan` (below) and expect `order: "unknown"` — the report still
-computes everything it safely can; it only refuses to resolve
-assessment supersession without real order.
+Three rules the reporter enforces on this shape:
 
-### Capturing today, with what already exists
+**References are merged, not ignored.** Evidence a finding, receipt or
+assessment names is frequently *not* on the page — the daemon resolves it
+into `references` instead. The reporter indexes page and closure as one
+record set, so linked evidence resolves; reading only `tuples` would treat
+that evidence as absent and silently discard the verdict that depends on it.
+A closure record whose id is already on the page is dropped as a duplicate
+and counted, never double-counted as a second observation.
+
+**Coverage is propagated, never assumed.** Each `missing_references` id is
+reported as an `unresolved_records` entry of kind `missing_reference` — a
+hole in the capture, not proof the tuple never existed. `coverage.complete:
+false` blocks the mechanism goal exactly as `truncated` does, because the
+unresolved reference could be the very receipt or assessment that changes a
+count. A bare array or a raw `rk --json scan` object declares no coverage at
+all, which is reported as `undeclared` and is **not** read as complete.
+
+**The order claim is validated, not believed.** `"order":
+"persistence_sequence"` is a string any file can contain. It is accepted
+only when every page record carries a numeric `commit_sequence`, those are
+strictly ascending in array order, and every reference carries one too
+(otherwise the closure cannot be placed among the page records). A claim
+that fails any of these is refused: the capture is downgraded to
+`order: "unknown"` and the refusal reason is reported under
+`capture.order_claim_rejected`. Shapes 1 and 2 are unknown-order without a
+refusal — that is compatibility, not failure.
+
+Order matters for two derivations specifically. Assessment supersession, as
+above. And the per-segment provider cost: a provider reports a *cumulative*
+total within one `(session, provider_session)` segment, so the segment's
+real total is whichever record persisted last — `observed_at` is stamped by
+the producer and can disagree. Under a validated capture the persistence
+position decides; without one, a multi-row segment is refused finality
+rather than resolved by a field that cannot answer the question. A
+single-row segment is its own last record and stays final either way.
+
+### Capturing
+
+The envelope above is what `rk bbs export` produces — use it:
+
+```bash
+# Pin ONE snapshot across pages: take `boundary` from page 1 and echo it back,
+# and resume from the previous page's `next_cursor`.
+rk --json bbs export --repo <repo> --limit 2000 > page1.json
+rk --json bbs export --repo <repo> --limit 2000 \
+  --boundary "$(jq -r .boundary page1.json)" \
+  --after    "$(jq -r .next_cursor page1.json)" > page2.json
+```
+
+Without `--boundary`, each page takes a fresh snapshot and a concurrent write
+can appear mid-paging. Pages are merged by concatenating `tuples` in order and
+unioning `references`; `truncated` and `coverage` must be OR-ed and unioned
+across pages, never dropped.
+
+### Legacy fallback: raw scans
+
+Still accepted, still correct, but `order: "unknown"` — no assessment
+supersession and no multi-row cost-segment finality (see above).
 
 ```bash
 # One JSON object per category, per repo scope, merged by hand or with jq -s:
