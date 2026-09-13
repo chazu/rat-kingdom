@@ -146,6 +146,7 @@ fn usage_from(value: &Value) -> TokenUsage {
         output: value["output_tokens"].as_u64().unwrap_or(0),
         cache_read: value["cache_read_input_tokens"].as_u64().unwrap_or(0),
         cache_creation: value["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        ..Default::default()
     }
 }
 
