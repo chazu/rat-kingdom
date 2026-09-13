@@ -2,11 +2,11 @@
 //!
 //! Offline, deterministic evidence report for the stigmergy program
 //! (docs/2026-09-12-stigmergy-evidence-and-trial.md, S3:
-//! TKT-tavik-kifos-lozuf; corrected under TKT-nonub-pugar-pilid). No daemon
-//! connection, worker credentials, model call or network is required: this is
-//! pure aggregation over three JSON files an operator prepares ahead of time.
-//! See docs/2026-09-13-stigmergy-report-capture.md for the capture recipe,
-//! the capture-envelope contract this module consumes, and compact templates
+//! TKT-tavik-kifos-lozuf). No daemon connection, worker credentials, model
+//! call or network is required: this is pure aggregation over three JSON
+//! files an operator prepares ahead of time. See
+//! docs/2026-09-13-stigmergy-report-capture.md for the capture recipe, the
+//! capture-envelope contract this module consumes, and compact templates
 //! for each input.
 //!
 //! This tool has no dispatch, landing, repair or approval authority; it only
@@ -17,47 +17,13 @@
 //! A source tuple id and a consumer's exact agent generation do not exist
 //! before a live batch runs — a manifest written ahead of time cannot name
 //! them. What CAN and MUST be frozen ahead of time is *scope*: which
-//! batches exist, which consumer tasks are in play for each, the repository
-//! set, the measurement window, and the (fixed, not manifest-configurable)
-//! eligibility rule itself. Concrete pairs (source, consumer generation) are
-//! enrolled later, in the reviews file, each bound to an already-frozen
-//! batch/task. A manifest may still predeclare full pairs directly
-//! (`eligible_pairs`) for deterministic fixture/replay cases where the pair
-//! identities are already known.
-//!
-//! # What this module will and will not certify
-//!
-//! Every rule below exists because the weaker version of it produced a false
-//! positive or erased a denominator (operator review of `43faffe`):
-//!
-//! * A record is only trusted when it structurally matches what the
-//!   *committed producer* writes — category, lifecycle, `schema_version`,
-//!   reserved identity prefix, and the `instance == payload.agent` binding
-//!   that `Tuple::new` guarantees for every S1 BBS write
-//!   (crates/rk-daemon/src/bbs.rs). Matching `category` + `bbs_kind` alone
-//!   lets an ordinary mutable artifact masquerade as a finding.
-//! * `exposure`/`open` telemetry is authored by the CASTLE, so `instance` is
-//!   the castle and never the consumer. Consumer identity is only
-//!   `payload.agent`/`payload.spawn`/`payload.bound`, and only
-//!   `bound == "agent"` is an exact generation.
-//! * A prepared exposure is not a launched consumer opportunity. It is only
-//!   counted as `prepared` once native launch evidence exists for that exact
-//!   generation; otherwise it is reported as `prepared_not_launched`.
-//! * Author-exit is credited ONLY from an `agent_exit` observation for the
-//!   source author's exact `(spawn, session)`, with no intervening relaunch
-//!   before the consuming decision. `harness_result` is task-completion
-//!   evidence — the supervisor emits it at `rk done`, while the OS process is
-//!   still alive — and `agent_lifecycle` carries no `spawn` binding at all
-//!   and may describe a *start*. Both are refused with a reason.
-//! * Cost is a reported estimate, evaluated as the last reported total per
-//!   proven `(spawn, session, provider_session)` segment, never summed across
-//!   the results of one segment, never pooled across `cost_basis` values, and
-//!   never final while the last result for a segment was `paused` and the
-//!   process went on to do more work.
-//! * Launch-to-exit is *process lifetime*, not measured active model work.
-//!   `active_work_ms` is therefore always an explicit unknown.
-//! * A bad claim removes the claim, not the opportunity: an invalid receipt
-//!   leaves its pair in the eligible denominator with no claimed outcome.
+//! batches exist, which consumer tasks are in play for each, and the
+//! (fixed, not manifest-configurable) eligibility rule itself. So
+//! `Manifest` freezes batches and consumer-task scope; concrete pairs
+//! (source, consumer generation) are enrolled later, in the reviews file,
+//! each bound to an already-frozen batch/task. A manifest may still
+//! predeclare full pairs directly (`eligible_pairs`) for deterministic
+//! fixture/replay cases where the pair identities are already known.
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -73,9 +39,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// `schema_version`, when diffing two reports across a rebuild.
 ///
 /// * 1 — initial S3 evaluator (`TKT-tavik-kifos-lozuf`).
-/// * 2 — `TKT-nonub-pugar-pilid`: native identity binding, window/repo
-///   scoping, launch-joined exposure, `agent_exit`-only author exit,
-///   segment-keyed cost with explicit finality, denominator retention.
+/// * 2 — `TKT-buruk-parut-zisoh` (slice A of `TKT-nonub-pugar-pilid`): native
+///   record identity binding, evidence resolution, repo/window scope, and
+///   opportunity-denominator retention. Author-exit and per-delivery cost are
+///   reported as UNSUPPORTED in this version pending
+///   `TKT-bonik-vuruv-mivuh`.
 pub const EVALUATOR_VERSION: u32 = 2;
 
 /// Frozen per the design doc: "three verified used/adapted effects across at
@@ -85,26 +53,22 @@ pub const MECHANISM_EFFECTS_REQUIRED: usize = 3;
 pub const MECHANISM_BATCHES_REQUIRED: usize = 2;
 pub const MECHANISM_AUTHOR_EXIT_REQUIRED: usize = 1;
 
-/// Longest accepted operator free-text reference. A reviewed annotation is
-/// operator judgment, so its text is bounded rather than unbounded input.
-const MAX_REFERENCE_LEN: usize = 512;
-
-// `bbs_kind` literals from the design doc's payload contract table, plus the
-// two native observation kinds S2's published contract adds
-// (docs/2026-09-13-s2-native-observation-and-export-contract.md, consumed via
-// BBS artifact 01M2CF3RJHX58HH085WKZBJD9A).
+// `bbs_kind` literals from the design doc's payload contract table.
 const FINDING: &str = "finding";
 const ANSWER: &str = "answer";
 const REUSE: &str = "reuse";
 const ASSESSMENT: &str = "assessment";
 const EXPOSURE: &str = "exposure";
 const OPEN: &str = "open";
-const AGENT_EXIT: &str = "agent_exit";
-const AGENT_FINAL_USAGE: &str = "agent_final_usage";
 
-/// Reserved identity prefixes the daemon mints for each BBS record kind
-/// (`rk_core::bbs::RESERVED_IDENTITY_PREFIXES`). A record whose identity does
-/// not carry its kind's prefix was not written by the BBS write path.
+/// The identity each BBS record kind is actually minted with by
+/// `crates/rk-daemon/src/bbs.rs`. A record whose identity does not carry its
+/// kind's prefix was not written by the BBS write path.
+///
+/// Read off the producers rather than off
+/// `rk_core::bbs::RESERVED_IDENTITY_PREFIXES`: the digest-suffixed kinds match
+/// that list, but `record_open` mints the fixed identity `"bbs-open"` with no
+/// trailing dash. Acceptance here has to match what is actually emitted.
 fn reserved_prefix(bbs_kind: &str) -> Option<&'static str> {
     match bbs_kind {
         FINDING => Some("bbs-finding-"),
@@ -112,37 +76,42 @@ fn reserved_prefix(bbs_kind: &str) -> Option<&'static str> {
         REUSE => Some("bbs-reuse-"),
         ASSESSMENT => Some("bbs-assessment-"),
         EXPOSURE => Some("bbs-exposure-"),
-        // NOTE, verified against the producer rather than the constant list:
-        // `record_open` writes the identity `"bbs-open"` with NO trailing
-        // dash, while `rk_core::bbs::RESERVED_IDENTITY_PREFIXES` lists
-        // `"bbs-open-"`. Matching the constant here would reject every real
-        // open record, so this matches what is actually written. (The daemon's
-        // own reserved-prefix guard has the same gap; filed separately, not
-        // patched from this ticket.)
         OPEN => Some("bbs-open"),
-        AGENT_EXIT => Some("bbs-agent-exit"),
-        AGENT_FINAL_USAGE => Some("bbs-agent-final-usage"),
         _ => None,
     }
 }
 
-/// `AgentState` values that mean this launch produced its *last* provider
-/// result. A `paused` result may be followed by more model usage and then a
-/// budget kill with no further result, which makes the reported total a
-/// partial amount rather than a final cost.
-const TERMINAL_USAGE_STATES: [&str; 3] = ["completed", "failed", "stopped"];
-
-/// The only `cost_basis` a *provider-reported* total may carry. A
-/// daemon-priced estimate is an estimate of an estimate and is reported in
-/// its own field, never pooled with this one.
-const PROVIDER_COST_BASIS: &str = "provider_reported_segment_total";
-const DAEMON_COST_BASIS: &str = "daemon_priced_increments";
-
-/// Native events that prove an agent generation actually started a process.
-/// `agent_spawned`/`agent_respawned` carry `spawn` additively since S2's
-/// `48fb2da`; a `harness_result` also proves the generation ran, because the
-/// supervisor only emits one for a generation that produced a result.
+/// Native events that prove an agent generation actually started a process, so
+/// a prepared exposure can be joined to a LAUNCHED consumer rather than
+/// counted for a spawn that never ran. `spawn` is additive on these events
+/// (S2's `48fb2da`); a `harness_result` also proves the generation ran.
 const LAUNCH_EVENT_IDENTITIES: [&str; 2] = ["agent_spawned", "agent_respawned"];
+
+/// Author-exit and per-delivery cost derivation are deliberately absent from
+/// this evaluator version. Both were previously credited from evidence that
+/// cannot establish them — `harness_result` is emitted at `rk done` while the
+/// process is still alive, and a provisional completion cost was summed as a
+/// final total — so rather than ship a known false positive, this version
+/// reports them as unsupported and refuses to pass the mechanism goal. See
+/// `TKT-bonik-vuruv-mivuh`.
+const AUTHOR_EXIT_UNSUPPORTED: &str =
+    "author-exit derivation is not implemented in this evaluator version: crediting it needs a \
+     physical-exit observation bound to the source author's exact generation and launch, with no \
+     intervening resume before the consuming decision. A harness_result cannot establish it (the \
+     supervisor emits it at `rk done`, while the OS process is still alive) and neither can an \
+     agent_lifecycle event (it carries no `spawn` binding and its `change` may be `started`). \
+     Pending TKT-bonik-vuruv-mivuh.";
+
+const DELIVERY_COST_UNSUPPORTED: &str =
+    "per-delivery cost and duration derivation is not implemented in this evaluator version: a \
+     provider total is cumulative within one query segment and a harness_result cost is \
+     provisional, so neither may be summed as measured spend, and launch-to-exit is process \
+     lifetime rather than active model work. Reported as unknown rather than estimated. Pending \
+     TKT-bonik-vuruv-mivuh.";
+
+const INTERVENTIONS_UNSUPPORTED: &str =
+    "unknown: an attention_hold span count is a lower bound on operator interventions, not a \
+     total, and span aggregation is not derived in this evaluator version.";
 
 // ---------------------------------------------------------------------
 // Manifest: the versioned, frozen experiment/scope declaration.
@@ -158,10 +127,9 @@ pub struct Manifest {
     /// reason rather than silently aggregated.
     #[serde(default)]
     pub repos: Vec<String>,
-    /// Frozen measurement window. Enforced against every native observation
-    /// (exposure, open, completion, launch, exit, final usage, phase span).
+    /// Frozen measurement window, ENFORCED against every native observation.
     /// Source findings/artifacts are deliberately NOT window-filtered: an
-    /// older source that a batch consumer reused is exactly the case the
+    /// older source that a batch consumer reused is exactly what the
     /// experiment is looking for, so it is retained as linked context.
     #[serde(default)]
     pub window: Window,
@@ -172,15 +140,12 @@ pub struct Manifest {
     pub batches: Vec<Batch>,
     /// Frozen consumer-task scope: which tasks are in play for which batch.
     /// Required before a review may enroll a live pair for that task/batch;
-    /// also the primary scope deliveries are derived from, so a frozen task
-    /// that produced no source and no receipt still reports its own cost,
-    /// failures and acceptance instead of disappearing.
+    /// not required for a predeclared `eligible_pairs` fixture.
     #[serde(default)]
     pub consumer_tasks: Vec<ConsumerTaskScope>,
     /// Full pairs known ahead of time — deterministic fixture/replay only.
     /// A live batch cannot populate this (see module docs); use reviews'
-    /// `declares` instead. A fixture pair's `repo` must match its batch's
-    /// `repo`: naming a known batch id is not enough.
+    /// `declares` instead.
     #[serde(default)]
     pub eligible_pairs: Vec<EligiblePair>,
 }
@@ -195,8 +160,9 @@ pub struct Window {
 }
 
 /// Where an observation falls relative to the frozen window. An observation
-/// with no parsable timestamp is `Undated`, never silently treated as either
-/// inside or outside: it is reported as missing coverage.
+/// with no parsable timestamp is `Undated` — never silently treated as either
+/// inside or outside, because that is how a missing observation becomes a
+/// manufactured zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowFit {
     Inside,
@@ -275,6 +241,12 @@ pub struct ConsumerTaskScope {
 /// decision, applies to the task, and is not the consumer's own work"
 /// (design doc). `consumer_generation` is the exact agent generation
 /// (matches a tuple payload's `spawn` field) credited with the reuse.
+///
+/// Populated one of two ways: predeclared directly in
+/// `Manifest.eligible_pairs` (fixture/replay, pair identities already
+/// known), or minted by a `Review.declares` entry bound to an
+/// already-frozen `ConsumerTaskScope` (a live batch, where the source id
+/// and consumer generation only exist once the batch has actually run).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EligiblePair {
@@ -319,15 +291,15 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
     }
     let repos: BTreeSet<&str> = m.repos.iter().map(String::as_str).collect();
     let repo_in_scope = |repo: &str| repos.is_empty() || repos.contains(repo);
-    let mut seen_batches: BTreeMap<&str, &str> = BTreeMap::new();
+    // Batch id -> its declared repo, so a pair can be checked against the repo
+    // its batch actually belongs to and not merely against a known batch id.
+    let mut batch_repos: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut seen_batches = BTreeSet::new();
     for b in &m.batches {
         if b.id.trim().is_empty() {
             bail!("batch id must not be empty");
         }
-        if seen_batches
-            .insert(b.id.as_str(), b.repo.as_str())
-            .is_some()
-        {
+        if !seen_batches.insert(b.id.as_str()) {
             bail!("duplicate batch id: {}", b.id);
         }
         if b.arm.trim().is_empty() {
@@ -344,6 +316,7 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
                 m.repos
             );
         }
+        batch_repos.insert(b.id.as_str(), b.repo.as_str());
     }
     let mut seen_tasks = BTreeSet::new();
     for c in &m.consumer_tasks {
@@ -357,7 +330,11 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
                 c.batch
             );
         }
-        if seen_batches.get(c.batch.as_str()) != Some(&c.repo.as_str()) {
+        if !m
+            .batches
+            .iter()
+            .any(|b| b.id == c.batch && b.repo == c.repo)
+        {
             bail!(
                 "consumer_tasks entry for task {} references a batch {} not declared in batches \
                  (with matching repo)",
@@ -374,20 +351,10 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         if !seen_pairs.insert(p.id.as_str()) {
             bail!("duplicate eligible pair id in manifest: {}", p.id);
         }
-        if p.source.trim().is_empty()
-            || p.consumer_task.trim().is_empty()
-            || p.consumer_generation.trim().is_empty()
-            || p.repo.trim().is_empty()
-        {
-            bail!(
-                "eligible pair {} must declare source/consumer_task/consumer_generation/repo",
-                p.id
-            );
-        }
         // A fixture pair naming a known batch id is not enough: the pair's
-        // repo has to be the batch's repo, or one batch silently aggregates
+        // repo has to BE that batch's repo, or one batch silently aggregates
         // two repositories' evidence.
-        match seen_batches.get(p.batch.as_str()) {
+        match batch_repos.get(p.batch.as_str()) {
             None => bail!(
                 "eligible pair {} references unknown batch {}",
                 p.id,
@@ -408,6 +375,16 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
                 p.id,
                 p.repo,
                 m.repos
+            );
+        }
+        if p.source.trim().is_empty()
+            || p.consumer_task.trim().is_empty()
+            || p.consumer_generation.trim().is_empty()
+            || p.repo.trim().is_empty()
+        {
+            bail!(
+                "eligible pair {} must declare source/consumer_task/consumer_generation/repo",
+                p.id
             );
         }
     }
@@ -436,14 +413,15 @@ pub struct TupleCapture {
     pub order: Order,
     pub tuples: Vec<Value>,
     pub truncated: bool,
+    #[allow(dead_code)]
     pub source: Option<String>,
 }
 
 /// Parses either shape: a bare tuple array, the raw `rk --json scan` object
-/// (`{"tuples":[...], "truncated":bool, ...}`), or the capture envelope
-/// (`{"schema_version":1,"order":"persistence_sequence","tuples":[...],...}`).
-/// Legacy/raw input is always `Order::Unknown` — never inferred from tuple id
-/// (ULID) or `created_at`.
+/// (`{"tuples":[...], "truncated":bool, ...}`), or the forward-looking
+/// capture envelope (`{"schema_version":1,"order":"persistence_sequence",
+/// "tuples":[...],...}`). Legacy/raw input is always `Order::Unknown` —
+/// never inferred from tuple id (ULID) or `created_at`.
 pub fn parse_tuple_capture(raw: &Value) -> Result<TupleCapture> {
     if let Some(arr) = raw.as_array() {
         return Ok(TupleCapture {
@@ -485,120 +463,17 @@ pub fn parse_tuple_capture(raw: &Value) -> Result<TupleCapture> {
 // Reviews: operator judgments, not daemon facts.
 // ---------------------------------------------------------------------
 
-/// An operator reference backing a reviewed annotation. Deliberately NOT an
-/// arbitrary unchecked string: it is bounded, must be non-blank, and the
-/// report reports whether it resolves to a tuple actually present in the
-/// capture. It is also deliberately closed to unknown fields, so a reviewer
-/// cannot smuggle an invented "time saved" figure into a measurement report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ReviewedEvidence {
-    /// `"evidence": "<tuple-id-or-reference>"`
-    Reference(String),
-    /// `"evidence": {"reference": "...", "note": "..."}`
-    Detailed {
-        reference: String,
-        #[serde(default)]
-        note: Option<String>,
-    },
-}
-
-impl ReviewedEvidence {
-    pub fn reference(&self) -> &str {
-        match self {
-            Self::Reference(r) => r,
-            Self::Detailed { reference, .. } => reference,
-        }
-    }
-
-    pub fn note(&self) -> Option<&str> {
-        match self {
-            Self::Reference(_) => None,
-            Self::Detailed { note, .. } => note.as_deref(),
-        }
-    }
-
-    fn validate(&self, what: &str) -> Result<()> {
-        let r = self.reference();
-        if r.trim().is_empty() {
-            bail!("{what} reference must not be blank");
-        }
-        if r.len() > MAX_REFERENCE_LEN {
-            bail!("{what} reference exceeds {MAX_REFERENCE_LEN} bytes");
-        }
-        if let Some(note) = self.note() {
-            if note.len() > MAX_REFERENCE_LEN {
-                bail!("{what} note exceeds {MAX_REFERENCE_LEN} bytes");
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Coverage {
     /// An operator manually confirms this source was prepared for this
     /// consumer generation (e.g. before S2's exposure telemetry existed).
-    /// Reported as `prepared_reviewed`, never merged into native prepared
-    /// coverage: operator judgment and daemon telemetry stay distinguishable.
-    Prepared { evidence: ReviewedEvidence },
+    Prepared { evidence: String },
     /// An operator manually confirms telemetry was checked and this source
     /// was absent from it.
-    NotPrepared { evidence: ReviewedEvidence },
+    NotPrepared { evidence: String },
     /// No telemetry and no operator determination either way.
     Unknown { reason: String },
-}
-
-/// A reviewed observation that native telemetry cannot supply: an operator
-/// intervention with no `attention_hold` span, a repeated investigation, or
-/// rework the spans do not name. Each carries a reference so the claim is
-/// checkable. There is deliberately NO time-saving field: the design doc
-/// forbids turning an estimate of time saved into a measured saving, and
-/// `deny_unknown_fields` makes adding one a hard input error rather than a
-/// silently-ignored key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewedAnnotation {
-    /// Free-form short classifier, e.g. `operator-steer`, `manual-dispatch`,
-    /// `repeat-investigation`.
-    pub kind: String,
-    pub reference: String,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-impl ReviewedAnnotation {
-    fn validate(&self, task: &str) -> Result<()> {
-        if self.kind.trim().is_empty() {
-            bail!("reviewed annotation for task {task} must declare a non-empty kind");
-        }
-        if self.kind.len() > MAX_REFERENCE_LEN {
-            bail!("reviewed annotation kind for task {task} exceeds {MAX_REFERENCE_LEN} bytes");
-        }
-        ReviewedEvidence::Detailed {
-            reference: self.reference.clone(),
-            note: self.note.clone(),
-        }
-        .validate(&format!("reviewed annotation for task {task}"))
-    }
-}
-
-/// Task-scoped reviewed annotations. Pair-scoped judgment lives on `Review`;
-/// interventions, repeated investigations and rework are properties of a
-/// task, not of a source/consumer pair, and a task with no eligible pair at
-/// all still has them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskAnnotation {
-    pub task: String,
-    pub repo: String,
-    #[serde(default)]
-    pub interventions: Vec<ReviewedAnnotation>,
-    #[serde(default)]
-    pub repeated_investigations: Vec<ReviewedAnnotation>,
-    #[serde(default)]
-    pub rework: Vec<ReviewedAnnotation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -606,19 +481,21 @@ pub struct TaskAnnotation {
 pub struct Review {
     /// References a predeclared `Manifest.eligible_pairs[].id` (fixture/
     /// replay), or is a fresh id the reviewer mints for a pair discovered
-    /// during a live batch — exactly one of these two, never both.
+    /// during a live batch — exactly one of these two, never both: a
+    /// review may add evidence to a frozen pair, or enroll a new one bound
+    /// to frozen scope, but never redeclare/mutate a pair that is already
+    /// predeclared.
     pub pair: String,
     #[serde(default)]
     pub declares: Option<PairDeclaration>,
     #[serde(default = "unknown_coverage")]
     pub coverage: Coverage,
-    /// Tuple id of native evidence that the source's authoring generation had
-    /// physically EXITED before this reuse. Must resolve to an `agent_exit`
-    /// observation for the source's exact `(spawn, session)` in the pair's
-    /// repo. A `harness_result` is refused: the supervisor emits it at
-    /// `rk done`, while the process is still alive. An `agent_lifecycle` is
-    /// refused: it carries no `spawn` binding and its `change` may be
-    /// `started`. See `resolve_author_exit`.
+    /// Tuple id of native evidence that the source's authoring generation
+    /// had already exited before this reuse. A reviewer boolean alone
+    /// cannot establish author-exit (design correction): this must resolve
+    /// to a real lifecycle-terminal tuple (`harness_result`/
+    /// `agent_lifecycle`) for the source's own generation, timestamped no
+    /// later than the reuse — see `resolve_author_exit`.
     #[serde(default)]
     pub author_terminal_evidence: Option<String>,
     /// True if the King/operator pointed the consumer at the source. Must
@@ -635,114 +512,6 @@ fn unknown_coverage() -> Coverage {
     Coverage::Unknown {
         reason: "review did not state coverage".into(),
     }
-}
-
-/// The `--reviews FILE` payload. A bare array is the pair-only form every
-/// existing fixture uses; the object form additionally carries task-scoped
-/// reviewed annotations.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum ReviewsFile {
-    Pairs(Vec<Review>),
-    Structured {
-        #[serde(default)]
-        pairs: Vec<Review>,
-        #[serde(default)]
-        tasks: Vec<TaskAnnotation>,
-    },
-}
-
-impl ReviewsFile {
-    pub fn pairs(&self) -> &[Review] {
-        match self {
-            Self::Pairs(p) => p,
-            Self::Structured { pairs, .. } => pairs,
-        }
-    }
-
-    pub fn tasks(&self) -> &[TaskAnnotation] {
-        match self {
-            Self::Pairs(_) => &[],
-            Self::Structured { tasks, .. } => tasks,
-        }
-    }
-}
-
-fn validate_reviews(
-    reviews: &[Review],
-    tasks: &[TaskAnnotation],
-    manifest: &Manifest,
-) -> Result<()> {
-    for r in reviews {
-        if r.pair.trim().is_empty() {
-            bail!("review pair id must not be blank");
-        }
-        match &r.coverage {
-            Coverage::Prepared { evidence } => {
-                evidence.validate(&format!("review {} coverage.prepared", r.pair))?
-            }
-            Coverage::NotPrepared { evidence } => {
-                evidence.validate(&format!("review {} coverage.not_prepared", r.pair))?
-            }
-            Coverage::Unknown { reason } => {
-                if reason.trim().is_empty() {
-                    bail!("review {} coverage.unknown must state a reason", r.pair);
-                }
-            }
-        }
-        if let Some(id) = &r.author_terminal_evidence {
-            if id.trim().is_empty() {
-                bail!(
-                    "review {} author_terminal_evidence must be a tuple id, not a blank string",
-                    r.pair
-                );
-            }
-        }
-    }
-    let frozen: BTreeSet<(&str, &str)> = manifest
-        .consumer_tasks
-        .iter()
-        .map(|c| (c.task.as_str(), c.repo.as_str()))
-        .chain(
-            manifest
-                .eligible_pairs
-                .iter()
-                .map(|p| (p.consumer_task.as_str(), p.repo.as_str())),
-        )
-        .collect();
-    let mut seen = BTreeSet::new();
-    for t in tasks {
-        if t.task.trim().is_empty() || t.repo.trim().is_empty() {
-            bail!("task annotation must declare task and repo");
-        }
-        if !seen.insert((t.task.as_str(), t.repo.as_str())) {
-            bail!(
-                "duplicate task annotation for task {} in repo {}",
-                t.task,
-                t.repo
-            );
-        }
-        // A reviewed annotation cannot introduce a task the manifest never
-        // froze: retrospective scope expansion is exactly what freezing is
-        // meant to prevent.
-        if !frozen.contains(&(t.task.as_str(), t.repo.as_str())) {
-            bail!(
-                "task annotation for {} (repo {}) is not frozen in manifest.consumer_tasks or \
-                 manifest.eligible_pairs",
-                t.task,
-                t.repo
-            );
-        }
-        for a in t
-            .interventions
-            .iter()
-            .chain(&t.repeated_investigations)
-            .chain(&t.rework)
-        {
-            a.validate(&t.task)?;
-        }
-    }
-    Ok(())
 }
 
 /// Merges `manifest.eligible_pairs` (predeclared) with pairs minted by
@@ -829,8 +598,8 @@ fn validate_and_merge_pairs(manifest: &Manifest, reviews: &[Review]) -> Result<V
 // ---------------------------------------------------------------------
 
 /// A pair that is not a distinct valid opportunity at all. Note what is NOT
-/// here: an invalid *claim*. A malformed or foreign receipt removes the
-/// claim, never the opportunity — see `RejectedClaim`.
+/// here any more: an invalid *claim*. A malformed or foreign receipt removes
+/// the claim, never the opportunity — see [`RejectedClaim`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Excluded {
     pub pair: String,
@@ -838,9 +607,9 @@ pub struct Excluded {
     pub detail: String,
 }
 
-/// A receipt that was refused for this pair. The pair itself stays in the
-/// eligible denominator with no claimed outcome, so a bad claim cannot erase
-/// a real opportunity from the discovery/reuse rates.
+/// A receipt refused for this pair. The pair itself stays in the eligible
+/// denominator with no claimed outcome, so a bad claim cannot erase a real
+/// opportunity from the discovery or verified-reuse rates.
 #[derive(Debug, Clone, Serialize)]
 pub struct RejectedClaim {
     pub pair: String,
@@ -849,14 +618,55 @@ pub struct RejectedClaim {
     pub detail: String,
 }
 
-/// A native record dropped with a reason. Rejecting these silently is what
-/// let an ordinary mutable artifact, a castle-authored row read as a
-/// consumer, or an unattributed legacy record certify a result.
+/// A native record dropped with a reason. Dropping these silently is what let
+/// an unversioned artifact, a castle-authored row read as a consumer, or an
+/// unattributed legacy record certify a result.
 #[derive(Debug, Clone, Serialize)]
 pub struct InvalidRecord {
     pub record: String,
     pub kind: String,
     pub reason: String,
+}
+
+/// What the capture actually contained, so a scoping or window mistake is
+/// visible instead of silently shrinking every metric.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CaptureSummary {
+    pub tuples: usize,
+    pub observations_in_window: usize,
+    pub observations_out_of_window: usize,
+    pub observations_undated: usize,
+    pub observations_out_of_scope_repo: usize,
+}
+
+/// The discovery denominator, reported explicitly rather than left implicit in
+/// a single rate. `rate` is `None` — not `0.0` — when nothing has known
+/// coverage: an absent denominator is not a zero numerator.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Discovery {
+    pub eligible_pairs: usize,
+    pub known_coverage_pairs: usize,
+    pub prepared_pairs: usize,
+    pub prepared_native: usize,
+    pub prepared_reviewed: usize,
+    pub not_prepared_pairs: usize,
+    pub unknown_coverage_pairs: usize,
+    /// Native exposure exists, but no native launch evidence for that exact
+    /// consumer generation. A selection prepared for a spawn that never ran is
+    /// neither a discovery success nor a discovery failure, so it is kept out
+    /// of both sides of the rate and reported here.
+    pub prepared_not_launched: Vec<String>,
+    pub rate: Option<f64>,
+}
+
+/// A derivation this evaluator version deliberately does not perform, named
+/// with the reason so its absence cannot be read as a zero.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnsupportedDerivation {
+    pub derivation: String,
+    pub status: String,
+    pub reason: String,
+    pub tracked_by: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -884,39 +694,20 @@ pub struct OutcomeClasses {
     pub incorrect: usize,
 }
 
-/// The discovery denominator, reported explicitly rather than left implicit
-/// in a single rate. `rate` is `None` — not `0.0` — when nothing has known
-/// coverage: an unknown denominator is not a zero numerator.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Discovery {
-    pub eligible_pairs: usize,
-    pub known_coverage_pairs: usize,
-    pub prepared_pairs: usize,
-    pub prepared_native: usize,
-    pub prepared_reviewed: usize,
-    pub not_prepared_pairs: usize,
-    pub unknown_coverage_pairs: usize,
-    /// Native exposure exists, but no native launch evidence for that exact
-    /// consumer generation: a prepared selection for a spawn that never ran
-    /// is not a consumer opportunity.
-    pub prepared_not_launched: Vec<String>,
-    pub rate: Option<f64>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct PairResult {
     pub pair: String,
     pub source: String,
+    pub consumer_task: String,
+    pub consumer_generation: String,
+    pub batch: String,
     pub source_kind: String,
     /// `false` for a legacy/ordinary artifact with no author generation. An
     /// unattributed source can neither be excluded as self-use nor support an
-    /// author-exit claim; it stays explicitly unknown on both.
+    /// author-exit claim; both stay explicitly unknown.
     pub source_attributed: bool,
     pub source_evidence: String,
-    pub consumer_task: String,
-    pub consumer_generation: String,
     pub repo: String,
-    pub batch: String,
     pub coverage_status: String,
     pub coverage_provenance: String,
     pub coverage_reference: Option<String>,
@@ -932,8 +723,8 @@ pub struct PairResult {
     pub relayed_by_operator: bool,
     pub regression: bool,
     /// A verified, changed-work (used/adapted) effect on fully established
-    /// evidence. The same gate the per-task verified-reuse rate uses, so the
-    /// two can never disagree.
+    /// evidence. The SAME gate the per-task verified-reuse rate uses, so the
+    /// two can never disagree about what "verified" means.
     pub verified_effect: bool,
     /// `verified_effect` and not relayed by the operator — the unit the
     /// mechanism goal counts.
@@ -960,174 +751,47 @@ pub struct MechanismResult {
     pub batches_required: usize,
     pub author_exit_required: usize,
     pub goal_met: bool,
+    /// Why the goal cannot pass, when something other than the raw counts
+    /// blocks it (a truncated capture, or a derivation this evaluator version
+    /// does not perform). Present exactly when `goal_met` is forced `false`.
+    pub goal_blocked_reason: Option<String>,
     pub effect_pairs: Vec<String>,
 }
 
-/// Phase durations, bucketed. Deliberately NOT one "active" number: a phase
-/// duration is wall-clock time a phase span covered, which is not the same
-/// thing as model-active work.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct PhaseDurations {
-    /// Every phase that is neither verification admission nor a human wait.
-    pub work_phases_ms: Option<i64>,
-    /// `verification` span duration plus its own queue wait.
-    pub verification_ms: Option<i64>,
-    /// `attention_hold` — waiting on a human.
-    pub attention_hold_ms: Option<i64>,
-    /// Pre-phase queue wait on every other phase.
-    pub queue_wait_ms: Option<i64>,
-}
-
-/// One observed provider-cost segment: a `(spawn, session, provider_session)`
-/// triple. The provider reports a CUMULATIVE total within one segment, so the
-/// last reported total is the segment's amount and repeated results must
-/// never be summed.
-#[derive(Debug, Clone, Serialize)]
-pub struct CostSegment {
-    pub spawn: String,
-    pub session: String,
-    pub provider_session: Option<String>,
-    pub record: String,
-    pub reported_usd: Option<f64>,
-    pub cost_basis: String,
-    pub state: Option<String>,
-    /// `true` only when the last result for this segment was terminal AND no
-    /// later work is observable after it. A `paused` result followed by more
-    /// work and a kill leaves a partial amount, not a final cost.
-    pub final_cost: bool,
-    pub finality_reason: String,
-}
-
-/// One physical process launch of one generation: the `(spawn, session)` pair
-/// S2's contract names as the only safe aggregation key.
-#[derive(Debug, Clone, Serialize)]
-pub struct LaunchObservation {
-    pub session: String,
-    pub launched_at: Option<String>,
-    pub exited_at: Option<String>,
-    pub exit_record: Option<String>,
-    pub exit_code: Option<i64>,
-    pub crashed: Option<bool>,
-    pub prior_state: Option<String>,
-    /// `exited_at - launched_at`. PROCESS LIFETIME, not measured active model
-    /// work: a Claude process can sit paused awaiting verification or the
-    /// operator for most of it.
-    pub process_lifetime_ms: Option<i64>,
-}
-
-/// One completion (`harness_result`) for a generation. Task-completion
-/// evidence only: it is emitted at `rk done`, before terminal provider usage
-/// and while the OS process is still alive, so its cost is provisional.
-#[derive(Debug, Clone, Serialize)]
-pub struct CompletionObservation {
-    pub record: String,
-    pub declared_done: bool,
-    pub is_error: bool,
-    pub provisional_cost_usd: Option<f64>,
-    pub failed: bool,
-}
-
-/// Everything observed for one agent generation on one task. Every attempt,
-/// including every failure, is retained.
-#[derive(Debug, Clone, Serialize)]
-pub struct GenerationObservation {
-    pub spawn: String,
-    pub agent: Option<String>,
-    pub completions: Vec<CompletionObservation>,
-    pub launches: Vec<LaunchObservation>,
-    pub cost_segments: Vec<CostSegment>,
-}
-
+/// Per-task delivery accounting. This evaluator version reports the SCOPE it
+/// would account for and nothing numeric: the previous version summed a
+/// provisional `harness_result` cost as a measured total, read a `merge` span
+/// as an accepted delivery, and labelled a phase-duration sum as active work.
+/// Rather than keep shipping those, every figure here is an explicit unknown
+/// until `TKT-bonik-vuruv-mivuh` supplies the real derivation.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryCost {
     pub task: String,
     pub repo: String,
     pub batches: Vec<String>,
     /// `frozen_consumer_task` (manifest scope) or `fixture_pair` (a
-    /// predeclared pair's task). Deliveries are NOT derived from the pairs
-    /// that survived evaluation: a frozen task with no eligible source and no
+    /// predeclared pair's task). Deliberately NOT derived from the pairs that
+    /// survived evaluation: a frozen task with no eligible source and no
     /// receipt still owns its costs, failures and acceptance.
     pub enrollment: String,
-    pub generations: Vec<GenerationObservation>,
-    pub completions: usize,
-    pub failed_completions: usize,
-    pub launches: usize,
-    pub exits: usize,
-    /// Sum of the last provider-reported total per proven segment. `None`
-    /// whenever any observed segment's cost is unknown or only partial —
-    /// never a silent zero and never a partial sum presented as a total.
-    pub reported_cost_estimate_usd: Option<f64>,
-    pub reported_cost_basis: Option<String>,
-    /// `complete` (every segment final), `partial` (some segment reported an
-    /// amount that is not final), `missing` (no final-usage observation at
-    /// all), `none_observed` (no native generation observed for this task).
-    pub cost_coverage: String,
-    /// Amounts that were reported but are NOT final, kept separate so a
-    /// partial figure is never read as spend.
-    pub partial_reported_usd: Option<f64>,
-    /// The supervisor's own priced-increment fallback for harnesses that do
-    /// not self-report USD. An estimate of an estimate: reported separately
-    /// and never pooled with a provider-reported total.
-    pub daemon_priced_estimate_usd: Option<f64>,
-    /// `harness_result.cost_usd`, summed per generation. PROVISIONAL: emitted
-    /// at `rk done`, before terminal provider usage. Never a final spend and
-    /// never merged into `reported_cost_estimate_usd`.
-    pub provisional_completion_cost_usd: Option<f64>,
-    pub unknown_cost: Vec<String>,
-    /// Sum of `exited_at - launched_at` over observed launches. Labelled
-    /// process lifetime deliberately.
-    pub process_lifetime_ms: Option<i64>,
-    /// Always `None`. No native observation distinguishes model-active time
-    /// from a process paused awaiting verification or the operator, so this
-    /// stays an explicit unknown rather than being aliased to process
-    /// lifetime or to a phase-duration sum.
+    pub derivation_status: String,
+    pub derivation_reason: String,
+    pub cost_usd: Option<f64>,
     pub active_work_ms: Option<i64>,
-    pub active_work_coverage: String,
-    pub phase_ms: PhaseDurations,
-    /// `Some(true)` only on an actual `delivery_closure` span in this repo and
-    /// window. A `merge` span alone is not proof (a merge can be reverted);
-    /// absence is unknown, not a negative.
+    pub process_lifetime_ms: Option<i64>,
+    pub verification_ms: Option<i64>,
+    pub queue_ms: Option<i64>,
     pub accepted: Option<bool>,
-    pub acceptance_evidence: Option<String>,
-}
-
-/// A reviewed observation echoed into the report with its provenance and
-/// whether its reference resolved against the capture.
-#[derive(Debug, Clone, Serialize)]
-pub struct ReviewedRef {
-    pub task: String,
-    pub repo: String,
-    pub kind: String,
-    pub reference: String,
-    pub reference_resolved: bool,
-    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QualitySummary {
-    /// `attention_hold` phase spans. A LOWER BOUND on operator
-    /// interventions: an intervention that left no span is only present via a
-    /// reviewed annotation.
-    pub attention_hold_spans: usize,
-    pub reviewed_interventions: Vec<ReviewedRef>,
-    pub interventions_known: usize,
+    /// `None`, with `interventions_coverage` saying why: an `attention_hold`
+    /// span count is a lower bound on operator interventions, not a total.
+    pub interventions: Option<usize>,
     pub interventions_coverage: String,
-    pub repeated_investigations: Vec<ReviewedRef>,
-    pub rework_spans: usize,
-    pub reviewed_rework: Vec<ReviewedRef>,
     pub incorrect_reuse: usize,
     pub regressions: Vec<String>,
-}
-
-/// What the capture actually contained, so a scoping mistake is visible
-/// instead of silently shrinking every metric.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct CaptureSummary {
-    pub tuples: usize,
-    pub observations_in_window: usize,
-    pub observations_out_of_window: usize,
-    pub observations_undated: usize,
-    pub observations_out_of_scope_repo: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1140,14 +804,16 @@ pub struct Report {
     pub window: Window,
     pub tuples_order: String,
     pub tuples_truncated: bool,
-    pub tuples_source: Option<String>,
     pub capture: CaptureSummary,
     pub invalid_records: Vec<InvalidRecord>,
-    /// Records that are structurally fine but cannot be placed or resolved:
-    /// an undated observation, a legacy row with no generation id, an
-    /// operator/unbound exposure, evidence that simply is not in this
-    /// capture. These stay UNKNOWN — they are never read as a negative.
+    /// Records that are structurally fine but cannot be placed or resolved: an
+    /// undated observation, a legacy row with no generation id, an
+    /// operator/unbound exposure, evidence simply absent from this capture.
+    /// These stay UNKNOWN — they are never read as a negative.
     pub unresolved_records: Vec<InvalidRecord>,
+    /// Derivations this evaluator version does not perform, named so their
+    /// absence cannot be mistaken for a measured zero.
+    pub unsupported: Vec<UnsupportedDerivation>,
     pub eligible: usize,
     pub excluded: Vec<Excluded>,
     pub rejected_claims: Vec<RejectedClaim>,
@@ -1165,7 +831,6 @@ pub struct Report {
     pub author_exit_reuse: Vec<String>,
     pub mechanism: MechanismResult,
     pub deliveries: Vec<DeliveryCost>,
-    pub tasks_without_native_records: Vec<String>,
     pub quality: QualitySummary,
     pub pairs: Vec<PairResult>,
 }
@@ -1188,18 +853,26 @@ fn record_id(t: &Value) -> String {
     t["id"].as_str().unwrap_or("<no id>").to_string()
 }
 
+/// Whether a payload merely CLAIMS a `bbs_kind`. A tuple with no `bbs_kind` is
+/// ordinary traffic, not a defective BBS record, so only claimants are
+/// validated (and therefore only claimants are ever reported as invalid).
+fn claims_kind(t: &Value, bbs_kind: &str) -> bool {
+    t["payload"]["bbs_kind"] == bbs_kind
+}
+
 /// Structural contract check for an artifact-category BBS record
 /// (`finding`/`answer`/`reuse`/`assessment`). Returns the reason it is NOT
 /// one, or `None` when it is genuine.
 ///
-/// The checks are exactly the invariants `crates/rk-daemon/src/bbs.rs`
-/// guarantees at write time:
-/// * `Category::Artifact` with `Lifecycle::Furniture` (immutable furniture),
-/// * `payload.schema_version == 1` for the S1 kinds that carry it,
-/// * the kind's reserved identity prefix, and
-/// * `instance == payload.agent`, which `Tuple::new(.., caller, ..)` makes
-///   unconditional for every BBS write. A row where they disagree was not
-///   written by that path.
+/// These are exactly the invariants `crates/rk-daemon/src/bbs.rs` guarantees
+/// at write time: immutable `Furniture` lifecycle, `payload.schema_version`
+/// for the kinds that carry one, the kind's daemon-minted identity prefix,
+/// and `instance == payload.agent`, which
+/// `Tuple::new(category, scope, identity, caller, payload)` makes
+/// unconditional for every BBS write — each one passes the authenticated
+/// caller as both. A row where they disagree was not written by that path.
+/// Matching `category` + `bbs_kind` alone, as this module previously did, lets
+/// an ordinary unversioned artifact masquerade as a finding.
 fn artifact_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if t["category"] != "artifact" {
         return Some(format!(
@@ -1234,20 +907,22 @@ fn artifact_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if instance.is_empty() || agent.is_empty() || instance != agent {
         return Some(format!(
             "instance {instance:?} does not match payload.agent {agent:?}; every BBS write \
-             authors the tuple as its own caller"
+             authors the tuple as its own authenticated caller"
         ));
     }
     None
 }
 
 /// Structural contract check for a daemon-authored telemetry Event
-/// (`exposure`/`open`/`agent_exit`/`agent_final_usage`).
+/// (`exposure`/`open`).
 ///
-/// Note what is deliberately NOT checked: `instance == payload.agent`. These
-/// records are authored by the CASTLE about an agent, so `instance` is the
-/// castle and the consumer identity lives only in the payload. Reading
-/// `instance` as the consumer generation is the mistake this comment exists
-/// to prevent.
+/// Note what is deliberately NOT checked here: `instance == payload.agent`.
+/// These records are authored by the CASTLE *about* an agent, so `instance` is
+/// the castle and the consumer identity lives only in
+/// `payload.agent`/`payload.spawn`/`payload.bound`. Reading `instance` as the
+/// consumer generation attributes the record to the wrong party. What is
+/// checked instead is that the tuple's scope agrees with the `repo` the daemon
+/// wrote into the payload.
 fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if t["category"] != "event" {
         return Some(format!(
@@ -1275,8 +950,6 @@ fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
             ));
         }
     }
-    // The daemon writes the repo into the payload as well as the tuple scope;
-    // a row where they disagree was not produced by that path.
     let scope = str_field(t, &["scope"]);
     let repo = str_field(t, &["payload", "repo"]);
     if repo.is_empty() {
@@ -1288,17 +961,6 @@ fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
         ));
     }
     None
-}
-
-/// Whether a payload merely CLAIMS a `bbs_kind`. Used to decide whether a row
-/// is worth validating (and therefore worth reporting as invalid) at all — a
-/// tuple with no `bbs_kind` is ordinary traffic, not a defective BBS record.
-fn claims_kind(t: &Value, bbs_kind: &str) -> bool {
-    t["payload"]["bbs_kind"] == bbs_kind
-}
-
-fn is_task_span(t: &Value) -> bool {
-    t["category"] == "event" && t["identity"] == "task_span"
 }
 
 fn is_harness_result(t: &Value) -> bool {
@@ -1351,9 +1013,9 @@ impl EvidenceCheck {
 
 /// A record's evidence is only trustworthy when every id it names resolves to
 /// a real ARTIFACT tuple present in this same repo's capture. Checking scope
-/// alone let an event, a receipt, or a telemetry row stand in for an
-/// artifact; filtering non-string members silently let `["ok", 7]` pass as if
-/// it had named one thing.
+/// alone let an event, a receipt or a telemetry row stand in for the artifact
+/// a finding claims; filtering non-string members silently let `["ev-1", 7]`
+/// pass as though it had named one thing.
 fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) -> EvidenceCheck {
     let Some(items) = evidence.as_array() else {
         return EvidenceCheck::Invalid(if evidence.is_null() {
@@ -1403,8 +1065,10 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
 
 /// Whether `source` is something a receipt may legitimately name. Mirrors the
 /// daemon's own `bbs.reuse` rule (crates/rk-daemon/src/bbs.rs): an ordinary
-/// artifact with NO `bbs_kind` at all, or a genuine `finding`/`answer`. A
-/// receipt, an assessment, or a telemetry record is never a source, and a row
+/// artifact with NO `bbs_kind` at all — reusable regardless of lifecycle,
+/// since a daemon-authored gate result carries reproduction evidence just as
+/// much as a session-lifecycle one — or a genuine `finding`/`answer`. A
+/// receipt, an assessment or a telemetry record is never a source, and a row
 /// merely claiming `"bbs_kind":"finding"` must satisfy the real predicate.
 fn source_defect(t: &Value, repo: &str) -> Option<String> {
     if t["category"] != "artifact" {
@@ -1420,7 +1084,7 @@ fn source_defect(t: &Value, repo: &str) -> Option<String> {
         ));
     }
     match t["payload"].get("bbs_kind") {
-        None => None, // ordinary artifact: reusable regardless of lifecycle
+        None => None,
         Some(kind) => {
             let Some(kind) = kind.as_str() else {
                 return Some("payload.bbs_kind is present but not a string".into());
@@ -1446,67 +1110,17 @@ fn created_at(t: &Value) -> Option<DateTime<Utc>> {
     t["created_at"].as_str().and_then(parse_rfc3339)
 }
 
-fn payload_time(t: &Value, field: &str) -> Option<DateTime<Utc>> {
-    t["payload"][field].as_str().and_then(parse_rfc3339)
-}
-
 // ---------------------------------------------------------------------
 // Native observation index: scope-, window- and identity-filtered.
 // ---------------------------------------------------------------------
 
-struct ExitRow {
-    repo: String,
-    task: String,
-    agent: String,
-    spawn: String,
-    session: String,
-    exited_at: Option<DateTime<Utc>>,
-    launched_at: Option<DateTime<Utc>>,
-    exit_code: Option<i64>,
-    crashed: Option<bool>,
-    prior_state: Option<String>,
-    record: String,
-}
-
-struct UsageRow {
-    repo: String,
-    task: String,
-    spawn: String,
-    session: String,
-    provider_session: Option<String>,
-    state: Option<String>,
-    cost_usd: Option<f64>,
-    cost_basis: String,
-    observed_at: Option<DateTime<Utc>>,
-    record: String,
-}
-
-struct CompletionRow {
-    repo: String,
-    task: String,
-    agent: String,
-    spawn: String,
-    declared_done: bool,
-    is_error: bool,
-    cost_usd: Option<f64>,
-    record: String,
-}
-
 /// Native proof that a generation actually started a process, or at least ran
-/// far enough to author a record of its own. Used for two distinct things: to
-/// decide whether a prepared exposure was a *launched* consumer opportunity,
-/// and to refuse an author-exit claim when the generation was relaunched
-/// between the exit and the consuming decision.
+/// far enough to author a record of its own. Used to decide whether a prepared
+/// exposure was a *launched* consumer opportunity rather than a selection
+/// prepared for a spawn that never ran.
 struct LaunchRow {
     repo: String,
     spawn: String,
-    /// Present only for records that identify a physical launch. An
-    /// `agent_spawned`/`agent_respawned` event and an authored record do not,
-    /// so a relaunch is detected by time, not by session identity alone.
-    session: Option<String>,
-    at: Option<DateTime<Utc>>,
-    record: String,
-    kind: &'static str,
 }
 
 struct Index<'a> {
@@ -1516,10 +1130,6 @@ struct Index<'a> {
     /// `(repo, source, consumer_spawn)`.
     opened: BTreeSet<(String, String, String)>,
     launches: Vec<LaunchRow>,
-    exits: Vec<ExitRow>,
-    usage: Vec<UsageRow>,
-    completions: Vec<CompletionRow>,
-    spans: Vec<&'a Value>,
     /// `(source, consumer_task)` -> candidate receipts, in capture order.
     reuse_by_source_task: BTreeMap<(String, String), Vec<&'a Value>>,
     /// `receipt id` -> `(capture position, assessment)`.
@@ -1529,26 +1139,29 @@ struct Index<'a> {
     capture: CaptureSummary,
 }
 
+impl Index<'_> {
+    /// Native proof that `spawn` ran in `repo`.
+    fn launched(&self, repo: &str, spawn: &str) -> bool {
+        self.launches
+            .iter()
+            .any(|l| l.repo == repo && l.spawn == spawn)
+    }
+}
+
 fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> {
     let repos: BTreeSet<&str> = manifest.repos.iter().map(String::as_str).collect();
     let in_scope = |repo: &str| repos.is_empty() || repos.contains(repo);
     let window = &manifest.window;
 
-    let by_id: BTreeMap<&str, &Value> = capture
-        .tuples
-        .iter()
-        .filter_map(|t| t.get("id").and_then(Value::as_str).map(|id| (id, t)))
-        .collect();
-
     let mut idx = Index {
-        by_id,
+        by_id: capture
+            .tuples
+            .iter()
+            .filter_map(|t| t.get("id").and_then(Value::as_str).map(|id| (id, t)))
+            .collect(),
         prepared: BTreeMap::new(),
         opened: BTreeSet::new(),
         launches: Vec::new(),
-        exits: Vec::new(),
-        usage: Vec::new(),
-        completions: Vec::new(),
-        spans: Vec::new(),
         reuse_by_source_task: BTreeMap::new(),
         assessment_by_receipt: BTreeMap::new(),
         invalid: Vec::new(),
@@ -1559,17 +1172,16 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
         },
     };
 
-    // An observation is accepted only when it is in a manifest repo AND
-    // inside the frozen window. Both rejections are counted so a scoping or
-    // window mistake shows up as coverage loss instead of silently shrinking
-    // every metric to zero.
-    let admit = |idx: &mut Index<'a>, t: &Value, at: Option<DateTime<Utc>>| -> bool {
-        let scope = str_field(t, &["scope"]);
-        if !in_scope(scope) {
+    // An observation is accepted only when it is in a manifest repo AND inside
+    // the frozen window. Both rejections are COUNTED, so a scoping or window
+    // mistake shows up as visible coverage loss instead of silently shrinking
+    // every metric toward zero.
+    let admit = |idx: &mut Index<'a>, t: &Value| -> bool {
+        if !in_scope(str_field(t, &["scope"])) {
             idx.capture.observations_out_of_scope_repo += 1;
             return false;
         }
-        match window.fit(at) {
+        match window.fit(created_at(t)) {
             WindowFit::Inside => {
                 idx.capture.observations_in_window += 1;
                 true
@@ -1594,7 +1206,6 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     for (pos, t) in capture.tuples.iter().enumerate() {
         let scope = str_field(t, &["scope"]).to_string();
 
-        // --- exposure -------------------------------------------------
         if claims_kind(t, EXPOSURE) {
             if let Some(reason) = telemetry_record_defect(t, EXPOSURE) {
                 idx.invalid.push(InvalidRecord {
@@ -1604,13 +1215,13 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
-            if !admit(&mut idx, t, created_at(t)) {
+            if !admit(&mut idx, t) {
                 continue;
             }
-            // Only an exact agent generation counts toward agent exposure
-            // rates. `bound` is the daemon's own statement about whether it
-            // could establish one; operator/unbound rows are excluded by
-            // design rather than attributed to a guess.
+            // Only an exact agent generation counts toward agent exposure.
+            // `bound` is the daemon's own statement about whether it could
+            // establish one; an operator/unbound row is recorded as unknown
+            // rather than attributed to a guess.
             if str_field(t, &["payload", "bound"]) != "agent" {
                 idx.unresolved.push(InvalidRecord {
                     record: record_id(t),
@@ -1661,7 +1272,6 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             continue;
         }
 
-        // --- open -----------------------------------------------------
         if claims_kind(t, OPEN) {
             if let Some(reason) = telemetry_record_defect(t, OPEN) {
                 idx.invalid.push(InvalidRecord {
@@ -1671,7 +1281,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
-            if !admit(&mut idx, t, created_at(t)) {
+            if !admit(&mut idx, t) {
                 continue;
             }
             if str_field(t, &["payload", "bound"]) != "agent" {
@@ -1695,202 +1305,34 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
-            idx.opened.insert((scope.clone(), source, spawn));
+            idx.opened.insert((scope, source, spawn));
             continue;
         }
 
-        // --- agent_exit -----------------------------------------------
-        if claims_kind(t, AGENT_EXIT) {
-            if let Some(reason) = telemetry_record_defect(t, AGENT_EXIT) {
-                idx.invalid.push(InvalidRecord {
-                    record: record_id(t),
-                    kind: AGENT_EXIT.into(),
-                    reason,
-                });
-                continue;
-            }
-            let exited_at = payload_time(t, "exited_at");
-            if !admit(&mut idx, t, exited_at.or_else(|| created_at(t))) {
-                continue;
-            }
-            let spawn = str_field(t, &["payload", "spawn"]).to_string();
-            let session = str_field(t, &["payload", "session"]).to_string();
-            if spawn.is_empty() || session.is_empty() {
-                idx.invalid.push(InvalidRecord {
-                    record: record_id(t),
-                    kind: AGENT_EXIT.into(),
-                    reason: "an exit must identify both its generation (spawn) and its physical \
-                             launch (session)"
-                        .into(),
-                });
-                continue;
-            }
-            let launched_at = payload_time(t, "launched_at");
-            idx.launches.push(LaunchRow {
-                repo: scope.clone(),
-                spawn: spawn.clone(),
-                session: Some(session.clone()),
-                at: launched_at,
-                record: record_id(t),
-                kind: AGENT_EXIT,
-            });
-            idx.exits.push(ExitRow {
-                repo: scope.clone(),
-                task: str_field(t, &["payload", "task"]).to_string(),
-                agent: str_field(t, &["payload", "agent"]).to_string(),
-                spawn,
-                session,
-                exited_at,
-                launched_at,
-                exit_code: t["payload"]["exit_code"].as_i64(),
-                crashed: t["payload"]["crashed"].as_bool(),
-                prior_state: t["payload"]["prior_state"].as_str().map(str::to_string),
-                record: record_id(t),
-            });
-            continue;
-        }
-
-        // --- agent_final_usage ----------------------------------------
-        if claims_kind(t, AGENT_FINAL_USAGE) {
-            if let Some(reason) = telemetry_record_defect(t, AGENT_FINAL_USAGE) {
-                idx.invalid.push(InvalidRecord {
-                    record: record_id(t),
-                    kind: AGENT_FINAL_USAGE.into(),
-                    reason,
-                });
-                continue;
-            }
-            let observed_at = payload_time(t, "observed_at");
-            if !admit(&mut idx, t, observed_at.or_else(|| created_at(t))) {
-                continue;
-            }
-            let spawn = str_field(t, &["payload", "spawn"]).to_string();
-            let session = str_field(t, &["payload", "session"]).to_string();
-            if spawn.is_empty() || session.is_empty() {
-                idx.invalid.push(InvalidRecord {
-                    record: record_id(t),
-                    kind: AGENT_FINAL_USAGE.into(),
-                    reason: "a usage observation must identify both its generation (spawn) and \
-                             its physical launch (session)"
-                        .into(),
-                });
-                continue;
-            }
-            let cost_basis = str_field(t, &["payload", "cost_basis"]).to_string();
-            if cost_basis.is_empty() {
-                idx.invalid.push(InvalidRecord {
-                    record: record_id(t),
-                    kind: AGENT_FINAL_USAGE.into(),
-                    reason: "payload.cost_basis is absent; a cost with no stated basis cannot be \
-                             aggregated"
-                        .into(),
-                });
-                continue;
-            }
-            idx.launches.push(LaunchRow {
-                repo: scope.clone(),
-                spawn: spawn.clone(),
-                session: Some(session.clone()),
-                at: observed_at,
-                record: record_id(t),
-                kind: AGENT_FINAL_USAGE,
-            });
-            idx.usage.push(UsageRow {
-                repo: scope.clone(),
-                task: str_field(t, &["payload", "task"]).to_string(),
-                spawn,
-                session,
-                provider_session: t["payload"]["provider_session"]
-                    .as_str()
-                    .map(str::to_string),
-                state: t["payload"]["state"].as_str().map(str::to_string),
-                cost_usd: t["payload"]["cost_usd"].as_f64(),
-                cost_basis,
-                observed_at,
-                record: record_id(t),
-            });
-            continue;
-        }
-
-        // --- harness_result (completion, NOT exit) --------------------
-        if is_harness_result(t) {
-            if !admit(&mut idx, t, created_at(t)) {
+        // `harness_result` proves the generation RAN. It is used here only as
+        // launch evidence; it is never author-exit evidence (the supervisor
+        // emits it at `rk done`, while the process is still alive).
+        if is_harness_result(t) || is_launch_event(t) {
+            if !admit(&mut idx, t) {
                 continue;
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if spawn.is_empty() {
-                // Pre-C1 completions carry no generation id. Legacy and
-                // unattributed, so retained as an explicit unknown rather
-                // than attributed to whoever shares the agent name.
-                idx.unresolved.push(InvalidRecord {
-                    record: record_id(t),
-                    kind: "harness_result".into(),
-                    reason: "no payload.spawn: legacy completion cannot be bound to an exact \
-                             generation"
-                        .into(),
-                });
-                continue;
-            }
-            idx.launches.push(LaunchRow {
-                repo: scope.clone(),
-                spawn: spawn.clone(),
-                session: None,
-                at: created_at(t),
-                record: record_id(t),
-                kind: "harness_result",
-            });
-            idx.completions.push(CompletionRow {
-                repo: scope.clone(),
-                task: str_field(t, &["payload", "task"]).to_string(),
-                agent: str_field(t, &["payload", "agent"]).to_string(),
-                spawn,
-                declared_done: t["payload"]["declared_done"].as_bool().unwrap_or(false),
-                is_error: t["payload"]["is_error"].as_bool().unwrap_or(false),
-                cost_usd: t["payload"]["cost_usd"].as_f64(),
-                record: record_id(t),
-            });
-            continue;
-        }
-
-        // --- agent_spawned / agent_respawned --------------------------
-        if is_launch_event(t) {
-            if !admit(&mut idx, t, created_at(t)) {
-                continue;
-            }
-            // `spawn` is additive on these events (S2 `48fb2da`); older rows
-            // omit it and cannot prove which generation launched.
-            let spawn = str_field(t, &["payload", "spawn"]).to_string();
-            if spawn.is_empty() {
+                // Pre-C1 completions and pre-`48fb2da` launch events carry no
+                // generation id. Legacy and unattributed, so retained as an
+                // explicit unknown rather than attributed to whoever happens
+                // to share the agent name.
                 idx.unresolved.push(InvalidRecord {
                     record: record_id(t),
                     kind: str_field(t, &["identity"]).to_string(),
-                    reason: "no payload.spawn: this launch event predates the additive generation \
-                             field and cannot be bound to a generation"
-                        .into(),
+                    reason: "no payload.spawn: cannot be bound to an exact generation".into(),
                 });
                 continue;
             }
-            idx.launches.push(LaunchRow {
-                repo: scope.clone(),
-                spawn,
-                session: None,
-                at: created_at(t),
-                record: record_id(t),
-                kind: "launch_event",
-            });
+            idx.launches.push(LaunchRow { repo: scope, spawn });
             continue;
         }
 
-        // --- task_span ------------------------------------------------
-        if is_task_span(t) {
-            if !admit(&mut idx, t, created_at(t)) {
-                continue;
-            }
-            idx.spans.push(t);
-            continue;
-        }
-
-        // --- reuse receipts -------------------------------------------
         if claims_kind(t, REUSE) {
             if let Some(reason) = artifact_record_defect(t, REUSE) {
                 idx.invalid.push(InvalidRecord {
@@ -1900,17 +1342,13 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
-            // A receipt authored by a generation is itself proof that the
+            // A receipt authored by a generation is itself proof the
             // generation ran, so it also serves as launch evidence.
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if !spawn.is_empty() {
                 idx.launches.push(LaunchRow {
                     repo: scope.clone(),
                     spawn,
-                    session: None,
-                    at: created_at(t),
-                    record: record_id(t),
-                    kind: "authored_record",
                 });
             }
             let source = str_field(t, &["payload", "source"]).to_string();
@@ -1922,7 +1360,6 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             continue;
         }
 
-        // --- assessments ----------------------------------------------
         if claims_kind(t, ASSESSMENT) {
             if let Some(reason) = assessment_defect(t) {
                 idx.invalid.push(InvalidRecord {
@@ -1948,9 +1385,8 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             continue;
         }
 
-        // --- findings ------------------------------------------------
-        // Validated here only so a malformed one is REPORTED; source
-        // selection re-checks per pair against that pair's repo.
+        // Findings are validated here only so a malformed one is REPORTED;
+        // source selection re-checks per pair against that pair's repo.
         if claims_kind(t, FINDING) {
             if let Some(reason) = artifact_record_defect(t, FINDING) {
                 idx.invalid.push(InvalidRecord {
@@ -1962,645 +1398,79 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if !spawn.is_empty() {
-                idx.launches.push(LaunchRow {
-                    repo: scope.clone(),
-                    spawn,
-                    session: None,
-                    at: created_at(t),
-                    record: record_id(t),
-                    kind: "authored_record",
-                });
+                idx.launches.push(LaunchRow { repo: scope, spawn });
             }
         }
     }
 
     idx.invalid
         .sort_by(|a, b| (&a.record, &a.kind).cmp(&(&b.record, &b.kind)));
-    idx.unresolved
-        .sort_by(|a, b| (&a.record, &a.kind).cmp(&(&b.record, &b.kind)));
     idx
 }
 
-impl Index<'_> {
-    /// Native proof that `spawn` ran in `repo`.
-    fn launched(&self, repo: &str, spawn: &str) -> bool {
-        self.launches
-            .iter()
-            .any(|l| l.repo == repo && l.spawn == spawn)
-    }
-
-    /// The earliest observed launch of `spawn` strictly after `after` and no
-    /// later than `until` — i.e. a relaunch that invalidates treating an
-    /// earlier exit as permanent. `agent_spawned`/`agent_respawned` and
-    /// authored records do not carry a session, so this is a time test, not a
-    /// session-identity test; a record belonging to the already-exited
-    /// session is excluded by `exclude_session`.
-    fn relaunch_between(
-        &self,
-        repo: &str,
-        spawn: &str,
-        exclude_session: &str,
-        after: DateTime<Utc>,
-        until: DateTime<Utc>,
-    ) -> Option<&LaunchRow> {
-        self.launches
-            .iter()
-            .filter(|l| l.repo == repo && l.spawn == spawn)
-            .filter(|l| l.session.as_deref() != Some(exclude_session))
-            .filter(|l| l.at.is_some_and(|at| at > after && at <= until))
-            .min_by_key(|l| (l.at, l.record.clone()))
-    }
-}
-
-/// Validates a review's `author_terminal_evidence` id against the capture.
-///
-/// Only an `agent_exit` observation can establish this, and only for the
-/// source author's exact `(spawn, session)` in the pair's repo, no later than
-/// the reuse, with no relaunch of that generation in between. The two
-/// tempting alternatives are both refused with an explicit reason:
-///
-/// * `harness_result` is task-completion evidence. `Supervisor::route_completion`
-///   emits it when the agent routes `rk done`; the OS process is still alive
-///   until `HarnessEvent::Exited`, and the provider may still report a later,
-///   different total for the same query.
-/// * `agent_lifecycle` carries no `spawn` field at all (its identity fields
-///   are `agent` and `generation`), is not repo-bound, and its `change` may be
-///   `started` — so it cannot identify a terminal generation even in
-///   principle.
-fn resolve_author_exit(
-    evidence_id: &str,
-    idx: &Index<'_>,
-    repo: &str,
-    source_agent: &str,
-    source_spawn: &str,
-    claim_created: Option<DateTime<Utc>>,
-) -> std::result::Result<String, String> {
-    let Some(ev) = idx.by_id.get(evidence_id) else {
-        return Err(format!(
-            "author_terminal_evidence {evidence_id} is not present in the tuple capture"
-        ));
-    };
-    if is_harness_result(ev) {
-        return Err(format!(
-            "{evidence_id} is a harness_result: task-completion evidence emitted at `rk done` \
-             while the process is still alive. Author-exit requires an agent_exit observation"
-        ));
-    }
-    if ev["identity"] == "agent_lifecycle" {
-        return Err(format!(
-            "{evidence_id} is an agent_lifecycle event: it carries no `spawn` binding, is not \
-             repo-bound, and its `change` may be `started`, so it cannot establish a terminal \
-             generation"
-        ));
-    }
-    if !claims_kind(ev, AGENT_EXIT) {
-        return Err(format!("{evidence_id} is not an agent_exit observation"));
-    }
-    if let Some(reason) = telemetry_record_defect(ev, AGENT_EXIT) {
-        return Err(format!(
-            "{evidence_id} is not a valid agent_exit record: {reason}"
-        ));
-    }
-    if source_spawn.is_empty() {
-        return Err(format!(
-            "the source carries no authoring generation, so {evidence_id} cannot be bound to it \
-             (legacy/unattributed source)"
-        ));
-    }
-    let Some(exit) = idx.exits.iter().find(|e| e.record == evidence_id) else {
-        return Err(format!(
-            "{evidence_id} is an agent_exit record but was excluded from the frozen repo scope or \
-             measurement window"
-        ));
-    };
-    if exit.repo != repo {
-        return Err(format!(
-            "{evidence_id} is scoped to repo {}, not the pair's {repo}",
-            exit.repo
-        ));
-    }
-    if exit.spawn != source_spawn {
-        return Err(format!(
-            "{evidence_id} records the exit of generation {}, not the source's {source_spawn}",
-            exit.spawn
-        ));
-    }
-    if !source_agent.is_empty() && !exit.agent.is_empty() && exit.agent != source_agent {
-        return Err(format!(
-            "{evidence_id} names agent {}, not the source's author {source_agent}",
-            exit.agent
-        ));
-    }
-    let Some(exited_at) = exit.exited_at else {
-        return Err(format!("{evidence_id} carries no parsable exited_at"));
-    };
-    let Some(claim_at) = claim_created else {
-        return Err(format!(
-            "{evidence_id} cannot be ordered against the reuse: the reuse has no captured, \
-             parsable timestamp"
-        ));
-    };
-    if exited_at > claim_at {
-        return Err(format!(
-            "{evidence_id} records an exit at {exited_at} which is AFTER the reuse at {claim_at}"
-        ));
-    }
-    // A manual respawn continues the same SpawnId, so an earlier exit is not
-    // proof the author was gone when the consumer decided.
-    if let Some(relaunch) =
-        idx.relaunch_between(repo, source_spawn, &exit.session, exited_at, claim_at)
-    {
-        return Err(format!(
-            "generation {source_spawn} was observed running again at {} ({} {}) after the exit at \
-             {exited_at} and before the reuse at {claim_at}",
-            relaunch
-                .at
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_else(|| "unknown time".into()),
-            relaunch.kind,
-            relaunch.record
-        ));
-    }
-    Ok(evidence_id.to_string())
-}
-
-// ---------------------------------------------------------------------
-// Pair evaluation.
-// ---------------------------------------------------------------------
-
-#[allow(clippy::too_many_lines)]
-fn evaluate_pair(
-    pair: &EligiblePair,
-    review: Option<&Review>,
-    idx: &Index<'_>,
-    capture_order: Order,
-    excluded: &mut Vec<Excluded>,
-    rejected_claims: &mut Vec<RejectedClaim>,
-    unresolved: &mut Vec<InvalidRecord>,
-    ambiguous_assessments: &mut Vec<AmbiguousAssessment>,
-    author_exit_unsupported: &mut Vec<AuthorExitUnsupported>,
-) -> Option<PairResult> {
-    let Some(source) = idx.by_id.get(pair.source.as_str()) else {
-        excluded.push(Excluded {
-            pair: pair.id.clone(),
-            reason: "source_not_captured".into(),
-            detail: format!("source {} is not present in the tuple capture", pair.source),
-        });
-        return None;
-    };
-    if let Some(reason) = source_defect(source, &pair.repo) {
-        excluded.push(Excluded {
-            pair: pair.id.clone(),
-            reason: "invalid_source".into(),
-            detail: reason,
-        });
-        return None;
-    }
-    let source_kind = source["payload"]["bbs_kind"]
-        .as_str()
-        .unwrap_or("artifact")
-        .to_string();
-    let source_spawn = str_field(source, &["payload", "spawn"]).to_string();
-    let source_agent = str_field(source, &["payload", "agent"]).to_string();
-    let source_attributed = !source_spawn.is_empty();
-    if source_attributed && source_spawn == pair.consumer_generation {
-        excluded.push(Excluded {
-            pair: pair.id.clone(),
-            reason: "self".into(),
-            detail: "source was authored by the consumer's own generation".into(),
-        });
-        return None;
-    }
-    // A finding declares its evidence; an ordinary artifact has no evidence
-    // contract to check. Unresolvable evidence leaves the opportunity standing
-    // but keeps it from certifying anything.
-    let source_evidence = if source_kind == FINDING || source_kind == ANSWER {
-        let check = check_evidence(&source["payload"]["evidence"], &idx.by_id, &pair.repo);
-        match &check {
-            EvidenceCheck::Invalid(reason) => {
-                excluded.push(Excluded {
-                    pair: pair.id.clone(),
-                    reason: "invalid_source_evidence".into(),
-                    detail: reason.clone(),
-                });
-                return None;
-            }
-            EvidenceCheck::Unknown(reason) => unresolved.push(InvalidRecord {
-                record: pair.source.clone(),
-                kind: source_kind.clone(),
-                reason: reason.clone(),
-            }),
-            EvidenceCheck::Resolved => {}
-        }
-        check.label().to_string()
-    } else {
-        "not_applicable".to_string()
-    };
-    let source_created = created_at(source);
-
-    // --- the receipt -------------------------------------------------
-    // Every rejection below removes the CLAIM, not the pair: the opportunity
-    // stays in the eligible denominator with no claimed outcome.
-    let mut claim: Option<&Value> = None;
-    if let Some(candidates) = idx
-        .reuse_by_source_task
-        .get(&(pair.source.clone(), pair.consumer_task.clone()))
-    {
-        for c in candidates {
-            let cid = record_id(c);
-            if str_field(c, &["scope"]) != pair.repo {
-                rejected_claims.push(RejectedClaim {
-                    pair: pair.id.clone(),
-                    record: cid,
-                    reason: "wrong_repo".into(),
-                    detail: format!(
-                        "receipt is scoped to {:?}, not the pair's {}",
-                        c["scope"].as_str().unwrap_or(""),
-                        pair.repo
-                    ),
-                });
-                continue;
-            }
-            let spawn = str_field(c, &["payload", "spawn"]);
-            if spawn != pair.consumer_generation {
-                rejected_claims.push(RejectedClaim {
-                    pair: pair.id.clone(),
-                    record: cid,
-                    reason: "wrong_generation".into(),
-                    detail: format!(
-                        "receipt was written by generation {spawn:?}, not the pair's {}",
-                        pair.consumer_generation
-                    ),
-                });
-                continue;
-            }
-            match check_evidence(&c["payload"]["evidence"], &idx.by_id, &pair.repo) {
-                EvidenceCheck::Invalid(detail) => {
-                    rejected_claims.push(RejectedClaim {
-                        pair: pair.id.clone(),
-                        record: cid,
-                        reason: "invalid_evidence".into(),
-                        detail,
-                    });
-                    continue;
-                }
-                EvidenceCheck::Unknown(detail) => {
-                    rejected_claims.push(RejectedClaim {
-                        pair: pair.id.clone(),
-                        record: cid,
-                        reason: "unresolved_evidence".into(),
-                        detail,
-                    });
-                    continue;
-                }
-                EvidenceCheck::Resolved => {}
-            }
-            let claim_created = created_at(c);
-            if claim_created.is_none() {
-                rejected_claims.push(RejectedClaim {
-                    pair: pair.id.clone(),
-                    record: cid,
-                    reason: "undated".into(),
-                    detail: "receipt has no parsable created_at, so it cannot be ordered against \
-                             the source"
-                        .into(),
-                });
-                continue;
-            }
-            if let (Some(sc), Some(cc)) = (source_created, claim_created) {
-                if sc > cc {
-                    rejected_claims.push(RejectedClaim {
-                        pair: pair.id.clone(),
-                        record: cid,
-                        reason: "future_source".into(),
-                        detail: format!(
-                            "source {} was created at {sc}, after the reuse it supposedly \
-                             informed at {cc}",
-                            pair.source
-                        ),
-                    });
-                    continue;
-                }
-            }
-            claim = Some(c);
-            break;
-        }
-    }
-
-    let claimed_outcome = claim
-        .and_then(|c| c["payload"]["outcome"].as_str())
-        .map(str::to_string);
-    let claim_evidence = claim.map(|c| record_id(c));
-    let claim_created = claim.and_then(created_at);
-
-    // --- the verdict --------------------------------------------------
-    let mut assessed_verdict: Option<String> = None;
-    let mut assessment_evidence: Option<String> = None;
-    if let Some(receipt) = &claim_evidence {
-        if let Some(all) = idx.assessment_by_receipt.get(receipt) {
-            let mut candidates: Vec<(usize, &Value)> = Vec::new();
-            for (pos, a) in all {
-                if str_field(a, &["scope"]) != pair.repo {
-                    unresolved.push(InvalidRecord {
-                        record: record_id(a),
-                        kind: ASSESSMENT.into(),
-                        reason: format!(
-                            "scoped to {:?}, not the assessed pair's repo {}",
-                            a["scope"].as_str().unwrap_or(""),
-                            pair.repo
-                        ),
-                    });
-                    continue;
-                }
-                match check_evidence(&a["payload"]["evidence"], &idx.by_id, &pair.repo) {
-                    EvidenceCheck::Resolved => candidates.push((*pos, a)),
-                    EvidenceCheck::Invalid(reason) | EvidenceCheck::Unknown(reason) => {
-                        unresolved.push(InvalidRecord {
-                            record: record_id(a),
-                            kind: ASSESSMENT.into(),
-                            reason: format!("verdict cannot be trusted: {reason}"),
-                        });
-                    }
-                }
-            }
-            match candidates.len() {
-                0 => {}
-                1 => {
-                    let (_, a) = candidates[0];
-                    assessed_verdict = a["payload"]["verdict"].as_str().map(str::to_string);
-                    assessment_evidence = Some(record_id(a));
-                }
-                n => {
-                    if capture_order == Order::PersistenceSequence {
-                        let (_, a) = candidates.iter().max_by_key(|(pos, _)| *pos).unwrap();
-                        assessed_verdict = a["payload"]["verdict"].as_str().map(str::to_string);
-                        assessment_evidence = Some(record_id(a));
-                    } else {
-                        ambiguous_assessments.push(AmbiguousAssessment {
-                            pair: pair.id.clone(),
-                            receipt: receipt.clone(),
-                            reason: format!(
-                                "{n} assessments for this receipt but tuple capture order is \
-                                 unknown; the current one cannot be determined without \
-                                 persistence order"
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // --- coverage -----------------------------------------------------
-    // Native telemetry and operator judgment are kept strictly apart, and a
-    // prepared selection for a generation that never ran is neither.
-    let consumer_launched = idx.launched(&pair.repo, &pair.consumer_generation);
-    let native_prepared = idx.prepared.get(&(
-        pair.repo.clone(),
-        pair.source.clone(),
-        pair.consumer_generation.clone(),
-    ));
-    let (coverage_status, coverage_provenance, coverage_reference, coverage_reference_resolved) =
-        match (native_prepared, consumer_launched) {
-            (Some(record), true) => (
-                "prepared".to_string(),
-                "native".to_string(),
-                Some(record.clone()),
-                Some(true),
-            ),
-            (Some(record), false) => (
-                "prepared_not_launched".to_string(),
-                "native".to_string(),
-                Some(record.clone()),
-                Some(true),
-            ),
-            (None, _) => match review.map(|r| &r.coverage) {
-                Some(Coverage::Prepared { evidence }) => {
-                    let r = evidence.reference().to_string();
-                    let resolved = idx.by_id.contains_key(r.as_str());
-                    (
-                        "prepared".to_string(),
-                        "reviewed".to_string(),
-                        Some(r),
-                        Some(resolved),
-                    )
-                }
-                Some(Coverage::NotPrepared { evidence }) => {
-                    let r = evidence.reference().to_string();
-                    let resolved = idx.by_id.contains_key(r.as_str());
-                    (
-                        "not_prepared".to_string(),
-                        "reviewed".to_string(),
-                        Some(r),
-                        Some(resolved),
-                    )
-                }
-                _ => ("unknown".to_string(), "none".to_string(), None, None),
-            },
-        };
-    let opened = idx.opened.contains(&(
-        pair.repo.clone(),
-        pair.source.clone(),
-        pair.consumer_generation.clone(),
-    ));
-
-    // --- author exit --------------------------------------------------
-    let mut author_terminal = false;
-    let mut author_terminal_evidence = None;
-    if let Some(evidence_id) = review.and_then(|r| r.author_terminal_evidence.as_deref()) {
-        match resolve_author_exit(
-            evidence_id,
-            idx,
-            &pair.repo,
-            &source_agent,
-            &source_spawn,
-            claim_created,
-        ) {
-            Ok(id) => {
-                author_terminal = true;
-                author_terminal_evidence = Some(id);
-            }
-            Err(reason) => author_exit_unsupported.push(AuthorExitUnsupported {
-                pair: pair.id.clone(),
-                evidence: evidence_id.to_string(),
-                reason,
-            }),
-        }
-    }
-    let relayed_by_operator = review.is_some_and(|r| r.relayed_by_operator);
-    let regression = review.is_some_and(|r| r.regression);
-
-    // A verified effect must never be certified on incomplete evidence.
-    // Every conjunct below is a real observation, not a default:
-    let temporal_order_known = source_created.is_some() && claim_created.is_some();
-    let changed_work = matches!(claimed_outcome.as_deref(), Some("used") | Some("adapted"));
-    let verified_effect = changed_work
-        && assessed_verdict.as_deref() == Some("verified")
-        && temporal_order_known
-        && coverage_status == "prepared"
-        && consumer_launched
-        && source_evidence != "unknown"
-        && claim_evidence.is_some();
-    let counts_as_effect = verified_effect && !relayed_by_operator;
-
-    Some(PairResult {
-        pair: pair.id.clone(),
-        source: pair.source.clone(),
-        source_kind,
-        source_attributed,
-        source_evidence,
-        consumer_task: pair.consumer_task.clone(),
-        consumer_generation: pair.consumer_generation.clone(),
-        repo: pair.repo.clone(),
-        batch: pair.batch.clone(),
-        coverage_status,
-        coverage_provenance,
-        coverage_reference,
-        coverage_reference_resolved,
-        consumer_launched,
-        opened,
-        claimed_outcome,
-        claim_evidence,
-        assessed_verdict,
-        assessment_evidence,
-        author_terminal,
-        author_terminal_evidence,
-        relayed_by_operator,
-        regression,
-        verified_effect,
-        counts_as_effect,
-    })
-}
-
-// ---------------------------------------------------------------------
-// Delivery derivation: frozen task scope, NOT surviving pairs.
-// ---------------------------------------------------------------------
-
-struct TaskScope {
-    task: String,
-    repo: String,
-    batches: BTreeSet<String>,
-    enrollment: &'static str,
-}
-
-fn frozen_task_scope(manifest: &Manifest) -> Vec<TaskScope> {
-    let mut scopes: BTreeMap<(String, String), TaskScope> = BTreeMap::new();
+/// The scope deliveries are accounted over: frozen consumer tasks plus the
+/// consumer tasks of predeclared fixture pairs. Deliberately NOT the pairs that
+/// survived evaluation — a frozen task with no eligible source and no receipt
+/// still owns its delivery accounting.
+fn frozen_task_scope(manifest: &Manifest) -> Vec<DeliveryCost> {
+    let mut scopes: BTreeMap<(String, String), (BTreeSet<String>, &'static str)> = BTreeMap::new();
     for c in &manifest.consumer_tasks {
         let e = scopes
             .entry((c.task.clone(), c.repo.clone()))
-            .or_insert_with(|| TaskScope {
-                task: c.task.clone(),
-                repo: c.repo.clone(),
-                batches: BTreeSet::new(),
-                enrollment: "frozen_consumer_task",
-            });
-        e.batches.insert(c.batch.clone());
-        e.enrollment = "frozen_consumer_task";
+            .or_insert_with(|| (BTreeSet::new(), "frozen_consumer_task"));
+        e.0.insert(c.batch.clone());
+        e.1 = "frozen_consumer_task";
     }
-    // Supported fixture enrollment: a predeclared pair's consumer task is in
-    // scope for delivery accounting even when the manifest lists no
-    // `consumer_tasks` (the deterministic fixture/replay shape).
     for p in &manifest.eligible_pairs {
         let e = scopes
             .entry((p.consumer_task.clone(), p.repo.clone()))
-            .or_insert_with(|| TaskScope {
-                task: p.consumer_task.clone(),
-                repo: p.repo.clone(),
-                batches: BTreeSet::new(),
-                enrollment: "fixture_pair",
-            });
-        e.batches.insert(p.batch.clone());
+            .or_insert_with(|| (BTreeSet::new(), "fixture_pair"));
+        e.0.insert(p.batch.clone());
     }
-    scopes.into_values().collect()
-}
-
-/// Per-segment cost finality. A `paused` provider result can be followed by
-/// more model usage and then a budget kill with no further result; the earlier
-/// cumulative total is then a partial amount, not this launch's final cost.
-/// Finality therefore needs an observed exit for the same launch AND a
-/// terminal last result AND an exit whose `prior_state` agrees with it.
-fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
-    let state = last.state.as_deref().unwrap_or("");
-    if !TERMINAL_USAGE_STATES.contains(&state) {
-        return (
-            false,
-            format!(
-                "last result for this segment is state={state:?}, which is not terminal: more \
-                 usage may follow"
-            ),
-        );
-    }
-    let Some(exit) = exit else {
-        return (
-            false,
-            "no agent_exit observed for this launch, so the process may still be running and \
-             report more usage"
-                .into(),
-        );
-    };
-    match exit.prior_state.as_deref() {
-        None => (
-            true,
-            format!(
-                "terminal result (state={state}) followed by observed exit {}",
-                exit.record
-            ),
-        ),
-        Some(prior) if prior == state => (
-            true,
-            format!(
-                "terminal result (state={state}) followed by observed exit {}",
-                exit.record
-            ),
-        ),
-        Some(prior) => (
-            false,
-            format!(
-                "last result said state={state:?} but the exit records prior_state={prior:?}: the \
-                 launch did more work after that result, so the reported amount is partial"
-            ),
-        ),
-    }
-}
-
-fn opt_sum(acc: &mut Option<i64>, v: Option<i64>) {
-    if let Some(v) = v {
-        *acc.get_or_insert(0) += v;
-    }
+    scopes
+        .into_iter()
+        .map(|((task, repo), (batches, enrollment))| DeliveryCost {
+            task,
+            repo,
+            batches: batches.into_iter().collect(),
+            enrollment: enrollment.to_string(),
+            derivation_status: "unsupported".into(),
+            derivation_reason: DELIVERY_COST_UNSUPPORTED.into(),
+            cost_usd: None,
+            active_work_ms: None,
+            process_lifetime_ms: None,
+            verification_ms: None,
+            queue_ms: None,
+            accepted: None,
+        })
+        .collect()
 }
 
 /// Computes the deterministic report. Same inputs always produce the same
 /// output (stable sort keys throughout; no reliance on hash-map iteration
 /// order, wall-clock "now", or randomness).
 #[allow(clippy::too_many_lines)]
-pub fn compute(
-    manifest: &Manifest,
-    capture: &TupleCapture,
-    reviews: &ReviewsFile,
-) -> Result<Report> {
+pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) -> Result<Report> {
     validate_manifest(manifest)?;
-    let review_list = reviews.pairs();
-    let task_annotations = reviews.tasks();
-    validate_reviews(review_list, task_annotations, manifest)?;
-    let all_pairs = validate_and_merge_pairs(manifest, review_list)?;
+    let all_pairs = validate_and_merge_pairs(manifest, reviews)?;
 
     let idx = build_index(capture, manifest);
     let review_by_pair: BTreeMap<&str, &Review> =
-        review_list.iter().map(|r| (r.pair.as_str(), r)).collect();
+        reviews.iter().map(|r| (r.pair.as_str(), r)).collect();
 
     let mut sorted_pairs = all_pairs;
     sorted_pairs.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut seen_keys: BTreeSet<(String, String, String, String)> = BTreeSet::new();
-    let mut excluded = Vec::new();
-    let mut rejected_claims = Vec::new();
+    let mut excluded: Vec<Excluded> = Vec::new();
+    let mut rejected_claims: Vec<RejectedClaim> = Vec::new();
     let mut unresolved = idx.unresolved.clone();
-    let mut ambiguous_assessments = Vec::new();
-    let mut author_exit_unsupported = Vec::new();
-    let mut pairs_out = Vec::new();
+    let mut ambiguous_assessments: Vec<AmbiguousAssessment> = Vec::new();
+    let mut author_exit_unsupported: Vec<AuthorExitUnsupported> = Vec::new();
+    let mut pairs_out: Vec<PairResult> = Vec::new();
 
     for pair in &sorted_pairs {
-        // Duplicate identity is counted once and REPORTED, so a repeated
+        // A duplicate identity is counted once and REPORTED, so a repeated
         // enrollment cannot inflate a denominator.
         let key = (
             pair.repo.clone(),
@@ -2617,22 +1487,327 @@ pub fn compute(
             });
             continue;
         }
-        if let Some(result) = evaluate_pair(
-            pair,
-            review_by_pair.get(pair.id.as_str()).copied(),
-            &idx,
-            capture.order,
-            &mut excluded,
-            &mut rejected_claims,
-            &mut unresolved,
-            &mut ambiguous_assessments,
-            &mut author_exit_unsupported,
-        ) {
-            pairs_out.push(result);
+        let Some(source) = idx.by_id.get(pair.source.as_str()) else {
+            excluded.push(Excluded {
+                pair: pair.id.clone(),
+                reason: "source_not_captured".into(),
+                detail: format!("source {} is not present in the tuple capture", pair.source),
+            });
+            continue;
+        };
+        if let Some(reason) = source_defect(source, &pair.repo) {
+            excluded.push(Excluded {
+                pair: pair.id.clone(),
+                reason: "invalid_source".into(),
+                detail: reason,
+            });
+            continue;
         }
+        let source_kind = source["payload"]["bbs_kind"]
+            .as_str()
+            .unwrap_or("artifact")
+            .to_string();
+        let source_spawn = str_field(source, &["payload", "spawn"]).to_string();
+        let source_attributed = !source_spawn.is_empty();
+        if source_attributed && source_spawn == pair.consumer_generation {
+            excluded.push(Excluded {
+                pair: pair.id.clone(),
+                reason: "self".into(),
+                detail: "source was authored by the consumer's own generation".into(),
+            });
+            continue;
+        }
+        // A finding/answer declares its evidence; an ordinary artifact has no
+        // evidence contract to check. Unresolvable evidence leaves the
+        // opportunity standing but stops it certifying anything.
+        let source_evidence = if source_kind == FINDING || source_kind == ANSWER {
+            let check = check_evidence(&source["payload"]["evidence"], &idx.by_id, &pair.repo);
+            match &check {
+                EvidenceCheck::Invalid(reason) => {
+                    excluded.push(Excluded {
+                        pair: pair.id.clone(),
+                        reason: "invalid_source_evidence".into(),
+                        detail: reason.clone(),
+                    });
+                    continue;
+                }
+                EvidenceCheck::Unknown(reason) => unresolved.push(InvalidRecord {
+                    record: pair.source.clone(),
+                    kind: source_kind.clone(),
+                    reason: reason.clone(),
+                }),
+                EvidenceCheck::Resolved => {}
+            }
+            check.label().to_string()
+        } else {
+            "not_applicable".to_string()
+        };
+        let source_created = created_at(source);
+
+        // Find the receipt. Every rejection below removes the CLAIM, not the
+        // pair: the opportunity stays in the eligible denominator with no
+        // claimed outcome, because a malformed or foreign receipt is not
+        // evidence that no opportunity existed.
+        let mut claim: Option<&Value> = None;
+        if let Some(candidates) = idx
+            .reuse_by_source_task
+            .get(&(pair.source.clone(), pair.consumer_task.clone()))
+        {
+            for c in candidates {
+                let cid = record_id(c);
+                if str_field(c, &["scope"]) != pair.repo {
+                    rejected_claims.push(RejectedClaim {
+                        pair: pair.id.clone(),
+                        record: cid,
+                        reason: "wrong_repo".into(),
+                        detail: format!(
+                            "receipt is scoped to {:?}, not the pair's {}",
+                            c["scope"].as_str().unwrap_or(""),
+                            pair.repo
+                        ),
+                    });
+                    continue;
+                }
+                let spawn = str_field(c, &["payload", "spawn"]);
+                if spawn != pair.consumer_generation {
+                    rejected_claims.push(RejectedClaim {
+                        pair: pair.id.clone(),
+                        record: cid,
+                        reason: "wrong_generation".into(),
+                        detail: format!(
+                            "receipt was written by generation {spawn:?}, not the pair's {}",
+                            pair.consumer_generation
+                        ),
+                    });
+                    continue;
+                }
+                match check_evidence(&c["payload"]["evidence"], &idx.by_id, &pair.repo) {
+                    EvidenceCheck::Invalid(detail) => {
+                        rejected_claims.push(RejectedClaim {
+                            pair: pair.id.clone(),
+                            record: cid,
+                            reason: "invalid_evidence".into(),
+                            detail,
+                        });
+                        continue;
+                    }
+                    EvidenceCheck::Unknown(detail) => {
+                        rejected_claims.push(RejectedClaim {
+                            pair: pair.id.clone(),
+                            record: cid,
+                            reason: "unresolved_evidence".into(),
+                            detail,
+                        });
+                        continue;
+                    }
+                    EvidenceCheck::Resolved => {}
+                }
+                let claim_created = created_at(c);
+                if claim_created.is_none() {
+                    rejected_claims.push(RejectedClaim {
+                        pair: pair.id.clone(),
+                        record: cid,
+                        reason: "undated".into(),
+                        detail: "receipt has no parsable created_at, so it cannot be ordered \
+                                 against the source"
+                            .into(),
+                    });
+                    continue;
+                }
+                if let (Some(sc), Some(cc)) = (source_created, claim_created) {
+                    if sc > cc {
+                        rejected_claims.push(RejectedClaim {
+                            pair: pair.id.clone(),
+                            record: cid,
+                            reason: "future_source".into(),
+                            detail: format!(
+                                "source {} was created at {sc}, after the reuse it supposedly \
+                                 informed at {cc}",
+                                pair.source
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                claim = Some(c);
+                break;
+            }
+        }
+
+        let review = review_by_pair.get(pair.id.as_str()).copied();
+        let claimed_outcome = claim
+            .and_then(|c| c["payload"]["outcome"].as_str())
+            .map(str::to_string);
+        let claim_evidence = claim.map(record_id);
+        let claim_created = claim.and_then(created_at);
+
+        let mut assessed_verdict: Option<String> = None;
+        let mut assessment_evidence: Option<String> = None;
+        if let Some(receipt) = &claim_evidence {
+            if let Some(all) = idx.assessment_by_receipt.get(receipt) {
+                // Same-repo and resolvable-evidence filters are applied here,
+                // not at collection time, because both depend on this pair's
+                // repo. A verdict on unresolvable evidence is not a verdict.
+                let mut candidates: Vec<(usize, &Value)> = Vec::new();
+                for (pos, a) in all {
+                    if str_field(a, &["scope"]) != pair.repo {
+                        unresolved.push(InvalidRecord {
+                            record: record_id(a),
+                            kind: ASSESSMENT.into(),
+                            reason: format!(
+                                "scoped to {:?}, not the assessed pair's repo {}",
+                                a["scope"].as_str().unwrap_or(""),
+                                pair.repo
+                            ),
+                        });
+                        continue;
+                    }
+                    match check_evidence(&a["payload"]["evidence"], &idx.by_id, &pair.repo) {
+                        EvidenceCheck::Resolved => candidates.push((*pos, a)),
+                        EvidenceCheck::Invalid(reason) | EvidenceCheck::Unknown(reason) => {
+                            unresolved.push(InvalidRecord {
+                                record: record_id(a),
+                                kind: ASSESSMENT.into(),
+                                reason: format!("verdict cannot be trusted: {reason}"),
+                            });
+                        }
+                    }
+                }
+                match candidates.len() {
+                    0 => {}
+                    1 => {
+                        let (_, a) = candidates[0];
+                        assessed_verdict = a["payload"]["verdict"].as_str().map(str::to_string);
+                        assessment_evidence = Some(record_id(a));
+                    }
+                    n => {
+                        if capture.order == Order::PersistenceSequence {
+                            let (_, a) = candidates.iter().max_by_key(|(pos, _)| *pos).unwrap();
+                            assessed_verdict = a["payload"]["verdict"].as_str().map(str::to_string);
+                            assessment_evidence = Some(record_id(a));
+                        } else {
+                            ambiguous_assessments.push(AmbiguousAssessment {
+                                pair: pair.id.clone(),
+                                receipt: receipt.clone(),
+                                reason: format!(
+                                    "{n} assessments for this receipt but tuple capture order is \
+                                     unknown; the current one cannot be determined without \
+                                     persistence order"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Coverage. Native telemetry and operator judgment are kept strictly
+        // apart — merging them made an operator's note indistinguishable from a
+        // daemon observation — and a selection prepared for a generation that
+        // never ran is neither.
+        let consumer_launched = idx.launched(&pair.repo, &pair.consumer_generation);
+        let native_prepared = idx.prepared.get(&(
+            pair.repo.clone(),
+            pair.source.clone(),
+            pair.consumer_generation.clone(),
+        ));
+        let (coverage_status, coverage_provenance, coverage_reference, coverage_reference_resolved) =
+            match (native_prepared, consumer_launched) {
+                (Some(record), true) => (
+                    "prepared".to_string(),
+                    "native".to_string(),
+                    Some(record.clone()),
+                    Some(true),
+                ),
+                (Some(record), false) => (
+                    "prepared_not_launched".to_string(),
+                    "native".to_string(),
+                    Some(record.clone()),
+                    Some(true),
+                ),
+                (None, _) => match review.map(|r| &r.coverage) {
+                    Some(Coverage::Prepared { evidence }) => (
+                        "prepared".to_string(),
+                        "reviewed".to_string(),
+                        Some(evidence.clone()),
+                        Some(idx.by_id.contains_key(evidence.as_str())),
+                    ),
+                    Some(Coverage::NotPrepared { evidence }) => (
+                        "not_prepared".to_string(),
+                        "reviewed".to_string(),
+                        Some(evidence.clone()),
+                        Some(idx.by_id.contains_key(evidence.as_str())),
+                    ),
+                    _ => ("unknown".to_string(), "none".to_string(), None, None),
+                },
+            };
+        let opened = idx.opened.contains(&(
+            pair.repo.clone(),
+            pair.source.clone(),
+            pair.consumer_generation.clone(),
+        ));
+
+        // Author exit is NOT derived in this evaluator version. Any supplied
+        // evidence is reported as unsupported with the reason, rather than
+        // credited from a record that cannot establish a physical exit.
+        if let Some(evidence_id) = review.and_then(|r| r.author_terminal_evidence.as_deref()) {
+            author_exit_unsupported.push(AuthorExitUnsupported {
+                pair: pair.id.clone(),
+                evidence: evidence_id.to_string(),
+                reason: AUTHOR_EXIT_UNSUPPORTED.to_string(),
+            });
+        }
+        let relayed_by_operator = review.is_some_and(|r| r.relayed_by_operator);
+        let regression = review.is_some_and(|r| r.regression);
+
+        // A verified effect is never certified on incomplete evidence. Every
+        // conjunct is a real observation, not a default: unknown temporal order
+        // means the source was not shown to predate the reuse; unknown or
+        // not-prepared coverage means the source was never shown to be
+        // discoverable to this consumer; an unlaunched consumer never made a
+        // decision at all.
+        let temporal_order_known = source_created.is_some() && claim_created.is_some();
+        let changed_work = matches!(claimed_outcome.as_deref(), Some("used") | Some("adapted"));
+        let verified_effect = changed_work
+            && assessed_verdict.as_deref() == Some("verified")
+            && temporal_order_known
+            && coverage_status == "prepared"
+            && consumer_launched
+            && source_evidence != "unknown"
+            && claim_evidence.is_some();
+        let counts_as_effect = verified_effect && !relayed_by_operator;
+
+        pairs_out.push(PairResult {
+            pair: pair.id.clone(),
+            source: pair.source.clone(),
+            source_kind,
+            source_attributed,
+            source_evidence,
+            consumer_task: pair.consumer_task.clone(),
+            consumer_generation: pair.consumer_generation.clone(),
+            repo: pair.repo.clone(),
+            batch: pair.batch.clone(),
+            coverage_status,
+            coverage_provenance,
+            coverage_reference,
+            coverage_reference_resolved,
+            consumer_launched,
+            opened,
+            claimed_outcome,
+            claim_evidence,
+            assessed_verdict,
+            assessment_evidence,
+            // Author exit cannot be established in this version; see
+            // `AUTHOR_EXIT_UNSUPPORTED`.
+            author_terminal: false,
+            author_terminal_evidence: None,
+            relayed_by_operator,
+            regression,
+            verified_effect,
+            counts_as_effect,
+        });
     }
 
-    // --- discovery denominator ---------------------------------------
     let eligible = pairs_out.len();
     let prepared_native = pairs_out
         .iter()
@@ -2659,9 +1834,6 @@ pub fn compute(
         .collect();
     unknown_coverage.sort();
     let prepared_pairs = prepared_native + prepared_reviewed;
-    // A pair whose consumer generation never launched is neither a discovery
-    // success nor a discovery failure: there was no decision to inform. It is
-    // reported on its own rather than distorting either side of the rate.
     let known_coverage_pairs = prepared_pairs + not_prepared_pairs;
     let discovery = Discovery {
         eligible_pairs: eligible,
@@ -2671,7 +1843,7 @@ pub fn compute(
         prepared_reviewed,
         not_prepared_pairs,
         unknown_coverage_pairs: unknown_coverage.len(),
-        prepared_not_launched: prepared_not_launched.clone(),
+        prepared_not_launched,
         rate: (known_coverage_pairs > 0)
             .then(|| prepared_pairs as f64 / known_coverage_pairs as f64),
     };
@@ -2703,11 +1875,12 @@ pub fn compute(
         }
     }
 
-    // --- verified reuse, per distinct eligible consumer task ----------
-    // Uses `verified_effect` — the SAME gate the mechanism goal counts — so
-    // the two can never disagree about what "verified" means. Confirmations
-    // and rejections are independent counts, reported alongside rather than
-    // instead of a verified effect.
+    // Verified reuse is per distinct eligible consumer task, not per pair — a
+    // task with several eligible pairs is one opportunity to act. It uses the
+    // SAME `verified_effect` gate the mechanism goal counts; previously it
+    // applied a weaker test and could report reuse the goal refused.
+    // Confirmations and rejections are independent counts, reported alongside
+    // rather than instead of a verified effect.
     let mut tasks: BTreeMap<(&str, &str), Vec<&PairResult>> = BTreeMap::new();
     for p in &pairs_out {
         tasks
@@ -2745,13 +1918,6 @@ pub fn compute(
         rejected_tasks,
     };
 
-    let mut author_exit_reuse: Vec<String> = pairs_out
-        .iter()
-        .filter(|p| p.counts_as_effect && p.author_terminal)
-        .map(|p| p.pair.clone())
-        .collect();
-    author_exit_reuse.sort();
-
     let mut effect_pairs: Vec<String> = pairs_out
         .iter()
         .filter(|p| p.counts_as_effect)
@@ -2763,368 +1929,31 @@ pub fn compute(
         .filter(|p| p.counts_as_effect)
         .map(|p| p.batch.as_str())
         .collect();
-    let author_exit_effects = author_exit_reuse.len();
+    // The author-exit sub-goal cannot be satisfied at all in this version, so
+    // the mechanism goal is forced `false` with the reason attached. This is
+    // the whole point of the intermediate: a goal that cannot be evaluated
+    // must not report as met, and the previous version would have passed it on
+    // author-exit evidence that establishes nothing.
+    let goal_blocked_reason = if capture.truncated {
+        Some(
+            "the tuple capture is truncated: a reuse or assessment outside the truncation window \
+             could change any of these counts"
+                .to_string(),
+        )
+    } else {
+        Some(AUTHOR_EXIT_UNSUPPORTED.to_string())
+    };
     let mechanism = MechanismResult {
         effects: effect_pairs.len(),
         batches: effect_batches.len(),
-        author_exit_effects,
+        author_exit_effects: 0,
         effects_required: MECHANISM_EFFECTS_REQUIRED,
         batches_required: MECHANISM_BATCHES_REQUIRED,
         author_exit_required: MECHANISM_AUTHOR_EXIT_REQUIRED,
-        // A truncated capture cannot certify the goal: an assessment or reuse
-        // tuple outside the truncation window could exist and change any of
-        // these counts.
-        goal_met: !capture.truncated
-            && effect_pairs.len() >= MECHANISM_EFFECTS_REQUIRED
-            && effect_batches.len() >= MECHANISM_BATCHES_REQUIRED
-            && author_exit_effects >= MECHANISM_AUTHOR_EXIT_REQUIRED,
+        goal_met: false,
+        goal_blocked_reason,
         effect_pairs,
     };
-
-    // --- deliveries, from frozen scope -------------------------------
-    let mut deliveries = Vec::new();
-    let mut tasks_without_native_records = Vec::new();
-    let mut attention_hold_spans = 0usize;
-    let mut rework_spans = 0usize;
-    for scope in frozen_task_scope(manifest) {
-        // Spans are pre-filtered by repo and window here because
-        // `build_critical_path` dedups on `(phase, attempt)` across whatever
-        // it is handed and does not filter by scope: two repos' same-named
-        // task ids would silently merge.
-        let task_spans: Vec<Value> = idx
-            .spans
-            .iter()
-            .filter(|t| {
-                str_field(t, &["scope"]) == scope.repo
-                    && t["payload"]["task"] == scope.task.as_str()
-            })
-            .map(|t| (*t).clone())
-            .collect();
-        let cp = crate::critical_path::build_critical_path(&scope.task, &task_spans);
-        let mut phase_ms = PhaseDurations::default();
-        if let Some(phases) = cp["phases"].as_array() {
-            for phase in phases {
-                let dur = phase["duration_ms"].as_i64();
-                let wait = phase["queue_wait_ms"].as_i64();
-                match phase["phase"].as_str().unwrap_or("") {
-                    "verification" => {
-                        // Admission/check queue AND its own run time both count
-                        // as verification time, never as work.
-                        opt_sum(&mut phase_ms.verification_ms, dur);
-                        opt_sum(&mut phase_ms.verification_ms, wait);
-                    }
-                    "attention_hold" => {
-                        attention_hold_spans += 1;
-                        opt_sum(&mut phase_ms.attention_hold_ms, dur);
-                        opt_sum(&mut phase_ms.attention_hold_ms, wait);
-                    }
-                    other => {
-                        if other == "rework" {
-                            rework_spans += 1;
-                        }
-                        opt_sum(&mut phase_ms.work_phases_ms, dur);
-                        // Generic pre-phase queueing is a wait, not work, even
-                        // for an otherwise-active phase.
-                        opt_sum(&mut phase_ms.queue_wait_ms, wait);
-                    }
-                }
-            }
-        }
-        let acceptance_evidence = idx
-            .spans
-            .iter()
-            .filter(|t| {
-                str_field(t, &["scope"]) == scope.repo
-                    && t["payload"]["task"] == scope.task.as_str()
-                    && t["payload"]["phase"] == "delivery_closure"
-            })
-            .map(|t| record_id(t))
-            .min();
-        let accepted = acceptance_evidence.as_ref().map(|_| true);
-
-        // Every native generation observed for this task, whether or not it
-        // ever produced an eligible pair or a receipt.
-        let mut spawns: BTreeSet<&str> = BTreeSet::new();
-        for c in &idx.completions {
-            if c.repo == scope.repo && c.task == scope.task {
-                spawns.insert(c.spawn.as_str());
-            }
-        }
-        for e in &idx.exits {
-            if e.repo == scope.repo && e.task == scope.task {
-                spawns.insert(e.spawn.as_str());
-            }
-        }
-        for u in &idx.usage {
-            if u.repo == scope.repo && u.task == scope.task {
-                spawns.insert(u.spawn.as_str());
-            }
-        }
-
-        let mut generations = Vec::new();
-        let mut completions_total = 0usize;
-        let mut failed_completions = 0usize;
-        let mut launches_total = 0usize;
-        let mut exits_total = 0usize;
-        let mut provisional: Option<f64> = None;
-        let mut provisional_known = true;
-        let mut provider_total: Option<f64> = None;
-        let mut daemon_total: Option<f64> = None;
-        let mut partial_total: Option<f64> = None;
-        let mut all_final = true;
-        let mut any_segment = false;
-        let mut non_provider_basis = false;
-        let mut unknown_cost: Vec<String> = Vec::new();
-        let mut lifetime: Option<i64> = None;
-
-        for spawn in spawns {
-            let mut completions = Vec::new();
-            for c in idx
-                .completions
-                .iter()
-                .filter(|c| c.repo == scope.repo && c.task == scope.task && c.spawn == spawn)
-            {
-                completions_total += 1;
-                // TKT-175: an undeclared generation is also an error, but the
-                // two are recorded separately so "the rat said it was done"
-                // stays distinguishable from "nothing went wrong".
-                let failed = c.is_error || !c.declared_done;
-                if failed {
-                    failed_completions += 1;
-                }
-                match c.cost_usd {
-                    Some(v) => *provisional.get_or_insert(0.0) += v,
-                    None => provisional_known = false,
-                }
-                completions.push(CompletionObservation {
-                    record: c.record.clone(),
-                    declared_done: c.declared_done,
-                    is_error: c.is_error,
-                    provisional_cost_usd: c.cost_usd,
-                    failed,
-                });
-            }
-            completions.sort_by(|a, b| a.record.cmp(&b.record));
-
-            let mut agent = idx
-                .completions
-                .iter()
-                .find(|c| c.repo == scope.repo && c.spawn == spawn && !c.agent.is_empty())
-                .map(|c| c.agent.clone());
-            if agent.is_none() {
-                agent = idx
-                    .exits
-                    .iter()
-                    .find(|e| e.repo == scope.repo && e.spawn == spawn && !e.agent.is_empty())
-                    .map(|e| e.agent.clone());
-            }
-
-            let mut launches = Vec::new();
-            for e in idx
-                .exits
-                .iter()
-                .filter(|e| e.repo == scope.repo && e.task == scope.task && e.spawn == spawn)
-            {
-                exits_total += 1;
-                launches_total += 1;
-                let ms = match (e.launched_at, e.exited_at) {
-                    (Some(l), Some(x)) => Some((x - l).num_milliseconds()),
-                    _ => None,
-                };
-                opt_sum(&mut lifetime, ms);
-                launches.push(LaunchObservation {
-                    session: e.session.clone(),
-                    launched_at: e.launched_at.map(|t| t.to_rfc3339()),
-                    exited_at: e.exited_at.map(|t| t.to_rfc3339()),
-                    exit_record: Some(e.record.clone()),
-                    exit_code: e.exit_code,
-                    crashed: e.crashed,
-                    prior_state: e.prior_state.clone(),
-                    process_lifetime_ms: ms,
-                });
-            }
-            launches.sort_by(|a, b| a.session.cmp(&b.session));
-
-            // Group usage by (session, provider_session): the provider reports
-            // a CUMULATIVE total within one segment, so only the last result
-            // per segment is that segment's amount.
-            let mut by_segment: BTreeMap<(String, Option<String>), Vec<&UsageRow>> =
-                BTreeMap::new();
-            for u in idx
-                .usage
-                .iter()
-                .filter(|u| u.repo == scope.repo && u.task == scope.task && u.spawn == spawn)
-            {
-                by_segment
-                    .entry((u.session.clone(), u.provider_session.clone()))
-                    .or_default()
-                    .push(u);
-            }
-            let mut cost_segments = Vec::new();
-            for ((session, provider_session), mut rows) in by_segment {
-                any_segment = true;
-                rows.sort_by(|a, b| (a.observed_at, &a.record).cmp(&(b.observed_at, &b.record)));
-                let last = rows.last().copied().expect("segment has at least one row");
-                let exit = idx
-                    .exits
-                    .iter()
-                    .find(|e| e.repo == scope.repo && e.spawn == spawn && e.session == session);
-                let (final_cost, finality_reason) = segment_finality(last, exit);
-                if !final_cost {
-                    all_final = false;
-                    unknown_cost.push(format!(
-                        "{spawn}/{session}/{}: {finality_reason}",
-                        provider_session.as_deref().unwrap_or("no-provider-session")
-                    ));
-                }
-                if last.cost_basis != PROVIDER_COST_BASIS {
-                    non_provider_basis = true;
-                }
-                match (final_cost, last.cost_usd, last.cost_basis.as_str()) {
-                    (true, Some(v), PROVIDER_COST_BASIS) => {
-                        *provider_total.get_or_insert(0.0) += v;
-                    }
-                    (true, Some(v), DAEMON_COST_BASIS) => {
-                        *daemon_total.get_or_insert(0.0) += v;
-                    }
-                    (false, Some(v), _) => {
-                        *partial_total.get_or_insert(0.0) += v;
-                    }
-                    (_, None, _) => {
-                        all_final = false;
-                        unknown_cost.push(format!(
-                            "{spawn}/{session}/{}: reported cost is null (cost_basis={})",
-                            provider_session.as_deref().unwrap_or("no-provider-session"),
-                            last.cost_basis
-                        ));
-                    }
-                    (true, Some(_), _) => {}
-                }
-                cost_segments.push(CostSegment {
-                    spawn: spawn.to_string(),
-                    session,
-                    provider_session,
-                    record: last.record.clone(),
-                    reported_usd: last.cost_usd,
-                    cost_basis: last.cost_basis.clone(),
-                    state: last.state.clone(),
-                    final_cost,
-                    finality_reason,
-                });
-            }
-            cost_segments.sort_by(|a, b| {
-                (&a.spawn, &a.session, &a.provider_session).cmp(&(
-                    &b.spawn,
-                    &b.session,
-                    &b.provider_session,
-                ))
-            });
-            if cost_segments.is_empty() {
-                unknown_cost.push(format!(
-                    "{spawn}: no agent_final_usage observation, so this generation's provider cost \
-                     is unknown"
-                ));
-            }
-            generations.push(GenerationObservation {
-                spawn: spawn.to_string(),
-                agent,
-                completions,
-                launches,
-                cost_segments,
-            });
-        }
-        generations.sort_by(|a, b| a.spawn.cmp(&b.spawn));
-
-        if generations.is_empty() && task_spans.is_empty() {
-            tasks_without_native_records.push(format!("{}/{}", scope.repo, scope.task));
-        }
-
-        let cost_coverage = if generations.is_empty() {
-            "none_observed"
-        } else if !any_segment {
-            "missing"
-        } else if all_final && !non_provider_basis {
-            "complete"
-        } else {
-            "partial"
-        };
-        // A provider total is only reported when EVERY observed segment is a
-        // final, provider-reported total. A partial segment, a null cost, or a
-        // daemon-priced segment all leave the task total unknown rather than
-        // pooling bases or presenting a partial sum as a total.
-        let reported_cost_estimate_usd = (cost_coverage == "complete")
-            .then_some(provider_total)
-            .flatten();
-        unknown_cost.sort();
-
-        deliveries.push(DeliveryCost {
-            task: scope.task.clone(),
-            repo: scope.repo.clone(),
-            batches: scope.batches.iter().cloned().collect(),
-            enrollment: scope.enrollment.to_string(),
-            generations,
-            completions: completions_total,
-            failed_completions,
-            launches: launches_total,
-            exits: exits_total,
-            reported_cost_estimate_usd,
-            reported_cost_basis: reported_cost_estimate_usd
-                .map(|_| PROVIDER_COST_BASIS.to_string()),
-            cost_coverage: cost_coverage.to_string(),
-            partial_reported_usd: partial_total,
-            daemon_priced_estimate_usd: daemon_total,
-            provisional_completion_cost_usd: provisional_known.then_some(provisional).flatten(),
-            unknown_cost,
-            process_lifetime_ms: lifetime,
-            active_work_ms: None,
-            active_work_coverage:
-                "unknown: launch-to-exit is process lifetime, and no native observation \
-                 distinguishes model-active time from a process paused awaiting verification or \
-                 the operator"
-                    .into(),
-            phase_ms,
-            accepted,
-            acceptance_evidence,
-        });
-    }
-    deliveries.sort_by(|a, b| (&a.repo, &a.task).cmp(&(&b.repo, &b.task)));
-    tasks_without_native_records.sort();
-
-    // --- quality ------------------------------------------------------
-    let annotate = |items: &[ReviewedAnnotation], t: &TaskAnnotation| -> Vec<ReviewedRef> {
-        items
-            .iter()
-            .map(|a| ReviewedRef {
-                task: t.task.clone(),
-                repo: t.repo.clone(),
-                kind: a.kind.clone(),
-                reference: a.reference.clone(),
-                reference_resolved: idx.by_id.contains_key(a.reference.as_str()),
-                note: a.note.clone(),
-            })
-            .collect()
-    };
-    let mut reviewed_interventions = Vec::new();
-    let mut repeated_investigations = Vec::new();
-    let mut reviewed_rework = Vec::new();
-    for t in task_annotations {
-        reviewed_interventions.extend(annotate(&t.interventions, t));
-        repeated_investigations.extend(annotate(&t.repeated_investigations, t));
-        reviewed_rework.extend(annotate(&t.rework, t));
-    }
-    let sort_refs = |v: &mut Vec<ReviewedRef>| {
-        v.sort_by(|a, b| {
-            (&a.repo, &a.task, &a.kind, &a.reference).cmp(&(
-                &b.repo,
-                &b.task,
-                &b.kind,
-                &b.reference,
-            ))
-        });
-    };
-    sort_refs(&mut reviewed_interventions);
-    sort_refs(&mut repeated_investigations);
-    sort_refs(&mut reviewed_rework);
 
     let incorrect_reuse = pairs_out
         .iter()
@@ -3137,16 +1966,8 @@ pub fn compute(
         .collect();
     regressions.sort();
     let quality = QualitySummary {
-        attention_hold_spans,
-        interventions_known: attention_hold_spans + reviewed_interventions.len(),
-        interventions_coverage:
-            "lower bound: attention_hold spans only cover waits the daemon recorded; an operator \
-             intervention that left no span is present only as a reviewed annotation"
-                .into(),
-        reviewed_interventions,
-        repeated_investigations,
-        rework_spans,
-        reviewed_rework,
+        interventions: None,
+        interventions_coverage: INTERVENTIONS_UNSUPPORTED.into(),
         incorrect_reuse,
         regressions,
     };
@@ -3171,10 +1992,23 @@ pub fn compute(
             Order::Unknown => "unknown".into(),
         },
         tuples_truncated: capture.truncated,
-        tuples_source: capture.source.clone(),
         capture: idx.capture.clone(),
         invalid_records: idx.invalid.clone(),
         unresolved_records: unresolved,
+        unsupported: vec![
+            UnsupportedDerivation {
+                derivation: "author_exit".into(),
+                status: "unsupported".into(),
+                reason: AUTHOR_EXIT_UNSUPPORTED.into(),
+                tracked_by: "TKT-bonik-vuruv-mivuh".into(),
+            },
+            UnsupportedDerivation {
+                derivation: "delivery_cost_and_duration".into(),
+                status: "unsupported".into(),
+                reason: DELIVERY_COST_UNSUPPORTED.into(),
+                tracked_by: "TKT-bonik-vuruv-mivuh".into(),
+            },
+        ],
         eligible,
         excluded,
         rejected_claims,
@@ -3189,15 +2023,18 @@ pub fn compute(
         ambiguous_assessments,
         author_exit_unsupported,
         verified_reuse,
-        author_exit_reuse,
+        // Cannot be established in this version; see `AUTHOR_EXIT_UNSUPPORTED`.
+        author_exit_reuse: vec![],
         mechanism,
-        deliveries,
-        tasks_without_native_records,
+        deliveries: frozen_task_scope(manifest),
         quality,
         pairs: pairs_out,
     })
 }
 
+/// Renders a `Report` as human-readable text. JSON output should use
+/// `serde_json::to_string_pretty` directly on the `Report` for a byte-stable
+/// machine shape.
 fn opt_rate(rate: Option<f64>) -> String {
     match rate {
         Some(r) => format!("{:.1}%", r * 100.0),
@@ -3205,26 +2042,13 @@ fn opt_rate(rate: Option<f64>) -> String {
     }
 }
 
-fn opt_usd(v: Option<f64>) -> String {
-    match v {
-        Some(v) => format!("${v:.4}"),
-        None => "unknown".into(),
-    }
-}
-
-/// Renders a `Report` as human-readable text. JSON output should use
-/// `serde_json::to_string_pretty` directly on the `Report` for a byte-stable
-/// machine shape.
 pub fn render(report: &Report) -> String {
     let mut out = format!("## Stigmergy evidence report: {}\n\n", report.experiment_id);
     let _ = writeln!(
         out,
-        "evaluator_version={} schema_version={}",
-        report.evaluator_version, report.schema_version
-    );
-    let _ = writeln!(
-        out,
-        "eligible={} excluded={} rejected_claims={} opened={} claimed={} assessed={}",
+        "evaluator_version={} eligible={} excluded={} rejected_claims={} opened={} claimed={} \
+         assessed={}",
+        report.evaluator_version,
         report.eligible,
         report.excluded.len(),
         report.rejected_claims.len(),
@@ -3288,6 +2112,16 @@ pub fn render(report: &Report) -> String {
         report.mechanism.author_exit_required,
         report.mechanism.goal_met
     );
+    if let Some(reason) = &report.mechanism.goal_blocked_reason {
+        let _ = writeln!(out, "  goal cannot pass: {reason}");
+    }
+    for u in &report.unsupported {
+        let _ = writeln!(
+            out,
+            "UNSUPPORTED {} [{}]: {}",
+            u.derivation, u.status, u.reason
+        );
+    }
     if !report.unknown_coverage.is_empty() {
         let _ = writeln!(
             out,
@@ -3345,62 +2179,18 @@ pub fn render(report: &Report) -> String {
         }
     }
     if !report.deliveries.is_empty() {
-        out.push_str("deliveries (reported cost ESTIMATES, not billed charges):\n");
+        out.push_str("deliveries (scope only; cost/duration are UNSUPPORTED here):\n");
         for d in &report.deliveries {
             let _ = writeln!(
                 out,
-                "  {}/{} [{}] completions={} failed={} launches={} exits={}",
-                d.repo,
-                d.task,
-                d.enrollment,
-                d.completions,
-                d.failed_completions,
-                d.launches,
-                d.exits
+                "  {}/{} [{}] cost_usd=unknown active_work_ms=unknown accepted=unknown ({})",
+                d.repo, d.task, d.enrollment, d.derivation_status
             );
-            let _ = writeln!(
-                out,
-                "    cost: reported={} coverage={} partial={} daemon_priced={} provisional_completion={}",
-                opt_usd(d.reported_cost_estimate_usd),
-                d.cost_coverage,
-                opt_usd(d.partial_reported_usd),
-                opt_usd(d.daemon_priced_estimate_usd),
-                opt_usd(d.provisional_completion_cost_usd)
-            );
-            let _ = writeln!(
-                out,
-                "    time: process_lifetime_ms={:?} active_work_ms=unknown work_phases_ms={:?} \
-                 verification_ms={:?} attention_hold_ms={:?} queue_wait_ms={:?}",
-                d.process_lifetime_ms,
-                d.phase_ms.work_phases_ms,
-                d.phase_ms.verification_ms,
-                d.phase_ms.attention_hold_ms,
-                d.phase_ms.queue_wait_ms
-            );
-            let _ = writeln!(out, "    accepted={:?}", d.accepted);
-            for u in &d.unknown_cost {
-                let _ = writeln!(out, "    unknown cost: {u}");
-            }
         }
-    }
-    if !report.tasks_without_native_records.is_empty() {
-        let _ = writeln!(
-            out,
-            "frozen tasks with no native record at all: {}",
-            report.tasks_without_native_records.join(", ")
-        );
     }
     let _ = writeln!(
         out,
-        "quality: attention_hold_spans={} reviewed_interventions={} interventions_known={} \
-         rework_spans={} reviewed_rework={} repeated_investigations={} incorrect_reuse={} \
-         regressions={}",
-        report.quality.attention_hold_spans,
-        report.quality.reviewed_interventions.len(),
-        report.quality.interventions_known,
-        report.quality.rework_spans,
-        report.quality.reviewed_rework.len(),
-        report.quality.repeated_investigations.len(),
+        "quality: interventions=unknown incorrect_reuse={} regressions={}",
         report.quality.incorrect_reuse,
         report.quality.regressions.join(", ")
     );
@@ -3420,28 +2210,12 @@ pub fn to_json(report: &Report) -> Value {
 mod tests {
     use super::*;
 
-    // ------------------------------------------------------------------
-    // Fixtures. Every one is shaped like the COMMITTED producer writes it:
-    // the daemon-minted `bbs-<kind>-<digest>` identity, `Furniture`
-    // lifecycle, `schema_version: 1`, and `instance == payload.agent` for the
-    // S1 artifact kinds (`Tuple::new(.., caller, ..)` makes that
-    // unconditional). Telemetry fixtures instead carry the castle as
-    // `instance` and the consumer only in the payload, exactly as
-    // `write_telemetry` does.
-    // ------------------------------------------------------------------
-
-    const CASTLE: &str = "castle-1";
-
-    fn manifest_with(
-        pairs: Vec<EligiblePair>,
-        consumer_tasks: Vec<ConsumerTaskScope>,
-        window: Window,
-    ) -> Manifest {
+    fn manifest(pairs: Vec<EligiblePair>) -> Manifest {
         Manifest {
             schema_version: SCHEMA_VERSION,
             experiment_id: "exp-1".into(),
             repos: vec!["repo".into()],
-            window,
+            window: Window::default(),
             build: BuildIdentity::default(),
             quality_criteria: vec![],
             batches: vec![Batch {
@@ -3449,13 +2223,9 @@ mod tests {
                 arm: "real".into(),
                 repo: "repo".into(),
             }],
-            consumer_tasks,
+            consumer_tasks: vec![],
             eligible_pairs: pairs,
         }
-    }
-
-    fn manifest(pairs: Vec<EligiblePair>) -> Manifest {
-        manifest_with(pairs, vec![], Window::default())
     }
 
     fn pair(id: &str, source: &str, task: &str, gen: &str) -> EligiblePair {
@@ -3470,22 +2240,24 @@ mod tests {
     }
 
     fn finding(id: &str, spawn: &str, created: &str) -> Value {
-        finding_in(id, "author", spawn, created, "repo")
-    }
-
-    fn finding_in(id: &str, agent: &str, spawn: &str, created: &str, scope: &str) -> Value {
         json!({
             "id": id,
             "category": "artifact",
-            "scope": scope,
+            "scope": "repo",
             "identity": format!("bbs-finding-{id}"),
-            "instance": agent,
+            "instance": "author",
             "lifecycle": "furniture",
             "created_at": created,
             "payload": {
-                "schema_version": 1, "bbs_kind": FINDING, "agent": agent, "spawn": spawn,
-                "task": "TKT-source", "text": "a reusable interface constraint",
-                "areas": ["src/x.rs"], "revision": "abc123", "evidence": ["ev-1"],
+                "schema_version": 1,
+                "bbs_kind": FINDING,
+                "agent": "author",
+                "spawn": spawn,
+                "task": "TKT-source",
+                "text": "a reusable interface constraint",
+                "areas": ["src/x.rs"],
+                "revision": "abc123",
+                "evidence": ["ev-1"],
                 "limitations": "none noted"
             }
         })
@@ -3508,9 +2280,15 @@ mod tests {
             "lifecycle": "furniture",
             "created_at": created,
             "payload": {
-                "schema_version": 1, "bbs_kind": REUSE, "agent": "consumer", "spawn": spawn,
-                "task": task, "source": source, "outcome": outcome,
-                "text": "used the constraint directly", "evidence": ["ev-2"]
+                "schema_version": 1,
+                "bbs_kind": REUSE,
+                "agent": "consumer",
+                "spawn": spawn,
+                "task": task,
+                "source": source,
+                "outcome": outcome,
+                "text": "used the constraint directly",
+                "evidence": ["ev-2"]
             }
         })
     }
@@ -3525,15 +2303,25 @@ mod tests {
             "lifecycle": "furniture",
             "created_at": created,
             "payload": {
-                "schema_version": 1, "bbs_kind": ASSESSMENT, "agent": "operator", "spawn": null,
-                "task": "TKT-source", "receipt": receipt, "verdict": verdict,
-                "reason": "matches delivered work", "evidence": ["ev-3"]
+                "schema_version": 1,
+                "bbs_kind": ASSESSMENT,
+                "agent": "operator",
+                "spawn": null,
+                "task": "TKT-source",
+                "receipt": receipt,
+                "verdict": verdict,
+                "reason": "matches delivered work",
+                "evidence": ["ev-3"]
             }
         })
     }
 
-    /// `record_exposure`'s exact payload: castle-authored, consumer only in
-    /// the payload, `entries[].source` naming the selected tuple.
+    const CASTLE: &str = "castle-1";
+
+    /// `record_exposure`'s exact payload (crates/rk-daemon/src/bbs.rs on
+    /// rat/scurry-15/tkt-tapip-puhot-sitih): castle-authored, so `instance` is
+    /// the CASTLE and the consumer lives only in the payload, with the
+    /// selected tuple named by `entries[].source`.
     fn exposure(id: &str, source: &str, spawn: &str, created: &str) -> Value {
         exposure_full(id, source, spawn, created, "repo", "agent")
     }
@@ -3583,84 +2371,34 @@ mod tests {
         })
     }
 
-    /// `harness_result`: task-completion evidence, emitted at `rk done`.
-    fn harness_result(id: &str, agent: &str, spawn: &str, task: &str, created: &str) -> Value {
+    /// A `harness_result`: task-completion evidence, and therefore proof the
+    /// generation RAN. Never author-exit evidence — the supervisor emits it at
+    /// `rk done`, while the OS process is still alive.
+    fn harness_result(id: &str, spawn: &str, task: &str, created: &str) -> Value {
         json!({
-            "id": id, "category": "event", "scope": "repo", "identity": "harness_result",
-            "instance": spawn, "created_at": created,
+            "id": id,
+            "category": "event",
+            "scope": "repo",
+            "identity": "harness_result",
+            "instance": spawn,
+            "created_at": created,
             "payload": {
-                "agent": agent, "spawn": spawn, "role": "rat", "task": task,
-                "is_error": false, "declared_done": true, "cost_usd": 0.5, "tokens": 1000,
-                "result": "done"
+                "agent": spawn,
+                "spawn": spawn,
+                "task": task,
+                "is_error": false,
+                "declared_done": true,
+                "cost_usd": 0.5
             }
         })
     }
 
-    /// S2's `agent_exit`: the only physical-exit observation.
-    #[allow(clippy::too_many_arguments)]
-    fn agent_exit(
-        id: &str,
-        agent: &str,
-        spawn: &str,
-        session: &str,
-        task: &str,
-        launched_at: &str,
-        exited_at: &str,
-        prior_state: Option<&str>,
-    ) -> Value {
-        json!({
-            "id": id, "category": "event", "scope": "repo", "identity": "bbs-agent-exit",
-            "instance": CASTLE, "lifecycle": "furniture", "created_at": exited_at,
-            "payload": {
-                "schema_version": 1, "bbs_kind": AGENT_EXIT, "repo": "repo", "task": task,
-                "agent": agent, "spawn": spawn, "session": session, "provider_session": "ps-1",
-                "exited_at": exited_at, "exit_code": 0, "crashed": false,
-                "prior_state": prior_state, "launched_at": launched_at
-            }
-        })
-    }
-
-    /// S2's `agent_final_usage`: one provider result for one segment.
-    #[allow(clippy::too_many_arguments)]
-    fn final_usage(
-        id: &str,
-        spawn: &str,
-        session: &str,
-        provider_session: &str,
-        task: &str,
-        state: &str,
-        cost: Option<f64>,
-        basis: &str,
-        observed_at: &str,
-    ) -> Value {
-        json!({
-            "id": id, "category": "event", "scope": "repo",
-            "identity": "bbs-agent-final-usage", "instance": CASTLE, "lifecycle": "furniture",
-            "created_at": observed_at,
-            "payload": {
-                "schema_version": 1, "bbs_kind": AGENT_FINAL_USAGE, "repo": "repo", "task": task,
-                "agent": "author", "spawn": spawn, "session": session,
-                "provider_session": provider_session, "observed_at": observed_at,
-                "state": state, "declared_done": true, "cost_usd": cost, "cost_basis": basis,
-                "cost_provenance": "HarnessEvent::Completed.total_cost_usd", "usage": null
-            }
-        })
-    }
-
-    fn span(id: &str, task: &str, phase: &str, dur: i64, wait: Option<i64>) -> Value {
-        json!({
-            "id": id, "category": "event", "scope": "repo", "identity": "task_span",
-            "instance": CASTLE, "lifecycle": "furniture",
-            "created_at": "2026-01-02T00:00:00Z",
-            "payload": {
-                "task": task, "phase": phase, "attempt": 1, "repo": "repo",
-                "duration_ms": dur, "queue_wait_ms": wait
-            }
-        })
-    }
-
-    /// Wraps test tuples into a capture, auto-injecting the generic evidence
-    /// artifacts the fixtures above reference by default.
+    /// Wraps test tuples into a capture, auto-injecting the generic
+    /// evidence artifacts ("ev-1"/"ev-2"/"ev-3") the `finding`/`reuse`/
+    /// `assessment` fixtures above reference by default, so an unrelated
+    /// test (e.g. one exercising self/wrong_repo/wrong_generation
+    /// exclusion) doesn't also have to construct evidence tuples just to
+    /// satisfy the evidence-resolves-in-repo check.
     fn capture(mut tuples: Vec<Value>, order: Order) -> TupleCapture {
         for id in ["ev-1", "ev-2", "ev-3"] {
             if !tuples.iter().any(|t| t["id"] == id) {
@@ -3678,40 +2416,9 @@ mod tests {
         }
     }
 
-    fn reviews(rs: Vec<Review>) -> ReviewsFile {
-        ReviewsFile::Pairs(rs)
-    }
-
-    fn review(pair_id: &str) -> Review {
-        Review {
-            pair: pair_id.into(),
-            declares: None,
-            coverage: unknown_coverage(),
-            author_terminal_evidence: None,
-            relayed_by_operator: false,
-            regression: false,
-            notes: None,
-        }
-    }
-
-    fn review_reviewed_prepared(pair_id: &str, reference: &str) -> Review {
-        Review {
-            coverage: Coverage::Prepared {
-                evidence: ReviewedEvidence::Reference(reference.into()),
-            },
-            ..review(pair_id)
-        }
-    }
-
-    fn review_with_exit(pair_id: &str, exit_evidence: &str) -> Review {
-        Review {
-            author_terminal_evidence: Some(exit_evidence.into()),
-            ..review(pair_id)
-        }
-    }
-
-    /// The happy path: finding, receipt, verdict, native exposure, and a
-    /// completion proving the consumer generation actually launched.
+    /// The happy path, shaped natively: finding, receipt, operator verdict, a
+    /// castle-authored exposure binding the source to the consumer generation,
+    /// and a completion proving that generation actually launched.
     fn verified_tuples() -> Vec<Value> {
         vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
@@ -3725,7 +2432,7 @@ mod tests {
             ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
             exposure("x1", "src-1", "gen-1", "2026-01-01T12:00:00Z"),
-            harness_result("h1", "consumer", "gen-1", "TKT-1", "2026-01-02T01:00:00Z"),
+            harness_result("h1", "gen-1", "TKT-1", "2026-01-02T01:00:00Z"),
         ]
     }
 
@@ -3738,71 +2445,897 @@ mod tests {
         report.excluded.iter().map(|e| e.reason.as_str()).collect()
     }
 
-    // ------------------------------------------------------------------
-    // Baseline / determinism.
-    // ------------------------------------------------------------------
+    fn review_with_exit(pair_id: &str, exit_evidence: &str, relayed: bool) -> Review {
+        Review {
+            pair: pair_id.into(),
+            declares: None,
+            coverage: Coverage::Prepared {
+                evidence: "exposure-1".into(),
+            },
+            author_terminal_evidence: Some(exit_evidence.into()),
+            relayed_by_operator: relayed,
+            regression: false,
+            notes: None,
+        }
+    }
+
+    fn review_no_exit(pair_id: &str) -> Review {
+        Review {
+            pair: pair_id.into(),
+            declares: None,
+            coverage: Coverage::Prepared {
+                evidence: "exposure-1".into(),
+            },
+            author_terminal_evidence: None,
+            relayed_by_operator: false,
+            regression: false,
+            notes: None,
+        }
+    }
 
     #[test]
     fn verified_used_effect_counts_and_is_deterministic() {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
-        let c = capture(verified_tuples(), Order::Unknown);
-        let r = reviews(vec![review("p1")]);
-        let first = compute(&m, &c, &r).unwrap();
-        let second = compute(&m, &c, &r).unwrap();
-        assert_eq!(to_json(&first), to_json(&second), "must be deterministic");
-        assert_eq!(first.eligible, 1);
-        assert_eq!(first.presented_native, 1, "native exposure, not reviewed");
-        assert_eq!(first.presented_reviewed, 0);
-        assert_eq!(first.discovery.rate, Some(1.0));
-        assert_eq!(first.outcome_classes.used, 1);
-        assert_eq!(first.outcome_classes.verified, 1);
-        assert_eq!(first.mechanism.effects, 1);
-        assert!(only(&first).verified_effect);
-        assert!(!first.mechanism.goal_met, "one effect is not three");
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+            harness_result("hr1", "author-gen", "TKT-source", "2026-01-01T12:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![review_with_exit("p1", "hr1", false)];
+        let r1 = compute(&m, &c, &reviews).unwrap();
+        assert_eq!(r1.claimed, 1);
+        assert_eq!(r1.assessed, 1);
+        assert_eq!(r1.mechanism.effects, 1);
+        // The previous evaluator credited author-exit from this very
+        // `harness_result`. It is completion evidence, not physical exit, and
+        // this version credits nothing at all until the real derivation lands.
+        assert!(r1.author_exit_reuse.is_empty());
+        assert_eq!(r1.author_exit_unsupported.len(), 1);
+        assert_eq!(r1.author_exit_unsupported[0].evidence, "hr1");
+        assert!(r1.author_exit_unsupported[0].reason.contains("still alive"));
+        assert_eq!(r1.mechanism.author_exit_effects, 0);
+        assert!(!r1.mechanism.goal_met);
+        assert_eq!(r1.verified_reuse.verified_used_or_adapted_tasks, 1);
+        assert_eq!(r1.verified_reuse.eligible_consumer_tasks, 1);
+        assert!(r1.excluded.is_empty());
+
+        let r2 = compute(&m, &c, &reviews).unwrap();
+        assert_eq!(
+            serde_json::to_string(&r1).unwrap(),
+            serde_json::to_string(&r2).unwrap(),
+            "same inputs must produce byte-identical output"
+        );
+    }
+
+    #[test]
+    fn author_exit_evidence_missing_from_capture_is_not_credited() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        // Reviewer claims author-exit but points at a tuple that was never
+        // captured: a bare assertion, no native evidence.
+        let reviews = vec![review_with_exit("p1", "nonexistent-tuple", false)];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert_eq!(r.mechanism.effects, 1);
+        assert!(r.author_exit_reuse.is_empty());
+        assert_eq!(r.author_exit_unsupported.len(), 1);
+        assert_eq!(r.author_exit_unsupported[0].pair, "p1");
+    }
+
+    #[test]
+    fn author_exit_evidence_for_wrong_generation_is_not_credited() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+            // Terminal event for a DIFFERENT generation than the source's author.
+            harness_result("hr1", "someone-else", "TKT-other", "2026-01-01T12:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![review_with_exit("p1", "hr1", false)];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert!(r.author_exit_reuse.is_empty());
+        assert_eq!(r.author_exit_unsupported.len(), 1);
+    }
+
+    #[test]
+    fn author_exit_evidence_after_reuse_is_not_credited() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+            // Exit happens AFTER the reuse it's supposed to precede.
+            harness_result("hr1", "author-gen", "TKT-source", "2026-01-05T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![review_with_exit("p1", "hr1", false)];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert!(r.author_exit_reuse.is_empty());
+        assert_eq!(r.author_exit_unsupported.len(), 1);
+    }
+
+    #[test]
+    fn confirmation_alone_never_counts_as_a_changed_work_effect() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "confirmed",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.mechanism.effects, 0);
+        assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, 0);
+        assert_eq!(r.verified_reuse.confirmed_tasks, 1);
+        assert_eq!(r.outcome_classes.confirmed, 1);
+    }
+
+    #[test]
+    fn duplicate_pair_excluded_and_counted_once() {
+        let m = manifest(vec![
+            pair("p1", "src-1", "TKT-1", "gen-1"),
+            pair("p2", "src-1", "TKT-1", "gen-1"),
+        ]);
+        let tuples = vec![finding("src-1", "author-gen", "2026-01-01T00:00:00Z")];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.excluded.len(), 1);
+        assert_eq!(r.excluded[0].pair, "p2");
+        assert_eq!(r.excluded[0].reason, "duplicate");
+    }
+
+    #[test]
+    fn self_use_excluded() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "author-gen")]);
+        let tuples = vec![finding("src-1", "author-gen", "2026-01-01T00:00:00Z")];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.excluded[0].reason, "self");
+    }
+
+    #[test]
+    fn wrong_repo_excluded() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut f = finding("src-1", "author-gen", "2026-01-01T00:00:00Z");
+        f["scope"] = json!("other-repo");
+        let c = capture(vec![f], Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.excluded[0].reason, "invalid_source");
+        assert!(r.excluded[0].detail.contains("!= pair repo repo"));
+    }
+
+    #[test]
+    fn a_pair_repo_outside_manifest_repos_is_an_input_error() {
+        // `manifest.repos` was enforced nowhere before this correction.
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.eligible_pairs[0].repo = "other-repo".into();
+        let err = validate_manifest(&m).unwrap_err().to_string();
+        assert!(err.contains("declared for repo repo"), "{err}");
+    }
+
+    #[test]
+    fn missing_evidence_excluded() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut f = finding("src-1", "author-gen", "2026-01-01T00:00:00Z");
+        f["payload"]["evidence"] = json!([]);
+        let c = capture(vec![f], Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.excluded[0].reason, "invalid_source_evidence");
+        assert!(r.excluded[0].detail.contains("empty"));
+    }
+
+    #[test]
+    fn wrong_generation_claim_excluded() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            // Written by a different generation than the frozen pair names.
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-OTHER",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        // OMITTED DENOMINATOR before this correction: the pair was `excluded`,
+        // deleting a real opportunity from both rates. A bad claim removes the
+        // claim.
+        assert!(r.excluded.is_empty(), "the opportunity is not erased");
+        assert_eq!(r.eligible, 1);
+        assert_eq!(r.rejected_claims.len(), 1);
+        assert_eq!(r.rejected_claims[0].reason, "wrong_generation");
+        assert_eq!(r.claimed, 0);
+        assert_eq!(r.verified_reuse.eligible_consumer_tasks, 1);
+        assert_eq!(r.verified_reuse.rate, Some(0.0));
+    }
+
+    #[test]
+    fn future_source_excluded() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            // Source postdates the reuse it supposedly informed.
+            finding("src-1", "author-gen", "2026-02-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert!(r.excluded.is_empty(), "the opportunity is not erased");
+        assert_eq!(r.eligible, 1);
+        assert_eq!(r.rejected_claims[0].reason, "future_source");
+        assert_eq!(r.claimed, 0);
+    }
+
+    #[test]
+    fn unsupported_assessment_never_counts_toward_verified_reuse() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "unsupported", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.claimed, 1);
+        assert_eq!(r.assessed, 1);
+        assert_eq!(r.outcome_classes.unsupported, 1);
+        assert_eq!(r.mechanism.effects, 0);
+        assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, 0);
+    }
+
+    #[test]
+    fn operator_relayed_effect_excluded_from_mechanism_goal() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![review_with_exit("p1", "nonexistent", true)];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert_eq!(r.mechanism.effects, 0);
+        assert!(!r.mechanism.goal_met);
+    }
+
+    #[test]
+    fn mechanism_goal_needs_three_effects_two_batches_one_author_exit() {
+        let mut m = manifest(vec![]);
+        m.batches.push(Batch {
+            id: "batch-2".into(),
+            arm: "real".into(),
+            repo: "repo".into(),
+        });
+        m.eligible_pairs = vec![
+            EligiblePair {
+                id: "p1".into(),
+                source: "src-1".into(),
+                consumer_task: "TKT-1".into(),
+                consumer_generation: "gen-1".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            },
+            EligiblePair {
+                id: "p2".into(),
+                source: "src-2".into(),
+                consumer_task: "TKT-2".into(),
+                consumer_generation: "gen-2".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            },
+            EligiblePair {
+                id: "p3".into(),
+                source: "src-3".into(),
+                consumer_task: "TKT-3".into(),
+                consumer_generation: "gen-3".into(),
+                repo: "repo".into(),
+                batch: "batch-2".into(),
+            },
+        ];
+        let mut tuples = vec![];
+        for (src, task, gen) in [
+            ("src-1", "TKT-1", "gen-1"),
+            ("src-2", "TKT-2", "gen-2"),
+            ("src-3", "TKT-3", "gen-3"),
+        ] {
+            tuples.push(finding(src, "author-gen", "2026-01-01T00:00:00Z"));
+            tuples.push(reuse(
+                &format!("r-{src}"),
+                src,
+                task,
+                gen,
+                "adapted",
+                "2026-01-02T00:00:00Z",
+            ));
+            tuples.push(assessment(
+                &format!("a-{src}"),
+                &format!("r-{src}"),
+                "verified",
+                "2026-01-03T00:00:00Z",
+            ));
+        }
+        tuples.push(harness_result(
+            "hr1",
+            "author-gen",
+            "TKT-source",
+            "2026-01-01T12:00:00Z",
+        ));
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![
+            review_no_exit("p1"),
+            review_no_exit("p2"),
+            review_with_exit("p3", "hr1", false),
+        ];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert_eq!(r.mechanism.effects, 3);
+        assert_eq!(r.mechanism.batches, 2);
+        // The effect and batch counts clear the bar, and the goal STILL must
+        // not pass: the author-exit sub-goal cannot be evaluated in this
+        // evaluator version, and the previous one would have passed it here on
+        // a `harness_result` that establishes no physical exit. A goal that
+        // cannot be evaluated does not report as met.
+        assert_eq!(r.mechanism.author_exit_effects, 0);
+        assert!(!r.mechanism.goal_met);
+        assert!(r
+            .mechanism
+            .goal_blocked_reason
+            .as_ref()
+            .unwrap()
+            .contains("author-exit derivation is not implemented"));
+    }
+
+    #[test]
+    fn ambiguous_assessment_order_is_not_silently_resolved() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            // Two revisions of the same assessment, order unknown: a naive
+            // implementation might pick "last in array" or "highest ULID"
+            // and silently manufacture a verdict. Neither is legitimate
+            // without real persistence order.
+            assessment("a1", "r1", "unsupported", "2026-01-03T00:00:00Z"),
+            assessment("a2", "r1", "verified", "2026-01-04T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.assessed, 0);
+        assert_eq!(r.ambiguous_assessments.len(), 1);
+        assert_eq!(r.ambiguous_assessments[0].pair, "p1");
+        assert_eq!(r.mechanism.effects, 0);
+    }
+
+    #[test]
+    fn persistence_sequence_order_resolves_supersession_by_position() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "incorrect", "2026-01-03T00:00:00Z"),
+            assessment("a2", "r1", "verified", "2026-01-04T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::PersistenceSequence);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert!(r.ambiguous_assessments.is_empty());
+        assert_eq!(r.pairs[0].assessed_verdict.as_deref(), Some("verified"));
+    }
+
+    #[test]
+    fn unknown_coverage_listed_separately_and_excluded_from_presented() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![finding("src-1", "author-gen", "2026-01-01T00:00:00Z")];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.presented_native, 0);
+        assert_eq!(r.unknown_coverage, vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn wraps_bare_scan_object_and_rejects_missing_tuples_field() {
+        let scan_output = json!({"tuples": [finding("src-1", "author-gen", "2026-01-01T00:00:00Z")], "truncated": true});
+        let parsed = parse_tuple_capture(&scan_output).unwrap();
+        assert_eq!(parsed.order, Order::Unknown);
+        assert!(parsed.truncated);
+        assert_eq!(parsed.tuples.len(), 1);
+
+        let bad = json!({"not_tuples": []});
+        assert!(parse_tuple_capture(&bad).is_err());
+    }
+
+    #[test]
+    fn envelope_with_persistence_sequence_order_is_honored() {
+        let envelope = json!({
+            "schema_version": 1,
+            "order": "persistence_sequence",
+            "tuples": [],
+        });
+        let parsed = parse_tuple_capture(&envelope).unwrap();
+        assert_eq!(parsed.order, Order::PersistenceSequence);
+    }
+
+    #[test]
+    fn rejects_wrong_schema_version() {
+        let mut m = manifest(vec![]);
+        m.schema_version = 99;
+        let c = capture(vec![], Order::Unknown);
+        assert!(compute(&m, &c, &[]).is_err());
+    }
+
+    #[test]
+    fn rejects_review_for_pair_not_in_manifest_or_declared() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let c = capture(vec![], Order::Unknown);
+        let reviews = vec![review_no_exit("not-a-real-pair")];
+        assert!(compute(&m, &c, &reviews).is_err());
+    }
+
+    #[test]
+    fn rejects_review_that_redeclares_a_predeclared_pair() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let c = capture(vec![], Order::Unknown);
+        let mut r = review_no_exit("p1");
+        r.declares = Some(PairDeclaration {
+            source: "src-2".into(),
+            consumer_task: "TKT-1".into(),
+            consumer_generation: "gen-1".into(),
+            repo: "repo".into(),
+            batch: "batch-1".into(),
+        });
+        assert!(compute(&m, &c, &[r]).is_err());
+    }
+
+    #[test]
+    fn live_enrollment_mints_a_pair_bound_to_frozen_scope() {
+        // No predeclared pairs at all — everything discovered live, as a
+        // real batch would: only batches + consumer_tasks are frozen ahead
+        // of time.
+        let mut m = manifest(vec![]);
+        m.consumer_tasks.push(ConsumerTaskScope {
+            task: "TKT-1".into(),
+            repo: "repo".into(),
+            batch: "batch-1".into(),
+        });
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let mut r = review_no_exit("p1");
+        r.declares = Some(PairDeclaration {
+            source: "src-1".into(),
+            consumer_task: "TKT-1".into(),
+            consumer_generation: "gen-1".into(),
+            repo: "repo".into(),
+            batch: "batch-1".into(),
+        });
+        let report = compute(&m, &c, &[r]).unwrap();
+        assert_eq!(report.eligible, 1);
+        assert_eq!(report.claimed, 1);
+        assert_eq!(report.mechanism.effects, 1);
+    }
+
+    #[test]
+    fn live_enrollment_rejects_task_not_frozen_in_consumer_tasks() {
+        let m = manifest(vec![]); // no consumer_tasks frozen
+        let c = capture(vec![], Order::Unknown);
+        let mut r = review_no_exit("p1");
+        r.declares = Some(PairDeclaration {
+            source: "src-1".into(),
+            consumer_task: "TKT-1".into(),
+            consumer_generation: "gen-1".into(),
+            repo: "repo".into(),
+            batch: "batch-1".into(),
+        });
+        assert!(compute(&m, &c, &[r]).is_err());
     }
 
     // ------------------------------------------------------------------
-    // Review finding 1: record identity binding and evidence resolution.
+    // Slice A reports cost/duration as UNSUPPORTED rather than estimating it.
+    // The six aggregation tests that used to live here asserted properties of
+    // a derivation that produced false positives — a provisional
+    // `harness_result` cost summed as a measured total, a `merge` span read as
+    // an accepted delivery, a phase-duration sum labelled active work. They
+    // return with the real derivation in TKT-bonik-vuruv-mivuh.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn deliveries_come_from_frozen_scope_and_report_cost_as_unsupported() {
+        // OMITTED DENOMINATOR the previous version had: deliveries were derived
+        // from the pairs that survived evaluation, so a frozen task with no
+        // eligible source and no receipt vanished along with its accounting.
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-lonely".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let report = compute(&m, &capture(vec![], Order::Unknown), &[]).unwrap();
+        assert_eq!(report.eligible, 0, "no pairs at all");
+        assert_eq!(report.deliveries.len(), 1, "the frozen task still appears");
+        let d = &report.deliveries[0];
+        assert_eq!(d.task, "TKT-lonely");
+        assert_eq!(d.repo, "repo");
+        assert_eq!(d.enrollment, "frozen_consumer_task");
+        assert_eq!(d.derivation_status, "unsupported");
+        // Every figure is an explicit unknown, never a manufactured zero.
+        assert_eq!(d.cost_usd, None);
+        assert_eq!(d.active_work_ms, None);
+        assert_eq!(d.process_lifetime_ms, None);
+        assert_eq!(d.accepted, None);
+        assert_eq!(report.quality.interventions, None);
+        assert!(report
+            .quality
+            .interventions_coverage
+            .contains("lower bound"));
+    }
+
+    #[test]
+    fn a_fixture_pairs_task_is_also_enrolled_for_delivery_accounting() {
+        let report = compute(
+            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+            &capture(verified_tuples(), Order::Unknown),
+            &[review_no_exit("p1")],
+        )
+        .unwrap();
+        assert_eq!(report.deliveries.len(), 1);
+        assert_eq!(report.deliveries[0].task, "TKT-1");
+        assert_eq!(report.deliveries[0].enrollment, "fixture_pair");
+    }
+
+    #[test]
+    fn unsupported_derivations_are_named_with_their_reason_and_tracking_ticket() {
+        // An absent metric has to be legible as absent, in machine output as
+        // well as human output, or a reader fills the gap with a zero.
+        let report = compute(&manifest(vec![]), &capture(vec![], Order::Unknown), &[]).unwrap();
+        let named: Vec<&str> = report
+            .unsupported
+            .iter()
+            .map(|u| u.derivation.as_str())
+            .collect();
+        assert_eq!(named, vec!["author_exit", "delivery_cost_and_duration"]);
+        for u in &report.unsupported {
+            assert_eq!(u.status, "unsupported");
+            assert_eq!(u.tracked_by, "TKT-bonik-vuruv-mivuh");
+            assert!(!u.reason.is_empty());
+        }
+        let text = render(&report);
+        assert!(text.contains("UNSUPPORTED author_exit"), "{text}");
+        assert!(
+            text.contains("UNSUPPORTED delivery_cost_and_duration"),
+            "{text}"
+        );
+        assert!(text.contains("cost_usd=unknown") || report.deliveries.is_empty());
+    }
+
+    #[test]
+    fn forged_assessment_not_authored_by_operator_is_not_trusted() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut a = assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z");
+        a["payload"]["agent"] = json!("some-rat");
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            a,
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.assessed, 0);
+        assert_eq!(r.mechanism.effects, 0);
+    }
+
+    #[test]
+    fn evidence_referencing_a_different_repo_does_not_resolve() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut f = finding("src-1", "author-gen", "2026-01-01T00:00:00Z");
+        f["payload"]["evidence"] = json!(["ev-foreign"]);
+        let foreign = json!({
+            "id": "ev-foreign", "category": "artifact", "scope": "other-repo",
+            "identity": "x", "instance": "author", "created_at": "2026-01-01T00:00:00Z",
+            "payload": {}
+        });
+        let c = capture(vec![f, foreign], Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.excluded[0].reason, "invalid_source_evidence");
+        assert!(r.excluded[0].detail.contains("scoped to \"other-repo\""));
+    }
+
+    #[test]
+    fn evidence_referencing_a_nonexistent_artifact_does_not_resolve() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut f = finding("src-1", "author-gen", "2026-01-01T00:00:00Z");
+        f["payload"]["evidence"] = json!(["never-captured"]);
+        let c = capture(vec![f], Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        // An id absent from the capture is UNKNOWN, not a negative: a partial
+        // capture must not delete a real opportunity. The pair survives and
+        // simply cannot certify anything.
+        assert!(r.excluded.is_empty());
+        assert_eq!(r.eligible, 1);
+        assert_eq!(only(&r).source_evidence, "unknown");
+        assert!(!only(&r).verified_effect);
+        assert!(r
+            .unresolved_records
+            .iter()
+            .any(|u| u.reason.contains("never-captured")));
+    }
+
+    #[test]
+    fn evidence_with_a_non_string_member_is_rejected_explicitly() {
+        // The previous `evidence_ids` silently filtered non-strings, so
+        // `["ev-1", 7]` looked like a clean one-item list.
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut f = finding("src-1", "author-gen", "2026-01-01T00:00:00Z");
+        f["payload"]["evidence"] = json!(["ev-1", 7]);
+        let r = compute(&m, &capture(vec![f], Order::Unknown), &[]).unwrap();
+        assert_eq!(r.excluded[0].reason, "invalid_source_evidence");
+        assert!(r.excluded[0].detail.contains("non-string member"));
+    }
+
+    #[test]
+    fn evidence_naming_a_non_artifact_is_invalid_not_resolved() {
+        // Checking only `scope` let an EVENT stand in for the artifact a
+        // finding claims as its evidence.
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let f = finding("src-1", "author-gen", "2026-01-01T00:00:00Z");
+        let ev = json!({
+            "id": "ev-1", "category": "event", "scope": "repo", "identity": "something",
+            "instance": "x", "created_at": "2026-01-01T00:00:00Z", "payload": {}
+        });
+        let r = compute(&m, &capture(vec![f, ev], Order::Unknown), &[]).unwrap();
+        assert_eq!(r.excluded[0].reason, "invalid_source_evidence");
+        assert!(r.excluded[0].detail.contains("not an artifact"));
+    }
+
+    #[test]
+    fn missing_source_timestamp_prevents_counting_a_verified_effect() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut f = finding("src-1", "author-gen", "2026-01-01T00:00:00Z");
+        f.as_object_mut().unwrap().remove("created_at");
+        let tuples = vec![
+            f,
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        // Still legitimately claimed/assessed (transparency), just not
+        // credited as a mechanism-goal effect without known temporal order.
+        assert_eq!(r.claimed, 1);
+        assert_eq!(r.assessed, 1);
+        assert_eq!(r.mechanism.effects, 0);
+    }
+
+    #[test]
+    fn unknown_coverage_prevents_counting_a_verified_effect() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        // No review at all: coverage_status stays "unknown".
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.pairs[0].coverage_status, "unknown");
+        assert_eq!(r.mechanism.effects, 0);
+    }
+
+    #[test]
+    fn truncated_capture_cannot_certify_the_mechanism_goal() {
+        let mut m = manifest(vec![]);
+        m.batches.push(Batch {
+            id: "batch-2".into(),
+            arm: "real".into(),
+            repo: "repo".into(),
+        });
+        m.eligible_pairs = vec![
+            pair("p1", "src-1", "TKT-1", "gen-1"),
+            pair("p2", "src-2", "TKT-2", "gen-2"),
+            EligiblePair {
+                id: "p3".into(),
+                source: "src-3".into(),
+                consumer_task: "TKT-3".into(),
+                consumer_generation: "gen-3".into(),
+                repo: "repo".into(),
+                batch: "batch-2".into(),
+            },
+        ];
+        let mut tuples = vec![];
+        for (src, task, gen) in [
+            ("src-1", "TKT-1", "gen-1"),
+            ("src-2", "TKT-2", "gen-2"),
+            ("src-3", "TKT-3", "gen-3"),
+        ] {
+            tuples.push(finding(src, "author-gen", "2026-01-01T00:00:00Z"));
+            tuples.push(reuse(
+                &format!("r-{src}"),
+                src,
+                task,
+                gen,
+                "adapted",
+                "2026-01-02T00:00:00Z",
+            ));
+            tuples.push(assessment(
+                &format!("a-{src}"),
+                &format!("r-{src}"),
+                "verified",
+                "2026-01-03T00:00:00Z",
+            ));
+        }
+        tuples.push(harness_result(
+            "hr1",
+            "author-gen",
+            "TKT-source",
+            "2026-01-01T12:00:00Z",
+        ));
+        let reviews = vec![
+            review_no_exit("p1"),
+            review_no_exit("p2"),
+            review_with_exit("p3", "hr1", false),
+        ];
+        let mut c = capture(tuples, Order::Unknown);
+        c.truncated = true;
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert_eq!(r.mechanism.effects, 3);
+        assert!(
+            !r.mechanism.goal_met,
+            "a truncated capture must never certify the mechanism goal even when raw counts satisfy it"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Record identity binding. Each of these passed the previous
+    // category+bbs_kind check and could certify a result.
     // ------------------------------------------------------------------
 
     #[test]
     fn source_whose_instance_disagrees_with_its_author_is_rejected() {
-        // FALSE POSITIVE the old evaluator produced: `is_kind` checked only
-        // category + lifecycle + bbs_kind + schema_version, so a row whose
-        // tuple author is not its claimed payload author passed as a genuine
-        // finding. Every real BBS write authors the tuple as its own caller.
+        // `Tuple::new(.., caller, ..)` makes `instance == payload.agent`
+        // unconditional for every BBS write, so a row where they disagree was
+        // not written by that path.
         let mut tuples = verified_tuples();
         tuples[0]["instance"] = json!("someone-else");
-        let report = compute(
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
             &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
+            &[review_no_exit("p1")],
         )
         .unwrap();
-        assert_eq!(exclusion_reasons(&report), vec!["invalid_source"]);
-        assert!(report.excluded[0].detail.contains("instance"));
-        assert_eq!(report.mechanism.effects, 0);
+        assert_eq!(exclusion_reasons(&r), vec!["invalid_source"]);
+        assert!(r.excluded[0].detail.contains("instance"));
+        assert_eq!(r.mechanism.effects, 0);
     }
 
     #[test]
     fn source_without_the_daemon_minted_identity_prefix_is_rejected() {
         let mut tuples = verified_tuples();
         tuples[0]["identity"] = json!("finding-1");
-        let report = compute(
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
             &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
+            &[review_no_exit("p1")],
         )
         .unwrap();
-        assert_eq!(exclusion_reasons(&report), vec!["invalid_source"]);
-        assert!(report.excluded[0].detail.contains("bbs-finding-"));
+        assert_eq!(exclusion_reasons(&r), vec!["invalid_source"]);
+        assert!(r.excluded[0].detail.contains("bbs-finding-"));
     }
 
     #[test]
     fn a_receipt_is_not_a_reusable_source() {
         // The daemon refuses `bbs.reuse` on a receipt; the report must refuse
-        // the same pairing rather than treat a telemetry/receipt row as a
-        // shared finding.
+        // the same pairing rather than let a receipt stand in for a finding.
         let source = reuse(
             "rx",
             "src-0",
@@ -3811,20 +3344,58 @@ mod tests {
             "used",
             "2026-01-01T00:00:00Z",
         );
-        let report = compute(
+        let r = compute(
             &manifest(vec![pair("p1", "rx", "TKT-1", "gen-1")]),
             &capture(vec![source], Order::Unknown),
-            &reviews(vec![review("p1")]),
+            &[],
         )
         .unwrap();
-        assert_eq!(exclusion_reasons(&report), vec!["invalid_source"]);
-        assert!(report.excluded[0].detail.contains("not a reusable source"));
+        assert_eq!(exclusion_reasons(&r), vec!["invalid_source"]);
+        assert!(r.excluded[0].detail.contains("not a reusable source"));
     }
 
     #[test]
+    fn an_ordinary_artifact_is_a_valid_source_and_stays_unattributed() {
+        // Mirrors the daemon rule: an artifact with NO bbs_kind is reusable
+        // regardless of lifecycle. It carries no authoring generation, so
+        // attribution stays explicitly unknown rather than being guessed.
+        let plain = json!({
+            "id": "src-plain", "category": "artifact", "scope": "repo",
+            "identity": "gate-result", "instance": CASTLE, "lifecycle": "furniture",
+            "created_at": "2026-01-01T00:00:00Z", "payload": {"note": "repro"}
+        });
+        let mut tuples = verified_tuples();
+        tuples[0] = plain;
+        tuples[1] = reuse(
+            "r1",
+            "src-plain",
+            "TKT-1",
+            "gen-1",
+            "used",
+            "2026-01-02T00:00:00Z",
+        );
+        tuples[3] = exposure("x1", "src-plain", "gen-1", "2026-01-01T12:00:00Z");
+        let r = compute(
+            &manifest(vec![pair("p1", "src-plain", "TKT-1", "gen-1")]),
+            &capture(tuples, Order::Unknown),
+            &[review_no_exit("p1")],
+        )
+        .unwrap();
+        assert!(r.excluded.is_empty());
+        let p = only(&r);
+        assert_eq!(p.source_kind, "artifact");
+        assert!(!p.source_attributed);
+        assert_eq!(p.source_evidence, "not_applicable");
+    }
+
+    // ------------------------------------------------------------------
+    // Exposure scoping, binding, and the launch join.
+    // ------------------------------------------------------------------
+
+    #[test]
     fn exposure_from_another_repo_is_not_native_coverage() {
-        // OMITTED SCOPE the old evaluator had: `is_event_kind` ignored tuple
-        // scope entirely, so a foreign repo's exposure counted as prepared.
+        // The previous `is_event_kind` ignored tuple scope entirely, so a
+        // foreign repo's exposure counted as prepared.
         let mut tuples = verified_tuples();
         tuples[3] = exposure_full(
             "x1",
@@ -3834,44 +3405,33 @@ mod tests {
             "other",
             "agent",
         );
-        let report = compute(
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
             &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
+            &[],
         )
         .unwrap();
-        assert_eq!(only(&report).coverage_status, "unknown");
-        assert_eq!(report.presented_native, 0);
-        assert_eq!(report.capture.observations_out_of_scope_repo, 1);
-        assert!(
-            !only(&report).verified_effect,
-            "unknown coverage cannot certify"
-        );
+        assert_eq!(only(&r).coverage_status, "unknown");
+        assert_eq!(r.presented_native, 0);
+        assert_eq!(r.capture.observations_out_of_scope_repo, 1);
+        assert!(!only(&r).verified_effect, "unknown coverage cannot certify");
     }
 
     #[test]
     fn exposure_outside_the_frozen_window_is_not_native_coverage() {
-        // Manifest.window was enforced NOWHERE before this correction.
-        let m = manifest_with(
-            vec![pair("p1", "src-1", "TKT-1", "gen-1")],
-            vec![],
-            Window {
-                since: Some("2026-02-01T00:00:00Z".parse().unwrap()),
-                until: None,
-            },
-        );
-        let report = compute(
-            &m,
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert_eq!(only(&report).coverage_status, "unknown");
-        assert!(report.capture.observations_out_of_window >= 1);
+        // `Manifest.window` was enforced NOWHERE before this correction.
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some("2026-02-01T00:00:00Z".parse().unwrap()),
+            until: None,
+        };
+        let r = compute(&m, &capture(verified_tuples(), Order::Unknown), &[]).unwrap();
+        assert_eq!(only(&r).coverage_status, "unknown");
+        assert!(r.capture.observations_out_of_window >= 1);
     }
 
     #[test]
-    fn operator_bound_exposure_is_not_agent_exposure() {
+    fn an_operator_bound_exposure_is_not_agent_exposure() {
         let mut tuples = verified_tuples();
         tuples[3] = exposure_full(
             "x1",
@@ -3881,501 +3441,89 @@ mod tests {
             "repo",
             "operator",
         );
-        let report = compute(
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
             &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
+            &[],
         )
         .unwrap();
-        assert_eq!(only(&report).coverage_status, "unknown");
-        assert!(report
+        assert_eq!(only(&r).coverage_status, "unknown");
+        assert!(r
             .unresolved_records
             .iter()
             .any(|u| u.kind == EXPOSURE && u.reason.contains("no exact consumer generation")));
     }
 
     #[test]
+    fn an_exposure_entry_without_a_source_id_is_reported_invalid() {
+        let mut tuples = verified_tuples();
+        tuples[3]["payload"]["entries"] = json!([{"reason": "task or dependency"}]);
+        let r = compute(
+            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+            &capture(tuples, Order::Unknown),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(only(&r).coverage_status, "unknown");
+        assert!(r
+            .invalid_records
+            .iter()
+            .any(|i| i.kind == "exposure_entry" && i.reason.contains("no `source` id")));
+    }
+
+    #[test]
     fn exposure_for_a_generation_that_never_launched_is_not_an_opportunity() {
-        // A prepared selection for a spawn that never ran is neither a
-        // discovery success nor a discovery failure: there was no decision.
+        // A selection prepared for a spawn that never ran is neither a
+        // discovery success nor a discovery failure: there was no decision to
+        // inform, so it is kept out of both sides of the rate.
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
             exposure("x1", "src-1", "gen-1", "2026-01-01T12:00:00Z"),
         ];
-        let report = compute(
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
             &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
+            &[],
         )
         .unwrap();
-        assert_eq!(only(&report).coverage_status, "prepared_not_launched");
-        assert!(!only(&report).consumer_launched);
-        assert_eq!(report.discovery.prepared_not_launched, vec!["p1"]);
-        assert_eq!(report.discovery.known_coverage_pairs, 0);
-        assert_eq!(
-            report.discovery.rate, None,
-            "absent denominator, not a 0% rate"
-        );
+        let p = only(&r);
+        assert_eq!(p.coverage_status, "prepared_not_launched");
+        assert!(!p.consumer_launched);
+        assert_eq!(r.discovery.prepared_not_launched, vec!["p1"]);
+        assert_eq!(r.discovery.known_coverage_pairs, 0);
+        assert_eq!(r.discovery.rate, None, "absent denominator, not a 0% rate");
+        assert!(!p.verified_effect);
     }
 
     #[test]
-    fn evidence_naming_a_non_artifact_is_invalid_not_resolved() {
-        // The old check tested only `scope`, so an EVENT could stand in for
-        // the artifact a finding claims as its evidence.
-        let mut tuples = verified_tuples();
-        tuples.push(json!({
-            "id": "ev-1", "category": "event", "scope": "repo", "identity": "something",
-            "instance": "x", "created_at": "2026-01-01T00:00:00Z", "payload": {}
-        }));
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert_eq!(exclusion_reasons(&report), vec!["invalid_source_evidence"]);
-        assert!(report.excluded[0].detail.contains("not an artifact"));
-    }
-
-    #[test]
-    fn evidence_with_a_non_string_member_is_rejected_explicitly() {
-        // The old `evidence_ids` silently filtered non-strings, so
-        // `["ev-1", 7]` looked like a clean one-item list.
-        let mut tuples = verified_tuples();
-        tuples[0]["payload"]["evidence"] = json!(["ev-1", 7]);
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert_eq!(exclusion_reasons(&report), vec!["invalid_source_evidence"]);
-        assert!(report.excluded[0].detail.contains("non-string member"));
-    }
-
-    #[test]
-    fn evidence_absent_from_the_capture_stays_unknown_rather_than_negative() {
-        let mut tuples = verified_tuples();
-        tuples[0]["payload"]["evidence"] = json!(["ev-missing"]);
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert!(report.excluded.is_empty(), "the opportunity still stands");
-        let p = only(&report);
-        assert_eq!(p.source_evidence, "unknown");
-        assert!(
-            !p.verified_effect,
-            "unknown evidence cannot certify an effect"
-        );
-        assert!(report
-            .unresolved_records
-            .iter()
-            .any(|u| u.reason.contains("ev-missing")));
-    }
-
-    #[test]
-    fn forged_assessment_not_authored_by_operator_is_not_trusted() {
-        let mut tuples = verified_tuples();
-        tuples[2]["instance"] = json!("consumer");
-        tuples[2]["payload"]["agent"] = json!("consumer");
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert_eq!(only(&report).assessed_verdict, None);
-        assert_eq!(report.mechanism.effects, 0);
-        assert!(report
-            .invalid_records
-            .iter()
-            .any(|i| i.kind == ASSESSMENT && i.reason.contains("operator-only")));
-    }
-
-    // ------------------------------------------------------------------
-    // Review finding 2: author exit.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn agent_exit_for_the_source_generation_credits_author_exit() {
-        let mut tuples = verified_tuples();
-        tuples.push(agent_exit(
-            "e1",
-            "author",
-            "author-gen",
-            "sess-1",
-            "TKT-source",
-            "2026-01-01T00:00:00Z",
-            "2026-01-01T18:00:00Z",
-            Some("completed"),
-        ));
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review_with_exit("p1", "e1")]),
-        )
-        .unwrap();
-        assert!(report.author_exit_unsupported.is_empty());
-        assert!(only(&report).author_terminal);
-        assert_eq!(report.author_exit_reuse, vec!["p1"]);
-        assert_eq!(report.mechanism.author_exit_effects, 1);
-    }
-
-    #[test]
-    fn harness_result_is_refused_as_author_exit_evidence() {
-        // FALSE POSITIVE: the old evaluator accepted `harness_result` as a
-        // "lifecycle-terminal identity". The supervisor emits it when the
-        // agent routes `rk done`, while the OS process is still alive and the
-        // provider may still report a later total.
-        let mut tuples = verified_tuples();
-        tuples.push(harness_result(
-            "h-author",
-            "author",
-            "author-gen",
-            "TKT-source",
-            "2026-01-01T18:00:00Z",
-        ));
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review_with_exit("p1", "h-author")]),
-        )
-        .unwrap();
-        assert!(!only(&report).author_terminal);
-        assert_eq!(report.author_exit_unsupported.len(), 1);
-        assert!(report.author_exit_unsupported[0]
-            .reason
-            .contains("still alive"));
-        assert_eq!(report.mechanism.author_exit_effects, 0);
-    }
-
-    #[test]
-    fn agent_lifecycle_is_refused_as_author_exit_evidence() {
-        // The old evaluator listed `agent_lifecycle` as terminal, but
-        // `emit_coordinator_event` writes no `spawn` field at all and its
-        // `change` may be `started` — it cannot identify a terminal
-        // generation even in principle.
-        let mut tuples = verified_tuples();
-        tuples.push(json!({
-            "id": "l1", "category": "event", "scope": "repo", "identity": "agent_lifecycle",
-            "instance": CASTLE, "created_at": "2026-01-01T18:00:00Z",
-            "payload": {
-                "route": "rollup", "severity": "info", "change": "started",
-                "summary": "author started", "agent": "author",
-                "generation": "2026-01-01T00:00:00Z", "declared_done": false
-            }
-        }));
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review_with_exit("p1", "l1")]),
-        )
-        .unwrap();
-        assert!(!only(&report).author_terminal);
-        assert!(report.author_exit_unsupported[0]
-            .reason
-            .contains("no `spawn` binding"));
-    }
-
-    #[test]
-    fn agent_exit_followed_by_a_relaunch_before_the_reuse_is_not_credited() {
-        // A manual respawn CONTINUES the same SpawnId, so an earlier exit is
-        // not proof the author was gone when the consumer decided.
-        let mut tuples = verified_tuples();
-        tuples.push(agent_exit(
-            "e1",
-            "author",
-            "author-gen",
-            "sess-1",
-            "TKT-source",
-            "2026-01-01T00:00:00Z",
-            "2026-01-01T06:00:00Z",
-            Some("completed"),
-        ));
-        tuples.push(json!({
-            "id": "s2", "category": "event", "scope": "repo", "identity": "agent_respawned",
-            "instance": CASTLE, "created_at": "2026-01-01T12:00:00Z",
-            "payload": {"agent": "author", "spawn": "author-gen", "task": "TKT-source",
-                        "role": "rat", "launched_at": "2026-01-01T12:00:00Z"}
-        }));
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review_with_exit("p1", "e1")]),
-        )
-        .unwrap();
-        assert!(!only(&report).author_terminal);
-        assert!(report.author_exit_unsupported[0]
-            .reason
-            .contains("running again"));
-    }
-
-    #[test]
-    fn agent_exit_for_another_generation_or_repo_or_after_the_reuse_is_not_credited() {
-        for (label, exit) in [
-            (
-                "wrong generation",
-                agent_exit(
-                    "e1",
-                    "author",
-                    "other-gen",
-                    "s",
-                    "TKT-source",
-                    "2026-01-01T00:00:00Z",
-                    "2026-01-01T06:00:00Z",
-                    Some("completed"),
-                ),
+    fn an_authored_record_is_itself_launch_evidence() {
+        // A generation that wrote a receipt demonstrably ran, so a pair with a
+        // real claim is never mis-reported as never-launched.
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
             ),
-            (
-                "after the reuse",
-                agent_exit(
-                    "e1",
-                    "author",
-                    "author-gen",
-                    "s",
-                    "TKT-source",
-                    "2026-01-01T00:00:00Z",
-                    "2026-01-05T00:00:00Z",
-                    Some("completed"),
-                ),
-            ),
-        ] {
-            let mut tuples = verified_tuples();
-            tuples.push(exit);
-            let report = compute(
-                &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-                &capture(tuples, Order::Unknown),
-                &reviews(vec![review_with_exit("p1", "e1")]),
-            )
-            .unwrap();
-            assert!(
-                !only(&report).author_terminal,
-                "{label} must not be credited"
-            );
-            assert_eq!(report.author_exit_unsupported.len(), 1, "{label}");
-        }
-        // A foreign-repo exit is dropped from the index by scope, so it is
-        // reported as "excluded from the frozen repo scope or window".
-        let mut tuples = verified_tuples();
-        let mut foreign = agent_exit(
-            "e1",
-            "author",
-            "author-gen",
-            "s",
-            "TKT-source",
-            "2026-01-01T00:00:00Z",
-            "2026-01-01T06:00:00Z",
-            Some("completed"),
-        );
-        foreign["scope"] = json!("other");
-        foreign["payload"]["repo"] = json!("other");
-        tuples.push(foreign);
-        let report = compute(
+            exposure("x1", "src-1", "gen-1", "2026-01-01T12:00:00Z"),
+        ];
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
             &capture(tuples, Order::Unknown),
-            &reviews(vec![review_with_exit("p1", "e1")]),
+            &[],
         )
         .unwrap();
-        assert!(
-            !only(&report).author_terminal,
-            "foreign repo must not be credited"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Review finding 3: scope, denominators, and the verified-reuse gate.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn fixture_pair_repo_must_match_its_batch_repo() {
-        // The old validation only checked that the batch id existed.
-        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
-        m.eligible_pairs[0].repo = "other".into();
-        let err = validate_manifest(&m).unwrap_err().to_string();
-        assert!(
-            err.contains("its batch batch-1 is declared for repo repo"),
-            "{err}"
-        );
+        assert!(only(&r).consumer_launched);
+        assert_eq!(only(&r).coverage_status, "prepared");
+        assert_eq!(r.discovery.prepared_native, 1);
     }
 
     #[test]
-    fn a_rejected_receipt_keeps_its_pair_in_the_eligible_denominator() {
-        // OMITTED DENOMINATOR: the old evaluator `continue`d past the pair on
-        // a wrong-generation claim, deleting a real opportunity from both the
-        // discovery and verified-reuse rates. A bad claim removes the CLAIM.
-        let mut tuples = verified_tuples();
-        tuples[1] = reuse(
-            "r1",
-            "src-1",
-            "TKT-1",
-            "someone-else",
-            "used",
-            "2026-01-02T00:00:00Z",
-        );
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert!(report.excluded.is_empty(), "the opportunity is not erased");
-        assert_eq!(report.eligible, 1);
-        assert_eq!(report.discovery.eligible_pairs, 1);
-        assert_eq!(report.claimed, 0);
-        assert_eq!(report.rejected_claims.len(), 1);
-        assert_eq!(report.rejected_claims[0].reason, "wrong_generation");
-        assert_eq!(report.verified_reuse.eligible_consumer_tasks, 1);
-        assert_eq!(report.verified_reuse.verified_used_or_adapted_tasks, 0);
-        assert_eq!(report.verified_reuse.rate, Some(0.0));
-    }
-
-    #[test]
-    fn duplicate_pair_is_counted_once_and_reported() {
-        let m = manifest(vec![
-            pair("p1", "src-1", "TKT-1", "gen-1"),
-            pair("p2", "src-1", "TKT-1", "gen-1"),
-        ]);
-        let report = compute(
-            &m,
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![review("p1"), review("p2")]),
-        )
-        .unwrap();
-        assert_eq!(
-            report.eligible, 1,
-            "a duplicate must not inflate the denominator"
-        );
-        assert_eq!(exclusion_reasons(&report), vec!["duplicate"]);
-    }
-
-    #[test]
-    fn self_use_and_future_source_are_still_refused() {
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "author-gen")]),
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert_eq!(exclusion_reasons(&report), vec!["self"]);
-
-        let mut tuples = verified_tuples();
-        tuples[0] = finding("src-1", "author-gen", "2026-01-09T00:00:00Z");
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert_eq!(report.rejected_claims[0].reason, "future_source");
-        assert_eq!(report.claimed, 0);
-    }
-
-    #[test]
-    fn verified_reuse_uses_the_same_gate_as_the_mechanism_goal() {
-        // The old per-task rate checked only outcome + verdict, so a pair the
-        // mechanism goal refused for unknown coverage still counted as
-        // verified reuse. The two can no longer disagree.
-        let mut tuples = verified_tuples();
-        tuples.remove(3); // drop the native exposure -> coverage unknown
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert_eq!(only(&report).coverage_status, "unknown");
-        assert_eq!(
-            report.outcome_classes.verified, 1,
-            "the verdict is still reported"
-        );
-        assert_eq!(report.verified_reuse.verified_used_or_adapted_tasks, 0);
-        assert_eq!(report.mechanism.effects, 0);
-        assert_eq!(report.unknown_coverage, vec!["p1"]);
-    }
-
-    #[test]
-    fn a_not_prepared_pair_cannot_be_a_verified_effect() {
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(
-                verified_tuples()
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != 3)
-                    .map(|(_, t)| t)
-                    .collect(),
-                Order::Unknown,
-            ),
-            &reviews(vec![Review {
-                coverage: Coverage::NotPrepared {
-                    evidence: ReviewedEvidence::Reference("telemetry-checked".into()),
-                },
-                ..review("p1")
-            }]),
-        )
-        .unwrap();
-        assert_eq!(only(&report).coverage_status, "not_prepared");
-        assert!(!only(&report).verified_effect);
-        assert_eq!(report.discovery.known_coverage_pairs, 1);
-        assert_eq!(report.discovery.rate, Some(0.0));
-    }
-
-    #[test]
-    fn operator_relayed_effect_is_verified_but_excluded_from_the_goal() {
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![Review {
-                relayed_by_operator: true,
-                ..review("p1")
-            }]),
-        )
-        .unwrap();
-        assert!(only(&report).verified_effect);
-        assert!(!only(&report).counts_as_effect);
-        assert_eq!(report.mechanism.effects, 0);
-    }
-
-    #[test]
-    fn ambiguous_assessment_order_is_not_silently_resolved_but_sequence_order_is() {
-        let mut tuples = verified_tuples();
-        tuples.push(assessment("a2", "r1", "incorrect", "2026-01-04T00:00:00Z"));
-        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
-        let r = reviews(vec![review("p1")]);
-
-        let unknown = compute(&m, &capture(tuples.clone(), Order::Unknown), &r).unwrap();
-        assert_eq!(unknown.ambiguous_assessments.len(), 1);
-        assert_eq!(only(&unknown).assessed_verdict, None);
-        assert_eq!(unknown.mechanism.effects, 0);
-
-        let ordered = compute(&m, &capture(tuples, Order::PersistenceSequence), &r).unwrap();
-        assert!(ordered.ambiguous_assessments.is_empty());
-        assert_eq!(
-            only(&ordered).assessed_verdict.as_deref(),
-            Some("incorrect")
-        );
-        assert_eq!(ordered.quality.incorrect_reuse, 1);
-    }
-
-    #[test]
-    fn truncated_capture_cannot_certify_the_mechanism_goal() {
-        let mut c = capture(verified_tuples(), Order::Unknown);
-        c.truncated = true;
-        let report = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &c,
-            &reviews(vec![review("p1")]),
-        )
-        .unwrap();
-        assert!(!report.mechanism.goal_met);
-        assert!(report.tuples_truncated);
-    }
-
-    #[test]
-    fn opens_are_reported_and_bound_to_the_consumer_generation() {
+    fn opens_are_bound_to_the_exact_consumer_generation() {
         let mut tuples = verified_tuples();
         tuples.push(open_record("o1", "src-1", "gen-1", "2026-01-01T13:00:00Z"));
         tuples.push(open_record(
@@ -4384,826 +3532,135 @@ mod tests {
             "other-gen",
             "2026-01-01T13:00:00Z",
         ));
-        let report = compute(
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
             &capture(tuples, Order::Unknown),
-            &reviews(vec![review("p1")]),
+            &[],
         )
         .unwrap();
-        assert!(only(&report).opened);
-        assert_eq!(
-            report.opened, 1,
-            "a different generation's open is not this pair's"
-        );
+        assert!(only(&r).opened);
+        assert_eq!(r.opened, 1, "another generation's open is not this pair's");
     }
 
     // ------------------------------------------------------------------
-    // Review finding 4: deliveries, cost segments and durations.
+    // Denominators and gate parity.
     // ------------------------------------------------------------------
 
     #[test]
-    fn a_frozen_task_with_no_pair_still_reports_its_costs_and_failures() {
-        // OMITTED DENOMINATOR: deliveries used to be derived from the pairs
-        // that survived evaluation, so a frozen task with no eligible source
-        // and no receipt vanished along with its spend and its failures.
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-lonely".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let mut failed = harness_result("h1", "rat", "gen-9", "TKT-lonely", "2026-01-02T00:00:00Z");
-        failed["payload"]["is_error"] = json!(true);
-        failed["payload"]["declared_done"] = json!(false);
-        let report = compute(&m, &capture(vec![failed], Order::Unknown), &reviews(vec![])).unwrap();
-        assert_eq!(report.eligible, 0);
-        assert_eq!(report.deliveries.len(), 1);
-        let d = &report.deliveries[0];
-        assert_eq!(d.task, "TKT-lonely");
-        assert_eq!(d.enrollment, "frozen_consumer_task");
-        assert_eq!(d.completions, 1);
-        assert_eq!(d.failed_completions, 1, "a failed attempt is retained");
-        assert_eq!(d.provisional_completion_cost_usd, Some(0.5));
-        assert_eq!(
-            d.reported_cost_estimate_usd, None,
-            "provisional is never final"
-        );
-        assert_eq!(d.cost_coverage, "missing");
-    }
-
-    #[test]
-    fn cumulative_results_within_one_segment_are_not_summed() {
-        // Provider `total_cost_usd` is CUMULATIVE within one query; the last
-        // reported total per segment is the amount.
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let tuples = vec![
-            final_usage(
-                "u1",
-                "gen-1",
-                "sess-1",
-                "ps-1",
-                "TKT-1",
-                "completed",
-                Some(3.0),
-                PROVIDER_COST_BASIS,
-                "2026-01-02T00:00:00Z",
-            ),
-            final_usage(
-                "u2",
-                "gen-1",
-                "sess-1",
-                "ps-1",
-                "TKT-1",
-                "completed",
-                Some(7.25),
-                PROVIDER_COST_BASIS,
-                "2026-01-02T01:00:00Z",
-            ),
-            agent_exit(
-                "e1",
-                "rat",
-                "gen-1",
-                "sess-1",
-                "TKT-1",
-                "2026-01-02T00:00:00Z",
-                "2026-01-02T02:00:00Z",
-                Some("completed"),
-            ),
-        ];
-        let report = compute(&m, &capture(tuples, Order::Unknown), &reviews(vec![])).unwrap();
-        let d = &report.deliveries[0];
-        assert_eq!(d.cost_coverage, "complete");
-        assert_eq!(
-            d.reported_cost_estimate_usd,
-            Some(7.25),
-            "last total, not 10.25"
-        );
-        assert_eq!(d.reported_cost_basis.as_deref(), Some(PROVIDER_COST_BASIS));
-        assert_eq!(d.process_lifetime_ms, Some(2 * 60 * 60 * 1000));
-        assert_eq!(
-            d.active_work_ms, None,
-            "process lifetime is not active work"
-        );
-        assert!(d.active_work_coverage.contains("unknown"));
-    }
-
-    #[test]
-    fn two_provider_segments_of_one_launch_are_summed_but_a_second_launch_is_its_own_segment() {
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let tuples = vec![
-            final_usage(
-                "u1",
-                "gen-1",
-                "sess-1",
-                "ps-1",
-                "TKT-1",
-                "completed",
-                Some(2.0),
-                PROVIDER_COST_BASIS,
-                "2026-01-02T00:00:00Z",
-            ),
-            final_usage(
-                "u2",
-                "gen-1",
-                "sess-2",
-                "ps-2",
-                "TKT-1",
-                "completed",
-                Some(3.0),
-                PROVIDER_COST_BASIS,
-                "2026-01-02T03:00:00Z",
-            ),
-            agent_exit(
-                "e1",
-                "rat",
-                "gen-1",
-                "sess-1",
-                "TKT-1",
-                "2026-01-02T00:00:00Z",
-                "2026-01-02T01:00:00Z",
-                Some("completed"),
-            ),
-            agent_exit(
-                "e2",
-                "rat",
-                "gen-1",
-                "sess-2",
-                "TKT-1",
-                "2026-01-02T02:00:00Z",
-                "2026-01-02T04:00:00Z",
-                Some("completed"),
-            ),
-        ];
-        let report = compute(&m, &capture(tuples, Order::Unknown), &reviews(vec![])).unwrap();
-        let d = &report.deliveries[0];
-        assert_eq!(d.reported_cost_estimate_usd, Some(5.0));
-        assert_eq!(d.launches, 2, "one SpawnId, two physical launches");
-        assert_eq!(d.generations.len(), 1);
-        assert_eq!(d.generations[0].cost_segments.len(), 2);
-    }
-
-    #[test]
-    fn paused_result_then_more_work_then_a_kill_leaves_the_cost_unknown() {
-        // The acceptance edge case: a `paused` provider result can be followed
-        // by more usage and then a budget kill with no further result. The
-        // earlier cumulative total is a partial amount, not final cost —
-        // finality is NOT inferred from finding any result before an exit.
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let mut killed = agent_exit(
-            "e1",
-            "rat",
-            "gen-1",
-            "sess-1",
-            "TKT-1",
-            "2026-01-02T00:00:00Z",
-            "2026-01-02T05:00:00Z",
-            Some("running"),
-        );
-        killed["payload"]["exit_code"] = Value::Null;
-        killed["payload"]["crashed"] = json!(true);
-        let tuples = vec![
-            final_usage(
-                "u1",
-                "gen-1",
-                "sess-1",
-                "ps-1",
-                "TKT-1",
-                "paused",
-                Some(4.5),
-                PROVIDER_COST_BASIS,
-                "2026-01-02T01:00:00Z",
-            ),
-            killed,
-        ];
-        let report = compute(&m, &capture(tuples, Order::Unknown), &reviews(vec![])).unwrap();
-        let d = &report.deliveries[0];
-        assert_eq!(
-            d.reported_cost_estimate_usd, None,
-            "a partial amount is not a total"
-        );
-        assert_eq!(d.partial_reported_usd, Some(4.5));
-        assert_eq!(d.cost_coverage, "partial");
-        assert!(d.unknown_cost.iter().any(|u| u.contains("not terminal")));
-        assert!(!d.generations[0].cost_segments[0].final_cost);
-    }
-
-    #[test]
-    fn a_terminal_result_with_no_observed_exit_is_not_final_either() {
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let tuples = vec![final_usage(
-            "u1",
-            "gen-1",
-            "sess-1",
-            "ps-1",
-            "TKT-1",
-            "completed",
-            Some(1.5),
-            PROVIDER_COST_BASIS,
-            "2026-01-02T01:00:00Z",
-        )];
-        let report = compute(&m, &capture(tuples, Order::Unknown), &reviews(vec![])).unwrap();
-        let d = &report.deliveries[0];
-        assert_eq!(d.reported_cost_estimate_usd, None);
-        assert!(d
-            .unknown_cost
-            .iter()
-            .any(|u| u.contains("no agent_exit observed")));
-        assert_eq!(
-            d.process_lifetime_ms, None,
-            "never invented from a result time"
-        );
-    }
-
-    #[test]
-    fn a_daemon_priced_segment_is_never_pooled_with_a_provider_total() {
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let tuples = vec![
-            final_usage(
-                "u1",
-                "gen-1",
-                "sess-1",
-                "ps-1",
-                "TKT-1",
-                "completed",
-                Some(2.0),
-                DAEMON_COST_BASIS,
-                "2026-01-02T00:00:00Z",
-            ),
-            agent_exit(
-                "e1",
-                "rat",
-                "gen-1",
-                "sess-1",
-                "TKT-1",
-                "2026-01-02T00:00:00Z",
-                "2026-01-02T01:00:00Z",
-                Some("completed"),
-            ),
-        ];
-        let report = compute(&m, &capture(tuples, Order::Unknown), &reviews(vec![])).unwrap();
-        let d = &report.deliveries[0];
-        assert_eq!(d.reported_cost_estimate_usd, None);
-        assert_eq!(d.daemon_priced_estimate_usd, Some(2.0));
-        assert_eq!(d.cost_coverage, "partial");
-    }
-
-    #[test]
-    fn a_null_reported_cost_is_unknown_not_zero() {
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let tuples = vec![
-            final_usage(
-                "u1",
-                "gen-1",
-                "sess-1",
-                "ps-1",
-                "TKT-1",
-                "completed",
-                None,
-                "unknown",
-                "2026-01-02T00:00:00Z",
-            ),
-            agent_exit(
-                "e1",
-                "rat",
-                "gen-1",
-                "sess-1",
-                "TKT-1",
-                "2026-01-02T00:00:00Z",
-                "2026-01-02T01:00:00Z",
-                Some("completed"),
-            ),
-        ];
-        let report = compute(&m, &capture(tuples, Order::Unknown), &reviews(vec![])).unwrap();
-        let d = &report.deliveries[0];
-        assert_eq!(d.reported_cost_estimate_usd, None);
-        assert_eq!(d.partial_reported_usd, None);
-        assert!(d.unknown_cost.iter().any(|u| u.contains("null")));
-    }
-
-    #[test]
-    fn phase_durations_are_bucketed_and_acceptance_needs_delivery_closure() {
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let merge_only = vec![
-            span("s1", "TKT-1", "agent_launched", 1_000, Some(250)),
-            span("s2", "TKT-1", "verification", 5_000, Some(700)),
-            span("s3", "TKT-1", "attention_hold", 9_000, None),
-            span("s4", "TKT-1", "rework", 400, None),
-            span("s5", "TKT-1", "merge", 100, None),
-        ];
-        let report = compute(
-            &m,
-            &capture(merge_only.clone(), Order::Unknown),
-            &reviews(vec![]),
-        )
-        .unwrap();
-        let d = &report.deliveries[0];
-        assert_eq!(
-            d.phase_ms.work_phases_ms,
-            Some(1_500),
-            "launch+rework+merge only"
-        );
-        assert_eq!(
-            d.phase_ms.verification_ms,
-            Some(5_700),
-            "duration plus its own queue"
-        );
-        assert_eq!(d.phase_ms.attention_hold_ms, Some(9_000));
-        assert_eq!(d.phase_ms.queue_wait_ms, Some(250));
-        assert_eq!(d.accepted, None, "a merge alone does not prove acceptance");
-        assert_eq!(report.quality.attention_hold_spans, 1);
-        assert_eq!(report.quality.rework_spans, 1);
-
-        let mut closed = merge_only;
-        closed.push(span("s6", "TKT-1", "delivery_closure", 10, None));
-        let report = compute(&m, &capture(closed, Order::Unknown), &reviews(vec![])).unwrap();
-        assert_eq!(report.deliveries[0].accepted, Some(true));
-        assert_eq!(
-            report.deliveries[0].acceptance_evidence.as_deref(),
-            Some("s6")
-        );
-    }
-
-    #[test]
-    fn spans_from_another_repo_do_not_merge_into_a_same_named_task() {
-        // `build_critical_path` dedups on (phase, attempt) and does NOT filter
-        // by scope, so the caller has to pre-filter or two repos' identically
-        // named tasks silently merge.
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let mut foreign = span("s-foreign", "TKT-1", "delivery_closure", 10, None);
-        foreign["scope"] = json!("other");
-        let report = compute(
-            &m,
-            &capture(vec![foreign], Order::Unknown),
-            &reviews(vec![]),
-        )
-        .unwrap();
-        assert_eq!(report.deliveries[0].accepted, None);
-        assert_eq!(report.capture.observations_out_of_scope_repo, 1);
-        assert_eq!(report.tasks_without_native_records, vec!["repo/TKT-1"]);
-    }
-
-    // ------------------------------------------------------------------
-    // Review finding 5: reviewed annotations kept apart from telemetry.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn reviewed_prepared_coverage_is_labelled_reviewed_not_native() {
-        let tuples: Vec<Value> = verified_tuples()
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| *i != 3)
-            .map(|(_, t)| t)
-            .collect();
-        let report = compute(
+    fn native_and_reviewed_prepared_coverage_stay_distinguishable() {
+        // Merging them made an operator's note indistinguishable from a daemon
+        // observation.
+        let mut tuples = verified_tuples();
+        tuples.remove(3); // no native exposure
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
             &capture(tuples, Order::Unknown),
-            &reviews(vec![review_reviewed_prepared("p1", "operator-notebook-p3")]),
+            &[review_no_exit("p1")],
         )
         .unwrap();
-        let p = only(&report);
+        let p = only(&r);
         assert_eq!(p.coverage_status, "prepared");
         assert_eq!(p.coverage_provenance, "reviewed");
         assert_eq!(
             p.coverage_reference_resolved,
             Some(false),
-            "labelled, not silently trusted"
+            "an operator reference that is not a captured tuple is labelled, not trusted"
         );
-        assert_eq!(report.presented_native, 0);
-        assert_eq!(report.presented_reviewed, 1);
-        assert_eq!(report.discovery.prepared_native, 0);
-        assert_eq!(report.discovery.prepared_reviewed, 1);
+        assert_eq!(r.presented_native, 0);
+        assert_eq!(r.presented_reviewed, 1);
+        assert_eq!(r.discovery.prepared_native, 0);
+        assert_eq!(r.discovery.prepared_reviewed, 1);
     }
 
     #[test]
-    fn a_blank_reviewed_reference_is_rejected() {
-        let err = compute(
+    fn verified_reuse_uses_the_same_gate_as_the_mechanism_goal() {
+        // The previous per-task rate checked only outcome + verdict, so a pair
+        // the mechanism goal refused for unknown coverage still counted as
+        // verified reuse. The two can no longer disagree.
+        let mut tuples = verified_tuples();
+        tuples.remove(3); // drop the native exposure -> coverage unknown
+        let r = compute(
             &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![review_reviewed_prepared("p1", "   ")]),
+            &capture(tuples, Order::Unknown),
+            &[],
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("must not be blank"), "{err}");
+        .unwrap();
+        assert_eq!(only(&r).coverage_status, "unknown");
+        assert_eq!(
+            r.outcome_classes.verified, 1,
+            "the verdict is still reported"
+        );
+        assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, 0);
+        assert_eq!(r.mechanism.effects, 0);
+        assert_eq!(r.unknown_coverage, vec!["p1"]);
     }
 
     #[test]
-    fn a_reviewed_annotation_cannot_smuggle_an_invented_time_saving() {
-        // `deny_unknown_fields` makes an invented measurement a hard input
-        // error rather than a silently-ignored key.
-        let err = serde_json::from_value::<ReviewedAnnotation>(json!({
-            "kind": "operator-steer",
-            "reference": "01M2...",
-            "time_saved_ms": 900000
-        }))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("time_saved_ms"), "{err}");
-    }
-
-    #[test]
-    fn reviewed_interventions_supplement_attention_hold_spans_as_a_lower_bound() {
-        // An `attention_hold` count is NOT every intervention.
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
+    fn a_not_prepared_pair_is_a_known_denominator_but_never_an_effect() {
+        let mut tuples = verified_tuples();
+        tuples.remove(3);
+        let r = compute(
+            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+            &capture(tuples, Order::Unknown),
+            &[Review {
+                coverage: Coverage::NotPrepared {
+                    evidence: "telemetry-checked".into(),
+                },
+                ..review_no_exit("p1")
             }],
-            Window::default(),
-        );
-        let file: ReviewsFile = serde_json::from_value(json!({
-            "pairs": [],
-            "tasks": [{
-                "task": "TKT-1",
-                "repo": "repo",
-                "interventions": [
-                    {"kind": "operator-steer", "reference": "x1", "note": "re-scoped by hand"}
-                ],
-                "repeated_investigations": [
-                    {"kind": "repeat-investigation", "reference": "x2"}
-                ]
-            }]
-        }))
-        .unwrap();
-        let report = compute(
-            &m,
-            &capture(
-                vec![span("s3", "TKT-1", "attention_hold", 5, None)],
-                Order::Unknown,
-            ),
-            &file,
         )
         .unwrap();
-        assert_eq!(report.quality.attention_hold_spans, 1);
-        assert_eq!(report.quality.reviewed_interventions.len(), 1);
-        assert_eq!(report.quality.interventions_known, 2);
-        assert!(report
-            .quality
-            .interventions_coverage
-            .contains("lower bound"));
-        assert_eq!(report.quality.repeated_investigations.len(), 1);
-        assert!(!report.quality.repeated_investigations[0].reference_resolved);
+        assert_eq!(only(&r).coverage_status, "not_prepared");
+        assert!(!only(&r).verified_effect);
+        assert_eq!(r.discovery.known_coverage_pairs, 1);
+        assert_eq!(r.discovery.rate, Some(0.0));
     }
 
     #[test]
-    fn a_task_annotation_cannot_introduce_unfrozen_scope() {
-        let file: ReviewsFile = serde_json::from_value(json!({
-            "pairs": [],
-            "tasks": [{"task": "TKT-not-frozen", "repo": "repo"}]
-        }))
-        .unwrap();
-        let err = compute(&manifest(vec![]), &capture(vec![], Order::Unknown), &file)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not frozen"), "{err}");
-    }
-
-    // ------------------------------------------------------------------
-    // Input shapes and enrollment.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn parses_bare_array_scan_object_and_capture_envelope() {
-        assert_eq!(
-            parse_tuple_capture(&json!([])).unwrap().order,
-            Order::Unknown
-        );
-        let scan = parse_tuple_capture(&json!({"tuples": [], "truncated": true})).unwrap();
-        assert_eq!(
-            scan.order,
-            Order::Unknown,
-            "scan order is never persistence order"
-        );
-        assert!(scan.truncated);
-        let env = parse_tuple_capture(&json!({
-            "schema_version": 1, "order": "persistence_sequence",
-            "source": "space.persistence_delta", "tuples": []
-        }))
-        .unwrap();
-        assert_eq!(env.order, Order::PersistenceSequence);
-        assert_eq!(env.source.as_deref(), Some("space.persistence_delta"));
-        assert!(parse_tuple_capture(&json!({"rows": []})).is_err());
+    fn rates_are_unknown_rather_than_zero_when_there_is_no_denominator() {
+        let r = compute(&manifest(vec![]), &capture(vec![], Order::Unknown), &[]).unwrap();
+        assert_eq!(r.discovery.rate, None);
+        assert_eq!(r.verified_reuse.rate, None);
+        let text = render(&r);
+        assert!(text.contains("unknown (no denominator)"), "{text}");
+        assert!(text.contains("evaluator_version=2"), "{text}");
     }
 
     #[test]
-    fn rejects_wrong_schema_version_and_unknown_manifest_fields() {
-        let mut m = manifest(vec![]);
-        m.schema_version = 2;
-        assert!(validate_manifest(&m).is_err());
+    fn a_misspelled_manifest_field_is_an_input_error_not_a_silent_default() {
+        // This is how `window` came to be unenforced in the first place.
         let err = serde_json::from_value::<Manifest>(json!({
-            "schema_version": 1, "experiment_id": "e", "batches": [],
+            "schema_version": 1, "experiment_id": "e",
+            "batches": [{"id": "b", "arm": "real", "repo": "repo"}],
             "windwo": {"since": "2026-01-01T00:00:00Z"}
         }))
         .unwrap_err()
         .to_string();
-        assert!(
-            err.contains("windwo"),
-            "a misspelled window must not be ignored: {err}"
-        );
+        assert!(err.contains("windwo"), "{err}");
     }
 
     #[test]
-    fn live_enrollment_mints_a_pair_bound_to_frozen_scope_only() {
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let declares = PairDeclaration {
-            source: "src-1".into(),
-            consumer_task: "TKT-1".into(),
-            consumer_generation: "gen-1".into(),
+    fn manifest_rejects_a_backwards_window_and_duplicate_frozen_tasks() {
+        let mut m = manifest(vec![]);
+        m.window = Window {
+            since: Some("2026-02-01T00:00:00Z".parse().unwrap()),
+            until: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+        };
+        assert!(validate_manifest(&m)
+            .unwrap_err()
+            .to_string()
+            .contains("after"));
+
+        let mut m = manifest(vec![]);
+        let scope = ConsumerTaskScope {
+            task: "TKT-1".into(),
             repo: "repo".into(),
             batch: "batch-1".into(),
         };
-        let report = compute(
-            &m,
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![Review {
-                declares: Some(declares.clone()),
-                ..review("live-1")
-            }]),
-        )
-        .unwrap();
-        assert_eq!(report.eligible, 1);
-        assert_eq!(only(&report).pair, "live-1");
-
-        // A task outside frozen scope cannot be enrolled retrospectively.
-        let mut bad = declares;
-        bad.consumer_task = "TKT-elsewhere".into();
-        assert!(compute(
-            &m,
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![Review {
-                declares: Some(bad),
-                ..review("live-2")
-            }]),
-        )
-        .is_err());
-
-        // A review may add evidence to a predeclared pair but never redeclare it.
-        let pm = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
-        assert!(compute(
-            &pm,
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![Review {
-                declares: Some(PairDeclaration {
-                    source: "src-1".into(),
-                    consumer_task: "TKT-1".into(),
-                    consumer_generation: "other".into(),
-                    repo: "repo".into(),
-                    batch: "batch-1".into(),
-                }),
-                ..review("p1")
-            }]),
-        )
-        .is_err());
-        // ...and a pair nobody froze is refused outright.
-        assert!(compute(
-            &pm,
-            &capture(verified_tuples(), Order::Unknown),
-            &reviews(vec![review("ghost")]),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn mechanism_goal_needs_three_effects_across_two_batches_with_one_author_exit() {
-        let mut m = manifest(vec![]);
-        m.batches.push(Batch {
-            id: "batch-2".into(),
-            arm: "real".into(),
-            repo: "repo".into(),
-        });
-        let mut tuples = vec![];
-        let mut pairs = vec![];
-        let mut rs = vec![];
-        for (n, batch) in [(1, "batch-1"), (2, "batch-1"), (3, "batch-2")] {
-            let src = format!("src-{n}");
-            let gen = format!("gen-{n}");
-            let task = format!("TKT-{n}");
-            tuples.push(finding_in(
-                &src,
-                &format!("author-{n}"),
-                &format!("agen-{n}"),
-                "2026-01-01T00:00:00Z",
-                "repo",
-            ));
-            tuples.push(reuse(
-                &format!("r{n}"),
-                &src,
-                &task,
-                &gen,
-                "used",
-                "2026-01-02T00:00:00Z",
-            ));
-            tuples.push(assessment(
-                &format!("a{n}"),
-                &format!("r{n}"),
-                "verified",
-                "2026-01-03T00:00:00Z",
-            ));
-            tuples.push(exposure(
-                &format!("x{n}"),
-                &src,
-                &gen,
-                "2026-01-01T12:00:00Z",
-            ));
-            tuples.push(harness_result(
-                &format!("h{n}"),
-                "consumer",
-                &gen,
-                &task,
-                "2026-01-02T01:00:00Z",
-            ));
-            pairs.push(EligiblePair {
-                id: format!("p{n}"),
-                source: src,
-                consumer_task: task,
-                consumer_generation: gen,
-                repo: "repo".into(),
-                batch: batch.into(),
-            });
-            rs.push(review(&format!("p{n}")));
-        }
-        // Only the third author is proven to have physically exited.
-        tuples.push(agent_exit(
-            "e3",
-            "author-3",
-            "agen-3",
-            "sess-3",
-            "TKT-source",
-            "2026-01-01T00:00:00Z",
-            "2026-01-01T06:00:00Z",
-            Some("completed"),
-        ));
-        rs[2] = review_with_exit("p3", "e3");
-        m.eligible_pairs = pairs;
-        let report = compute(&m, &capture(tuples, Order::Unknown), &reviews(rs)).unwrap();
-        assert_eq!(report.mechanism.effects, 3);
-        assert_eq!(report.mechanism.batches, 2);
-        assert_eq!(report.mechanism.author_exit_effects, 1);
-        assert!(report.mechanism.goal_met);
-        assert_eq!(report.verified_reuse.verified_used_or_adapted_tasks, 3);
-        assert_eq!(report.verified_reuse.rate, Some(1.0));
-    }
-
-    #[test]
-    fn render_reports_unknowns_as_unknown_rather_than_zero() {
-        let report = compute(
-            &manifest(vec![]),
-            &capture(vec![], Order::Unknown),
-            &reviews(vec![]),
-        )
-        .unwrap();
-        let text = render(&report);
-        assert!(text.contains("unknown (no denominator)"), "{text}");
-        assert!(text.contains("evaluator_version=2"));
-        assert_eq!(report.discovery.rate, None);
-        assert_eq!(report.verified_reuse.rate, None);
-    }
-
-    // ------------------------------------------------------------------
-    // Review finding 6: replay against a real native producer.
-    // ------------------------------------------------------------------
-
-    /// Drives the COMMITTED `task_span` producer
-    /// (`rk_daemon::span::record_phase_span`) against a real in-memory
-    /// `Space`, reads the rows back out, and feeds the resulting wire tuples
-    /// straight into `compute`. Nothing here transcribes a field name by
-    /// hand, so a producer-side rename breaks this test instead of silently
-    /// zeroing a metric.
-    ///
-    /// LIMITATION, stated rather than hidden: only `task_span` has a producer
-    /// reachable from this crate today. `harness_result` lives behind the
-    /// supervisor, and `exposure`/`open`/`agent_exit`/`agent_final_usage` have
-    /// no committed producer on `main` at all, so their field compatibility is
-    /// still established only against S2's published contract. The combined
-    /// real-CLI `rk bbs export | rk bbs report` replay belongs to S2/S4.
-    #[test]
-    fn native_task_span_producer_replays_directly_into_the_report() {
-        use rk_daemon::span::{Phase, PhaseSpan};
-        use rk_space::Space;
-
-        let space = Space::open_in_memory().unwrap();
-        // Anchor every span to one fixed instant so the wire payload — and so
-        // this test — is deterministic.
-        let now: DateTime<Utc> = "2026-01-02T00:00:00Z".parse().unwrap();
-        for (phase, dur) in [
-            (Phase::AgentLaunched, 1_000u64),
-            (Phase::VerificationQueued, 5_000),
-            (Phase::AttentionHold, 9_000),
-            (Phase::DeliveryClosure, 10),
-        ] {
-            let span =
-                PhaseSpan::from_durations("TKT-native", phase, None, Some(dur), now).repo("repo");
-            assert!(rk_daemon::span::record_phase_span(&space, "repo", CASTLE, &span).unwrap());
-        }
-        let rows: Vec<Value> = space
-            .scan(
-                &rk_core::tuple::Pattern::category(rk_core::tuple::Category::Event)
-                    .identity(rk_daemon::span::SPAN_IDENTITY)
-                    .scope("repo"),
-            )
-            .unwrap()
-            .iter()
-            .map(|t| serde_json::to_value(t).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 4, "the real producer wrote four spans");
-
-        let m = manifest_with(
-            vec![],
-            vec![ConsumerTaskScope {
-                task: "TKT-native".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            Window::default(),
-        );
-        let report = compute(&m, &capture(rows, Order::Unknown), &reviews(vec![])).unwrap();
-        let d = &report.deliveries[0];
-        assert_eq!(d.task, "TKT-native");
-        assert_eq!(
-            d.phase_ms.work_phases_ms,
-            Some(1_010),
-            "agent_launched + delivery_closure, read off real producer rows"
-        );
-        assert_eq!(d.phase_ms.verification_ms, Some(5_000));
-        assert_eq!(d.phase_ms.attention_hold_ms, Some(9_000));
-        assert_eq!(d.accepted, Some(true));
-        assert_eq!(report.quality.attention_hold_spans, 1);
-        assert!(report.tasks_without_native_records.is_empty());
+        m.consumer_tasks = vec![scope.clone(), scope];
+        assert!(validate_manifest(&m)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate consumer_tasks"));
     }
 }

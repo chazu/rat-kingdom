@@ -1,4 +1,4 @@
-use crate::bbs_report::{self, Manifest, ReviewsFile};
+use crate::bbs_report::{self, Manifest, Review};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use rk_core::bbs::Briefing;
@@ -317,10 +317,8 @@ fn run_report(args: ReportArgs, as_json: bool) -> Result<()> {
     let tuples_raw = read_json(&args.tuples, "tuples")?;
     let capture = bbs_report::parse_tuple_capture(&tuples_raw)?;
     let reviews_raw = read_json(&args.reviews, "reviews")?;
-    let reviews: ReviewsFile = serde_json::from_value(reviews_raw).context(
-        "reviews file does not match the expected schema (a JSON array of pair reviews, or an \
-         object with `pairs` and `tasks`)",
-    )?;
+    let reviews: Vec<Review> = serde_json::from_value(reviews_raw)
+        .context("reviews file does not match the expected schema (must be a JSON array)")?;
 
     let report = bbs_report::compute(&manifest, &capture, &reviews)?;
     let value = bbs_report::to_json(&report);
