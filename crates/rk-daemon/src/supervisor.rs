@@ -575,6 +575,50 @@ fn scope_json(spent: f64, cap: f64, warn_at: f64, repo: Option<String>) -> serde
     obj
 }
 
+/// What one physical launch has been observed to do, for cost/exit
+/// measurement only.
+///
+/// The question this answers is the one the operator flagged: a `Paused`
+/// provider result can be followed by MORE model usage and then a budget kill
+/// with no further result. The earlier cumulative total is then a reported
+/// PARTIAL amount, not this launch's final cost, and finality must not be
+/// inferred merely from finding some result before an exit.
+#[derive(Debug, Clone)]
+struct AttemptWatch {
+    /// The launch this watch belongs to. A stale session's events are ignored
+    /// rather than merged into the live launch's measurement.
+    session: rk_core::id::SpawnId,
+    launched_at: DateTime<Utc>,
+    /// Any result at all has been reported for this launch.
+    saw_result: bool,
+    /// Model usage has been observed SINCE the last reported result, so that
+    /// result's total no longer covers everything this launch did.
+    usage_since_result: bool,
+}
+
+/// How completely the last reported cost covers a finished launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CostCoverage {
+    /// A result was reported and no further usage followed it.
+    Final,
+    /// A result was reported but more model usage ran past it and the launch
+    /// then ended without another result: the known total is a partial amount
+    /// and the remainder is UNKNOWN, not zero.
+    PartialUnknown,
+    /// No result was ever reported for this launch.
+    None,
+}
+
+impl CostCoverage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::PartialUnknown => "partial_unknown",
+            Self::None => "none",
+        }
+    }
+}
+
 pub struct Supervisor {
     layout: Layout,
     castle: String,
@@ -595,6 +639,11 @@ pub struct Supervisor {
     /// that actually changes across a respawn instead of a stale check with
     /// stale data.
     session_tokens: Mutex<HashMap<String, rk_core::id::SpawnId>>,
+    /// Per-launch measurement watch, keyed by agent name and fenced on the
+    /// session token. Exists so an exit can say whether the last reported cost
+    /// was actually FINAL for the launch, or only a partial total that further
+    /// model work ran past. Measurement only: nothing here gates lifecycle.
+    attempts: Mutex<HashMap<String, AttemptWatch>>,
     space: Space,
     /// Shared with the server so ticket-lifecycle writes serialize on one lock.
     tickets: Arc<crate::tickets::Tickets>,
@@ -1067,6 +1116,7 @@ impl Supervisor {
             registry: Mutex::new(registry),
             controls: Mutex::new(HashMap::new()),
             session_tokens: Mutex::new(HashMap::new()),
+            attempts: Mutex::new(HashMap::new()),
             space,
             tickets,
             pricing,
@@ -2638,6 +2688,16 @@ impl Supervisor {
             }
             HarnessEvent::Usage { usage } => {
                 let real_usage = usage.total() > 0;
+                // Model work after a reported result means that result's total
+                // no longer covers this launch. Fenced to the live session so
+                // a stale launch's late event cannot dirty the active one.
+                if real_usage {
+                    if let Some(watch) = self.lock_attempts().get_mut(name) {
+                        if watch.session == session && watch.saw_result {
+                            watch.usage_since_result = true;
+                        }
+                    }
+                }
                 let updated = self.lock_registry().update(name, |r| {
                     r.usage.add(&usage);
                     // Incremental cost for harnesses that don't self-report
@@ -2711,7 +2771,7 @@ impl Supervisor {
                     // call, exactly once) is untouched — this only updates the
                     // live `agent.status` view.
                     let completed_via_reconcile = pre.state == AgentState::Completed;
-                    let _ = self.lock_registry().update(name, |r| {
+                    let merged = self.lock_registry().update(name, |r| {
                         if completed_via_reconcile {
                             r.result = Some(result.clone());
                         }
@@ -2726,6 +2786,25 @@ impl Supervisor {
                             r.session_id = session_id.clone();
                         }
                     });
+                    // This path exists precisely because the disposition was
+                    // decided elsewhere — a budget stop, or `rk done` already
+                    // routed by `reconcile_task_done`. That is exactly the
+                    // done-before-final-result case: the completion is already
+                    // published and THIS is the later, authoritative total. It
+                    // must be observed, or the only surviving cost record is
+                    // the provisional one.
+                    if let Ok(Some(record)) = merged {
+                        let state = if completed_via_reconcile {
+                            "completed"
+                        } else {
+                            "stopped"
+                        };
+                        self.observe_final_usage(
+                            &record, session, cost_usd, &usage, state,
+                            completed_via_reconcile,
+                        );
+                        self.note_result(name, session);
+                    }
                     return;
                 }
                 let claim = self.claim_completion(
@@ -2760,6 +2839,24 @@ impl Supervisor {
                     }
                 });
                 if let Ok(Some(record)) = updated {
+                    // Observed for BOTH dispositions. A `Paused` withheld turn
+                    // is a reported result too, and it is the one the partial-
+                    // cost case hinges on: more usage may follow it and the
+                    // launch may then be killed without another result.
+                    self.observe_final_usage(
+                        &record,
+                        session,
+                        cost_usd,
+                        &record.usage,
+                        match record.state {
+                            AgentState::Completed => "completed",
+                            AgentState::Failed => "failed",
+                            AgentState::Paused => "paused",
+                            _ => "unknown",
+                        },
+                        claim.declared_done,
+                    );
+                    self.note_result(name, session);
                     if claim.publish {
                         info!(agent = name, is_error, "agent completed");
                         self.route_completion(&record, is_error, claim.declared_done, diff);
@@ -2784,6 +2881,13 @@ impl Supervisor {
             }
             HarnessEvent::Exited { code } => {
                 let diff = self.diff_summary_for(name);
+                // Read BEFORE the update below terminalizes the record, so the
+                // exit observation can report what this launch was doing when
+                // it died rather than the state the exit itself produced.
+                let pre_exit_state = self
+                    .status(name)
+                    .map(|r| r.state)
+                    .unwrap_or(AgentState::Failed);
                 self.lock_controls().remove(name);
                 // The harness process behind this generation is provably
                 // gone — clean exit, crash, or kill alike. Any `verify.run`
@@ -2897,6 +3001,55 @@ impl Supervisor {
                 // did declare done never reaches here at all — `claim_completion`
                 // published its turn when it ended — which is what keeps this
                 // from collapsing into "every fake-harness agent fails".
+                // Physical exit for THIS launch. Emitted before the withheld-
+                // completion flush below so the exit fact is durable even if
+                // that routing fails, and deliberately NOT fenced on the live
+                // session token: a superseded launch's exit is still a true
+                // fact about that launch, and the record names the session it
+                // belongs to. (The recovery fence above stays session-fenced,
+                // because that one WRITES active generation state.)
+                if let Ok(Some(record)) = &updated {
+                    let watch = self.lock_attempts().get(name).cloned();
+                    let stale = watch.as_ref().is_some_and(|w| w.session != session);
+                    let coverage = match &watch {
+                        // A result was reported and nothing ran past it.
+                        Some(w) if w.session == session && w.saw_result && !w.usage_since_result => {
+                            CostCoverage::Final
+                        }
+                        // A result was reported but more model work followed
+                        // and the launch ended without another result: the
+                        // known total is PARTIAL and the rest stays unknown.
+                        Some(w) if w.session == session && w.saw_result => {
+                            CostCoverage::PartialUnknown
+                        }
+                        Some(w) if w.session == session => CostCoverage::None,
+                        // No watch, or a stale one: finality is not knowable
+                        // and must not be assumed from the presence of a result.
+                        _ => CostCoverage::None,
+                    };
+                    let capture = crate::bbs::record_exit(
+                        &self.space,
+                        &self.castle,
+                        &self.attempt_binding(record, session),
+                        code,
+                        record.crashed,
+                        &format!("{:?}", pre_exit_state).to_lowercase(),
+                        watch.as_ref().map(|w| w.launched_at.to_rfc3339()),
+                        coverage.as_str(),
+                        stale,
+                    );
+                    if capture.is_failed() {
+                        warn!(
+                            agent = name,
+                            "exit observation failed; the generation is unaffected and coverage is reported missing"
+                        );
+                    }
+                    // Only the live launch's watch is retired; a stale event
+                    // must not evict the active launch's measurement.
+                    if !stale {
+                        self.lock_attempts().remove(name);
+                    }
+                }
                 if let Ok(Some(record)) = updated {
                     if self.flush_withheld_completion(name, generation) {
                         info!(
@@ -3225,6 +3378,100 @@ impl Supervisor {
             }
             if floor_usage.total() > usage.total() {
                 *usage = floor_usage;
+            }
+        }
+    }
+
+    /// Bind one observation to the exact attempt it describes.
+    ///
+    /// `spawn` is the generation and `session` is the physical launch; a
+    /// manual respawn keeps the same `spawn`, so only the PAIR identifies an
+    /// attempt. `provider_session` is the harness's own id, a third identity
+    /// recorded beside them and never substituted for either.
+    fn attempt_binding(
+        &self,
+        record: &AgentRecord,
+        session: rk_core::id::SpawnId,
+    ) -> crate::bbs::AttemptBinding {
+        crate::bbs::AttemptBinding {
+            agent: record.name.clone(),
+            repo: record.repo_name.clone(),
+            task: record.task.clone(),
+            spawn: record.spawn_id().to_string(),
+            session: session.to_string(),
+            provider_session: record.session_id.clone(),
+        }
+    }
+
+    /// Record the reported usage/cost observed at one result event.
+    ///
+    /// Never raises and never changes lifecycle: a capture failure is logged
+    /// and reported as a telemetry gap, exactly like exposure/open capture.
+    /// Emitted at EVERY result path — including the ones that return early
+    /// because the disposition was already decided — so a `rk done` that
+    /// precedes the provider's final total leaves both observations behind
+    /// instead of only the provisional one.
+    fn observe_final_usage(
+        &self,
+        record: &AgentRecord,
+        session: rk_core::id::SpawnId,
+        cost_usd: Option<f64>,
+        usage: &TokenUsage,
+        state: &str,
+        declared_done: bool,
+    ) {
+        // An absent provider total is reported as unknown and stays null. The
+        // daemon-priced fallback is a different KIND of estimate and is
+        // labelled as such so the two can never be pooled into one figure.
+        let (basis, provenance) = match (cost_usd, record.model.as_deref()) {
+            (Some(_), _) => (
+                rk_core::bbs::CostBasis::ProviderReportedSegmentTotal,
+                "HarnessEvent::Completed.cost_usd (last total for this provider session segment; cumulative within the query, never summed)",
+            ),
+            (None, Some(_)) if usage.total() > 0 => (
+                rk_core::bbs::CostBasis::DaemonPricedIncrements,
+                "daemon-priced TokenUsage increments; the harness does not self-report USD",
+            ),
+            _ => (
+                rk_core::bbs::CostBasis::Unknown,
+                "no final usage was reported by the provider",
+            ),
+        };
+        let cost = match basis {
+            rk_core::bbs::CostBasis::ProviderReportedSegmentTotal => cost_usd,
+            rk_core::bbs::CostBasis::DaemonPricedIncrements => Some(record.cost_usd),
+            // Deliberately null: an unknown total is never manufactured.
+            rk_core::bbs::CostBasis::Unknown => None,
+        };
+        let capture = crate::bbs::record_final_usage(
+            &self.space,
+            &self.castle,
+            &self.attempt_binding(record, session),
+            &crate::bbs::FinalUsage {
+                cost_usd: cost,
+                basis,
+                provenance: provenance.to_string(),
+                usage: serde_json::to_value(usage).ok(),
+                state: state.to_string(),
+                declared_done,
+            },
+        );
+        if capture.is_failed() {
+            warn!(
+                agent = %record.name,
+                "final-usage observation failed; the generation is unaffected and coverage is reported missing"
+            );
+        }
+    }
+
+    /// Mark that a result was reported for this launch, and that its total is
+    /// (for now) current. A later `Usage` event flips `usage_since_result`
+    /// back on, which is what turns the exit's coverage into `partial_unknown`.
+    fn note_result(&self, name: &str, session: rk_core::id::SpawnId) {
+        if let Some(watch) = self.lock_attempts().get_mut(name) {
+            if watch.session == session {
+                watch.saw_result = true;
+                watch.usage_since_result = false;
             }
         }
     }
@@ -7647,6 +7894,13 @@ impl Supervisor {
         }
     }
 
+    fn lock_attempts(&self) -> std::sync::MutexGuard<'_, HashMap<String, AttemptWatch>> {
+        match self.attempts.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     fn lock_session_tokens(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<String, rk_core::id::SpawnId>> {
@@ -7665,6 +7919,18 @@ impl Supervisor {
         let token = rk_core::id::SpawnId::new();
         self.lock_controls().insert(name.to_string(), control);
         self.lock_session_tokens().insert(name.to_string(), token);
+        // Real launch time for this physical process, so an exit can report
+        // process lifetime against it. Overwrites any previous launch's watch:
+        // a respawn is a NEW launch even though it keeps the same `SpawnId`.
+        self.lock_attempts().insert(
+            name.to_string(),
+            AttemptWatch {
+                session: token,
+                launched_at: Utc::now(),
+                saw_result: false,
+                usage_since_result: false,
+            },
+        );
         // A daemon restart can leave a durable steer request without its
         // delivery acknowledgement. Replay it exactly once per new live
         // session; an existing ack makes `pending` omit it permanently.

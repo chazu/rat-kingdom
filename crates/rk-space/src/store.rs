@@ -1060,13 +1060,30 @@ impl Store {
     /// while concurrent writes continue past it. `more` reports whether
     /// further rows remain at or below that same boundary — truncation is
     /// always visible rather than inferred from a short page.
+    /// `pin` freezes the snapshot boundary across pages. `None` captures a
+    /// fresh boundary (first page); `Some(b)` pages against exactly `b`, so a
+    /// row written between page 1 and page 2 CANNOT appear in page 2. A pin
+    /// ahead of the store's current sequence is refused rather than clamped:
+    /// silently clamping would hand back a different snapshot than the caller
+    /// asked for and call it the same one.
     pub fn persistence_page(
         &self,
         scope: &str,
         after: Option<u64>,
         limit: usize,
+        pin: Option<u64>,
     ) -> rk_core::Result<PersistencePage> {
-        let boundary = self.latest_persistence_sequence()?;
+        let live = self.latest_persistence_sequence()?;
+        let boundary = match pin {
+            None => live,
+            Some(pinned) if pinned <= live => pinned,
+            Some(pinned) => {
+                return Err(Error::Other(format!(
+                    "pinned export boundary {pinned} is ahead of the store's current \
+                     persistence sequence {live}"
+                )))
+            }
+        };
         let after = i64::try_from(after.unwrap_or(0))
             .map_err(|_| Error::Other("tuple persistence cursor exceeds SQLite range".into()))?;
         let boundary_sql = i64::try_from(boundary)
@@ -1255,6 +1272,37 @@ impl Store {
                 "SELECT id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength
                  FROM tuples WHERE id = ?1",
                 [id.to_string()],
+                row_to_tuple,
+            )
+            .optional()
+            .map_err(sql_err)
+    }
+
+    /// Resolve one tuple AS OF a frozen persistence boundary.
+    ///
+    /// `Space::get` reads the CURRENT row, so a reference resolved through it
+    /// can pull a row persisted after the export's boundary into what claims
+    /// to be a snapshot of that boundary. This reads the immutable journal
+    /// instead and returns the newest version of `id` at or below `boundary`,
+    /// or `None` when the tuple did not yet exist there — in which case the
+    /// caller reports it as missing/unknown rather than exporting a
+    /// post-boundary row.
+    ///
+    /// Bounded and indexed: `id` is selected directly and the sequence
+    /// predicate is pushed into SQL, so this is per-id work regardless of
+    /// journal size.
+    pub fn get_as_of(&self, id: RecordId, boundary: u64) -> rk_core::Result<Option<Tuple>> {
+        let boundary = i64::try_from(boundary)
+            .map_err(|_| Error::Other("export boundary exceeds SQLite range".into()))?;
+        self.conn
+            .query_row(
+                "SELECT id, category, scope, identity, instance, lifecycle, payload,
+                        created_at, expires_at, strength
+                 FROM tuple_persistence_events
+                 WHERE id = ?1 AND commit_sequence <= ?2
+                 ORDER BY commit_sequence DESC
+                 LIMIT 1",
+                params_from_iter::<[&dyn rusqlite::ToSql; 2]>([&id.to_string(), &boundary]),
                 row_to_tuple,
             )
             .optional()

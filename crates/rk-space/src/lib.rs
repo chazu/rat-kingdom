@@ -205,13 +205,29 @@ impl Space {
     /// over [`Space::persistence_delta`] for any capture surface that must stay
     /// bounded on a production-sized store, and read `more` to report
     /// truncation explicitly.
+    /// `pin` freezes the boundary across pages so a concurrent write cannot
+    /// slip into a later page of the same snapshot; a pin ahead of the store's
+    /// current sequence is refused, never clamped.
     pub fn persistence_page(
         &self,
         scope: &str,
         after: Option<u64>,
         limit: usize,
+        pin: Option<u64>,
     ) -> rk_core::Result<PersistencePage> {
-        self.lock().store.persistence_page(scope, after, limit)
+        self.lock().store.persistence_page(scope, after, limit, pin)
+    }
+
+    /// Resolve one tuple as of a frozen persistence boundary, so an export's
+    /// references cannot pull in rows written after its snapshot. `None` means
+    /// the tuple did not exist at that boundary and must be reported as
+    /// missing rather than resolved through the live row.
+    pub fn get_as_of(
+        &self,
+        id: rk_core::id::RecordId,
+        boundary: u64,
+    ) -> rk_core::Result<Option<rk_core::tuple::Tuple>> {
+        self.lock().store.get_as_of(id, boundary)
     }
 
     /// Whether this local store ever persisted the tuple id, even if the live row

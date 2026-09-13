@@ -575,6 +575,8 @@ pub fn record_exit(
     crashed: bool,
     prior_state: &str,
     launched_at: Option<String>,
+    cost_coverage: &str,
+    stale_session: bool,
 ) -> Capture {
     let payload = serde_json::json!({
         "schema_version": 1,
@@ -591,6 +593,19 @@ pub fn record_exit(
         "crashed": crashed,
         "prior_state": prior_state,
         "launched_at": launched_at,
+        // How completely the last reported cost covers this launch:
+        // `final` | `partial_unknown` | `none`. Finality is NEVER inferred
+        // from merely finding some result before an exit — a paused result
+        // that more model usage ran past is `partial_unknown`, and the
+        // remainder stays unknown rather than being treated as zero.
+        "cost_coverage": cost_coverage,
+        // This exit arrived for a launch that had already been superseded.
+        "stale_session": stale_session,
+        // Process lifetime, NOT active model work: a Claude process can sit
+        // paused waiting on verification or the operator. `launched_at` to
+        // `exited_at` bounds the process, and active/paused phase attribution
+        // and verification-admission waits are deliberately NOT claimed here.
+        "duration_semantics": "process_lifetime_not_active_work",
         "semantics": "physical_exit",
     });
     write_telemetry(
@@ -728,6 +743,13 @@ pub struct ExportParams {
     pub after: Option<u64>,
     #[serde(default = "default_export_limit")]
     pub limit: usize,
+    /// Caller-pinned snapshot boundary, echoed from a prior page's `boundary`.
+    /// Without it every page captures a NEW boundary, so a row written between
+    /// pages appears in the later page and the "snapshot" silently spans two
+    /// different states. A boundary ahead of the store's current sequence is
+    /// refused rather than clamped.
+    #[serde(default)]
+    pub boundary: Option<u64>,
 }
 
 fn default_export_limit() -> usize {
@@ -738,6 +760,15 @@ const MAX_EXPORT_LIMIT: usize = 2000;
 /// References are resolved with bounded, indexed `get`s. The cap keeps a page
 /// of densely cross-linked records from turning into an unbounded fan-out.
 const MAX_EXPORT_REFERENCES: usize = 4000;
+/// How many hops of source/evidence linkage the closure follows. Finite by
+/// construction so a cyclic or deeply chained graph cannot make an export
+/// unbounded; exceeding it sets `reference_budget_exhausted` rather than
+/// letting `coverage.complete` claim a closure that never finished.
+const MAX_EXPORT_REFERENCE_DEPTH: usize = 4;
+
+/// The exact `order` value the accepted S3 capture contract defines. Only a
+/// persistence-sequence-ordered read may emit it.
+const ORDER_PERSISTENCE_SEQUENCE: &str = "persistence_sequence";
 
 /// Payload keys that name another tuple in the same repository. Every one of
 /// these must either appear in the exported page, be resolved and appended as
@@ -773,57 +804,71 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
             "repo is required and limit must be 1..{MAX_EXPORT_LIMIT}"
         )));
     }
-    let page = space.persistence_page(&params.repo, params.after, params.limit)?;
+    let page = space.persistence_page(&params.repo, params.after, params.limit, params.boundary)?;
+    let boundary = page.boundary;
     let present: HashSet<_> = page.entries.iter().map(|(_, t)| t.id).collect();
-    let mut wanted: Vec<rk_core::id::RecordId> = Vec::new();
-    let mut seen = HashSet::new();
-    let mut unresolvable: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut resolved: HashMap<rk_core::id::RecordId, Tuple> = HashMap::new();
+    let mut seen: HashSet<rk_core::id::RecordId> = HashSet::new();
     let mut reference_budget_exhausted = false;
-    for (_, tuple) in &page.entries {
-        if !is_bbs_record(tuple) {
-            continue;
-        }
-        let mut raw: Vec<String> = REFERENCE_KEYS
-            .iter()
-            .filter_map(|key| tuple.payload[*key].as_str().map(str::to_string))
-            .collect();
-        if let Some(evidence) = tuple.payload["evidence"].as_array() {
-            raw.extend(
-                evidence
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string)),
-            );
-        }
-        for id in raw {
-            match id.parse::<rk_core::id::RecordId>() {
-                Ok(parsed) if present.contains(&parsed) => {}
-                Ok(parsed) => {
-                    if !seen.insert(parsed) {
-                        continue;
+
+    // Multi-hop closure under an explicit finite budget. One hop is not
+    // enough: a receipt names a finding, and that finding names evidence of
+    // its own, which a single pass would leave unresolved while still
+    // reporting `complete`. Each newly resolved BBS record is re-scanned, so
+    // nested evidence is either carried or named — never silently absent.
+    let mut frontier: Vec<Tuple> = page.entries.iter().map(|(_, t)| t.clone()).collect();
+    let mut depth = 0usize;
+    while !frontier.is_empty() && depth < MAX_EXPORT_REFERENCE_DEPTH {
+        let mut next: Vec<Tuple> = Vec::new();
+        for tuple in &frontier {
+            if !is_bbs_record(tuple) {
+                continue;
+            }
+            for id in reference_ids(tuple) {
+                match id.parse::<rk_core::id::RecordId>() {
+                    // Already in the page: nothing to resolve.
+                    Ok(parsed) if present.contains(&parsed) => {}
+                    Ok(parsed) => {
+                        if !seen.insert(parsed) {
+                            continue;
+                        }
+                        if resolved.len() >= MAX_EXPORT_REFERENCES {
+                            reference_budget_exhausted = true;
+                            missing.push(id);
+                            continue;
+                        }
+                        // Fenced to the FROZEN boundary, not read through the
+                        // live row: a tuple persisted after this snapshot did
+                        // not exist in it and must be reported, not exported.
+                        match space.get_as_of(parsed, boundary)? {
+                            Some(found) if found.scope == params.repo => {
+                                next.push(found.clone());
+                                resolved.insert(parsed, found);
+                            }
+                            // Foreign scope, or absent at this boundary.
+                            Some(_) | None => missing.push(id),
+                        }
                     }
-                    if wanted.len() >= MAX_EXPORT_REFERENCES {
-                        reference_budget_exhausted = true;
-                        unresolvable.push(id);
-                        continue;
-                    }
-                    wanted.push(parsed);
+                    // A malformed reference cannot be resolved; report it
+                    // rather than dropping it or failing the whole export.
+                    Err(_) => missing.push(id),
                 }
-                // A malformed reference cannot be resolved; report it rather
-                // than dropping it or failing the whole export.
-                Err(_) => unresolvable.push(id),
             }
         }
+        frontier = next;
+        depth += 1;
     }
-    let mut references = Vec::new();
-    let mut missing = unresolvable;
-    for id in wanted {
-        match space.get(id)? {
-            // A reference into another repository is reported, never exported:
-            // a bounded per-repo capture must not leak a foreign scope.
-            Some(tuple) if tuple.scope == params.repo => references.push(tuple),
-            Some(_) | None => missing.push(id.to_string()),
+    // The loop stopped with work still queued: say so rather than let
+    // `complete` imply the closure was exhausted.
+    if !frontier.is_empty() {
+        reference_budget_exhausted = true;
+        for tuple in &frontier {
+            missing.push(tuple.id.to_string());
         }
     }
+
+    let references: Vec<Tuple> = resolved.into_values().collect();
     let sequences = space.commit_sequences(&references.iter().map(|t| t.id).collect::<Vec<_>>())?;
     let records: Vec<serde_json::Value> = page
         .entries
@@ -834,7 +879,7 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
             value
         })
         .collect();
-    let reference_records: Vec<serde_json::Value> = references
+    let mut reference_records: Vec<serde_json::Value> = references
         .iter()
         .map(|tuple| {
             let mut value = serde_json::to_value(tuple).unwrap_or(serde_json::Value::Null);
@@ -845,6 +890,8 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
             value
         })
         .collect();
+    // Deterministic output so a replay of the same snapshot is byte-stable.
+    reference_records.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     missing.sort();
     missing.dedup();
     Ok(serde_json::json!({
@@ -853,12 +900,22 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
         "repo": params.repo,
         "build": rk_core::version::BUILD_VERSION,
         "captured_at": chrono::Utc::now().to_rfc3339(),
-        // The ordering claim this surface exists to make. A consumer that does
-        // not see exactly this string must not assume persistence order.
-        "order": "tuple_persistence_events.commit_sequence ascending",
-        "boundary": page.boundary,
+        // The ordering claim this surface exists to make, spelled exactly as
+        // the accepted S3 capture contract names it. A consumer that does not
+        // see this exact value must treat the order as unknown.
+        "order": ORDER_PERSISTENCE_SEQUENCE,
+        // Implementation provenance, kept OUT of `order` so the wire enum
+        // stays stable if the underlying column or table is ever renamed.
+        "order_provenance": "tuple_persistence_events.commit_sequence ascending",
+        "source": "space.persistence_page",
+        "boundary": boundary,
         "after": params.after.unwrap_or(0),
+        // S3 capture-envelope aliases for the same two numbers.
+        "since": params.after.unwrap_or(0),
+        "cursor": page.next_cursor,
         "next_cursor": page.next_cursor,
+        // Echo this back as `boundary` on the next page to keep one snapshot.
+        "pinned_boundary": boundary,
         "limit": params.limit,
         "truncated": page.more,
         // Historical `rk scan` shape: an object carrying a `tuples` array.
@@ -868,11 +925,30 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
             "tuples": records.len(),
             "references": reference_records.len(),
             "missing_references": missing,
+            "reference_depth": MAX_EXPORT_REFERENCE_DEPTH,
+            // Never true while a reference — at ANY hop — is unresolved.
             "complete": !page.more && missing.is_empty() && !reference_budget_exhausted,
             "reference_budget_exhausted": reference_budget_exhausted,
             "scope": params.repo,
         },
     }))
+}
+
+/// Every tuple id named by one record's payload: the scalar reference keys
+/// plus its `evidence` array.
+fn reference_ids(tuple: &Tuple) -> Vec<String> {
+    let mut raw: Vec<String> = REFERENCE_KEYS
+        .iter()
+        .filter_map(|key| tuple.payload[*key].as_str().map(str::to_string))
+        .collect();
+    if let Some(evidence) = tuple.payload["evidence"].as_array() {
+        raw.extend(
+            evidence
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string)),
+        );
+    }
+    raw
 }
 
 /// Whether a tuple is one of the BBS record kinds whose payload may name other
