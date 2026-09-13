@@ -350,3 +350,235 @@ fn renders_offline_against_a_fresh_home_without_creating_daemon_artifacts() {
         );
     }
 }
+
+/// A compact, committed native-record fixture (not a copy of a full
+/// export capture) shaped exactly like the real S2 producer contract —
+/// `bbs-agent-exit`/`bbs-agent-final-usage`, castle-authored (`instance` is
+/// the castle, the observed generation lives only in the payload) — so
+/// author-exit and cost derivation are proven against the real wire shape,
+/// not only the module's own synthetic test helpers.
+fn native_manifest() -> Value {
+    json!({
+        "schema_version": 1,
+        "experiment_id": "native-replay-cli-test",
+        "repos": ["repo"],
+        "batches": [{"id": "batch-1", "arm": "real", "repo": "repo"}],
+        "consumer_tasks": [{"task": "TKT-native-1", "repo": "repo", "batch": "batch-1"}],
+        "eligible_pairs": [{
+            "id": "p1",
+            "source": "src-1",
+            "consumer_task": "TKT-native-1",
+            "consumer_generation": "gen-1",
+            "repo": "repo",
+            "batch": "batch-1"
+        }]
+    })
+}
+
+fn native_tuples_envelope() -> Value {
+    json!({
+        "order": "persistence_sequence",
+        "tuples": [
+            {
+                "id": "src-1", "category": "artifact", "scope": "repo",
+                "identity": "bbs-finding-native1", "instance": "author", "lifecycle": "furniture",
+                "created_at": "2026-01-01T00:00:00Z",
+                "payload": {
+                    "schema_version": 1, "bbs_kind": "finding", "agent": "author",
+                    "spawn": "author-gen", "task": "TKT-source",
+                    "text": "interface constraint", "areas": ["src/x.rs"],
+                    "revision": "abc123", "evidence": ["ev-1"], "limitations": "none"
+                }
+            },
+            {
+                "id": "ev-1", "category": "artifact", "scope": "repo",
+                "identity": "ev-1", "instance": "author",
+                "created_at": "2026-01-01T00:00:00Z", "payload": {}
+            },
+            {
+                "id": "r1", "category": "artifact", "scope": "repo",
+                "identity": "bbs-reuse-native1", "instance": "consumer", "lifecycle": "furniture",
+                "created_at": "2026-01-02T00:00:00Z",
+                "payload": {
+                    "schema_version": 1, "bbs_kind": "reuse", "agent": "consumer",
+                    "spawn": "gen-1", "task": "TKT-native-1", "source": "src-1",
+                    "outcome": "used", "text": "used it", "evidence": ["ev-2"]
+                }
+            },
+            {
+                "id": "ev-2", "category": "artifact", "scope": "repo",
+                "identity": "ev-2", "instance": "consumer",
+                "created_at": "2026-01-02T00:00:00Z", "payload": {}
+            },
+            {
+                "id": "a1", "category": "artifact", "scope": "repo",
+                "identity": "bbs-assessment-native1", "instance": "operator", "lifecycle": "furniture",
+                "created_at": "2026-01-03T00:00:00Z",
+                "payload": {
+                    "schema_version": 1, "bbs_kind": "assessment", "agent": "operator",
+                    "spawn": null, "task": "TKT-source", "receipt": "r1",
+                    "verdict": "verified", "reason": "matches delivered work",
+                    "evidence": ["ev-3"]
+                }
+            },
+            {
+                "id": "ev-3", "category": "artifact", "scope": "repo",
+                "identity": "ev-3", "instance": "operator",
+                "created_at": "2026-01-03T00:00:00Z", "payload": {}
+            },
+            {
+                "id": "x1", "category": "event", "scope": "repo",
+                "identity": "bbs-exposure-spawn", "instance": "castle-1", "lifecycle": "furniture",
+                "created_at": "2026-01-01T12:00:00Z",
+                "payload": {
+                    "schema_version": 1, "bbs_kind": "exposure", "surface": "spawn", "repo": "repo",
+                    "task": "TKT-native-1", "agent": "consumer", "spawn": "gen-1", "bound": "agent",
+                    "entries": [{"source": "src-1", "reason": "task or dependency",
+                                 "kind": "finding", "category": "artifact"}],
+                    "prepared": 1, "omitted": 0, "cursor": 10, "since": null,
+                    "semantics": "prepared"
+                }
+            },
+            {
+                "id": "u1", "category": "event", "scope": "repo",
+                "identity": "bbs-agent-final-usage", "instance": "castle-1", "lifecycle": "furniture",
+                "created_at": "2026-01-01T11:00:00Z",
+                "payload": {
+                    "schema_version": 1, "bbs_kind": "agent_final_usage", "repo": "repo",
+                    "task": "TKT-native-1", "agent": "consumer", "spawn": "gen-1",
+                    "session": "sess-1", "provider_session": "prov-1", "state": "completed",
+                    "declared_done": true, "cost_usd": 1.5,
+                    "cost_basis": "provider_reported_segment_total",
+                    "observed_at": "2026-01-01T11:00:00Z",
+                    "cost_provenance": "HarnessEvent::Completed.cost_usd",
+                    "usage": {"input": 10, "output": 5, "cache_creation": 0, "cache_read": 0}
+                }
+            },
+            {
+                "id": "ax1", "category": "event", "scope": "repo",
+                "identity": "bbs-agent-exit", "instance": "castle-1", "lifecycle": "furniture",
+                "created_at": "2026-01-01T12:00:00Z",
+                "payload": {
+                    "schema_version": 1, "bbs_kind": "agent_exit", "repo": "repo",
+                    "task": "TKT-native-1", "agent": "consumer", "spawn": "gen-1",
+                    "session": "sess-1", "provider_session": "prov-1",
+                    "launched_at": "2026-01-01T10:00:00Z", "exited_at": "2026-01-01T12:00:00Z",
+                    "prior_state": "completed", "crashed": false, "exit_code": 0,
+                    "stale_session": false,
+                    "duration_semantics": "process_lifetime_not_active_work",
+                    "cost_coverage": "final", "semantics": "physical_exit"
+                }
+            },
+            {
+                "id": "ax-author", "category": "event", "scope": "repo",
+                "identity": "bbs-agent-exit", "instance": "castle-1", "lifecycle": "furniture",
+                "created_at": "2026-01-01T10:30:00Z",
+                "payload": {
+                    "schema_version": 1, "bbs_kind": "agent_exit", "repo": "repo",
+                    "task": "TKT-source", "agent": "author", "spawn": "author-gen",
+                    "session": "author-sess", "provider_session": "author-prov",
+                    "launched_at": "2026-01-01T00:00:00Z", "exited_at": "2026-01-01T10:30:00Z",
+                    "prior_state": "completed", "crashed": false, "exit_code": 0,
+                    "stale_session": false,
+                    "duration_semantics": "process_lifetime_not_active_work",
+                    "cost_coverage": "final", "semantics": "physical_exit"
+                }
+            }
+        ],
+        "truncated": false
+    })
+}
+
+#[test]
+fn native_record_shapes_replay_author_exit_and_cost_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = write_json(dir.path(), "manifest.json", &native_manifest());
+    let tuples_path = write_json(dir.path(), "tuples.json", &native_tuples_envelope());
+    let reviews_path = write_json(
+        dir.path(),
+        "reviews.json",
+        &json!([{
+            "pair": "p1",
+            "coverage": {"status": "prepared", "evidence": "x1"},
+            "author_terminal_evidence": "ax-author",
+            "relayed_by_operator": false
+        }]),
+    );
+
+    let out = cli(&[
+        "--json",
+        "bbs",
+        "report",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--tuples",
+        tuples_path.to_str().unwrap(),
+        "--reviews",
+        reviews_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["evaluator_version"], 3);
+    assert_eq!(
+        report["author_exit_unsupported"].as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(report["mechanism"]["author_exit_effects"], 1);
+    assert_eq!(report["deliveries"][0]["cost_coverage"], "complete");
+    assert_eq!(report["deliveries"][0]["reported_cost_estimate_usd"], 1.5);
+    assert_eq!(
+        report["deliveries"][0]["process_lifetime_ms"],
+        2 * 60 * 60 * 1000
+    );
+}
+
+#[test]
+fn reviewed_annotations_are_accepted_through_the_object_shaped_reviews_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = write_json(dir.path(), "manifest.json", &manifest());
+    let tuples_path = write_json(dir.path(), "tuples.json", &tuples_envelope());
+    let reviews_path = write_json(
+        dir.path(),
+        "reviews.json",
+        &json!({
+            "reviews": reviews(),
+            "reviewed_annotations": [{
+                "task": "TKT-1",
+                "repo": "repo",
+                "repeated_investigations": [{
+                    "evidence": "ev-2",
+                    "reason": "same root cause investigated twice before the fix landed"
+                }],
+                "rework": [],
+                "interventions": []
+            }]
+        }),
+    );
+
+    let out = cli(&[
+        "--json",
+        "bbs",
+        "report",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--tuples",
+        tuples_path.to_str().unwrap(),
+        "--reviews",
+        reviews_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["quality"]["reviewed_repeated_investigations"], 1);
+    assert_eq!(
+        report["deliveries"][0]["reviewed_repeated_investigations"],
+        json!(["ev-2"])
+    );
+}
