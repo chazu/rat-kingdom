@@ -316,7 +316,10 @@ mod tests {
             ..Default::default()
         };
         assert!((price.cost(&usage) - 2059.0 * 10e-6).abs() < 1e-12);
-        assert_eq!(usage.total(), usage.input + usage.output + usage.cache_read + 2059);
+        assert_eq!(
+            usage.total(),
+            usage.input + usage.output + usage.cache_read + 2059
+        );
     }
 
     #[test]

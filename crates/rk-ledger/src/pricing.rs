@@ -303,7 +303,10 @@ mod tests {
             let price = table.lookup(name).unwrap();
             assert_eq!(price.input_cost_per_token, 5e-6, "{name} input");
             assert_eq!(price.output_cost_per_token, 25e-6, "{name} output");
-            assert_eq!(price.cache_read_input_token_cost, 0.5e-6, "{name} cache read");
+            assert_eq!(
+                price.cache_read_input_token_cost, 0.5e-6,
+                "{name} cache read"
+            );
         }
         // Opus 4 is untouched.
         let opus4 = table.lookup("claude-opus-4").unwrap();
