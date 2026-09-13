@@ -223,16 +223,23 @@ impl Space {
         self.lock().store.persistence_page(scope, after, limit, pin)
     }
 
-    /// Resolve one tuple as of a frozen persistence boundary, so an export's
-    /// references cannot pull in rows written after its snapshot. `None` means
-    /// the tuple did not exist at that boundary and must be reported as
-    /// missing rather than resolved through the live row.
+    /// Resolve one tuple as of a frozen persistence boundary, fenced to
+    /// `scope`, so an export's references cannot pull in rows written after
+    /// its snapshot or belonging to a different repository. `None` means the
+    /// tuple did not exist in that scope at that boundary and must be
+    /// reported as missing rather than resolved through the live row.
+    ///
+    /// The returned sequence is the matched journal row's own
+    /// `commit_sequence` — the only value that can honestly be called this
+    /// reference's as-of order. It is NOT the live row's `commit_sequence`,
+    /// which can differ (deleted, or reinforced after the boundary).
     pub fn get_as_of(
         &self,
         id: rk_core::id::RecordId,
         boundary: u64,
-    ) -> rk_core::Result<Option<rk_core::tuple::Tuple>> {
-        self.lock().store.get_as_of(id, boundary)
+        scope: &str,
+    ) -> rk_core::Result<Option<(u64, rk_core::tuple::Tuple)>> {
+        self.lock().store.get_as_of(id, boundary, scope)
     }
 
     /// Whether this local store ever persisted the tuple id, even if the live row
