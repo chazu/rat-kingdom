@@ -3,6 +3,7 @@
 mod agent_cmds;
 mod attention_cmds;
 mod bbs_cmds;
+mod bbs_report;
 mod critical_path;
 mod factory_cmds;
 mod factory_dashboard;

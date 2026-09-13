@@ -1,3 +1,4 @@
+use crate::bbs_report::{self, Manifest, Review};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use rk_core::bbs::Briefing;
@@ -41,6 +42,27 @@ pub enum BbsCommand {
         #[arg(long)]
         contribution: Option<String>,
     },
+    /// Offline stigmergy evidence report over saved manifest/tuple/review
+    /// JSON. No daemon connection is required or made.
+    Report(ReportArgs),
+}
+
+#[derive(Args)]
+pub struct ReportArgs {
+    /// Versioned experiment/eligibility manifest (frozen before the batch).
+    #[arg(long)]
+    manifest: std::path::PathBuf,
+    /// Native tuple capture: a bare tuple array, raw `rk --json scan`
+    /// output, or the capture envelope (see
+    /// docs/2026-09-13-stigmergy-report-capture.md).
+    #[arg(long)]
+    tuples: std::path::PathBuf,
+    /// Operator review annotations, one per frozen eligible pair.
+    #[arg(long)]
+    reviews: std::path::PathBuf,
+    /// Write the JSON report here in addition to stdout.
+    #[arg(long)]
+    output: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -136,6 +158,44 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
             contribution,
         } => {
             write(&mut client, "bbs.accept", json!({"question":question,"answer":answer,"text":text,"contribution":contribution}), as_json).await?;
+        }
+        BbsCommand::Report(args) => {
+            // Deliberately does not touch `client`/the daemon: this command
+            // must run with no daemon connection, worker credentials, model
+            // call or network (design doc, S3).
+            run_report(args, as_json)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_json(path: &std::path::Path, what: &str) -> Result<serde_json::Value> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {what} file {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parsing {what} file {} as JSON", path.display()))
+}
+
+fn run_report(args: ReportArgs, as_json: bool) -> Result<()> {
+    let manifest: Manifest = serde_json::from_value(read_json(&args.manifest, "manifest")?)
+        .context("manifest does not match the expected schema")?;
+    let tuples_raw = read_json(&args.tuples, "tuples")?;
+    let capture = bbs_report::parse_tuple_capture(&tuples_raw)?;
+    let reviews_raw = read_json(&args.reviews, "reviews")?;
+    let reviews: Vec<Review> = serde_json::from_value(reviews_raw)
+        .context("reviews file does not match the expected schema (must be a JSON array)")?;
+
+    let report = bbs_report::compute(&manifest, &capture, &reviews)?;
+    let value = bbs_report::to_json(&report);
+    if let Some(output) = &args.output {
+        std::fs::write(output, serde_json::to_string_pretty(&value)?)
+            .with_context(|| format!("writing report to {}", output.display()))?;
+    }
+    if as_json {
+        println!("{value}");
+    } else {
+        print!("{}", bbs_report::render(&report));
+        if let Some(output) = &args.output {
+            println!("(also written to {})", output.display());
         }
     }
     Ok(())
