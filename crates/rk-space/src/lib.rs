@@ -300,6 +300,17 @@ impl Space {
         self.lock().store.get(id)
     }
 
+    /// Bounded, indexed lookup of the live commit sequence for a small, known
+    /// set of ids — `O(len(ids))` regardless of total store size. Use this to
+    /// order a handful of records by actual persistence order instead of by
+    /// `RecordId`/ULID mint order, which a delayed writer can invert.
+    pub fn commit_sequences(
+        &self,
+        ids: &[rk_core::id::RecordId],
+    ) -> rk_core::Result<std::collections::HashMap<rk_core::id::RecordId, u64>> {
+        self.lock().store.commit_sequences(ids)
+    }
+
     /// Delete one tuple by id (archive-on-resolution, targeted GC). Returns
     /// whether a row was removed. Unlike [`Space::take`], this consumes a
     /// *specific* tuple rather than the oldest pattern match — the reactor uses
