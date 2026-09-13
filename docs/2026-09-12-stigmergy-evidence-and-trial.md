@@ -171,6 +171,26 @@ active-work duration.
 
 ## Trial design
 
+Before dispatch, freeze the selected tasks, build/configuration, eligibility and
+scoring rules, UTC start, and a prospective stopping rule in an immutable run
+plan. For the first real batch, the observation window ends at the earlier of
+six hours after that start or the first recorded observation that all selected
+work has settled. Settlement requires actual delivery or an explicit terminal
+failure disposition for every selected task, terminal enrolled launches, and no
+selected checks, reviews, queued landings or automatic continuations remaining.
+Record the native evidence establishing settlement; missing exit or usage
+observations remain unknown. A paused process or task-completion claim alone
+does not establish settlement.
+
+Materialize the evaluator manifest's end time mechanically from that frozen
+rule and endpoint evidence. Retain the plan, derivation, capture timestamp and
+pinned persistence boundary separately. Reaching the maximum leaves unfinished
+work incomplete/censored in this report; authorized recovery continues outside
+the window. It neither authorizes killing workers nor completes this program.
+The six-hour maximum is an operational bound, not a delivery SLA. The separate
+landing allowance is 120 minutes: the existing 60-minute gate and 45-minute
+review bounds plus 15 minutes margin. Keep actual durations and every failure.
+
 First deploy and verify the new product path. Use the same Claude/Sonnet worker
 configuration, existing two-worker implementation lane, repository gates and
 spend policy. Keep the host awake for measured windows and use a landing allowance
