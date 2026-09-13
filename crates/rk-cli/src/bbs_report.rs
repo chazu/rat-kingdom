@@ -69,27 +69,176 @@ const OPEN: &str = "open";
 const AGENT_EXIT: &str = "agent_exit";
 const AGENT_FINAL_USAGE: &str = "agent_final_usage";
 
+/// A `canonical_digest` is a lowercase hex SHA-256
+/// (`rk_core::action::canonical_digest`), so every digest-keyed identity
+/// suffix is exactly this many lowercase hex characters.
+const DIGEST_HEX_LEN: usize = 64;
+/// Every `rk_daemon::bbs::ExposureSurface::as_str()` value. An exposure's
+/// identity suffix is one of these and nothing else.
+const EXPOSURE_SURFACES: [&str; 4] = ["spawn", "resume", "recovery", "brief"];
+/// The literal author `record_phase_span`'s non-supervisor call sites pass.
+const DAEMON_AUTHOR: &str = "daemon";
+/// A castle's wire author id is `castle-<first 16 hex of its Ed25519 key>`
+/// (`rk_core::identity::actor_from_pubkey`). A configured `castle_name` is a
+/// presentation-only alias that `server.rs` deliberately never lets become the
+/// wire id, so the actor shape is the one an exported record carries.
+const CASTLE_ACTOR_PREFIX: &str = "castle-";
+const CASTLE_ACTOR_HEX_LEN: usize = 16;
+
+fn is_lower_hex(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether `instance` has the shape of a daemon-side author: the literal
+/// `"daemon"`, or a castle actor id.
+///
+/// This is a SHAPE check over a string in an offline export, not cryptographic
+/// proof — this module verifies no signature and cannot. What it does buy is
+/// real: an ordinary worker generation (`Scritch-15`, `rat-28`) can never be
+/// mistaken for the castle that is the only legitimate author of these
+/// records, which is the forged-authority case, and a record whose author is
+/// unrecognized stays an explicit reported finding rather than silent input.
+fn is_castle_author(instance: &str) -> bool {
+    instance == DAEMON_AUTHOR
+        || instance
+            .strip_prefix(CASTLE_ACTOR_PREFIX)
+            .is_some_and(|hex| hex.len() == CASTLE_ACTOR_HEX_LEN && is_lower_hex(hex))
+}
+
+/// How a BBS record kind's identity is actually MINTED by
+/// `crates/rk-daemon/src/bbs.rs`. Three distinct contracts, and flattening
+/// them into one `starts_with` is what let forged records in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeIdentity {
+    /// `format!("{prefix}{key}")` where `key` is
+    /// `rk_core::action::canonical_digest(..)` over the record's own content:
+    /// `bbs-finding-`, `bbs-answer-`, `bbs-reuse-`, `bbs-assessment-`. The
+    /// suffix is therefore exactly [`DIGEST_HEX_LEN`] lowercase hex
+    /// characters — never a short readable token.
+    Digest(&'static str),
+    /// `format!("bbs-exposure-{}", surface.as_str())`. A closed four-value
+    /// suffix, and the SAME value the producer writes to `payload.surface`
+    /// from that one `ExposureSurface`.
+    Surface(&'static str),
+    /// One FIXED identity, written bare and complete: `record_open` writes
+    /// `"bbs-open"`, `record_exit` writes `"bbs-agent-exit"`, and the final
+    /// usage producer writes `"bbs-agent-final-usage"`. No producer appends
+    /// anything, so any longer string is forged authority, not a variant.
+    Exact(&'static str),
+}
+
 /// The identity each BBS record kind is actually minted with by
-/// `crates/rk-daemon/src/bbs.rs`. A record whose identity does not carry its
-/// kind's prefix was not written by the BBS write path.
+/// `crates/rk-daemon/src/bbs.rs`. A record whose identity does not match its
+/// kind's minting rule was not written by the BBS write path.
 ///
 /// Read off the producers rather than off
-/// `rk_core::bbs::RESERVED_IDENTITY_PREFIXES`: the digest-suffixed kinds match
-/// that list, but `record_open` mints the fixed identity `"bbs-open"` with no
-/// trailing dash. Acceptance here has to match what is actually emitted.
-fn reserved_prefix(bbs_kind: &str) -> Option<&'static str> {
+/// `rk_core::bbs::RESERVED_IDENTITY_PREFIXES`: that list is a `starts_with`
+/// DENY list for the agent write path, where matching too much is safe. It is
+/// not an ACCEPT rule, and reusing it as one is the defect this enum fixes —
+/// `bbs-agent-exit-forged` is correctly refused a write by the deny list and
+/// was then wrongly admitted here as an `agent_exit`.
+fn native_identity(bbs_kind: &str) -> Option<NativeIdentity> {
+    use NativeIdentity::{Digest, Exact, Surface};
     match bbs_kind {
-        FINDING => Some("bbs-finding-"),
-        ANSWER => Some("bbs-answer-"),
-        REUSE => Some("bbs-reuse-"),
-        ASSESSMENT => Some("bbs-assessment-"),
-        EXPOSURE => Some("bbs-exposure-"),
-        OPEN => Some("bbs-open"),
-        AGENT_EXIT => Some("bbs-agent-exit"),
-        AGENT_FINAL_USAGE => Some("bbs-agent-final-usage"),
+        FINDING => Some(Digest("bbs-finding-")),
+        ANSWER => Some(Digest("bbs-answer-")),
+        REUSE => Some(Digest("bbs-reuse-")),
+        ASSESSMENT => Some(Digest("bbs-assessment-")),
+        EXPOSURE => Some(Surface("bbs-exposure-")),
+        OPEN => Some(Exact("bbs-open")),
+        AGENT_EXIT => Some(Exact("bbs-agent-exit")),
+        AGENT_FINAL_USAGE => Some(Exact("bbs-agent-final-usage")),
         _ => None,
     }
 }
+
+/// Why `t`'s identity is not one this `bbs_kind`'s producer could have minted,
+/// or `None` when it is. Each family keeps exactly the contract its own
+/// producer guarantees, so no real exported record is rejected:
+///
+/// - `Digest`: the full variable-identity contract is preserved — any digest
+///   is accepted, but it must actually BE one. A readable suffix
+///   (`bbs-finding-x`) is not something `canonical_digest` can return.
+/// - `Surface`: one of four `ExposureSurface` values, and the same value the
+///   producer independently wrote to `payload.surface`. Both come from one
+///   `as_str()` call, so requiring agreement can never reject a real record
+///   while it refuses `bbs-exposure-forged` even with a matching payload.
+/// - `Exact`: byte equality. This kind has no variants to preserve.
+fn identity_defect(t: &Value, bbs_kind: &str) -> Option<String> {
+    let identity = str_field(t, &["identity"]);
+    let strip = |prefix: &str| -> Result<&str, String> {
+        identity.strip_prefix(prefix).ok_or_else(|| {
+            format!("identity {identity:?} does not carry the daemon-minted {prefix}* prefix")
+        })
+    };
+    match native_identity(bbs_kind)? {
+        NativeIdentity::Exact(exact) => {
+            if identity != exact {
+                return Some(format!(
+                    "identity {identity:?} is not the fixed daemon-minted identity {exact:?}; \
+                     this kind is written bare, so a suffixed variant is forged"
+                ));
+            }
+        }
+        NativeIdentity::Digest(prefix) => {
+            let key = match strip(prefix) {
+                Ok(key) => key,
+                Err(reason) => return Some(reason),
+            };
+            if key.len() != DIGEST_HEX_LEN || !is_lower_hex(key) {
+                return Some(format!(
+                    "identity {identity:?} suffix is not a canonical_digest: a native key is \
+                     {DIGEST_HEX_LEN} lowercase hex characters, this one is {} character(s)",
+                    key.len()
+                ));
+            }
+        }
+        NativeIdentity::Surface(prefix) => {
+            let key = match strip(prefix) {
+                Ok(key) => key,
+                Err(reason) => return Some(reason),
+            };
+            if !EXPOSURE_SURFACES.contains(&key) {
+                return Some(format!(
+                    "identity {identity:?} names surface {key:?}, which is not an exposure \
+                     surface this daemon prepares"
+                ));
+            }
+            let surface = str_field(t, &["payload", "surface"]);
+            if key != surface {
+                return Some(format!(
+                    "identity {identity:?} names surface {key:?} but payload.surface is \
+                     {surface:?}; the producer renders both from one value"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// `rk_daemon::span::SPAN_IDENTITY`: the identity every phase-span Event is
+/// written under.
+const SPAN_IDENTITY: &str = "task_span";
+/// Every `rk_daemon::span::Phase::as_str()` value, in declaration order. A
+/// span naming anything else was not written by that enum.
+const SPAN_PHASES: [&str; 12] = [
+    "ticket_ready",
+    "claimed",
+    "agent_launched",
+    "first_progress",
+    "completed",
+    "verification",
+    "landing_prep",
+    "semantic_review",
+    "rework",
+    "merge",
+    "delivery_closure",
+    "attention_hold",
+];
+/// The only `duration_semantic` any producer stamps
+/// (`rk_daemon::span::PhaseSpan::from_durations`): `queue_wait_ms` and
+/// `duration_ms` are disjoint, so summing both is sound.
+const ADDITIVE_DURATION: &str = "additive";
 
 /// Native events that prove an agent generation actually started a process, so
 /// a prepared exposure can be joined to a LAUNCHED consumer rather than
@@ -106,6 +255,19 @@ const LAUNCH_EVENT_KIND: &str = "launch_event";
 /// budget kill with no further result, which makes the reported total a partial
 /// amount rather than a final cost for the launch.
 const TERMINAL_USAGE_STATES: [&str; 3] = ["completed", "failed", "stopped"];
+
+/// The one `agent_exit.cost_coverage` value that means "a result was reported
+/// and no further usage followed it" — the producer's OWN statement that the
+/// last reported total actually covers the launch
+/// (`rk_daemon::supervisor::CostCoverage::Final`).
+const FINAL_COST_COVERAGE: &str = "final";
+/// The non-final `cost_coverage` values the producer emits, each of which
+/// leaves an amount that is not this launch's total: `partial_unknown` (more
+/// model work ran past the last result), `none` (no result was ever reported),
+/// `unknown` (no watch survived, so finality is not knowable at all).
+/// Enumerated so an UNRECOGNIZED value is reported as its own finding rather
+/// than being quietly folded in with a known one.
+const NON_FINAL_COST_COVERAGE: [&str; 3] = ["partial_unknown", "none", "unknown"];
 
 /// The only `cost_basis` a *provider-reported* total may carry. The daemon's
 /// own priced-increment fallback is an estimate of an estimate: it is reported
@@ -1094,9 +1256,11 @@ pub struct CostSegment {
     pub reported_usd: Option<f64>,
     pub cost_basis: String,
     pub state: Option<String>,
-    /// `true` only when the last result for this segment was terminal AND no
-    /// later work is observable after it. A `paused` result followed by more
-    /// work and a kill leaves a partial amount, not a final cost.
+    /// `true` only when the last result for this segment was terminal, the
+    /// launch's exit agrees with it, AND that exit reports
+    /// `cost_coverage: "final"`. A `paused` result followed by more work and a
+    /// kill leaves a partial amount, not a final cost — and so does a terminal
+    /// result the producer itself marks `partial_unknown`.
     pub final_cost: bool,
     pub finality_reason: String,
 }
@@ -1331,13 +1495,8 @@ fn artifact_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if bbs_kind != ANSWER && t["payload"]["schema_version"] != 1 {
         return Some("payload.schema_version is not 1".into());
     }
-    if let Some(prefix) = reserved_prefix(bbs_kind) {
-        let identity = str_field(t, &["identity"]);
-        if !identity.starts_with(prefix) {
-            return Some(format!(
-                "identity {identity:?} does not carry the daemon-minted {prefix}* prefix"
-            ));
-        }
+    if let Some(reason) = identity_defect(t, bbs_kind) {
+        return Some(reason);
     }
     let instance = str_field(t, &["instance"]);
     let agent = str_field(t, &["payload", "agent"]);
@@ -1359,7 +1518,9 @@ fn artifact_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
 /// `payload.agent`/`payload.spawn`/`payload.bound`. Reading `instance` as the
 /// consumer generation attributes the record to the wrong party. What is
 /// checked instead is that the tuple's scope agrees with the `repo` the daemon
-/// wrote into the payload.
+/// wrote into the payload, and that the author has the shape of a castle at
+/// all — otherwise a worker-authored row with a correct fixed identity could
+/// still manufacture an open, an author exit or a final cost.
 fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if t["category"] != "event" {
         return Some(format!(
@@ -1379,13 +1540,16 @@ fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if t["payload"]["schema_version"] != 1 {
         return Some("payload.schema_version is not 1".into());
     }
-    if let Some(prefix) = reserved_prefix(bbs_kind) {
-        let identity = str_field(t, &["identity"]);
-        if !identity.starts_with(prefix) {
-            return Some(format!(
-                "identity {identity:?} does not carry the daemon-minted {prefix}* prefix"
-            ));
-        }
+    if let Some(reason) = identity_defect(t, bbs_kind) {
+        return Some(reason);
+    }
+    let instance = str_field(t, &["instance"]);
+    if !is_castle_author(instance) {
+        return Some(format!(
+            "instance {instance:?} is not a castle author ({DAEMON_AUTHOR} or \
+             {CASTLE_ACTOR_PREFIX}<hex>); daemon telemetry is authored by the castle, never by \
+             the generation it describes"
+        ));
     }
     let scope = str_field(t, &["scope"]);
     let repo = str_field(t, &["payload", "repo"]);
@@ -1401,7 +1565,181 @@ fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
 }
 
 fn is_task_span(t: &Value) -> bool {
-    t["category"] == "event" && t["identity"] == "task_span"
+    t["category"] == "event" && t["identity"] == SPAN_IDENTITY
+}
+
+/// Structural contract check for a native `task_span`, the record the critical
+/// path and every phase total are built from. Returns the reason it is NOT a
+/// span its producer could have written, or `None` when it is.
+///
+/// These are the invariants `crates/rk-daemon/src/span.rs` makes unconditional
+/// at write time: `record_phase_span` writes a `Furniture` Event under
+/// `SPAN_IDENTITY` authored by the CASTLE (every call site passes `"daemon"`
+/// or `&self.castle`, never an agent), into the ticket's repo scope, carrying
+/// `PhaseSpan::to_payload()` — `task`, a `Phase::as_str()` phase, a `u32`
+/// `attempt`, and the rest optional-but-typed.
+///
+/// Admitting a span on category+identity alone, as this module previously did,
+/// let a forged row name an unknown phase (summed into `work_phases_ms` by the
+/// catch-all arm), a negative or absurd `duration_ms`, or a second repo's
+/// task, and move `verification_ms`, the critical path and delivery
+/// acceptance with it.
+///
+/// Deliberately NOT required, because the producer genuinely omits them:
+/// `queued_at`/`started_at`/`ended_at` (a phase settled from durations alone
+/// has no wall-clock `queued_at`), `repo`/`target`/`candidate`/`lane`/
+/// `occurrence_key`/`proof_kind`/`proof_reused`/`authority` (set only where
+/// the calling producer has them), and `duration_semantic` (absent on every
+/// span recorded before that tag existed). Those legacy spans stay supported
+/// exactly where their weaker evidence is already made explicit — an untagged
+/// `verification` span is counted under `verification_ms_legacy_spans` rather
+/// than summed.
+fn task_span_defect(t: &Value) -> Option<String> {
+    if t["lifecycle"] != "furniture" {
+        return Some(format!(
+            "lifecycle is {} not furniture; a phase span is immutable furniture",
+            t["lifecycle"].as_str().unwrap_or("absent")
+        ));
+    }
+    // Producer authorship. `record_phase_span` names the castle as caller, so
+    // `instance` is `"daemon"` (every `landing.rs`/`managed_verification.rs`
+    // call site) or the castle actor id (`supervisor.rs`/`tickets.rs` pass
+    // `&self.castle`) — both shapes appear verbatim in the captured native
+    // records. It is NEVER the worker generation the span describes, so a
+    // worker-authored span is forged authority even when every other field is
+    // well formed. The `Furniture` lifecycle above is not sufficient on its
+    // own here: it is what the daemon refuses from an agent at WRITE time, but
+    // this module reads an offline export that never went through that path.
+    let instance = str_field(t, &["instance"]);
+    if !is_castle_author(instance) {
+        return Some(format!(
+            "instance {instance:?} is not a castle author ({DAEMON_AUTHOR} or \
+             {CASTLE_ACTOR_PREFIX}<hex>); a phase span is authored by the castle that recorded \
+             it, never by the worker it describes"
+        ));
+    }
+    // Repo binding: the span is written into the ticket's own repo scope, and
+    // `payload.repo`, where a producer set it, is that same repo.
+    let scope = str_field(t, &["scope"]);
+    if scope.is_empty() {
+        return Some("tuple scope is absent; a phase span is scoped to its repo".into());
+    }
+    match &t["payload"]["repo"] {
+        Value::Null => {}
+        Value::String(repo) if repo == scope => {}
+        other => {
+            return Some(format!(
+                "payload.repo {other} disagrees with tuple scope {scope:?}"
+            ))
+        }
+    }
+    if str_field(t, &["payload", "task"]).is_empty() {
+        return Some("payload.task is absent; a span with no ticket cannot be placed".into());
+    }
+    let phase = str_field(t, &["payload", "phase"]);
+    if !SPAN_PHASES.contains(&phase) {
+        return Some(format!(
+            "payload.phase {phase:?} is not a phase this daemon records; an unrecognized phase \
+             would be pooled into the work-phase total"
+        ));
+    }
+    // `PhaseSpan.attempt` is a `u32` and every producer numbers from 1.
+    match t["payload"]["attempt"].as_u64() {
+        Some(a) if a >= 1 && a <= u64::from(u32::MAX) => {}
+        _ => {
+            return Some(format!(
+                "payload.attempt {} is not a positive integer occurrence number",
+                t["payload"]["attempt"]
+            ))
+        }
+    }
+    // Times, where present, must parse and must not run backwards.
+    let mut times = Vec::new();
+    for field in ["queued_at", "started_at", "ended_at"] {
+        match &t["payload"][field] {
+            Value::Null => {}
+            Value::String(raw) => match parse_rfc3339(raw) {
+                Some(at) => times.push((field, at)),
+                None => return Some(format!("payload.{field} {raw:?} is not an RFC3339 time")),
+            },
+            other => return Some(format!("payload.{field} {other} is not a time")),
+        }
+    }
+    if let Some(w) = times.windows(2).find(|w| w[0].1 > w[1].1) {
+        return Some(format!(
+            "payload.{} is after payload.{}; a span cannot run backwards",
+            w[0].0, w[1].0
+        ));
+    }
+    // Durations are derived by the producer as non-negative millisecond
+    // differences over exactly those timestamps.
+    for field in ["queue_wait_ms", "duration_ms"] {
+        match &t["payload"][field] {
+            Value::Null => {}
+            v => match v.as_i64() {
+                Some(ms) if ms >= 0 => {}
+                _ => return Some(format!("payload.{field} {v} is not a non-negative duration")),
+            },
+        }
+    }
+    let stamped = |field: &str| -> Option<DateTime<Utc>> { payload_time(t, field) };
+    for (field, from, to) in [
+        ("queue_wait_ms", "queued_at", "started_at"),
+        ("duration_ms", "started_at", "ended_at"),
+    ] {
+        if let (Some(ms), Some(from_at), Some(to_at)) =
+            (t["payload"][field].as_i64(), stamped(from), stamped(to))
+        {
+            let derived = (to_at - from_at).num_milliseconds();
+            if ms != derived {
+                return Some(format!(
+                    "payload.{field} is {ms} but {from}..{to} is {derived}ms; the producer \
+                     derives one from the other"
+                ));
+            }
+        }
+    }
+    // `duration_semantic` is stamped by exactly one constructor with exactly
+    // one value; anything else is a claim the producer never makes, and
+    // `"additive"` is what unlocks summing a wait into `verification_ms`.
+    match &t["payload"]["duration_semantic"] {
+        Value::Null => {}
+        Value::String(v) if v == ADDITIVE_DURATION => {}
+        other => {
+            return Some(format!(
+                "payload.duration_semantic {other} is not {ADDITIVE_DURATION:?}"
+            ))
+        }
+    }
+    match &t["payload"]["authority"] {
+        Value::Null => {}
+        Value::String(v) if v == "human" || v == "llm" => {}
+        other => return Some(format!("payload.authority {other} is not human or llm")),
+    }
+    if !matches!(&t["payload"]["proof_reused"], Value::Null | Value::Bool(_)) {
+        return Some(format!(
+            "payload.proof_reused {} is not a boolean",
+            t["payload"]["proof_reused"]
+        ));
+    }
+    // The occurrence fence. Each is optional, but a present one must be a
+    // usable non-empty string: an empty `occurrence_key` claims a fence it
+    // cannot provide.
+    for field in [
+        "terminal_reason",
+        "target",
+        "candidate",
+        "lane",
+        "occurrence_key",
+        "proof_kind",
+    ] {
+        match &t["payload"][field] {
+            Value::Null => {}
+            Value::String(v) if !v.is_empty() => {}
+            other => return Some(format!("payload.{field} {other} is not a non-empty string")),
+        }
+    }
+    None
 }
 
 fn is_harness_result(t: &Value) -> bool {
@@ -1613,6 +1951,12 @@ struct ExitRow {
     /// (`s2-stale-event-observation-contract`, `TKT-tulir-kotah-gisub`).
     /// Absent on records predating that contract; treated as not-stale.
     stale_session: Option<bool>,
+    /// The producer's own measurement of how completely the last reported cost
+    /// covers this launch (`rk_daemon::bbs::record_exit`). Kept as the raw
+    /// string so an unrecognized value stays reportable instead of collapsing
+    /// into a boolean. `None` = a record predating the field, which is not
+    /// evidence of finality either.
+    cost_coverage: Option<String>,
     record: String,
 }
 
@@ -1957,6 +2301,9 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 crashed: t["payload"]["crashed"].as_bool(),
                 prior_state: t["payload"]["prior_state"].as_str().map(str::to_string),
                 stale_session: t["payload"]["stale_session"].as_bool(),
+                cost_coverage: t["payload"]["cost_coverage"]
+                    .as_str()
+                    .map(str::to_string),
                 record: record_id(t),
             });
             continue;
@@ -2101,6 +2448,20 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
 
         // --- task_span ------------------------------------------------
         if is_task_span(t) {
+            // Validated BEFORE indexing: an indexed span reaches
+            // `build_critical_path`, the phase totals and delivery acceptance,
+            // and nothing downstream re-checks it. Rejecting one never removes
+            // a selected task from the denominator — `deliveries` is built by
+            // iterating `frozen_task_scope(manifest)`, so the task still gets
+            // a row and simply reports no usable native span.
+            if let Some(reason) = task_span_defect(t) {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: SPAN_IDENTITY.into(),
+                    reason,
+                });
+                continue;
+            }
             if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
@@ -2383,7 +2744,9 @@ fn frozen_task_scope(manifest: &Manifest) -> Vec<TaskScope> {
 /// more model usage and then a budget kill with no further result; the earlier
 /// cumulative total is then a partial amount, not this launch's final cost.
 /// Finality therefore needs an observed exit for the same launch AND a
-/// terminal last result AND an exit whose `prior_state` agrees with it.
+/// terminal last result AND an exit whose `prior_state` agrees with it AND
+/// that exit's own `cost_coverage: "final"` — the producer's measurement that
+/// no further usage followed the result. State agreement alone is not it.
 fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
     let state = last.state.as_deref().unwrap_or("");
     if !TERMINAL_USAGE_STATES.contains(&state) {
@@ -2419,18 +2782,61 @@ fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
             ),
         );
     }
+    // Cost coverage is measured by the producer, not inferred here. A terminal
+    // last result and an agreeing `prior_state` say the launch's lifecycle
+    // state matched; they do NOT say no further model usage ran past that
+    // result, which is exactly what `CostCoverage` tracks and what the
+    // state-only check got wrong. Everything but `final` fails closed: the
+    // amount is preserved as a partial/unknown figure and never reaches a
+    // provider total. This bounds COST only — the exit itself remains valid
+    // physical-exit evidence for author exit and lifetime.
+    match exit.cost_coverage.as_deref() {
+        Some(FINAL_COST_COVERAGE) => {}
+        None => {
+            return (
+                false,
+                format!(
+                    "exit {} states no cost_coverage, so it is not evidence that the reported \
+                     amount covers the whole launch",
+                    exit.record
+                ),
+            )
+        }
+        Some(other) if NON_FINAL_COST_COVERAGE.contains(&other) => {
+            return (
+                false,
+                format!(
+                    "exit {} reports cost_coverage={other:?}: the launch's own producer states \
+                     the reported amount does not cover it",
+                    exit.record
+                ),
+            )
+        }
+        Some(other) => {
+            return (
+                false,
+                format!(
+                    "exit {} reports an unrecognized cost_coverage={other:?}, which cannot be \
+                     read as covering the launch",
+                    exit.record
+                ),
+            )
+        }
+    }
     match exit.prior_state.as_deref() {
         None => (
             true,
             format!(
-                "terminal result (state={state}) followed by observed exit {}",
+                "terminal result (state={state}) followed by observed exit {} with \
+                 cost_coverage={FINAL_COST_COVERAGE}",
                 exit.record
             ),
         ),
         Some(prior) if prior == state => (
             true,
             format!(
-                "terminal result (state={state}) followed by observed exit {}",
+                "terminal result (state={state}) followed by observed exit {} with \
+                 cost_coverage={FINAL_COST_COVERAGE}",
                 exit.record
             ),
         ),
@@ -3091,7 +3497,7 @@ pub fn compute_full(
                         // `duration_ms` from before admission was requested,
                         // so it already included `queue_wait_ms`; summing both
                         // for such a span here double-counted the wait.
-                        if phase["duration_semantic"] == "additive" {
+                        if phase["duration_semantic"] == ADDITIVE_DURATION {
                             opt_sum(&mut phase_ms.verification_ms, dur);
                             opt_sum(&mut phase_ms.verification_ms, wait);
                         } else if dur.is_some() || wait.is_some() {
@@ -3890,7 +4296,7 @@ mod tests {
             "id": id,
             "category": "artifact",
             "scope": "repo",
-            "identity": format!("bbs-finding-{id}"),
+            "identity": format!("bbs-finding-{}", digest_key(id)),
             "instance": "author",
             "lifecycle": "furniture",
             "created_at": created,
@@ -3921,7 +4327,7 @@ mod tests {
             "id": id,
             "category": "artifact",
             "scope": "repo",
-            "identity": format!("bbs-reuse-{id}"),
+            "identity": format!("bbs-reuse-{}", digest_key(id)),
             "instance": "consumer",
             "lifecycle": "furniture",
             "created_at": created,
@@ -3944,7 +4350,7 @@ mod tests {
             "id": id,
             "category": "artifact",
             "scope": "repo",
-            "identity": format!("bbs-assessment-{id}"),
+            "identity": format!("bbs-assessment-{}", digest_key(id)),
             "instance": "operator",
             "lifecycle": "furniture",
             "created_at": created,
@@ -3962,7 +4368,24 @@ mod tests {
         })
     }
 
-    const CASTLE: &str = "castle-1";
+    /// A real castle wire author id: `castle-<16 lowercase hex>`
+    /// (`rk_core::identity::actor_from_pubkey`). Taken from the captured
+    /// native records rather than shortened, because the author SHAPE is now
+    /// part of what a native record has to prove.
+    const CASTLE: &str = "castle-48451de05dc5e21a";
+
+    /// A producer-shaped identity key. `canonical_digest` returns a lowercase
+    /// hex SHA-256, so every native `bbs-finding-`/`bbs-answer-`/`bbs-reuse-`/
+    /// `bbs-assessment-` suffix is exactly 64 lowercase hex characters. Tests
+    /// derive a stable one per seed instead of a short readable stand-in the
+    /// real producer could never mint.
+    fn digest_key(seed: &str) -> String {
+        let mut key = String::with_capacity(DIGEST_HEX_LEN);
+        for (i, b) in seed.bytes().cycle().take(DIGEST_HEX_LEN / 2).enumerate() {
+            key.push_str(&format!("{:02x}", b ^ (i as u8)));
+        }
+        key
+    }
 
     /// `record_exposure`'s exact payload (crates/rk-daemon/src/bbs.rs on
     /// rat/scurry-15/tkt-tapip-puhot-sitih): castle-authored, so `instance` is
@@ -4072,9 +4495,20 @@ mod tests {
                 "agent": agent, "spawn": spawn, "session": session,
                 "launched_at": launched_at, "exited_at": exited_at,
                 "prior_state": prior_state, "crashed": crashed, "exit_code": 0,
-                "stale_session": stale_session
+                "stale_session": stale_session,
+                // The producer always states coverage; `final` is the shape of
+                // a launch whose last result did cover it. Override with
+                // `with_cost_coverage` to model the other outcomes.
+                "cost_coverage": FINAL_COST_COVERAGE
             }
         })
+    }
+
+    /// Restate an `agent_exit` fixture's `cost_coverage`. `Value::Null` models
+    /// a record predating the field.
+    fn with_cost_coverage(mut exit: Value, coverage: Value) -> Value {
+        exit["payload"]["cost_coverage"] = coverage;
+        exit
     }
 
     /// `agent_final_usage` (S2 contract, identity `bbs-agent-final-usage`):
@@ -4109,6 +4543,22 @@ mod tests {
                 "state": state, "cost_usd": cost_usd, "cost_basis": cost_basis,
                 "observed_at": observed_at
             }
+        })
+    }
+
+    /// `record_phase_span`'s exact envelope (crates/rk-daemon/src/span.rs):
+    /// a castle-authored `Furniture` Event under `task_span`, scoped to the
+    /// ticket's repo, carrying `PhaseSpan::to_payload()`.
+    fn span_full(id: &str, payload: Value) -> Value {
+        json!({
+            "id": id,
+            "category": "event",
+            "scope": "repo",
+            "identity": SPAN_IDENTITY,
+            "instance": "daemon",
+            "lifecycle": "furniture",
+            "created_at": "2026-01-01T00:00:00Z",
+            "payload": payload
         })
     }
 
@@ -5168,33 +5618,28 @@ mod tests {
             }],
             ..manifest(vec![])
         };
-        let additive_span = json!({
-            "id": "span-additive",
-            "category": "event",
-            "scope": "repo",
-            "identity": "task_span",
-            "instance": "daemon",
-            "lifecycle": "furniture",
-            "created_at": "2026-01-01T00:00:00Z",
-            "payload": {
+        // `from_durations` anchors `ended_at` at now and derives the two
+        // earlier stamps, so a real additive span carries all three.
+        let additive_span = span_full(
+            "span-additive",
+            json!({
                 "task": "TKT-verify", "phase": "verification", "attempt": 1,
+                "queued_at": "2026-01-01T00:00:00Z",
+                "started_at": "2026-01-01T00:00:00.500Z",
+                "ended_at": "2026-01-01T00:00:00.550Z",
                 "queue_wait_ms": 500, "duration_ms": 50,
-                "duration_semantic": "additive"
-            }
-        });
-        let legacy_span = json!({
-            "id": "span-legacy",
-            "category": "event",
-            "scope": "repo",
-            "identity": "task_span",
-            "instance": "daemon",
-            "lifecycle": "furniture",
-            "created_at": "2026-01-01T00:00:00Z",
-            "payload": {
+                "duration_semantic": ADDITIVE_DURATION, "repo": "repo"
+            }),
+        );
+        // A span recorded before the tag existed: durations only, no
+        // `duration_semantic`. Still a supported shape.
+        let legacy_span = span_full(
+            "span-legacy",
+            json!({
                 "task": "TKT-verify", "phase": "verification", "attempt": 2,
                 "queue_wait_ms": 800, "duration_ms": 900
-            }
-        });
+            }),
+        );
         let c = capture(vec![additive_span, legacy_span], Order::Unknown);
         let report = compute(&m, &c, &[]).unwrap();
         assert_eq!(report.deliveries.len(), 1);
