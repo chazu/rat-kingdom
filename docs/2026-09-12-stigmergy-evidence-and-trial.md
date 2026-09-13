@@ -170,6 +170,11 @@ denominator and all implementation, rework and review attempts in its cost
 numerator. With no accepted roots the ratio is undefined. Missing lineage or
 cost evidence remains unknown: a complete task-local cost row never proves
 complete batch coverage. Apply this identical rule to all comparison arms.
+Rework lineage has two authoritative sources, not one: a native rework ticket
+may carry `parent: null` (this trial's own Bavus ticket does), and the daemon's
+`landing_rework_dispatch` record then supplies the binding, linking task ->
+rework_ticket with its own repo/source/target. Closure follows BOTH link kinds,
+recursively, retaining failures, and never infers lineage from titles or names.
 
 Task completion, the final provider cost report, and physical process exit are
 separate observations. Native observations bind both the agent generation and
