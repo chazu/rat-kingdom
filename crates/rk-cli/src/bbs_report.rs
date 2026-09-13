@@ -1485,6 +1485,30 @@ fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
             "tuple scope {scope:?} disagrees with payload.repo {repo:?}"
         ));
     }
+    if matches!(bbs_kind, AGENT_EXIT | AGENT_FINAL_USAGE) {
+        if str_field(t, &["payload", "agent"]).trim().is_empty() {
+            return Some("payload.agent is absent; native usage/exit must name its agent".into());
+        }
+        if !matches!(&t["payload"]["task"], Value::Null | Value::String(_)) {
+            return Some("payload.task is neither a string nor an unassigned null".into());
+        }
+        let field = if bbs_kind == AGENT_EXIT {
+            "exited_at"
+        } else {
+            "observed_at"
+        };
+        if payload_time(t, field).is_none() {
+            return Some(format!(
+                "payload.{field} is absent or not an RFC3339 timestamp"
+            ));
+        }
+        if bbs_kind == AGENT_EXIT
+            && !t["payload"]["launched_at"].is_null()
+            && payload_time(t, "launched_at").is_none()
+        {
+            return Some("present payload.launched_at is not an RFC3339 timestamp".into());
+        }
+    }
     None
 }
 
@@ -1695,7 +1719,12 @@ impl EvidenceCheck {
 /// alone let an event, a receipt or a telemetry row stand in for the artifact
 /// a finding claims; filtering non-string members silently let `["ev-1", 7]`
 /// pass as though it had named one thing.
-fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) -> EvidenceCheck {
+fn check_evidence(
+    evidence: &Value,
+    by_id: &BTreeMap<&str, &Value>,
+    rejected: &[InvalidRecord],
+    repo: &str,
+) -> EvidenceCheck {
     let Some(items) = evidence.as_array() else {
         return EvidenceCheck::Invalid(if evidence.is_null() {
             "evidence is absent".into()
@@ -1716,6 +1745,9 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
         if id.trim().is_empty() {
             return EvidenceCheck::Invalid("evidence contains a blank member".into());
         }
+        if let Some(bad) = rejected.iter().find(|r| r.record == id) {
+            return EvidenceCheck::Invalid(format!("evidence {id} was rejected: {}", bad.reason));
+        }
         match by_id.get(id) {
             None => {
                 unknown.get_or_insert(format!("evidence {id} is not present in the capture"));
@@ -1733,6 +1765,19 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
                         t["scope"].as_str().unwrap_or("")
                     ));
                 }
+                let defect = match t["payload"]["bbs_kind"].as_str() {
+                    Some(ASSESSMENT) => assessment_defect(t),
+                    Some(kind @ (FINDING | ANSWER | REUSE)) => artifact_record_defect(t, kind),
+                    Some(kind @ (EXPOSURE | OPEN | AGENT_EXIT | AGENT_FINAL_USAGE)) => {
+                        telemetry_record_defect(t, kind)
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = defect {
+                    return EvidenceCheck::Invalid(format!(
+                        "evidence {id} has an invalid BBS contract: {reason}"
+                    ));
+                }
             }
         }
     }
@@ -1746,6 +1791,7 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
 fn resolve_annotated_evidence(
     items: &[AnnotatedEvidence],
     by_id: &BTreeMap<&str, &Value>,
+    rejected: &[InvalidRecord],
     repo: &str,
     kind: &str,
     invalid: &mut Vec<InvalidRecord>,
@@ -1753,7 +1799,7 @@ fn resolve_annotated_evidence(
 ) -> Vec<String> {
     let mut resolved = Vec::new();
     for item in items {
-        match check_evidence(&json!([item.evidence.clone()]), by_id, repo) {
+        match check_evidence(&json!([item.evidence.clone()]), by_id, rejected, repo) {
             EvidenceCheck::Resolved => resolved.push(item.evidence.clone()),
             EvidenceCheck::Unknown(reason) => unresolved.push(InvalidRecord {
                 record: item.evidence.clone(),
@@ -1849,6 +1895,7 @@ struct ExitRow {
 struct UsageRow {
     repo: String,
     task: String,
+    agent: String,
     spawn: String,
     session: String,
     provider_session: Option<String>,
@@ -2140,8 +2187,17 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
+            if str_field(t, &["payload", "task"]).trim().is_empty() {
+                idx.unresolved.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_EXIT.into(),
+                    reason: "native observation has no assigned task; it cannot be attributed"
+                        .into(),
+                });
+                continue;
+            }
             let exited_at = payload_time(t, "exited_at");
-            if !admit(&mut idx, t, exited_at.or_else(|| created_at(t))) {
+            if !admit(&mut idx, t, exited_at) {
                 continue;
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
@@ -2194,8 +2250,17 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
+            if str_field(t, &["payload", "task"]).trim().is_empty() {
+                idx.unresolved.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_FINAL_USAGE.into(),
+                    reason: "native observation has no assigned task; it cannot be attributed"
+                        .into(),
+                });
+                continue;
+            }
             let observed_at = payload_time(t, "observed_at");
-            if !admit(&mut idx, t, observed_at.or_else(|| created_at(t))) {
+            if !admit(&mut idx, t, observed_at) {
                 continue;
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
@@ -2233,6 +2298,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             idx.usage.push(UsageRow {
                 repo: scope.clone(),
                 task: str_field(t, &["payload", "task"]).to_string(),
+                agent: str_field(t, &["payload", "agent"]).to_string(),
                 spawn,
                 session,
                 provider_session: t["payload"]["provider_session"]
@@ -2449,6 +2515,7 @@ fn resolve_author_exit(
     idx: &Index<'_>,
     repo: &str,
     source_agent: &str,
+    source_task: &str,
     source_spawn: &str,
     claim_created: Option<DateTime<Utc>>,
 ) -> std::result::Result<String, String> {
@@ -2494,6 +2561,12 @@ fn resolve_author_exit(
         return Err(format!(
             "{evidence_id} is scoped to repo {}, not the pair's {repo}",
             exit.repo
+        ));
+    }
+    if source_task.trim().is_empty() || exit.task != source_task {
+        return Err(format!(
+            "{evidence_id} names task {:?}, not an established source task {source_task:?}",
+            exit.task
         ));
     }
     if exit.spawn != source_spawn {
@@ -2739,6 +2812,7 @@ pub fn compute_full(
         let repeated = resolve_annotated_evidence(
             &a.repeated_investigations,
             &idx.by_id,
+            &idx.invalid,
             &a.repo,
             "reviewed_repeated_investigation",
             &mut invalid_records,
@@ -2747,6 +2821,7 @@ pub fn compute_full(
         let rework = resolve_annotated_evidence(
             &a.rework,
             &idx.by_id,
+            &idx.invalid,
             &a.repo,
             "reviewed_rework",
             &mut invalid_records,
@@ -2755,6 +2830,7 @@ pub fn compute_full(
         let interventions = resolve_annotated_evidence(
             &a.interventions,
             &idx.by_id,
+            &idx.invalid,
             &a.repo,
             "reviewed_intervention",
             &mut invalid_records,
@@ -2819,7 +2895,12 @@ pub fn compute_full(
         // evidence contract to check. Unresolvable evidence leaves the
         // opportunity standing but stops it certifying anything.
         let source_evidence = if source_kind == FINDING || source_kind == ANSWER {
-            let check = check_evidence(&source["payload"]["evidence"], &idx.by_id, &pair.repo);
+            let check = check_evidence(
+                &source["payload"]["evidence"],
+                &idx.by_id,
+                &idx.invalid,
+                &pair.repo,
+            );
             match &check {
                 EvidenceCheck::Invalid(reason) => {
                     excluded.push(Excluded {
@@ -2879,7 +2960,12 @@ pub fn compute_full(
                     });
                     continue;
                 }
-                match check_evidence(&c["payload"]["evidence"], &idx.by_id, &pair.repo) {
+                match check_evidence(
+                    &c["payload"]["evidence"],
+                    &idx.by_id,
+                    &idx.invalid,
+                    &pair.repo,
+                ) {
                     EvidenceCheck::Invalid(detail) => {
                         rejected_claims.push(RejectedClaim {
                             pair: pair.id.clone(),
@@ -2960,7 +3046,12 @@ pub fn compute_full(
                         });
                         continue;
                     }
-                    match check_evidence(&a["payload"]["evidence"], &idx.by_id, &pair.repo) {
+                    match check_evidence(
+                        &a["payload"]["evidence"],
+                        &idx.by_id,
+                        &idx.invalid,
+                        &pair.repo,
+                    ) {
                         EvidenceCheck::Resolved => candidates.push((*pos, a)),
                         EvidenceCheck::Invalid(reason) | EvidenceCheck::Unknown(reason) => {
                             unresolved.push(InvalidRecord {
@@ -3054,6 +3145,7 @@ pub fn compute_full(
                 &idx,
                 &pair.repo,
                 &source_agent,
+                str_field(source, &["payload", "task"]),
                 &source_spawn,
                 claim_created,
             ) {
@@ -3550,10 +3642,13 @@ pub fn compute_full(
                     });
                 }
                 let last = rows.last().copied().expect("segment has at least one row");
-                let exit = idx
-                    .exits
-                    .iter()
-                    .find(|e| e.repo == scope.repo && e.spawn == spawn && e.session == session);
+                let exit = idx.exits.iter().find(|e| {
+                    e.repo == scope.repo
+                        && e.task == scope.task
+                        && e.agent == last.agent
+                        && e.spawn == spawn
+                        && e.session == session
+                });
                 // One row IS its own last, whatever the order; only a
                 // multi-row segment needs persistence order to resolve.
                 let (final_cost, finality_reason) = if rows.len() > 1 && !ordered {
@@ -6938,6 +7033,7 @@ mod tests {
             assert!(report
                 .invalid_records
                 .iter()
+                .chain(report.unresolved_records.iter())
                 .any(|r| r.record == if is_usage { "u" } else { "x" }));
         }
     }
