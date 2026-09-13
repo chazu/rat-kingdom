@@ -251,3 +251,11 @@ The execution ledger and ticket IDs are appended below as work proceeds.
 
 Initial source: `8e0cccf`; installed daemon: `72911dd1d382`. No live
 workers and no landing queue entries at preflight. Artifact directory: `/Users/chazu/.codex/artifacts/rk-stigmergy-20260913T022353Z`.
+
+- S1 test tracking: `TKT-lakir-sosit-novug` — created by the first worker at its committed checkpoint; the operator resumed S1 to finish these same acceptance tests before delivery. It is not independent delivered work.
+- S3 correction: `TKT-nonub-pugar-pilid` — operator review found incomplete native identity/scope validation and experiment denominators. Required before S4; retains the existing experiment criteria.
+
+S1 checkpoint `4f8cfb1` was committed with unit checks but lacked real-CLI
+integration/restart/authority coverage; resumed in its preserved worktree. S3
+checkpoint `43faffe` passed scoped checks and entered the normal landing gate.
+The operator review above is a deployment prerequisite, not a passing trial.
