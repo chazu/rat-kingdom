@@ -8,19 +8,24 @@
 //! deadline-exhaustion behavior is covered without a 30-second wall-clock
 //! test.
 //!
-//! TKT-mukos-pogim-lopis: `support::try_connect_or_report` additionally races
-//! (via `tokio::select!`, bounding each connect attempt so a stall cannot
-//! block the other two checks) a connect attempt against the spawned
-//! daemon's own `JoinHandle` and a deadline, so IF a daemon's `run()` has
-//! already returned (lost the singleton-lock race, failed its bind, any
+//! TKT-mukos-pogim-lopis: `support::try_connect_or_report` (built on the
+//! generic `support::race_attempt_or_report`) additionally races the WHOLE
+//! retrying connect attempt against the spawned daemon's own `JoinHandle`
+//! and one absolute deadline via `tokio::select!`, so IF a daemon's `run()`
+//! has already returned (lost the singleton-lock race, failed its bind, any
 //! other startup error), that real result is reported instead of reading as
-//! a slow daemon until the deadline expires. This is diagnostic
-//! instrumentation for the intermittent
-//! `restart_mid_queue_replays_fifo_order_*` failure, not a confirmed fix —
-//! whether an early-finished `run()` is the actual cause of that failure is
-//! still unproven pending an instrumented failing run. Exercised here
-//! against a fake near-instant task, same reasoning as the `poll_until`
-//! tests above.
+//! a slow daemon until the deadline expires. Individual attempts are never
+//! capped short by the retry `poll_interval` — an earlier version that did
+//! cap each attempt at `poll_interval` would cancel a real connect/auth
+//! attempt that is merely slow under load before it ever got to succeed,
+//! which is exactly the failure mode this instrumentation exists to avoid;
+//! see `race_attempt_or_report_lets_a_slow_but_healthy_attempt_finish_
+//! instead_of_cancelling_it` below. This is diagnostic instrumentation for
+//! the intermittent `restart_mid_queue_replays_fifo_order_*` failure, not a
+//! confirmed fix — whether an early-finished `run()` is the actual cause of
+//! that failure is still unproven pending an instrumented failing run.
+//! Exercised here against fake near-instant/slow-but-successful tasks, same
+//! reasoning as the `poll_until` tests above.
 
 mod support;
 
@@ -140,6 +145,59 @@ async fn try_connect_or_report_still_times_out_when_the_daemon_neither_connects_
     assert!(
         wall_clock_start.elapsed() < Duration::from_secs(5),
         "deadline exhaustion should resolve close to the configured deadline, not hang"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn race_attempt_or_report_lets_a_slow_but_healthy_attempt_finish_instead_of_cancelling_it() {
+    // Regression for a real defect caught in review: an earlier version
+    // wrapped each individual attempt in its own `poll_interval`-sized
+    // `tokio::time::timeout`, which would cancel a real connect/auth
+    // handshake that is merely slow under load (exactly the condition this
+    // instrumentation exists to survive) before it ever got a chance to
+    // succeed. This fake attempt only ever returns `Some` on its FIRST call,
+    // and only after sleeping well past `poll_interval` — under the buggy
+    // per-attempt-timeout design, that first attempt would have been
+    // cancelled and every subsequent call would return `None` immediately,
+    // spinning until `deadline` and reporting `TimedOut` instead of success.
+    let mut handle: tokio::task::JoinHandle<rk_core::Result<()>> =
+        tokio::spawn(async { std::future::pending().await });
+
+    let poll_interval = Duration::from_millis(20);
+    let attempt_delay = poll_interval * 3;
+    let deadline = Duration::from_secs(5);
+    let wall_clock_start = Instant::now();
+
+    let mut calls = 0;
+    let result = support::race_attempt_or_report(&mut handle, deadline, poll_interval, move || {
+        calls += 1;
+        let this_call = calls;
+        async move {
+            if this_call == 1 {
+                tokio::time::sleep(attempt_delay).await;
+                Some(())
+            } else {
+                // Only the slow first attempt ever succeeds — proves the
+                // fix didn't just get lucky on a later, fast retry.
+                None
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        matches!(result, Ok(())),
+        "a single slow-but-successful attempt within the deadline must succeed, got: {result:?}"
+    );
+    let elapsed = wall_clock_start.elapsed();
+    assert!(
+        elapsed >= attempt_delay,
+        "the attempt must have been allowed to run to completion, not cut short: {elapsed:?}"
+    );
+    assert!(
+        elapsed < deadline,
+        "must resolve well before the overall deadline, not by exhausting it: {elapsed:?}"
     );
     handle.abort();
 }

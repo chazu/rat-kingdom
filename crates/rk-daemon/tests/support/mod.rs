@@ -226,8 +226,80 @@ impl std::fmt::Display for StartupFailure {
 const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Diagnostic instrumentation, not a confirmed fix: races a connect attempt
-/// against `handle`'s completion and the `deadline`, so that IF a daemon's
+/// Generic core of [`try_connect_or_report`]: races a *retrying* `attempt`
+/// against `handle`'s completion and one absolute `deadline`. Generic over
+/// `attempt` so this racing logic — an already-finished handle winning
+/// immediately, a still-slow-but-eventually-successful attempt being allowed
+/// to finish, the deadline firing when neither happens — can be unit tested
+/// against a fake attempt closure instead of a real daemon socket and a
+/// production-sized deadline, mirroring how [`poll_until`] is tested apart
+/// from [`connect`].
+///
+/// `attempt` itself is NEVER individually capped short. A version of this
+/// that wrapped each attempt in its own `poll_interval`-sized timeout would
+/// cancel a legitimate attempt that is merely slow — a stalled connect or
+/// disk-bound auth-token read under real host contention, exactly the
+/// condition this instrumentation exists to survive — before it ever got a
+/// chance to succeed, misreporting a healthy-but-slow daemon as unreachable.
+/// `poll_interval` here is ONLY the backoff between FAILED attempts, never an
+/// acceptance deadline on any single attempt in flight. The sole upper bound
+/// on how long any one attempt may run is `deadline`, raced concurrently via
+/// the third `select!` branch below — so a stall is still bounded overall,
+/// just not truncated attempt-by-attempt.
+///
+/// `handle` is taken by `&mut` rather than by value so callers that still
+/// need it afterwards (e.g. to `abort()` a daemon that DID come up) keep
+/// ownership. It is safe to poll it inside `select!` because a branch that
+/// resolves the handle to `Ready` returns from this function immediately —
+/// the handle is never polled again after it has yielded its result.
+#[allow(dead_code)]
+pub async fn race_attempt_or_report<T, Fut>(
+    handle: &mut tokio::task::JoinHandle<rk_core::Result<()>>,
+    deadline: Duration,
+    poll_interval: Duration,
+    mut attempt: impl FnMut() -> Fut,
+) -> Result<T, StartupFailure>
+where
+    Fut: Future<Output = Option<T>>,
+{
+    let start = Instant::now();
+    // Wrapped in one `async` block rather than left as a bare `select!`
+    // branch expression so the retry loop (attempt, and on failure a real
+    // timer sleep) reads as the single logical unit it is; `select!` still
+    // only ever polls this whole unit, never an individual attempt, against
+    // `deadline`/`handle`.
+    let retrying_attempt = async move {
+        loop {
+            if let Some(value) = attempt().await {
+                return value;
+            }
+            // Not just pacing: a failed attempt against, e.g., a socket
+            // nobody is listening on typically resolves synchronously (no
+            // real await point). Without an unconditional real timer yield
+            // here, a single-threaded runtime could keep this loop always
+            // immediately ready and never hand control back to the
+            // executor — starving `handle`'s task of a chance to be polled
+            // to completion, which would misreport a genuinely stopped
+            // daemon as a plain timeout. `poll_until`'s loop has the same
+            // unconditional-sleep shape for the same reason.
+            tokio::time::sleep(poll_interval).await;
+        }
+    };
+    tokio::pin!(retrying_attempt);
+
+    tokio::select! {
+        biased;
+        join_result = &mut *handle => Err(match join_result {
+            Ok(result) => StartupFailure::DaemonExited(result),
+            Err(join_error) => StartupFailure::DaemonJoinError(join_error),
+        }),
+        value = &mut retrying_attempt => Ok(value),
+        _ = tokio::time::sleep(deadline) => Err(StartupFailure::TimedOut(start.elapsed())),
+    }
+}
+
+/// Diagnostic instrumentation, not a confirmed fix: see
+/// [`race_attempt_or_report`] for what this races and why. IF a daemon's
 /// `run()` future has already resolved — lost the singleton-lock race,
 /// failed its bind, or hit any other startup error — that actual result is
 /// reported instead of only ever seeing "daemon did not come up" with no
@@ -237,32 +309,6 @@ const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// observed under this instrumentation has yet captured a `DaemonExited` or
 /// `DaemonJoinError` outcome. Treat the underlying cause as unknown until an
 /// actual failing run under this instrumentation produces that evidence.
-///
-/// Each connect attempt is individually bounded via `tokio::select!` against
-/// `handle` and a per-attempt timeout capped at `poll_interval` (or the
-/// remaining budget, if smaller) — a stalled `connect`/auth handshake can
-/// therefore never prevent this loop from re-observing `handle` or
-/// `deadline`. A version of this that plainly `.await`ed the connect attempt
-/// before ever checking `handle` or the elapsed time would not actually race
-/// anything: a stall in that connect step would block both checks
-/// indefinitely, which is not "bounded" in any meaningful sense.
-///
-/// The trailing `sleep(poll_interval)` is not just pacing: a `connect`
-/// attempt against a socket nobody is listening on typically fails
-/// synchronously (no real await point), so without an unconditional real
-/// timer yield each iteration, a single-threaded runtime could keep this
-/// loop always immediately ready and never actually hand control back to the
-/// executor — starving `handle`'s task of a chance to be polled to
-/// completion at all, which would misreport a genuinely stopped daemon as a
-/// plain timeout. `poll_until`'s loop has the same unconditional-sleep shape
-/// for the same reason.
-///
-/// `handle` is taken by `&mut` rather than by value so callers that still
-/// need it afterwards (e.g. to `abort()` a daemon that DID come up) keep
-/// ownership. It is safe to poll repeatedly via `&mut *handle` inside the
-/// loop because a `select!` branch that resolves the handle to `Ready`
-/// immediately returns from this function — the handle is never polled again
-/// after it has yielded its result.
 #[allow(dead_code)]
 pub async fn try_connect_or_report(
     layout: &Layout,
@@ -270,35 +316,10 @@ pub async fn try_connect_or_report(
     deadline: Duration,
     poll_interval: Duration,
 ) -> Result<Client, StartupFailure> {
-    let start = Instant::now();
-    loop {
-        tokio::select! {
-            biased;
-            join_result = &mut *handle => {
-                return Err(match join_result {
-                    Ok(result) => StartupFailure::DaemonExited(result),
-                    Err(join_error) => StartupFailure::DaemonJoinError(join_error),
-                });
-            }
-            connect_result = tokio::time::timeout(
-                poll_interval,
-                Client::connect_as_operator(layout),
-            ) => {
-                if let Ok(Ok(client)) = connect_result {
-                    return Ok(client);
-                }
-                // Either the attempt timed out (bounded by `poll_interval`)
-                // or connected and was refused/failed — either way, fall
-                // through to the deadline check and retry below.
-            }
-        }
-
-        let elapsed = start.elapsed();
-        if elapsed >= deadline {
-            return Err(StartupFailure::TimedOut(elapsed));
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
+    race_attempt_or_report(handle, deadline, poll_interval, || async {
+        Client::connect_as_operator(layout).await.ok()
+    })
+    .await
 }
 
 /// Panicking wrapper over [`try_connect_or_report`] using the same
