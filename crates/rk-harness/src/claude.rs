@@ -493,7 +493,9 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
             "tool block must still come through"
         );
         assert!(
-            !second.iter().any(|e| matches!(e, HarnessEvent::Usage { .. })),
+            !second
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::Usage { .. })),
             "repeat sighting of the same id must drop its duplicate Usage"
         );
     }
@@ -507,9 +509,13 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
         let first = parse(first_line);
         let second = parse(second_line);
 
-        assert!(first.iter().any(|e| matches!(e, HarnessEvent::Usage { .. })));
+        assert!(first
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::Usage { .. })));
         assert!(
-            second.iter().any(|e| matches!(e, HarnessEvent::Usage { .. })),
+            second
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::Usage { .. })),
             "a different message id is a distinct turn, not a repeat"
         );
     }
@@ -550,7 +556,9 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
         for _ in 0..3 {
             let events = parse(line);
             assert!(
-                events.iter().any(|e| matches!(e, HarnessEvent::Usage { .. })),
+                events
+                    .iter()
+                    .any(|e| matches!(e, HarnessEvent::Usage { .. })),
                 "with no id to key on, the conservative choice is to never drop a Usage event"
             );
         }
