@@ -17,6 +17,35 @@ pub fn is_acceptance(tuple: &Tuple) -> bool {
         && tuple.payload["bbs_kind"] == "acceptance"
 }
 
+/// A published finding: a reproduction, interface constraint, reusable
+/// implementation, or failed approach a worker names as useful to peers.
+pub fn is_finding(tuple: &Tuple) -> bool {
+    tuple.category == Category::Artifact
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "finding"
+}
+
+/// A consumer's receipt recording use of an ordinary artifact or finding/answer.
+pub fn is_reuse(tuple: &Tuple) -> bool {
+    tuple.category == Category::Artifact
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "reuse"
+}
+
+/// An operator-only verdict against a reuse receipt. Multiple assessments may
+/// exist for one receipt; the newest by persistence order is current.
+pub fn is_assessment(tuple: &Tuple) -> bool {
+    tuple.category == Category::Artifact
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "assessment"
+}
+
+/// Receipt/assessment/telemetry records must never crowd findings out of
+/// discovery views such as `bbs brief`.
+pub fn is_excluded_from_discovery(tuple: &Tuple) -> bool {
+    is_reuse(tuple) || is_assessment(tuple)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BriefingEntry {
     pub id: String,

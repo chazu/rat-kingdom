@@ -3229,7 +3229,7 @@ impl Daemon {
                 self.supervisor.set_dispatch_paused(false);
                 reply(Response::ok(id, json!({"paused": false})))
             }
-            "bbs.ask" | "bbs.answer" | "bbs.accept" => {
+            "bbs.ask" | "bbs.answer" | "bbs.accept" | "bbs.publish" | "bbs.reuse" | "bbs.assess" => {
                 let _guard = self
                     .bbs_write_lock
                     .lock()
@@ -10671,7 +10671,14 @@ impl Daemon {
         }
         if is_agent
             && (params.payload.get("bbs_kind").is_some()
-                || ["bbs-question-", "bbs-answer-", "bbs-accept-"]
+                || [
+                    "bbs-question-",
+                    "bbs-answer-",
+                    "bbs-accept-",
+                    "bbs-finding-",
+                    "bbs-reuse-",
+                    "bbs-assessment-",
+                ]
                     .iter()
                     .any(|prefix| params.identity.starts_with(prefix)))
         {
