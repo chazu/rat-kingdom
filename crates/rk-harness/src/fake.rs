@@ -56,7 +56,7 @@ impl Harness for FakeHarness {
 
         let mut session = runner::launch(runner::Wiring {
             command: cmd,
-            parse: claude::parse_event_line,
+            parse: Box::new(claude::parse_event_line),
             steer_line: Some(|envelope: &ControlEnvelope| {
                 serde_json::json!({"type": "rk_control", "control": envelope}).to_string()
             }),
