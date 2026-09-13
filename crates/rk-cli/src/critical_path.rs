@@ -58,14 +58,17 @@ pub async fn show(layout: &Layout, task: &str, as_json: bool) -> Result<()> {
 /// Build the critical-path summary from raw `task_span` tuples (as returned
 /// by `space.scan`, each carrying `id`, `payload`, ... — the wire shape, not
 /// the daemon-internal `PhaseSpan`). Pure and deterministic: sorts oldest
-/// first by `id`, then dedups on `(phase, attempt, candidate, lane)` keeping
-/// the first occurrence — the same key `rk_daemon::span::record_phase_span`
-/// dedups on durably (`span.rs` module doc) — so a duplicate replay or
-/// reordering never double-counts a phase, but a landing gate's later round
-/// reusing an earlier round's small plan-position `attempt` against a
-/// genuinely new `candidate` is never collapsed into the earlier round's
-/// occurrence either. Never invents a value: every metric that has no
-/// supporting span in `tuples` comes out `null`, not `0`.
+/// first by `id`, then dedups on `(phase, attempt, target, candidate, lane,
+/// occurrence_key)` keeping the first occurrence — the IDENTICAL key
+/// `rk_daemon::span::record_phase_span` dedups on durably (`span.rs` module
+/// doc), so a row that survived storage as a distinct occurrence is never
+/// collapsed away again here — so a duplicate replay or reordering never
+/// double-counts a phase, but a landing gate's later round reusing an
+/// earlier round's small plan-position `attempt` against a genuinely new
+/// `candidate`, or a check whose command/toolchain/environment changed at
+/// the same candidate (a different `occurrence_key`), is never collapsed
+/// into an earlier occurrence either. Never invents a value: every metric
+/// that has no supporting span in `tuples` comes out `null`, not `0`.
 pub fn build_critical_path(task: &str, tuples: &[Value]) -> Value {
     let mut rows = tuples.to_vec();
     rows.sort_by(|a, b| {
@@ -75,15 +78,25 @@ pub fn build_critical_path(task: &str, tuples: &[Value]) -> Value {
             .cmp(b["id"].as_str().unwrap_or(""))
     });
 
-    let mut seen: BTreeSet<(String, u64, Option<String>, Option<String>)> = BTreeSet::new();
+    type SpanKey = (
+        String,
+        u64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut seen: BTreeSet<SpanKey> = BTreeSet::new();
     let mut phases: Vec<Value> = Vec::new();
     for t in rows {
         let p = t["payload"].clone();
         let phase = p["phase"].as_str().unwrap_or("?").to_string();
         let attempt = p["attempt"].as_u64().unwrap_or(1);
+        let target = p["target"].as_str().map(str::to_string);
         let candidate = p["candidate"].as_str().map(str::to_string);
         let lane = p["lane"].as_str().map(str::to_string);
-        if !seen.insert((phase, attempt, candidate, lane)) {
+        let occurrence_key = p["occurrence_key"].as_str().map(str::to_string);
+        if !seen.insert((phase, attempt, target, candidate, lane, occurrence_key)) {
             continue;
         }
         phases.push(p);
@@ -397,6 +410,75 @@ mod tests {
             2,
             "a later round's occurrence must survive even though it reuses an earlier \
              round's attempt number: {cp}"
+        );
+    }
+
+    /// A check whose command/toolchain/environment changed at the exact same
+    /// candidate and plan position — `phase`, `attempt`, `candidate` and
+    /// `lane` all identical, only `occurrence_key` differs — must still be
+    /// kept distinct, mirroring `span.rs`'s writer-side fence exactly (this
+    /// reader must never re-collapse a row storage already kept separate).
+    /// Also covers an exact duplicate replay (every field identical,
+    /// including `occurrence_key`) staying collapsed to one.
+    #[test]
+    fn a_changed_plan_at_the_same_candidate_is_not_collapsed_by_the_reader() {
+        let tuples = vec![
+            span(
+                "verification",
+                1,
+                json!({"candidate": "sha-a", "lane": "verify", "occurrence_key": "cmd-v1"}),
+            ),
+            span(
+                "verification",
+                1,
+                json!({"candidate": "sha-a", "lane": "verify", "occurrence_key": "cmd-v2"}),
+            ),
+        ];
+        let cp = build_critical_path("TKT-x", &tuples);
+        assert_eq!(
+            cp["phases"].as_array().unwrap().len(),
+            2,
+            "a changed occurrence_key at the same candidate/attempt/lane must survive: {cp}"
+        );
+
+        // An exact duplicate of the second row (identical occurrence_key
+        // too) is a genuine replay, not a third occurrence.
+        let mut replayed = tuples;
+        replayed.push(span(
+            "verification",
+            1,
+            json!({"candidate": "sha-a", "lane": "verify", "occurrence_key": "cmd-v2"}),
+        ));
+        let cp = build_critical_path("TKT-x", &replayed);
+        assert_eq!(
+            cp["phases"].as_array().unwrap().len(),
+            2,
+            "an exact replay (same occurrence_key) must not mint a third occurrence: {cp}"
+        );
+    }
+
+    /// `target` is fenced explicitly, not assumed implied by `candidate`: two
+    /// spans naming the SAME candidate but different targets (`phase`,
+    /// `attempt`, `candidate` and `lane` all identical) must both survive.
+    #[test]
+    fn a_same_candidate_different_target_occurrence_is_not_collapsed() {
+        let tuples = vec![
+            span(
+                "verification",
+                1,
+                json!({"target": "parent", "candidate": "sha-a", "lane": "verify"}),
+            ),
+            span(
+                "verification",
+                1,
+                json!({"target": "main", "candidate": "sha-a", "lane": "verify"}),
+            ),
+        ];
+        let cp = build_critical_path("TKT-x", &tuples);
+        assert_eq!(
+            cp["phases"].as_array().unwrap().len(),
+            2,
+            "a different target at the same candidate/attempt/lane must survive: {cp}"
         );
     }
 

@@ -13,8 +13,8 @@
 //! # Idempotency and restart safety
 //!
 //! A span is a fact keyed on `(task, phase, attempt)`, additionally fenced by
-//! `candidate`, `lane` and `occurrence_key` when a producer sets them.
-//! [`record_phase_span`] scans for an existing span on that exact key before
+//! `target`, `candidate`, `lane` and `occurrence_key` when a producer sets
+//! them. [`record_phase_span`] scans for an existing span on that exact key before
 //! writing a new one, so calling it twice for the same underlying occurrence
 //! — a retried caller, a duplicate event replay, or the same durable store
 //! reopened after a daemon restart — writes the tuple exactly once. This
@@ -27,24 +27,29 @@
 //! single point it settles, so there is no "started but never closed" state
 //! for a restart to strand.
 //!
-//! The `candidate`/`lane`/`occurrence_key` fence exists for one reason: a
-//! landing gate's per-check `VerificationQueued` span numbers `attempt` by
-//! the check's position in that round's plan (1, 2, 3, ...), the same small
-//! ordinal a LATER round over the same task reuses for its own checks
-//! against a genuinely new candidate. Keying dedup on `(task, phase,
-//! attempt)` alone would make the later round's real occurrence collide with
-//! — and be silently dropped by — the earlier round's, even though both
-//! actually ran. Every such per-check span already carries `candidate` (the
-//! tested sha), `lane` (the check name) and `occurrence_key` (a digest over
-//! what actually executed — command/toolchain/environment policy — so a
-//! check whose PLAN changed at the SAME candidate and plan position is also
-//! never confused with whatever ran there before), so folding all three into
-//! the key distinguishes a new occurrence from an exact replay of the same
-//! one: identical on every field on a retry (idempotent, no-op), different
-//! on at least one for a genuinely new occurrence (recorded, never
-//! shadowed). A phase that never sets these fields (all `None`) keeps
-//! exactly its old `(task, phase, attempt)` behavior, since `None == None`
-//! on every side changes nothing.
+//! The `target`/`candidate`/`lane`/`occurrence_key` fence exists for one
+//! reason: a landing gate's per-check `VerificationQueued` span numbers
+//! `attempt` by the check's position in that round's plan (1, 2, 3, ...),
+//! the same small ordinal a LATER round over the same task reuses for its
+//! own checks against a genuinely new candidate. Keying dedup on `(task,
+//! phase, attempt)` alone would make the later round's real occurrence
+//! collide with — and be silently dropped by — the earlier round's, even
+//! though both actually ran. Every such per-check span already carries
+//! `target` (the branch this round is landing onto), `candidate` (the tested
+//! sha), `lane` (the check name) and `occurrence_key` (a digest over what
+//! actually executed — command/toolchain/environment policy — so a check
+//! whose PLAN changed at the SAME candidate and plan position is also never
+//! confused with whatever ran there before), so folding all four into the
+//! key distinguishes a new occurrence from an exact replay of the same one:
+//! identical on every field on a retry (idempotent, no-op), different on at
+//! least one for a genuinely new occurrence (recorded, never shadowed).
+//! `target` is fenced explicitly rather than assumed implied by `candidate`
+//! (landing onto a different target ordinarily produces a different merge
+//! commit, but that is a property of `rk_git::Repo::prepare_merge`, not of
+//! this module, and is not something this module should have to rely on).
+//! A phase that never sets these fields (all `None`) keeps exactly its old
+//! `(task, phase, attempt)` behavior, since `None == None` on every side
+//! changes nothing.
 
 use chrono::{DateTime, Utc};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
@@ -342,8 +347,8 @@ impl PhaseSpan {
 }
 
 /// Record `span` once. Idempotent on `(task, phase, attempt)`, additionally
-/// fenced by `candidate`/`lane`/`occurrence_key` when `span` sets them
-/// (module doc): if a span already exists on that exact key (a retried
+/// fenced by `target`/`candidate`/`lane`/`occurrence_key` when `span` sets
+/// them (module doc): if a span already exists on that exact key (a retried
 /// caller, a duplicate event replay, or this same durable store reopened
 /// after a daemon restart), this is a no-op returning `Ok(false)`; otherwise
 /// the span is written as a
@@ -377,6 +382,7 @@ fn span_exists(space: &Space, scope: &str, span: &PhaseSpan) -> rk_core::Result<
     pattern.payload_search_and = Some(format!("\"phase\":\"{}\"", span.phase.as_str()));
     Ok(space.scan(&pattern)?.into_iter().any(|t| {
         t.payload.get("attempt").and_then(Value::as_u64) == Some(u64::from(span.attempt))
+            && t.payload.get("target").and_then(Value::as_str) == span.target.as_deref()
             && t.payload.get("candidate").and_then(Value::as_str) == span.candidate.as_deref()
             && t.payload.get("lane").and_then(Value::as_str) == span.lane.as_deref()
             && t.payload.get("occurrence_key").and_then(Value::as_str)
@@ -658,6 +664,36 @@ mod tests {
 
         // Exact replay (identical occurrence_key) stays idempotent.
         assert!(!record_phase_span(&space, SYSTEM_SCOPE, "daemon", &after).unwrap());
+        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 2);
+    }
+
+    /// `target` is fenced explicitly, not assumed implied by `candidate`: a
+    /// span naming the SAME candidate but a DIFFERENT target must still be
+    /// recorded as its own occurrence, and an exact replay against the same
+    /// target must still dedup.
+    #[test]
+    fn a_same_candidate_different_target_is_recorded_not_shadowed() {
+        let space = space();
+        let task = "TKT-retarget";
+        let onto_parent = PhaseSpan::new(task, Phase::VerificationQueued)
+            .attempt(1)
+            .target("parent")
+            .candidate("sha-a")
+            .lane("verify");
+        let onto_main = PhaseSpan::new(task, Phase::VerificationQueued)
+            .attempt(1)
+            .target("main")
+            .candidate("sha-a")
+            .lane("verify");
+        assert!(record_phase_span(&space, SYSTEM_SCOPE, "daemon", &onto_parent).unwrap());
+        assert!(
+            record_phase_span(&space, SYSTEM_SCOPE, "daemon", &onto_main).unwrap(),
+            "a different target at the same candidate/attempt/lane must still be recorded"
+        );
+        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 2);
+
+        // Exact replay against the same target stays idempotent.
+        assert!(!record_phase_span(&space, SYSTEM_SCOPE, "daemon", &onto_main).unwrap());
         assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 2);
     }
 }
