@@ -5148,6 +5148,7 @@ mod tests {
             let c = capture(
                 vec![
                     finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+                    exposure("x1", "src-1", "gen-1", "2026-01-02T12:00:00Z"),
                     reuse(
                         "r1",
                         "src-1",
@@ -5163,6 +5164,7 @@ mod tests {
             let r = compute(&m, &c, &[]).unwrap();
             assert_eq!(r.eligible, 1, "assessment timestamp {timestamp:?}");
             assert_eq!(r.claimed, 1, "assessment timestamp {timestamp:?}");
+            assert_eq!(r.discovery.prepared_pairs, 1);
             assert_eq!(r.assessed, expected, "assessment timestamp {timestamp:?}");
             assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, expected);
             assert!(!r.mechanism.goal_met);
