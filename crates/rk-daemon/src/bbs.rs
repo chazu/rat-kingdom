@@ -377,10 +377,10 @@ pub fn record_open(
     let dedup_key = format!(
         "{}:{}",
         source.id,
-        binding
-            .spawn
-            .clone()
-            .unwrap_or_else(|| format!("unbound:{}", binding.agent.as_deref().unwrap_or("operator")))
+        binding.spawn.clone().unwrap_or_else(|| format!(
+            "unbound:{}",
+            binding.agent.as_deref().unwrap_or("operator")
+        ))
     );
     let payload = serde_json::json!({
         "schema_version": 1,
@@ -645,7 +645,11 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
             .filter_map(|key| tuple.payload[*key].as_str().map(str::to_string))
             .collect();
         if let Some(evidence) = tuple.payload["evidence"].as_array() {
-            raw.extend(evidence.iter().filter_map(|v| v.as_str().map(str::to_string)));
+            raw.extend(
+                evidence
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string)),
+            );
         }
         for id in raw {
             match id.parse::<rk_core::id::RecordId>() {
@@ -677,9 +681,7 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
             Some(_) | None => missing.push(id.to_string()),
         }
     }
-    let sequences = space.commit_sequences(
-        &references.iter().map(|t| t.id).collect::<Vec<_>>(),
-    )?;
+    let sequences = space.commit_sequences(&references.iter().map(|t| t.id).collect::<Vec<_>>())?;
     let records: Vec<serde_json::Value> = page
         .entries
         .iter()
@@ -1909,5 +1911,282 @@ mod tests {
             minted_first.id.to_string(),
             "the record persisted LAST is current, even though it has the SMALLER RecordId"
         );
+    }
+
+    use rk_core::bbs::{ExposureSurface, TelemetryStatus};
+
+    fn exposures(space: &Space) -> Vec<Tuple> {
+        space
+            .scan(&Pattern::category(Category::Event).scope("repo"))
+            .unwrap()
+            .into_iter()
+            .filter(rk_core::bbs::is_exposure)
+            .collect()
+    }
+
+    #[test]
+    fn exposure_records_the_exact_selection_and_distinguishes_empty_from_absent() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        let task = Tuple::new(
+            Category::Task,
+            "repo",
+            format!("TKT-{}", rk_core::id::RecordId::new()),
+            "operator",
+            json!({"title":"Parser grammar","status":"open"}),
+        );
+        space.out(task.clone()).unwrap();
+
+        // Before anything relevant exists, the selection is genuinely EMPTY.
+        let params = BriefParams::for_task("repo", &task.identity);
+        let empty = brief(&space, &tickets, &params).unwrap();
+        assert!(empty.entries.is_empty());
+        let binding = ConsumerBinding::agent("Scurry-15", "spawn-1", Some(&task.identity));
+        let capture = record_exposure(&space, "castle", ExposureSurface::Spawn, &binding, &empty);
+        assert_eq!(capture.status, TelemetryStatus::Recorded);
+
+        let recorded = exposures(&space);
+        assert_eq!(recorded.len(), 1, "an empty selection is still an exposure");
+        let payload = &recorded[0].payload;
+        assert_eq!(payload["bbs_kind"], "exposure");
+        assert_eq!(payload["surface"], "spawn");
+        assert_eq!(payload["semantics"], "prepared");
+        assert_eq!(payload["spawn"], "spawn-1");
+        assert_eq!(payload["bound"], "agent");
+        assert_eq!(payload["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["prepared"], 0);
+        assert_eq!(
+            recorded[0].instance, "castle",
+            "the castle authors the record, never the agent it describes"
+        );
+
+        // A real peer post makes the next selection non-empty, and the record
+        // names the exact source id and the exact reason that selected it.
+        let post = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "peer-note",
+            "peer",
+            json!({"task":task.identity,"summary":"a reproduction"}),
+        );
+        space.out(post.clone()).unwrap();
+        let filled = brief(&space, &tickets, &params).unwrap();
+        record_exposure(&space, "castle", ExposureSurface::Brief, &binding, &filled);
+        let brief_record = exposures(&space)
+            .into_iter()
+            .find(|t| t.payload["surface"] == "brief")
+            .expect("brief surface recorded");
+        let entries = brief_record.payload["entries"].as_array().unwrap().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["source"], post.id.to_string());
+        assert_eq!(entries[0]["reason"], "task or dependency");
+
+        // An exposure is measurement metadata: it must never come back as a
+        // peer finding, however well it matches the task.
+        let after = brief(&space, &tickets, &params).unwrap();
+        assert!(
+            after
+                .entries
+                .iter()
+                .all(|e| e.id != brief_record.id.to_string()),
+            "telemetry must not surface as a useful peer post"
+        );
+    }
+
+    #[test]
+    fn open_binds_the_caller_and_deduplicates_by_source_and_generation() {
+        let space = Space::open_in_memory().unwrap();
+        let source = Tuple::new(Category::Artifact, "repo", "note", "peer", json!({}));
+        space.out(source.clone()).unwrap();
+
+        let agent = ConsumerBinding::agent("Scurry-15", "spawn-1", Some("TKT-a"));
+        let first = record_open(&space, "castle", &agent, &source);
+        let second = record_open(&space, "castle", &agent, &source);
+        assert_ne!(
+            first.record, second.record,
+            "repeat reads are retained as separate records"
+        );
+
+        let opens: Vec<_> = space
+            .scan(&Pattern::category(Category::Event).scope("repo"))
+            .unwrap()
+            .into_iter()
+            .filter(rk_core::bbs::is_open)
+            .collect();
+        assert_eq!(opens.len(), 2);
+        let keys: HashSet<_> = opens
+            .iter()
+            .map(|t| t.payload["dedup_key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "both retained reads share one source/generation dedup key"
+        );
+        assert_eq!(opens[0].payload["semantics"], "requested");
+        assert_eq!(opens[0].payload["source"], source.id.to_string());
+
+        // A different generation of the SAME agent name is a different
+        // consumer and must not collapse into the first one's key.
+        let successor = ConsumerBinding::agent("Scurry-15", "spawn-2", Some("TKT-a"));
+        record_open(&space, "castle", &successor, &source);
+        // An operator read is recorded explicitly as unbound, so a report can
+        // exclude it from agent exposure rates rather than misattribute it.
+        record_open(&space, "castle", &ConsumerBinding::operator(), &source);
+        let opens: Vec<_> = space
+            .scan(&Pattern::category(Category::Event).scope("repo"))
+            .unwrap()
+            .into_iter()
+            .filter(rk_core::bbs::is_open)
+            .collect();
+        let keys: HashSet<_> = opens
+            .iter()
+            .map(|t| t.payload["dedup_key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys.len(), 3);
+        assert!(opens
+            .iter()
+            .any(|t| t.payload["bound"] == "operator" && t.payload["agent"].is_null()));
+    }
+
+    #[test]
+    fn export_states_its_order_boundary_truncation_and_reference_coverage() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        let ev = evidence_artifact(&space, "repo", "evidence");
+        let finding = write(
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap();
+        let finding_id = finding["id"].as_str().unwrap().to_string();
+        // A record in ANOTHER repository must never appear in this capture.
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "other-repo",
+                "foreign",
+                "peer",
+                json!({}),
+            ))
+            .unwrap();
+
+        let full = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 500,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            full["order"], "tuple_persistence_events.commit_sequence ascending",
+            "the envelope makes its ordering claim explicit"
+        );
+        assert_eq!(full["truncated"], false);
+        assert_eq!(full["coverage"]["complete"], true);
+        assert!(full["boundary"].as_u64().unwrap() > 0);
+        let tuples = full["tuples"].as_array().unwrap();
+        assert!(
+            tuples.iter().all(|t| t["scope"] == "repo"),
+            "a bounded per-repo capture never leaks a foreign scope"
+        );
+        assert!(tuples.iter().any(|t| t["id"] == finding_id.as_str()));
+        // Persistence order is carried per record, ascending.
+        let sequences: Vec<u64> = tuples
+            .iter()
+            .map(|t| t["commit_sequence"].as_u64().unwrap())
+            .collect();
+        assert!(sequences.windows(2).all(|w| w[0] < w[1]));
+
+        // A page smaller than the scope reports truncation and a resume point
+        // rather than letting a short page imply completeness.
+        let page = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(page["truncated"], true);
+        assert_eq!(page["coverage"]["complete"], false);
+        assert_eq!(page["tuples"].as_array().unwrap().len(), 1);
+        let next = page["next_cursor"].as_u64().unwrap();
+        let second = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(next),
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_ne!(second["tuples"][0]["id"], page["tuples"][0]["id"]);
+
+        // A finding whose evidence points outside the page must have that
+        // reference resolved and carried, never silently dropped.
+        let narrow = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(next),
+                limit: 500,
+            },
+        )
+        .unwrap();
+        let carried = narrow["tuples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(narrow["references"].as_array().unwrap())
+            .any(|t| t["id"] == ev.as_str());
+        assert!(carried, "evidence is exported or reported, never dropped");
+
+        // An unresolvable reference is reported explicitly.
+        let dangling = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-reuse-dangling",
+            "peer",
+            json!({"schema_version":1,"bbs_kind":"reuse","agent":"peer","task":"t",
+                   "source":finding_id,"outcome":"used","text":"x",
+                   "evidence":["01ARZ3NDEKTSV4RRFFQ69G5FAV"]}),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(dangling).unwrap();
+        let with_gap = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 500,
+            },
+        )
+        .unwrap();
+        assert!(with_gap["coverage"]["missing_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert_eq!(with_gap["coverage"]["complete"], false);
+
+        // Limits are bounded, and an out-of-range request is refused rather
+        // than silently clamped into an unbounded read.
+        assert!(export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 0,
+            },
+        )
+        .is_err());
     }
 }
