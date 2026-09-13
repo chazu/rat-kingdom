@@ -39,12 +39,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// `schema_version`, when diffing two reports across a rebuild.
 ///
 /// * 1 — initial S3 evaluator (`TKT-tavik-kifos-lozuf`).
-/// * 2 — `TKT-buruk-parut-zisoh` (slice A of `TKT-nonub-pugar-pilid`): native
-///   record identity binding, evidence resolution, repo/window scope, and
-///   opportunity-denominator retention. Author-exit and per-delivery cost are
-///   reported as UNSUPPORTED in this version pending
-///   `TKT-bonik-vuruv-mivuh`.
-pub const EVALUATOR_VERSION: u32 = 2;
+/// * 2 — `TKT-buruk-parut-zisoh`: identity, evidence, scope and denominator validation.
+/// * 3 — `TKT-bonik-vuruv-mivuh`: physical author exits and final provider-segment cost.
+///   These fields are not comparable between version 2 and version 3 reports.
+pub const EVALUATOR_VERSION: u32 = 3;
 
 /// Frozen per the design doc: "three verified used/adapted effects across at
 /// least two batches, at least one after its author exited". Not
@@ -60,7 +58,6 @@ const REUSE: &str = "reuse";
 const ASSESSMENT: &str = "assessment";
 const EXPOSURE: &str = "exposure";
 const OPEN: &str = "open";
-
 // The two native observation kinds S2's published contract adds
 // (docs/2026-09-13-s2-native-observation-and-export-contract.md, consumed via
 // BBS artifact 01M2CF3RJHX58HH085WKZBJD9A).
@@ -195,37 +192,56 @@ fn identity_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     None
 }
 
+/// Native phase-span identity (`rk_daemon::span::SPAN_IDENTITY`).
+const SPAN_IDENTITY: &str = "task_span";
+/// Closed producer values from `rk_daemon::span::Phase::as_str()`.
+const SPAN_PHASES: [&str; 12] = [
+    "ticket_ready",
+    "claimed",
+    "agent_launched",
+    "first_progress",
+    "completed",
+    "verification",
+    "landing_prep",
+    "semantic_review",
+    "rework",
+    "merge",
+    "delivery_closure",
+    "attention_hold",
+];
+/// `PhaseSpan::from_durations` declares queue wait and duration disjoint.
+const ADDITIVE_DURATION: &str = "additive";
+
 /// Native events that prove an agent generation actually started a process, so
 /// a prepared exposure can be joined to a LAUNCHED consumer rather than
 /// counted for a spawn that never ran. `spawn` is additive on these events
 /// (S2's `48fb2da`); a `harness_result` also proves the generation ran.
 const LAUNCH_EVENT_IDENTITIES: [&str; 2] = ["agent_spawned", "agent_respawned"];
+/// Physical launch attempts without observed sessions; authored records do not count.
+const LAUNCH_EVENT_KIND: &str = "launch_event";
 
-/// Author-exit and per-delivery cost derivation are deliberately absent from
-/// this evaluator version. Both were previously credited from evidence that
-/// cannot establish them — `harness_result` is emitted at `rk done` while the
-/// process is still alive, and a provisional completion cost was summed as a
-/// final total — so rather than ship a known false positive, this version
-/// reports them as unsupported and refuses to pass the mechanism goal. See
-/// `TKT-bonik-vuruv-mivuh`.
-const AUTHOR_EXIT_UNSUPPORTED: &str =
-    "author-exit derivation is not implemented in this evaluator version: crediting it needs a \
-     physical-exit observation bound to the source author's exact generation and launch, with no \
-     intervening resume before the consuming decision. A harness_result cannot establish it (the \
-     supervisor emits it at `rk done`, while the OS process is still alive) and neither can an \
-     agent_lifecycle event (it carries no `spawn` binding and its `change` may be `started`). \
-     Pending TKT-bonik-vuruv-mivuh.";
+/// `AgentState` values that mean this launch produced its *last* provider result.
+const TERMINAL_USAGE_STATES: [&str; 3] = ["completed", "failed", "stopped"];
 
-const DELIVERY_COST_UNSUPPORTED: &str =
-    "per-delivery cost and duration derivation is not implemented in this evaluator version: a \
-     provider total is cumulative within one query segment and a harness_result cost is \
-     provisional, so neither may be summed as measured spend, and launch-to-exit is process \
-     lifetime rather than active model work. Reported as unknown rather than estimated. Pending \
-     TKT-bonik-vuruv-mivuh.";
+/// Only the producer's `CostCoverage::Final` supports final cost.
+const FINAL_COST_COVERAGE: &str = "final";
+/// The non-final values the producer emits: `partial_unknown` (more model work ran past the last result), `none` (no result was ever reported), `unknown` (no watch survived).
+const NON_FINAL_COST_COVERAGE: [&str; 3] = ["partial_unknown", "none", "unknown"];
 
-const INTERVENTIONS_UNSUPPORTED: &str =
-    "unknown: an attention_hold span count is a lower bound on operator interventions, not a \
-     total, and span aggregation is not derived in this evaluator version.";
+/// Provider-reported totals; keep the daemon-priced fallback in a separate field.
+const PROVIDER_COST_BASIS: &str = "provider_reported_segment_total";
+const DAEMON_COST_BASIS: &str = "daemon_priced_increments";
+
+/// Keep attention-hold spans separate from reviewed intervention counts.
+const INTERVENTIONS_LOWER_BOUND: &str =
+    "lower bound: attention_hold spans only cover waits the daemon recorded; an operator \
+     intervention that left no span is not counted here. A ReviewedAnnotation can supply \
+     evidenced interventions separately (quality.reviewed_interventions).";
+
+/// Active work remains unknown; process lifetime and phase durations cannot establish it.
+const ACTIVE_WORK_UNKNOWN: &str =
+    "unknown: launch-to-exit is process lifetime, and no native observation distinguishes \
+     model-active time from a process paused awaiting verification or the operator.";
 
 // ---------------------------------------------------------------------
 // Manifest: the versioned, frozen experiment/scope declaration.
@@ -787,6 +803,86 @@ fn unknown_coverage() -> Coverage {
     }
 }
 
+/// A captured evidence occurrence and the operator's reason it counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnnotatedEvidence {
+    pub evidence: String,
+    pub reason: String,
+}
+
+/// An evidenced operator judgment, distinct from native telemetry and measured time savings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedAnnotation {
+    pub task: String,
+    pub repo: String,
+    #[serde(default)]
+    pub repeated_investigations: Vec<AnnotatedEvidence>,
+    #[serde(default)]
+    pub rework: Vec<AnnotatedEvidence>,
+    #[serde(default)]
+    pub interventions: Vec<AnnotatedEvidence>,
+}
+
+/// Annotations must belong to frozen task scope and cannot duplicate a (task, repo) entry.
+fn validate_reviewed_annotations(
+    manifest: &Manifest,
+    annotations: &[ReviewedAnnotation],
+) -> Result<()> {
+    let frozen: BTreeSet<(String, String)> = frozen_task_scope(manifest)
+        .into_iter()
+        .map(|s| (s.task, s.repo))
+        .collect();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for a in annotations {
+        if !seen.insert((a.task.clone(), a.repo.clone())) {
+            bail!(
+                "duplicate reviewed annotation for task {} in repo {}",
+                a.task,
+                a.repo
+            );
+        }
+        if !frozen.contains(&(a.task.clone(), a.repo.clone())) {
+            bail!(
+                "reviewed annotation for task {} in repo {} is not in the frozen delivery scope \
+                 (must already appear in manifest.consumer_tasks or an eligible_pairs \
+                 consumer_task)",
+                a.task,
+                a.repo
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Accept legacy review arrays or an envelope containing reviews and reviewed annotations.
+pub fn parse_reviews_file(raw: &Value) -> Result<(Vec<Review>, Vec<ReviewedAnnotation>)> {
+    if raw.is_array() {
+        let reviews: Vec<Review> = serde_json::from_value(raw.clone())
+            .context("reviews file does not match the expected schema")?;
+        return Ok((reviews, Vec::new()));
+    }
+    if raw.is_object() {
+        let reviews: Vec<Review> = match raw.get("reviews") {
+            Some(v) => serde_json::from_value(v.clone())
+                .context("reviews file's `reviews` field does not match the expected schema")?,
+            None => Vec::new(),
+        };
+        let reviewed_annotations: Vec<ReviewedAnnotation> = match raw.get("reviewed_annotations") {
+            Some(v) => serde_json::from_value(v.clone()).context(
+                "reviews file's `reviewed_annotations` field does not match the expected schema",
+            )?,
+            None => Vec::new(),
+        };
+        return Ok((reviews, reviewed_annotations));
+    }
+    bail!(
+        "reviews file must be a JSON array (bare `Review` list) or an object with `reviews`/\
+         `reviewed_annotations` fields"
+    )
+}
+
 /// Merges `manifest.eligible_pairs` (predeclared) with pairs minted by
 /// `Review.declares` entries (live enrollment), validating that every
 /// minted pair is bound to an already-frozen batch/task scope and that no
@@ -1051,40 +1147,129 @@ pub struct MechanismResult {
     pub effect_pairs: Vec<String>,
 }
 
-/// Per-task delivery accounting. This evaluator version reports the SCOPE it
-/// would account for and nothing numeric: the previous version summed a
-/// provisional `harness_result` cost as a measured total, read a `merge` span
-/// as an accepted delivery, and labelled a phase-duration sum as active work.
-/// Rather than keep shipping those, every figure here is an explicit unknown
-/// until `TKT-bonik-vuruv-mivuh` supplies the real derivation.
+/// Wall-clock phase durations, kept separate from unknown model-active work.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PhaseDurations {
+    /// Every phase that is neither verification admission nor a human wait.
+    pub work_phases_ms: Option<i64>,
+    /// Sum verification duration and queue wait only for native spans explicitly tagged additive.
+    pub verification_ms: Option<i64>,
+    /// Retain untagged verification spans separately because their durations may overlap queue wait.
+    pub verification_ms_legacy_spans: usize,
+    /// `attention_hold` — waiting on a human.
+    pub attention_hold_ms: Option<i64>,
+    /// Pre-phase queue wait on every other phase.
+    pub queue_wait_ms: Option<i64>,
+}
+
+/// One observed provider-cost segment: a `(spawn, session, provider_session)` triple.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostSegment {
+    pub spawn: String,
+    pub session: String,
+    pub provider_session: Option<String>,
+    pub record: String,
+    pub reported_usd: Option<f64>,
+    pub cost_basis: String,
+    pub state: Option<String>,
+    /// `true` only when the last result for this segment was terminal, the launch's exit agrees with it, AND that exit reports `cost_coverage: "final"`.
+    pub final_cost: bool,
+    pub finality_reason: String,
+}
+
+/// One physical launch, keyed by S2's `(spawn, session)` contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct LaunchObservation {
+    /// `None` for sessionless `agent_spawned`/`agent_respawned` observations.
+    pub session: Option<String>,
+    /// Observation source: `agent_exit`, `agent_final_usage`, or `launch_event`.
+    pub observed_via: String,
+    pub launched_at: Option<String>,
+    pub exited_at: Option<String>,
+    pub exit_record: Option<String>,
+    pub exit_code: Option<i64>,
+    pub crashed: Option<bool>,
+    pub prior_state: Option<String>,
+    /// `exited_at - launched_at`: process lifetime includes paused time.
+    pub process_lifetime_ms: Option<i64>,
+}
+
+/// `harness_result` at `rk done`: task completion with provisional cost, before exit.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionObservation {
+    pub record: String,
+    pub declared_done: bool,
+    pub is_error: bool,
+    pub provisional_cost_usd: Option<f64>,
+    pub failed: bool,
+}
+
+/// Every observation and attempt for a task generation, including failures.
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerationObservation {
+    pub spawn: String,
+    pub agent: Option<String>,
+    pub completions: Vec<CompletionObservation>,
+    pub launches: Vec<LaunchObservation>,
+    pub cost_segments: Vec<CostSegment>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryCost {
     pub task: String,
     pub repo: String,
     pub batches: Vec<String>,
     /// `frozen_consumer_task` (manifest scope) or `fixture_pair` (a
-    /// predeclared pair's task). Deliberately NOT derived from the pairs that
-    /// survived evaluation: a frozen task with no eligible source and no
+    /// predeclared pair's task). Deliveries are NOT derived from the pairs
+    /// that survived evaluation: a frozen task with no eligible source and no
     /// receipt still owns its costs, failures and acceptance.
     pub enrollment: String,
-    pub derivation_status: String,
-    pub derivation_reason: String,
-    pub cost_usd: Option<f64>,
-    pub active_work_ms: Option<i64>,
+    pub generations: Vec<GenerationObservation>,
+    pub completions: usize,
+    pub failed_completions: usize,
+    /// All launch attempts, including those without a captured exit.
+    pub launches: usize,
+    pub exits: usize,
+    /// Sum final provider-segment totals; `None` if any segment is partial or unknown.
+    pub reported_cost_estimate_usd: Option<f64>,
+    pub reported_cost_basis: Option<String>,
+    /// `complete`, `partial`, `missing` usage, or `none_observed` generations.
+    pub cost_coverage: String,
+    /// Nonfinal reported amounts, kept separate from final spend.
+    pub partial_reported_usd: Option<f64>,
+    /// Daemon-priced fallback estimates, never pooled with provider-reported totals.
+    pub daemon_priced_estimate_usd: Option<f64>,
+    /// Provisional `harness_result.cost_usd` per generation, separate from final spend.
+    pub provisional_completion_cost_usd: Option<f64>,
+    pub unknown_cost: Vec<String>,
+    /// Sum process lifetimes (`exited_at - launched_at`) over observed launches.
     pub process_lifetime_ms: Option<i64>,
-    pub verification_ms: Option<i64>,
-    pub queue_ms: Option<i64>,
+    /// Always `None`: native observations cannot separate active work from paused time.
+    pub active_work_ms: Option<i64>,
+    pub active_work_coverage: String,
+    pub phase_ms: PhaseDurations,
+    /// `Some(true)` requires an in-scope `delivery_closure`; merge alone is insufficient.
     pub accepted: Option<bool>,
+    pub acceptance_evidence: Option<String>,
+    /// Resolved evidence ids from `ReviewedAnnotation` for this task.
+    pub reviewed_repeated_investigations: Vec<String>,
+    pub reviewed_rework: Vec<String>,
+    pub reviewed_interventions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QualitySummary {
-    /// `None`, with `interventions_coverage` saying why: an `attention_hold`
-    /// span count is a lower bound on operator interventions, not a total.
-    pub interventions: Option<usize>,
+    /// In-scope `attention_hold` spans: a lower bound on operator interventions.
+    pub attention_hold_spans: usize,
+    pub interventions_known: usize,
     pub interventions_coverage: String,
+    pub rework_spans: usize,
     pub incorrect_reuse: usize,
     pub regressions: Vec<String>,
+    /// Evidenced review judgments, separate from telemetry counts to avoid double counting.
+    pub reviewed_repeated_investigations: usize,
+    pub reviewed_rework: usize,
+    pub reviewed_interventions: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1124,6 +1309,7 @@ pub struct Report {
     pub author_exit_reuse: Vec<String>,
     pub mechanism: MechanismResult,
     pub deliveries: Vec<DeliveryCost>,
+    pub tasks_without_native_records: Vec<String>,
     pub quality: QualitySummary,
     pub pairs: Vec<PairResult>,
 }
@@ -1253,6 +1439,178 @@ fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
             "tuple scope {scope:?} disagrees with payload.repo {repo:?}"
         ));
     }
+    if matches!(bbs_kind, AGENT_EXIT | AGENT_FINAL_USAGE) {
+        if str_field(t, &["payload", "agent"]).trim().is_empty() {
+            return Some("payload.agent is absent; native usage/exit must name its agent".into());
+        }
+        if !matches!(&t["payload"]["task"], Value::Null | Value::String(_)) {
+            return Some("payload.task is neither a string nor an unassigned null".into());
+        }
+        let field = if bbs_kind == AGENT_EXIT {
+            "exited_at"
+        } else {
+            "observed_at"
+        };
+        if payload_time(t, field).is_none() {
+            return Some(format!(
+                "payload.{field} is absent or not an RFC3339 timestamp"
+            ));
+        }
+        if bbs_kind == AGENT_EXIT
+            && !t["payload"]["launched_at"].is_null()
+            && payload_time(t, "launched_at").is_none()
+        {
+            return Some("present payload.launched_at is not an RFC3339 timestamp".into());
+        }
+    }
+    None
+}
+
+fn is_task_span(t: &Value) -> bool {
+    t["category"] == "event" && t["identity"] == SPAN_IDENTITY
+}
+
+/// Validate native phase-span shape before it can affect delivery or timing.
+fn task_span_defect(t: &Value) -> Option<String> {
+    if t["lifecycle"] != "furniture" {
+        return Some(format!(
+            "lifecycle is {} not furniture; a phase span is immutable furniture",
+            t["lifecycle"].as_str().unwrap_or("absent")
+        ));
+    }
+    // Phase spans are authored by `daemon` or the castle actor, never the described worker.
+    let instance = str_field(t, &["instance"]);
+    if !is_castle_author(instance) {
+        return Some(format!(
+            "instance {instance:?} is not a castle author ({DAEMON_AUTHOR} or \
+             {CASTLE_ACTOR_PREFIX}<hex>); a phase span is authored by the castle that recorded \
+             it, never by the worker it describes"
+        ));
+    }
+    // A present payload.repo must match the ticket's tuple scope.
+    let scope = str_field(t, &["scope"]);
+    if scope.is_empty() {
+        return Some("tuple scope is absent; a phase span is scoped to its repo".into());
+    }
+    match &t["payload"]["repo"] {
+        Value::Null => {}
+        Value::String(repo) if repo == scope => {}
+        other => {
+            return Some(format!(
+                "payload.repo {other} disagrees with tuple scope {scope:?}"
+            ))
+        }
+    }
+    if str_field(t, &["payload", "task"]).is_empty() {
+        return Some("payload.task is absent; a span with no ticket cannot be placed".into());
+    }
+    let phase = str_field(t, &["payload", "phase"]);
+    if !SPAN_PHASES.contains(&phase) {
+        return Some(format!(
+            "payload.phase {phase:?} is not a phase this daemon records; an unrecognized phase \
+             would be pooled into the work-phase total"
+        ));
+    }
+    // `PhaseSpan.attempt` is a `u32` and every producer numbers from 1.
+    match t["payload"]["attempt"].as_u64() {
+        Some(a) if a >= 1 && a <= u64::from(u32::MAX) => {}
+        _ => {
+            return Some(format!(
+                "payload.attempt {} is not a positive integer occurrence number",
+                t["payload"]["attempt"]
+            ))
+        }
+    }
+    // Times, where present, must parse and must not run backwards.
+    let mut times = Vec::new();
+    for field in ["queued_at", "started_at", "ended_at"] {
+        match &t["payload"][field] {
+            Value::Null => {}
+            Value::String(raw) => match parse_rfc3339(raw) {
+                Some(at) => times.push((field, at)),
+                None => return Some(format!("payload.{field} {raw:?} is not an RFC3339 time")),
+            },
+            other => return Some(format!("payload.{field} {other} is not a time")),
+        }
+    }
+    if let Some(w) = times.windows(2).find(|w| w[0].1 > w[1].1) {
+        return Some(format!(
+            "payload.{} is after payload.{}; a span cannot run backwards",
+            w[0].0, w[1].0
+        ));
+    }
+    // Producer durations are nonnegative differences between their timestamps.
+    for field in ["queue_wait_ms", "duration_ms"] {
+        match &t["payload"][field] {
+            Value::Null => {}
+            v => match v.as_i64() {
+                Some(ms) if ms >= 0 => {}
+                _ => {
+                    return Some(format!(
+                        "payload.{field} {v} is not a non-negative duration"
+                    ))
+                }
+            },
+        }
+    }
+    // Each native duration requires both endpoints and equals their millisecond difference.
+    for (field, from, to) in [
+        ("queue_wait_ms", "queued_at", "started_at"),
+        ("duration_ms", "started_at", "ended_at"),
+    ] {
+        let Some(ms) = t["payload"][field].as_i64() else {
+            continue;
+        };
+        let (Some(from_at), Some(to_at)) = (payload_time(t, from), payload_time(t, to)) else {
+            return Some(format!(
+                "payload.{field} is {ms} but payload.{from}/payload.{to} are not both present; \
+                 the producer derives this duration from them and cannot state one without them"
+            ));
+        };
+        let derived = (to_at - from_at).num_milliseconds();
+        if ms != derived {
+            return Some(format!(
+                "payload.{field} is {ms} but {from}..{to} is {derived}ms; the producer derives \
+                 one from the other"
+            ));
+        }
+    }
+    // Only the producer's additive semantic permits summing queue wait into verification.
+    match &t["payload"]["duration_semantic"] {
+        Value::Null => {}
+        Value::String(v) if v == ADDITIVE_DURATION => {}
+        other => {
+            return Some(format!(
+                "payload.duration_semantic {other} is not {ADDITIVE_DURATION:?}"
+            ))
+        }
+    }
+    match &t["payload"]["authority"] {
+        Value::Null => {}
+        Value::String(v) if v == "human" || v == "llm" => {}
+        other => return Some(format!("payload.authority {other} is not human or llm")),
+    }
+    if !matches!(&t["payload"]["proof_reused"], Value::Null | Value::Bool(_)) {
+        return Some(format!(
+            "payload.proof_reused {} is not a boolean",
+            t["payload"]["proof_reused"]
+        ));
+    }
+    // Optional occurrence fences must be nonempty strings when present.
+    for field in [
+        "terminal_reason",
+        "target",
+        "candidate",
+        "lane",
+        "occurrence_key",
+        "proof_kind",
+    ] {
+        match &t["payload"][field] {
+            Value::Null => {}
+            Value::String(v) if !v.is_empty() => {}
+            other => return Some(format!("payload.{field} {other} is not a non-empty string")),
+        }
+    }
     None
 }
 
@@ -1309,7 +1667,12 @@ impl EvidenceCheck {
 /// alone let an event, a receipt or a telemetry row stand in for the artifact
 /// a finding claims; filtering non-string members silently let `["ev-1", 7]`
 /// pass as though it had named one thing.
-fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) -> EvidenceCheck {
+fn check_evidence(
+    evidence: &Value,
+    by_id: &BTreeMap<&str, &Value>,
+    rejected: &[InvalidRecord],
+    repo: &str,
+) -> EvidenceCheck {
     let Some(items) = evidence.as_array() else {
         return EvidenceCheck::Invalid(if evidence.is_null() {
             "evidence is absent".into()
@@ -1330,6 +1693,9 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
         if id.trim().is_empty() {
             return EvidenceCheck::Invalid("evidence contains a blank member".into());
         }
+        if let Some(bad) = rejected.iter().find(|r| r.record == id) {
+            return EvidenceCheck::Invalid(format!("evidence {id} was rejected: {}", bad.reason));
+        }
         match by_id.get(id) {
             None => {
                 unknown.get_or_insert(format!("evidence {id} is not present in the capture"));
@@ -1347,6 +1713,19 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
                         t["scope"].as_str().unwrap_or("")
                     ));
                 }
+                let defect = match t["payload"]["bbs_kind"].as_str() {
+                    Some(ASSESSMENT) => assessment_defect(t),
+                    Some(kind @ (FINDING | ANSWER | REUSE)) => artifact_record_defect(t, kind),
+                    Some(kind @ (EXPOSURE | OPEN | AGENT_EXIT | AGENT_FINAL_USAGE)) => {
+                        telemetry_record_defect(t, kind)
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = defect {
+                    return EvidenceCheck::Invalid(format!(
+                        "evidence {id} has an invalid BBS contract: {reason}"
+                    ));
+                }
             }
         }
     }
@@ -1354,6 +1733,35 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
         Some(reason) => EvidenceCheck::Unknown(reason),
         None => EvidenceCheck::Resolved,
     }
+}
+
+/// Resolve annotation evidence with the same artifact, repository, and type checks as findings.
+fn resolve_annotated_evidence(
+    items: &[AnnotatedEvidence],
+    by_id: &BTreeMap<&str, &Value>,
+    rejected: &[InvalidRecord],
+    repo: &str,
+    kind: &str,
+    invalid: &mut Vec<InvalidRecord>,
+    unresolved: &mut Vec<InvalidRecord>,
+) -> Vec<String> {
+    let mut resolved = Vec::new();
+    for item in items {
+        match check_evidence(&json!([item.evidence.clone()]), by_id, rejected, repo) {
+            EvidenceCheck::Resolved => resolved.push(item.evidence.clone()),
+            EvidenceCheck::Unknown(reason) => unresolved.push(InvalidRecord {
+                record: item.evidence.clone(),
+                kind: kind.to_string(),
+                reason,
+            }),
+            EvidenceCheck::Invalid(reason) => invalid.push(InvalidRecord {
+                record: item.evidence.clone(),
+                kind: kind.to_string(),
+                reason,
+            }),
+        }
+    }
+    resolved
 }
 
 /// Whether `source` is something a receipt may legitimately name. Mirrors the
@@ -1403,17 +1811,75 @@ fn created_at(t: &Value) -> Option<DateTime<Utc>> {
     t["created_at"].as_str().and_then(parse_rfc3339)
 }
 
+/// Window by producer time (`exited_at`/`observed_at`), not tuple persistence time.
+fn payload_time(t: &Value, field: &str) -> Option<DateTime<Utc>> {
+    t["payload"][field].as_str().and_then(parse_rfc3339)
+}
+
 // ---------------------------------------------------------------------
 // Native observation index: scope-, window- and identity-filtered.
 // ---------------------------------------------------------------------
 
+struct ExitRow {
+    repo: String,
+    task: String,
+    agent: String,
+    spawn: String,
+    session: String,
+    exited_at: Option<DateTime<Utc>>,
+    launched_at: Option<DateTime<Utc>>,
+    exit_code: Option<i64>,
+    crashed: Option<bool>,
+    prior_state: Option<String>,
+    /// `true` when this launch had already been superseded by a later one under the same `spawn` by the time this exit was recorded.
+    stale_session: Option<bool>,
+    /// The producer's own measurement of how completely the last reported cost covers this launch (`rk_daemon::bbs::record_exit`).
+    cost_coverage: Option<String>,
+    record: String,
+}
+
+struct UsageRow {
+    repo: String,
+    task: String,
+    agent: String,
+    spawn: String,
+    session: String,
+    provider_session: Option<String>,
+    state: Option<String>,
+    cost_usd: Option<f64>,
+    cost_basis: String,
+    observed_at: Option<DateTime<Utc>>,
+    /// Position in the merged capture.
+    position: usize,
+    record: String,
+}
+
+struct CompletionRow {
+    repo: String,
+    task: String,
+    agent: String,
+    spawn: String,
+    declared_done: bool,
+    is_error: bool,
+    cost_usd: Option<f64>,
+    record: String,
+}
+
 /// Native proof that a generation actually started a process, or at least ran
-/// far enough to author a record of its own. Used to decide whether a prepared
-/// exposure was a *launched* consumer opportunity rather than a selection
-/// prepared for a spawn that never ran.
+/// far enough to author a record of its own. Used for two distinct things: to
+/// decide whether a prepared exposure was a *launched* consumer opportunity,
+/// and to refuse an author-exit claim when the generation was relaunched
+/// between the exit and the consuming decision.
 struct LaunchRow {
     repo: String,
+    /// Observed task (or empty): enroll even tasks witnessed only by a launch event.
+    task: String,
     spawn: String,
+    /// Physical-launch session, if known; sessionless relaunches require time ordering.
+    session: Option<String>,
+    at: Option<DateTime<Utc>>,
+    record: String,
+    kind: &'static str,
 }
 
 struct Index<'a> {
@@ -1423,6 +1889,10 @@ struct Index<'a> {
     /// `(repo, source, consumer_spawn)`.
     opened: BTreeSet<(String, String, String)>,
     launches: Vec<LaunchRow>,
+    exits: Vec<ExitRow>,
+    usage: Vec<UsageRow>,
+    completions: Vec<CompletionRow>,
+    spans: Vec<&'a Value>,
     /// `(source, consumer_task)` -> candidate receipts, in capture order.
     reuse_by_source_task: BTreeMap<(String, String), Vec<&'a Value>>,
     /// `receipt id` -> `(capture position, assessment)`.
@@ -1439,6 +1909,23 @@ impl Index<'_> {
             .iter()
             .any(|l| l.repo == repo && l.spawn == spawn)
     }
+
+    /// The earliest observed launch of `spawn` strictly after `after` and no later than `until` — i.e.
+    fn relaunch_between(
+        &self,
+        repo: &str,
+        spawn: &str,
+        exclude_session: &str,
+        after: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Option<&LaunchRow> {
+        self.launches
+            .iter()
+            .filter(|l| l.repo == repo && l.spawn == spawn)
+            .filter(|l| l.session.as_deref() != Some(exclude_session))
+            .filter(|l| l.at.is_some_and(|at| at > after && at <= until))
+            .min_by_key(|l| (l.at, l.record.clone()))
+    }
 }
 
 fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> {
@@ -1446,7 +1933,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     let in_scope = |repo: &str| repos.is_empty() || repos.contains(repo);
     let window = &manifest.window;
 
-    // Index the native page and its resolved evidence closure together.
+    // Index both export tuples and referenced evidence as one captured record set.
     let merged = capture.merged();
 
     let mut idx = Index {
@@ -1458,6 +1945,10 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
         prepared: BTreeMap::new(),
         opened: BTreeSet::new(),
         launches: Vec::new(),
+        exits: Vec::new(),
+        usage: Vec::new(),
+        completions: Vec::new(),
+        spans: Vec::new(),
         reuse_by_source_task: BTreeMap::new(),
         assessment_by_receipt: BTreeMap::new(),
         invalid: Vec::new(),
@@ -1493,12 +1984,12 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     // the frozen window. Both rejections are COUNTED, so a scoping or window
     // mistake shows up as visible coverage loss instead of silently shrinking
     // every metric toward zero.
-    let admit = |idx: &mut Index<'a>, t: &Value| -> bool {
+    let admit = |idx: &mut Index<'a>, t: &Value, at: Option<DateTime<Utc>>| -> bool {
         if !in_scope(str_field(t, &["scope"])) {
             idx.capture.observations_out_of_scope_repo += 1;
             return false;
         }
-        match window.fit(created_at(t)) {
+        match window.fit(at) {
             WindowFit::Inside => {
                 idx.capture.observations_in_window += 1;
                 true
@@ -1532,7 +2023,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
-            if !admit(&mut idx, t) {
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             // Only an exact agent generation counts toward agent exposure.
@@ -1598,7 +2089,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
-            if !admit(&mut idx, t) {
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             if str_field(t, &["payload", "bound"]) != "agent" {
@@ -1626,27 +2117,227 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             continue;
         }
 
-        // `harness_result` proves the generation RAN. It is used here only as
-        // launch evidence; it is never author-exit evidence (the supervisor
-        // emits it at `rk done`, while the process is still alive).
-        if is_harness_result(t) || is_launch_event(t) {
-            if !admit(&mut idx, t) {
+        // --- agent_exit -----------------------------------------------
+        if claims_kind(t, AGENT_EXIT) {
+            if let Some(reason) = telemetry_record_defect(t, AGENT_EXIT) {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_EXIT.into(),
+                    reason,
+                });
+                continue;
+            }
+            if str_field(t, &["payload", "task"]).trim().is_empty() {
+                idx.unresolved.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_EXIT.into(),
+                    reason: "native observation has no assigned task; it cannot be attributed"
+                        .into(),
+                });
+                continue;
+            }
+            let exited_at = payload_time(t, "exited_at");
+            if !admit(&mut idx, t, exited_at) {
+                continue;
+            }
+            let spawn = str_field(t, &["payload", "spawn"]).to_string();
+            let session = str_field(t, &["payload", "session"]).to_string();
+            if spawn.is_empty() || session.is_empty() {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_EXIT.into(),
+                    reason: "an exit must identify both its generation (spawn) and its physical \
+                             launch (session)"
+                        .into(),
+                });
+                continue;
+            }
+            let launched_at = payload_time(t, "launched_at");
+            idx.launches.push(LaunchRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                spawn: spawn.clone(),
+                session: Some(session.clone()),
+                at: launched_at,
+                record: record_id(t),
+                kind: AGENT_EXIT,
+            });
+            idx.exits.push(ExitRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                agent: str_field(t, &["payload", "agent"]).to_string(),
+                spawn,
+                session,
+                exited_at,
+                launched_at,
+                exit_code: t["payload"]["exit_code"].as_i64(),
+                crashed: t["payload"]["crashed"].as_bool(),
+                prior_state: t["payload"]["prior_state"].as_str().map(str::to_string),
+                stale_session: t["payload"]["stale_session"].as_bool(),
+                cost_coverage: t["payload"]["cost_coverage"].as_str().map(str::to_string),
+                record: record_id(t),
+            });
+            continue;
+        }
+
+        // --- agent_final_usage ----------------------------------------
+        if claims_kind(t, AGENT_FINAL_USAGE) {
+            if let Some(reason) = telemetry_record_defect(t, AGENT_FINAL_USAGE) {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_FINAL_USAGE.into(),
+                    reason,
+                });
+                continue;
+            }
+            if str_field(t, &["payload", "task"]).trim().is_empty() {
+                idx.unresolved.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_FINAL_USAGE.into(),
+                    reason: "native observation has no assigned task; it cannot be attributed"
+                        .into(),
+                });
+                continue;
+            }
+            let observed_at = payload_time(t, "observed_at");
+            if !admit(&mut idx, t, observed_at) {
+                continue;
+            }
+            let spawn = str_field(t, &["payload", "spawn"]).to_string();
+            let session = str_field(t, &["payload", "session"]).to_string();
+            if spawn.is_empty() || session.is_empty() {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_FINAL_USAGE.into(),
+                    reason: "a usage observation must identify both its generation (spawn) and \
+                             its physical launch (session)"
+                        .into(),
+                });
+                continue;
+            }
+            let cost_basis = str_field(t, &["payload", "cost_basis"]).to_string();
+            if cost_basis.is_empty() {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_FINAL_USAGE.into(),
+                    reason: "payload.cost_basis is absent; a cost with no stated basis cannot be \
+                             aggregated"
+                        .into(),
+                });
+                continue;
+            }
+            idx.launches.push(LaunchRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                spawn: spawn.clone(),
+                session: Some(session.clone()),
+                at: observed_at,
+                record: record_id(t),
+                kind: AGENT_FINAL_USAGE,
+            });
+            idx.usage.push(UsageRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                agent: str_field(t, &["payload", "agent"]).to_string(),
+                spawn,
+                session,
+                provider_session: t["payload"]["provider_session"]
+                    .as_str()
+                    .map(str::to_string),
+                state: t["payload"]["state"].as_str().map(str::to_string),
+                cost_usd: t["payload"]["cost_usd"].as_f64(),
+                cost_basis,
+                observed_at,
+                position: pos,
+                record: record_id(t),
+            });
+            continue;
+        }
+
+        // --- harness_result (completion, NOT exit) --------------------
+        if is_harness_result(t) {
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if spawn.is_empty() {
-                // Pre-C1 completions and pre-`48fb2da` launch events carry no
-                // generation id. Legacy and unattributed, so retained as an
-                // explicit unknown rather than attributed to whoever happens
-                // to share the agent name.
+                // Legacy completions without generation IDs remain unattributed.
                 idx.unresolved.push(InvalidRecord {
                     record: record_id(t),
-                    kind: str_field(t, &["identity"]).to_string(),
-                    reason: "no payload.spawn: cannot be bound to an exact generation".into(),
+                    kind: "harness_result".into(),
+                    reason: "no payload.spawn: legacy completion cannot be bound to an exact \
+                             generation"
+                        .into(),
                 });
                 continue;
             }
-            idx.launches.push(LaunchRow { repo: scope, spawn });
+            idx.launches.push(LaunchRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                spawn: spawn.clone(),
+                session: None,
+                at: created_at(t),
+                record: record_id(t),
+                kind: "harness_result",
+            });
+            idx.completions.push(CompletionRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                agent: str_field(t, &["payload", "agent"]).to_string(),
+                spawn,
+                declared_done: t["payload"]["declared_done"].as_bool().unwrap_or(false),
+                is_error: t["payload"]["is_error"].as_bool().unwrap_or(false),
+                cost_usd: t["payload"]["cost_usd"].as_f64(),
+                record: record_id(t),
+            });
+            continue;
+        }
+
+        // --- agent_spawned / agent_respawned --------------------------
+        if is_launch_event(t) {
+            if !admit(&mut idx, t, created_at(t)) {
+                continue;
+            }
+            // Older launch events lack spawn and cannot establish generation identity.
+            let spawn = str_field(t, &["payload", "spawn"]).to_string();
+            if spawn.is_empty() {
+                idx.unresolved.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: str_field(t, &["identity"]).to_string(),
+                    reason: "no payload.spawn: this launch event predates the additive generation \
+                             field and cannot be bound to a generation"
+                        .into(),
+                });
+                continue;
+            }
+            idx.launches.push(LaunchRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                spawn,
+                // A sessionless launch event still proves an attempt, even without exit.
+                session: None,
+                at: created_at(t),
+                record: record_id(t),
+                kind: LAUNCH_EVENT_KIND,
+            });
+            continue;
+        }
+
+        // --- task_span ------------------------------------------------
+        if is_task_span(t) {
+            // Validated BEFORE indexing: an indexed span reaches `build_critical_path`, the phase totals and delivery acceptance, and nothing downstream re-checks it.
+            if let Some(reason) = task_span_defect(t) {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: SPAN_IDENTITY.into(),
+                    reason,
+                });
+                continue;
+            }
+            if !admit(&mut idx, t, created_at(t)) {
+                continue;
+            }
+            idx.spans.push(t);
             continue;
         }
 
@@ -1664,7 +2355,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             // receipt created outside it is excluded and counted under
             // `observations_out_of_window`, not silently admitted as a valid
             // claim (review 01M2CS8FMFPCPZKFPM65VGV5BH, TKT-figil-fobud-niluk).
-            if !admit(&mut idx, t) {
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             // A receipt authored by a generation is itself proof the
@@ -1673,7 +2364,12 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             if !spawn.is_empty() {
                 idx.launches.push(LaunchRow {
                     repo: scope.clone(),
+                    task: str_field(t, &["payload", "task"]).to_string(),
                     spawn,
+                    session: None,
+                    at: created_at(t),
+                    record: record_id(t),
+                    kind: "authored_record",
                 });
             }
             let source = str_field(t, &["payload", "source"]).to_string();
@@ -1696,7 +2392,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             }
             // Same window enforcement as REUSE above: an out-of-window verdict
             // must not be admitted as a valid assessment.
-            if !admit(&mut idx, t) {
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             let receipt = str_field(t, &["payload", "receipt"]).to_string();
@@ -1728,7 +2424,16 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if !spawn.is_empty() {
-                idx.launches.push(LaunchRow { repo: scope, spawn });
+                idx.launches.push(LaunchRow {
+                    repo: scope,
+                    task: str_field(t, &["payload", "task"]).to_string(),
+                    spawn,
+                    session: None,
+                    at: created_at(t),
+                    record: record_id(t),
+                    // An authored finding proves execution, not an additional launch attempt.
+                    kind: "authored_record",
+                });
             }
         }
     }
@@ -1738,51 +2443,276 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     idx
 }
 
-/// The scope deliveries are accounted over: frozen consumer tasks plus the
-/// consumer tasks of predeclared fixture pairs. Deliberately NOT the pairs that
-/// survived evaluation — a frozen task with no eligible source and no receipt
-/// still owns its delivery accounting.
-fn frozen_task_scope(manifest: &Manifest) -> Vec<DeliveryCost> {
-    let mut scopes: BTreeMap<(String, String), (BTreeSet<String>, &'static str)> = BTreeMap::new();
+/// Resolve exact physical exit with launch, repository, and decision-time fences.
+fn resolve_author_exit(
+    evidence_id: &str,
+    idx: &Index<'_>,
+    repo: &str,
+    source_agent: &str,
+    source_task: &str,
+    source_spawn: &str,
+    claim_created: Option<DateTime<Utc>>,
+) -> std::result::Result<String, String> {
+    let Some(ev) = idx.by_id.get(evidence_id) else {
+        return Err(format!(
+            "author_terminal_evidence {evidence_id} is not present in the tuple capture"
+        ));
+    };
+    if is_harness_result(ev) {
+        return Err(format!(
+            "{evidence_id} is a harness_result: task-completion evidence emitted at `rk done` \
+             while the process is still alive. Author-exit requires an agent_exit observation"
+        ));
+    }
+    if ev["identity"] == "agent_lifecycle" {
+        return Err(format!(
+            "{evidence_id} is an agent_lifecycle event: it carries no `spawn` binding, is not \
+             repo-bound, and its `change` may be `started`, so it cannot establish a terminal \
+             generation"
+        ));
+    }
+    if !claims_kind(ev, AGENT_EXIT) {
+        return Err(format!("{evidence_id} is not an agent_exit observation"));
+    }
+    if let Some(reason) = telemetry_record_defect(ev, AGENT_EXIT) {
+        return Err(format!(
+            "{evidence_id} is not a valid agent_exit record: {reason}"
+        ));
+    }
+    if source_spawn.is_empty() {
+        return Err(format!(
+            "the source carries no authoring generation, so {evidence_id} cannot be bound to it \
+             (legacy/unattributed source)"
+        ));
+    }
+    let Some(exit) = idx.exits.iter().find(|e| e.record == evidence_id) else {
+        return Err(format!(
+            "{evidence_id} is an agent_exit record but was excluded from the frozen repo scope or \
+             measurement window"
+        ));
+    };
+    if exit.repo != repo {
+        return Err(format!(
+            "{evidence_id} is scoped to repo {}, not the pair's {repo}",
+            exit.repo
+        ));
+    }
+    if source_task.trim().is_empty() || exit.task != source_task {
+        return Err(format!(
+            "{evidence_id} names task {:?}, not an established source task {source_task:?}",
+            exit.task
+        ));
+    }
+    if exit.spawn != source_spawn {
+        return Err(format!(
+            "{evidence_id} records the exit of generation {}, not the source's {source_spawn}",
+            exit.spawn
+        ));
+    }
+    if !source_agent.is_empty() && !exit.agent.is_empty() && exit.agent != source_agent {
+        return Err(format!(
+            "{evidence_id} names agent {}, not the source's author {source_agent}",
+            exit.agent
+        ));
+    }
+    // Reject stale-session exits: their lifecycle state describes a successor launch.
+    if exit.stale_session == Some(true) {
+        return Err(format!(
+            "{evidence_id} is a stale-session exit: a later launch of generation {source_spawn} \
+             already existed when it was recorded, so it cannot establish the terminal state at \
+             the time of the reuse"
+        ));
+    }
+    let Some(exited_at) = exit.exited_at else {
+        return Err(format!("{evidence_id} carries no parsable exited_at"));
+    };
+    let Some(claim_at) = claim_created else {
+        return Err(format!(
+            "{evidence_id} cannot be ordered against the reuse: the reuse has no captured, \
+             parsable timestamp"
+        ));
+    };
+    if exited_at > claim_at {
+        return Err(format!(
+            "{evidence_id} records an exit at {exited_at} which is AFTER the reuse at {claim_at}"
+        ));
+    }
+    // Respawn keeps SpawnId: an earlier exit cannot prove absence after relaunch.
+    if let Some(relaunch) =
+        idx.relaunch_between(repo, source_spawn, &exit.session, exited_at, claim_at)
+    {
+        return Err(format!(
+            "generation {source_spawn} was observed running again at {} ({} {}) after the exit at \
+             {exited_at} and before the reuse at {claim_at}",
+            relaunch
+                .at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "unknown time".into()),
+            relaunch.kind,
+            relaunch.record
+        ));
+    }
+    Ok(evidence_id.to_string())
+}
+
+// Derive deliveries from frozen task scope, including pairs that failed evaluation.
+
+struct TaskScope {
+    task: String,
+    repo: String,
+    batches: BTreeSet<String>,
+    enrollment: &'static str,
+}
+
+fn frozen_task_scope(manifest: &Manifest) -> Vec<TaskScope> {
+    let mut scopes: BTreeMap<(String, String), TaskScope> = BTreeMap::new();
     for c in &manifest.consumer_tasks {
         let e = scopes
             .entry((c.task.clone(), c.repo.clone()))
-            .or_insert_with(|| (BTreeSet::new(), "frozen_consumer_task"));
-        e.0.insert(c.batch.clone());
-        e.1 = "frozen_consumer_task";
+            .or_insert_with(|| TaskScope {
+                task: c.task.clone(),
+                repo: c.repo.clone(),
+                batches: BTreeSet::new(),
+                enrollment: "frozen_consumer_task",
+            });
+        e.batches.insert(c.batch.clone());
+        e.enrollment = "frozen_consumer_task";
     }
+    // Fixture pairs enroll their tasks even when consumer_tasks is omitted.
     for p in &manifest.eligible_pairs {
         let e = scopes
             .entry((p.consumer_task.clone(), p.repo.clone()))
-            .or_insert_with(|| (BTreeSet::new(), "fixture_pair"));
-        e.0.insert(p.batch.clone());
+            .or_insert_with(|| TaskScope {
+                task: p.consumer_task.clone(),
+                repo: p.repo.clone(),
+                batches: BTreeSet::new(),
+                enrollment: "fixture_pair",
+            });
+        e.batches.insert(p.batch.clone());
     }
-    scopes
-        .into_iter()
-        .map(|((task, repo), (batches, enrollment))| DeliveryCost {
-            task,
-            repo,
-            batches: batches.into_iter().collect(),
-            enrollment: enrollment.to_string(),
-            derivation_status: "unsupported".into(),
-            derivation_reason: DELIVERY_COST_UNSUPPORTED.into(),
-            cost_usd: None,
-            active_work_ms: None,
-            process_lifetime_ms: None,
-            verification_ms: None,
-            queue_ms: None,
-            accepted: None,
-        })
-        .collect()
+    scopes.into_values().collect()
+}
+
+/// Per-segment cost finality.
+fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
+    let state = last.state.as_deref().unwrap_or("");
+    if !TERMINAL_USAGE_STATES.contains(&state) {
+        return (
+            false,
+            format!(
+                "last result for this segment is state={state:?}, which is not terminal: more \
+                 usage may follow"
+            ),
+        );
+    }
+    let Some(exit) = exit else {
+        return (
+            false,
+            "no agent_exit observed for this launch, so the process may still be running and \
+             report more usage"
+                .into(),
+        );
+    };
+    // A stale exit's missing prior state denotes uncertainty about the superseded launch.
+    if exit.prior_state.is_none() && exit.stale_session == Some(true) {
+        return (
+            false,
+            format!(
+                "exit {} is a stale-session record: its prior_state is unknown (it would \
+                 describe a successor launch, not this one), so this segment cannot be confirmed \
+                 final",
+                exit.record
+            ),
+        );
+    }
+    // Coverage is measured by the producer, not inferred here.
+    match exit.cost_coverage.as_deref() {
+        Some(FINAL_COST_COVERAGE) => {}
+        None => {
+            return (
+                false,
+                format!(
+                    "exit {} states no cost_coverage, so it is not evidence that the reported \
+                     amount covers the whole launch",
+                    exit.record
+                ),
+            )
+        }
+        Some(other) if NON_FINAL_COST_COVERAGE.contains(&other) => {
+            return (
+                false,
+                format!(
+                    "exit {} reports cost_coverage={other:?}: the launch's own producer states \
+                     the reported amount does not cover it",
+                    exit.record
+                ),
+            )
+        }
+        Some(other) => {
+            return (
+                false,
+                format!(
+                    "exit {} reports an unrecognized cost_coverage={other:?}, which cannot be \
+                     read as covering the launch",
+                    exit.record
+                ),
+            )
+        }
+    }
+    // Agreement is required, so an absent prior_state fails closed like any unknown.
+    match exit.prior_state.as_deref() {
+        None => (
+            false,
+            format!(
+                "exit {} records no prior_state, so there is nothing to agree with the last \
+                 result (state={state:?}): the launch's position at exit is unknown and the \
+                 reported amount cannot be confirmed to cover it",
+                exit.record
+            ),
+        ),
+        Some(prior) if prior == state => (
+            true,
+            format!(
+                "terminal result (state={state}) followed by observed exit {} with \
+                 cost_coverage={FINAL_COST_COVERAGE}",
+                exit.record
+            ),
+        ),
+        Some(prior) => (
+            false,
+            format!(
+                "last result said state={state:?} but the exit records prior_state={prior:?}: the \
+                 launch did more work after that result, so the reported amount is partial"
+            ),
+        ),
+    }
+}
+
+fn opt_sum(acc: &mut Option<i64>, v: Option<i64>) {
+    if let Some(v) = v {
+        *acc.get_or_insert(0) += v;
+    }
+}
+
+/// Computes the deterministic report with no reviewed task-scoped annotations (repeated-investigation/rework/intervention).
+#[cfg(test)]
+fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) -> Result<Report> {
+    compute_full(manifest, capture, reviews, &[])
 }
 
 /// Computes the deterministic report. Same inputs always produce the same
 /// output (stable sort keys throughout; no reliance on hash-map iteration
 /// order, wall-clock "now", or randomness).
 #[allow(clippy::too_many_lines)]
-pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) -> Result<Report> {
+pub fn compute_full(
+    manifest: &Manifest,
+    capture: &TupleCapture,
+    reviews: &[Review],
+    reviewed_annotations: &[ReviewedAnnotation],
+) -> Result<Report> {
     validate_manifest(manifest)?;
     let all_pairs = validate_and_merge_pairs(manifest, reviews)?;
+    validate_reviewed_annotations(manifest, reviewed_annotations)?;
 
     let idx = build_index(capture, manifest);
     let review_by_pair: BTreeMap<&str, &Review> =
@@ -1798,6 +2728,47 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
     let mut ambiguous_assessments: Vec<AmbiguousAssessment> = Vec::new();
     let mut author_exit_unsupported: Vec<AuthorExitUnsupported> = Vec::new();
     let mut pairs_out: Vec<PairResult> = Vec::new();
+
+    // Resolve reviewed annotations once, then attach them by task.
+    let mut invalid_records: Vec<InvalidRecord> = idx.invalid.clone();
+    #[allow(clippy::type_complexity)]
+    let mut reviewed_by_task: BTreeMap<
+        (String, String),
+        (Vec<String>, Vec<String>, Vec<String>),
+    > = BTreeMap::new();
+    for a in reviewed_annotations {
+        let repeated = resolve_annotated_evidence(
+            &a.repeated_investigations,
+            &idx.by_id,
+            &idx.invalid,
+            &a.repo,
+            "reviewed_repeated_investigation",
+            &mut invalid_records,
+            &mut unresolved,
+        );
+        let rework = resolve_annotated_evidence(
+            &a.rework,
+            &idx.by_id,
+            &idx.invalid,
+            &a.repo,
+            "reviewed_rework",
+            &mut invalid_records,
+            &mut unresolved,
+        );
+        let interventions = resolve_annotated_evidence(
+            &a.interventions,
+            &idx.by_id,
+            &idx.invalid,
+            &a.repo,
+            "reviewed_intervention",
+            &mut invalid_records,
+            &mut unresolved,
+        );
+        reviewed_by_task.insert(
+            (a.task.clone(), a.repo.clone()),
+            (repeated, rework, interventions),
+        );
+    }
 
     for pair in &sorted_pairs {
         // A duplicate identity is counted once and REPORTED, so a repeated
@@ -1838,6 +2809,7 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             .unwrap_or("artifact")
             .to_string();
         let source_spawn = str_field(source, &["payload", "spawn"]).to_string();
+        let source_agent = str_field(source, &["payload", "agent"]).to_string();
         let source_attributed = !source_spawn.is_empty();
         if source_attributed && source_spawn == pair.consumer_generation {
             excluded.push(Excluded {
@@ -1851,7 +2823,12 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         // evidence contract to check. Unresolvable evidence leaves the
         // opportunity standing but stops it certifying anything.
         let source_evidence = if source_kind == FINDING || source_kind == ANSWER {
-            let check = check_evidence(&source["payload"]["evidence"], &idx.by_id, &pair.repo);
+            let check = check_evidence(
+                &source["payload"]["evidence"],
+                &idx.by_id,
+                &idx.invalid,
+                &pair.repo,
+            );
             match &check {
                 EvidenceCheck::Invalid(reason) => {
                     excluded.push(Excluded {
@@ -1911,7 +2888,12 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
                     });
                     continue;
                 }
-                match check_evidence(&c["payload"]["evidence"], &idx.by_id, &pair.repo) {
+                match check_evidence(
+                    &c["payload"]["evidence"],
+                    &idx.by_id,
+                    &idx.invalid,
+                    &pair.repo,
+                ) {
                     EvidenceCheck::Invalid(detail) => {
                         rejected_claims.push(RejectedClaim {
                             pair: pair.id.clone(),
@@ -1992,7 +2974,12 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
                         });
                         continue;
                     }
-                    match check_evidence(&a["payload"]["evidence"], &idx.by_id, &pair.repo) {
+                    match check_evidence(
+                        &a["payload"]["evidence"],
+                        &idx.by_id,
+                        &idx.invalid,
+                        &pair.repo,
+                    ) {
                         EvidenceCheck::Resolved => candidates.push((*pos, a)),
                         EvidenceCheck::Invalid(reason) | EvidenceCheck::Unknown(reason) => {
                             unresolved.push(InvalidRecord {
@@ -2077,15 +3064,29 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             pair.consumer_generation.clone(),
         ));
 
-        // Author exit is NOT derived in this evaluator version. Any supplied
-        // evidence is reported as unsupported with the reason, rather than
-        // credited from a record that cannot establish a physical exit.
+        // Author exit, derived.
+        let mut author_terminal = false;
+        let mut author_terminal_evidence = None;
         if let Some(evidence_id) = review.and_then(|r| r.author_terminal_evidence.as_deref()) {
-            author_exit_unsupported.push(AuthorExitUnsupported {
-                pair: pair.id.clone(),
-                evidence: evidence_id.to_string(),
-                reason: AUTHOR_EXIT_UNSUPPORTED.to_string(),
-            });
+            match resolve_author_exit(
+                evidence_id,
+                &idx,
+                &pair.repo,
+                &source_agent,
+                str_field(source, &["payload", "task"]),
+                &source_spawn,
+                claim_created,
+            ) {
+                Ok(id) => {
+                    author_terminal = true;
+                    author_terminal_evidence = Some(id);
+                }
+                Err(reason) => author_exit_unsupported.push(AuthorExitUnsupported {
+                    pair: pair.id.clone(),
+                    evidence: evidence_id.to_string(),
+                    reason,
+                }),
+            }
         }
         let relayed_by_operator = review.is_some_and(|r| r.relayed_by_operator);
         let regression = review.is_some_and(|r| r.regression);
@@ -2127,10 +3128,8 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             claim_evidence,
             assessed_verdict,
             assessment_evidence,
-            // Author exit cannot be established in this version; see
-            // `AUTHOR_EXIT_UNSUPPORTED`.
-            author_terminal: false,
-            author_terminal_evidence: None,
+            author_terminal,
+            author_terminal_evidence,
             relayed_by_operator,
             regression,
             verified_effect,
@@ -2259,11 +3258,14 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         .filter(|p| p.counts_as_effect)
         .map(|p| p.batch.as_str())
         .collect();
-    // The author-exit sub-goal cannot be satisfied at all in this version, so
-    // the mechanism goal is forced `false` with the reason attached. This is
-    // the whole point of the intermediate: a goal that cannot be evaluated
-    // must not report as met, and the previous version would have passed it on
-    // author-exit evidence that establishes nothing.
+    let mut author_exit_reuse: Vec<String> = pairs_out
+        .iter()
+        .filter(|p| p.counts_as_effect && p.author_terminal)
+        .map(|p| p.pair.clone())
+        .collect();
+    author_exit_reuse.sort();
+    let author_exit_effects = author_exit_reuse.len();
+    // Truncated capture or incomplete references cannot certify the mechanism goal.
     let goal_blocked_reason = if capture.truncated {
         Some(
             "the tuple capture is truncated: a reuse or assessment outside the truncation window \
@@ -2285,19 +3287,433 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             capture.coverage.missing_references.len()
         ))
     } else {
-        Some(AUTHOR_EXIT_UNSUPPORTED.to_string())
+        None
     };
     let mechanism = MechanismResult {
         effects: effect_pairs.len(),
         batches: effect_batches.len(),
-        author_exit_effects: 0,
+        author_exit_effects,
         effects_required: MECHANISM_EFFECTS_REQUIRED,
         batches_required: MECHANISM_BATCHES_REQUIRED,
         author_exit_required: MECHANISM_AUTHOR_EXIT_REQUIRED,
-        goal_met: false,
+        goal_met: goal_blocked_reason.is_none()
+            && effect_pairs.len() >= MECHANISM_EFFECTS_REQUIRED
+            && effect_batches.len() >= MECHANISM_BATCHES_REQUIRED
+            && author_exit_effects >= MECHANISM_AUTHOR_EXIT_REQUIRED,
         goal_blocked_reason,
         effect_pairs,
     };
+
+    // --- deliveries, from frozen scope -------------------------------
+    let mut deliveries = Vec::new();
+    let mut tasks_without_native_records = Vec::new();
+    let mut attention_hold_spans = 0usize;
+    let mut rework_spans = 0usize;
+    let mut reviewed_repeated_investigations_total = 0usize;
+    let mut reviewed_rework_total = 0usize;
+    let mut reviewed_interventions_total = 0usize;
+    for scope in frozen_task_scope(manifest) {
+        // Filter scope before build_critical_path: its phase/attempt dedup is scope-blind.
+        let task_spans: Vec<Value> = idx
+            .spans
+            .iter()
+            .filter(|t| {
+                str_field(t, &["scope"]) == scope.repo
+                    && t["payload"]["task"] == scope.task.as_str()
+            })
+            .map(|t| (*t).clone())
+            .collect();
+        let cp = crate::critical_path::build_critical_path(&scope.task, &task_spans);
+        let mut phase_ms = PhaseDurations::default();
+        if let Some(phases) = cp["phases"].as_array() {
+            for phase in phases {
+                let dur = phase["duration_ms"].as_i64();
+                let wait = phase["queue_wait_ms"].as_i64();
+                match phase["phase"].as_str().unwrap_or("") {
+                    "verification" => {
+                        // Verification includes admission and execution time only when the producer declares them disjoint.
+                        if phase["duration_semantic"] == ADDITIVE_DURATION {
+                            opt_sum(&mut phase_ms.verification_ms, dur);
+                            opt_sum(&mut phase_ms.verification_ms, wait);
+                        } else if dur.is_some() || wait.is_some() {
+                            phase_ms.verification_ms_legacy_spans += 1;
+                        }
+                    }
+                    "attention_hold" => {
+                        attention_hold_spans += 1;
+                        opt_sum(&mut phase_ms.attention_hold_ms, dur);
+                        opt_sum(&mut phase_ms.attention_hold_ms, wait);
+                    }
+                    other => {
+                        if other == "rework" {
+                            rework_spans += 1;
+                        }
+                        opt_sum(&mut phase_ms.work_phases_ms, dur);
+                        // Pre-phase queueing remains wait time, even for active phases.
+                        opt_sum(&mut phase_ms.queue_wait_ms, wait);
+                    }
+                }
+            }
+        }
+        let acceptance_evidence = idx
+            .spans
+            .iter()
+            .filter(|t| {
+                str_field(t, &["scope"]) == scope.repo
+                    && t["payload"]["task"] == scope.task.as_str()
+                    && t["payload"]["phase"] == "delivery_closure"
+            })
+            .map(|t| record_id(t))
+            .min();
+        let accepted = acceptance_evidence.as_ref().map(|_| true);
+
+        // Every native generation observed for this task, whether or not it ever produced an eligible pair or a receipt.
+        let mut spawns: BTreeSet<&str> = BTreeSet::new();
+        for c in &idx.completions {
+            if c.repo == scope.repo && c.task == scope.task {
+                spawns.insert(c.spawn.as_str());
+            }
+        }
+        for e in &idx.exits {
+            if e.repo == scope.repo && e.task == scope.task {
+                spawns.insert(e.spawn.as_str());
+            }
+        }
+        for u in &idx.usage {
+            if u.repo == scope.repo && u.task == scope.task {
+                spawns.insert(u.spawn.as_str());
+            }
+        }
+        for l in &idx.launches {
+            if l.repo == scope.repo && l.task == scope.task {
+                spawns.insert(l.spawn.as_str());
+            }
+        }
+
+        let mut generations = Vec::new();
+        let mut completions_total = 0usize;
+        let mut failed_completions = 0usize;
+        let mut launches_total = 0usize;
+        let mut exits_total = 0usize;
+        let mut provisional: Option<f64> = None;
+        let mut provisional_known = true;
+        let mut provider_total: Option<f64> = None;
+        let mut daemon_total: Option<f64> = None;
+        let mut partial_total: Option<f64> = None;
+        let mut all_final = true;
+        let mut any_segment = false;
+        let mut non_provider_basis = false;
+        let mut unknown_cost: Vec<String> = Vec::new();
+        let mut lifetime: Option<i64> = None;
+
+        for spawn in spawns {
+            let mut completions = Vec::new();
+            for c in idx
+                .completions
+                .iter()
+                .filter(|c| c.repo == scope.repo && c.task == scope.task && c.spawn == spawn)
+            {
+                completions_total += 1;
+                // TKT-175: declaration and success are independent observations.
+                let failed = c.is_error || !c.declared_done;
+                if failed {
+                    failed_completions += 1;
+                }
+                match c.cost_usd {
+                    Some(v) => *provisional.get_or_insert(0.0) += v,
+                    None => provisional_known = false,
+                }
+                completions.push(CompletionObservation {
+                    record: c.record.clone(),
+                    declared_done: c.declared_done,
+                    is_error: c.is_error,
+                    provisional_cost_usd: c.cost_usd,
+                    failed,
+                });
+            }
+            completions.sort_by(|a, b| a.record.cmp(&b.record));
+
+            let mut agent = idx
+                .completions
+                .iter()
+                .find(|c| c.repo == scope.repo && c.spawn == spawn && !c.agent.is_empty())
+                .map(|c| c.agent.clone());
+            if agent.is_none() {
+                agent = idx
+                    .exits
+                    .iter()
+                    .find(|e| e.repo == scope.repo && e.spawn == spawn && !e.agent.is_empty())
+                    .map(|e| e.agent.clone());
+            }
+
+            // ATTEMPTS, not exits.
+            let mut launches = Vec::new();
+            let mut sessioned: BTreeSet<&str> = BTreeSet::new();
+            for e in idx
+                .exits
+                .iter()
+                .filter(|e| e.repo == scope.repo && e.task == scope.task && e.spawn == spawn)
+            {
+                exits_total += 1;
+                sessioned.insert(e.session.as_str());
+                let ms = match (e.launched_at, e.exited_at) {
+                    (Some(l), Some(x)) => Some((x - l).num_milliseconds()),
+                    _ => None,
+                };
+                opt_sum(&mut lifetime, ms);
+                launches.push(LaunchObservation {
+                    session: Some(e.session.clone()),
+                    observed_via: AGENT_EXIT.into(),
+                    launched_at: e.launched_at.map(|t| t.to_rfc3339()),
+                    exited_at: e.exited_at.map(|t| t.to_rfc3339()),
+                    exit_record: Some(e.record.clone()),
+                    exit_code: e.exit_code,
+                    crashed: e.crashed,
+                    prior_state: e.prior_state.clone(),
+                    process_lifetime_ms: ms,
+                });
+            }
+            // Usage proves a launch even when its exit was not captured.
+            let mut usage_only: BTreeSet<&str> = BTreeSet::new();
+            for u in idx
+                .usage
+                .iter()
+                .filter(|u| u.repo == scope.repo && u.task == scope.task && u.spawn == spawn)
+            {
+                if !sessioned.contains(u.session.as_str()) {
+                    usage_only.insert(u.session.as_str());
+                }
+            }
+            for session in &usage_only {
+                launches.push(LaunchObservation {
+                    session: Some((*session).to_string()),
+                    observed_via: AGENT_FINAL_USAGE.into(),
+                    launched_at: None,
+                    exited_at: None,
+                    exit_record: None,
+                    exit_code: None,
+                    crashed: None,
+                    prior_state: None,
+                    process_lifetime_ms: None,
+                });
+            }
+            // Launch events carry no session, so they cannot be matched to the attempts above one-for-one.
+            let mut launch_events: Vec<&LaunchRow> = idx
+                .launches
+                .iter()
+                .filter(|l| {
+                    l.repo == scope.repo
+                        && l.task == scope.task
+                        && l.spawn == spawn
+                        && l.kind == LAUNCH_EVENT_KIND
+                })
+                .collect();
+            launch_events.sort_by(|a, b| (a.at, &a.record).cmp(&(b.at, &b.record)));
+            let accounted = sessioned.len() + usage_only.len();
+            for l in launch_events.iter().skip(accounted) {
+                launches.push(LaunchObservation {
+                    session: None,
+                    observed_via: LAUNCH_EVENT_KIND.into(),
+                    launched_at: l.at.map(|t| t.to_rfc3339()),
+                    exited_at: None,
+                    exit_record: None,
+                    exit_code: None,
+                    crashed: None,
+                    prior_state: None,
+                    process_lifetime_ms: None,
+                });
+            }
+            launches_total += launches.len();
+            launches.sort_by(|a, b| {
+                (&a.session, &a.launched_at, &a.exit_record).cmp(&(
+                    &b.session,
+                    &b.launched_at,
+                    &b.exit_record,
+                ))
+            });
+
+            // Provider totals are cumulative per (session, provider_session); take the last.
+            let mut by_segment: BTreeMap<(String, Option<String>), Vec<&UsageRow>> =
+                BTreeMap::new();
+            for u in idx
+                .usage
+                .iter()
+                .filter(|u| u.repo == scope.repo && u.task == scope.task && u.spawn == spawn)
+            {
+                by_segment
+                    .entry((u.session.clone(), u.provider_session.clone()))
+                    .or_default()
+                    .push(u);
+            }
+            let mut cost_segments = Vec::new();
+            let ordered = capture.order == Order::PersistenceSequence;
+            for ((session, provider_session), mut rows) in by_segment {
+                any_segment = true;
+                // WHICH record is the segment's last is a persistence-order question, and `observed_at` is a producer-stamped field, not persistence order.
+                if ordered {
+                    rows.sort_by(|a, b| (a.position, &a.record).cmp(&(b.position, &b.record)));
+                } else {
+                    rows.sort_by(|a, b| {
+                        (a.observed_at, &a.record).cmp(&(b.observed_at, &b.record))
+                    });
+                }
+                let last = rows.last().copied().expect("segment has at least one row");
+                let exit = idx.exits.iter().find(|e| {
+                    e.repo == scope.repo
+                        && e.task == scope.task
+                        && e.agent == last.agent
+                        && e.spawn == spawn
+                        && e.session == session
+                });
+                // A single row needs no ordering proof; multiple rows do.
+                let (final_cost, finality_reason) = if rows.len() > 1 && !ordered {
+                    (
+                        false,
+                        format!(
+                            "{} cumulative usage results in this segment but the capture declares \
+                             no validated persistence order, so the last one — the \
+                             segment's actual total — cannot be identified",
+                            rows.len()
+                        ),
+                    )
+                } else {
+                    segment_finality(last, exit)
+                };
+                if !final_cost {
+                    all_final = false;
+                    unknown_cost.push(format!(
+                        "{spawn}/{session}/{}: {finality_reason}",
+                        provider_session.as_deref().unwrap_or("no-provider-session")
+                    ));
+                }
+                if last.cost_basis != PROVIDER_COST_BASIS {
+                    non_provider_basis = true;
+                }
+                match (final_cost, last.cost_usd, last.cost_basis.as_str()) {
+                    (true, Some(v), PROVIDER_COST_BASIS) => {
+                        *provider_total.get_or_insert(0.0) += v;
+                    }
+                    (true, Some(v), DAEMON_COST_BASIS) => {
+                        *daemon_total.get_or_insert(0.0) += v;
+                    }
+                    (false, Some(v), _) => {
+                        *partial_total.get_or_insert(0.0) += v;
+                    }
+                    (_, None, _) => {
+                        all_final = false;
+                        unknown_cost.push(format!(
+                            "{spawn}/{session}/{}: reported cost is null (cost_basis={})",
+                            provider_session.as_deref().unwrap_or("no-provider-session"),
+                            last.cost_basis
+                        ));
+                    }
+                    (true, Some(_), other) => {
+                        // Unknown/mixed cost bases remain visible but cannot join either total.
+                        unknown_cost.push(format!(
+                            "{spawn}/{session}/{}: reported cost has unrecognized cost_basis={other:?}, \
+                             not pooled",
+                            provider_session.as_deref().unwrap_or("no-provider-session")
+                        ));
+                    }
+                }
+                cost_segments.push(CostSegment {
+                    spawn: spawn.to_string(),
+                    session,
+                    provider_session,
+                    record: last.record.clone(),
+                    reported_usd: last.cost_usd,
+                    cost_basis: last.cost_basis.clone(),
+                    state: last.state.clone(),
+                    final_cost,
+                    finality_reason,
+                });
+            }
+            cost_segments.sort_by(|a, b| {
+                (&a.spawn, &a.session, &a.provider_session).cmp(&(
+                    &b.spawn,
+                    &b.session,
+                    &b.provider_session,
+                ))
+            });
+            if cost_segments.is_empty() {
+                unknown_cost.push(format!(
+                    "{spawn}: no agent_final_usage observation, so this generation's provider cost \
+                     is unknown"
+                ));
+            }
+            generations.push(GenerationObservation {
+                spawn: spawn.to_string(),
+                agent,
+                completions,
+                launches,
+                cost_segments,
+            });
+        }
+        generations.sort_by(|a, b| a.spawn.cmp(&b.spawn));
+
+        if generations.is_empty() && task_spans.is_empty() {
+            tasks_without_native_records.push(format!("{}/{}", scope.repo, scope.task));
+        }
+
+        let cost_coverage = if generations.is_empty() {
+            "none_observed"
+        } else if !any_segment {
+            "missing"
+        } else if all_final && !non_provider_basis {
+            "complete"
+        } else {
+            "partial"
+        };
+        // Report a provider total only when every observed segment has a final provider total.
+        let reported_cost_estimate_usd = (cost_coverage == "complete")
+            .then_some(provider_total)
+            .flatten();
+        unknown_cost.sort();
+
+        let (reviewed_repeated_investigations, reviewed_rework, reviewed_interventions) =
+            reviewed_by_task
+                .get(&(scope.task.clone(), scope.repo.clone()))
+                .cloned()
+                .unwrap_or_default();
+        reviewed_repeated_investigations_total += reviewed_repeated_investigations.len();
+        reviewed_rework_total += reviewed_rework.len();
+        reviewed_interventions_total += reviewed_interventions.len();
+
+        deliveries.push(DeliveryCost {
+            task: scope.task.clone(),
+            repo: scope.repo.clone(),
+            batches: scope.batches.iter().cloned().collect(),
+            enrollment: scope.enrollment.to_string(),
+            generations,
+            completions: completions_total,
+            failed_completions,
+            launches: launches_total,
+            exits: exits_total,
+            reported_cost_estimate_usd,
+            reported_cost_basis: reported_cost_estimate_usd
+                .map(|_| PROVIDER_COST_BASIS.to_string()),
+            cost_coverage: cost_coverage.to_string(),
+            partial_reported_usd: partial_total,
+            daemon_priced_estimate_usd: daemon_total,
+            provisional_completion_cost_usd: provisional_known.then_some(provisional).flatten(),
+            unknown_cost,
+            process_lifetime_ms: lifetime,
+            active_work_ms: None,
+            active_work_coverage:
+                "unknown: launch-to-exit is process lifetime, and no native observation \
+                 distinguishes model-active time from a process paused awaiting verification or \
+                 the operator"
+                    .into(),
+            phase_ms,
+            accepted,
+            acceptance_evidence,
+            reviewed_repeated_investigations,
+            reviewed_rework,
+            reviewed_interventions,
+        });
+    }
+    deliveries.sort_by(|a, b| (&a.repo, &a.task).cmp(&(&b.repo, &b.task)));
+    tasks_without_native_records.sort();
 
     let incorrect_reuse = pairs_out
         .iter()
@@ -2310,10 +3726,15 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         .collect();
     regressions.sort();
     let quality = QualitySummary {
-        interventions: None,
-        interventions_coverage: INTERVENTIONS_UNSUPPORTED.into(),
+        attention_hold_spans,
+        interventions_known: attention_hold_spans,
+        interventions_coverage: INTERVENTIONS_LOWER_BOUND.into(),
+        rework_spans,
         incorrect_reuse,
         regressions,
+        reviewed_repeated_investigations: reviewed_repeated_investigations_total,
+        reviewed_rework: reviewed_rework_total,
+        reviewed_interventions: reviewed_interventions_total,
     };
 
     excluded.sort_by(|a, b| (&a.pair, &a.reason).cmp(&(&b.pair, &b.reason)));
@@ -2337,20 +3758,23 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         },
         tuples_truncated: capture.truncated,
         capture: idx.capture.clone(),
-        invalid_records: idx.invalid.clone(),
+        invalid_records,
         unresolved_records: unresolved,
+        // Version 3 derives exits and costs; remaining unsupported fields stay explicit.
         unsupported: vec![
             UnsupportedDerivation {
-                derivation: "author_exit".into(),
-                status: "unsupported".into(),
-                reason: AUTHOR_EXIT_UNSUPPORTED.into(),
-                tracked_by: "TKT-bonik-vuruv-mivuh".into(),
+                derivation: "active_work_ms".into(),
+                status: "unknown".into(),
+                reason: ACTIVE_WORK_UNKNOWN.into(),
+                tracked_by: "no native observation exists; not scheduled".into(),
             },
             UnsupportedDerivation {
-                derivation: "delivery_cost_and_duration".into(),
-                status: "unsupported".into(),
-                reason: DELIVERY_COST_UNSUPPORTED.into(),
-                tracked_by: "TKT-bonik-vuruv-mivuh".into(),
+                derivation: "total_operator_interventions".into(),
+                status: "lower_bound".into(),
+                reason: INTERVENTIONS_LOWER_BOUND.into(),
+                tracked_by: "no native observation can close this gap; ReviewedAnnotation \
+                             supplies a separate, evidenced figure rather than closing it"
+                    .into(),
             },
         ],
         eligible,
@@ -2367,10 +3791,10 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         ambiguous_assessments,
         author_exit_unsupported,
         verified_reuse,
-        // Cannot be established in this version; see `AUTHOR_EXIT_UNSUPPORTED`.
-        author_exit_reuse: vec![],
+        author_exit_reuse,
         mechanism,
-        deliveries: frozen_task_scope(manifest),
+        deliveries,
+        tasks_without_native_records,
         quality,
         pairs: pairs_out,
     })
@@ -2379,6 +3803,13 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
 /// Renders a `Report` as human-readable text. JSON output should use
 /// `serde_json::to_string_pretty` directly on the `Report` for a byte-stable
 /// machine shape.
+fn opt_usd(v: Option<f64>) -> String {
+    match v {
+        Some(v) => format!("${v:.4}"),
+        None => "unknown".into(),
+    }
+}
+
 fn opt_rate(rate: Option<f64>) -> String {
     match rate {
         Some(r) => format!("{:.1}%", r * 100.0),
@@ -2542,20 +3973,82 @@ pub fn render(report: &Report) -> String {
         }
     }
     if !report.deliveries.is_empty() {
-        out.push_str("deliveries (scope only; cost/duration are UNSUPPORTED here):\n");
+        out.push_str("deliveries (reported cost ESTIMATES, not billed charges):\n");
         for d in &report.deliveries {
             let _ = writeln!(
                 out,
-                "  {}/{} [{}] cost_usd=unknown active_work_ms=unknown accepted=unknown ({})",
-                d.repo, d.task, d.enrollment, d.derivation_status
+                "  {}/{} [{}] completions={} failed={} launches={} exits={}",
+                d.repo,
+                d.task,
+                d.enrollment,
+                d.completions,
+                d.failed_completions,
+                d.launches,
+                d.exits
             );
+            let _ = writeln!(
+                out,
+                "    cost: reported={} coverage={} partial={} daemon_priced={} \
+                 provisional_completion={}",
+                opt_usd(d.reported_cost_estimate_usd),
+                d.cost_coverage,
+                opt_usd(d.partial_reported_usd),
+                opt_usd(d.daemon_priced_estimate_usd),
+                opt_usd(d.provisional_completion_cost_usd)
+            );
+            let _ = writeln!(
+                out,
+                "    time: process_lifetime_ms={:?} active_work_ms=unknown work_phases_ms={:?} \
+                 verification_ms={:?} (legacy_spans={}) attention_hold_ms={:?} queue_wait_ms={:?}",
+                d.process_lifetime_ms,
+                d.phase_ms.work_phases_ms,
+                d.phase_ms.verification_ms,
+                d.phase_ms.verification_ms_legacy_spans,
+                d.phase_ms.attention_hold_ms,
+                d.phase_ms.queue_wait_ms
+            );
+            let _ = writeln!(out, "    accepted={:?}", d.accepted);
+            for u in &d.unknown_cost {
+                let _ = writeln!(out, "    unknown cost: {u}");
+            }
+            if !d.reviewed_repeated_investigations.is_empty()
+                || !d.reviewed_rework.is_empty()
+                || !d.reviewed_interventions.is_empty()
+            {
+                let _ = writeln!(
+                    out,
+                    "    reviewed: repeated_investigations={} rework={} interventions={}",
+                    d.reviewed_repeated_investigations.len(),
+                    d.reviewed_rework.len(),
+                    d.reviewed_interventions.len()
+                );
+            }
         }
+    }
+    if !report.tasks_without_native_records.is_empty() {
+        let _ = writeln!(
+            out,
+            "frozen tasks with no native record at all: {}",
+            report.tasks_without_native_records.join(", ")
+        );
     }
     let _ = writeln!(
         out,
-        "quality: interventions=unknown incorrect_reuse={} regressions={}",
+        "quality: attention_hold_spans={} interventions_known={} rework_spans={} \
+         incorrect_reuse={} regressions={}",
+        report.quality.attention_hold_spans,
+        report.quality.interventions_known,
+        report.quality.rework_spans,
         report.quality.incorrect_reuse,
         report.quality.regressions.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "  reviewed (operator judgment, not daemon facts): repeated_investigations={} rework={} \
+         interventions={}",
+        report.quality.reviewed_repeated_investigations,
+        report.quality.reviewed_rework,
+        report.quality.reviewed_interventions
     );
     let _ = writeln!(
         out,
@@ -2571,6 +4064,17 @@ pub fn to_json(report: &Report) -> Value {
 
 #[cfg(test)]
 mod tests {
+    // Shared fixture timeline: hours after 2026-01-01T00:00:00Z.
+    const T0: &str = "2026-01-01T00:00:00Z";
+    const T1: &str = "2026-01-01T01:00:00Z";
+    const T2: &str = "2026-01-01T02:00:00Z";
+    const T3: &str = "2026-01-01T03:00:00Z";
+    const T10: &str = "2026-01-01T10:00:00Z";
+    const T11: &str = "2026-01-01T11:00:00Z";
+    const T12: &str = "2026-01-01T12:00:00Z";
+    const T24: &str = "2026-01-02T00:00:00Z";
+    const T48: &str = "2026-01-03T00:00:00Z";
+
     use super::*;
 
     fn manifest(pairs: Vec<EligiblePair>) -> Manifest {
@@ -2770,6 +4274,71 @@ mod tests {
                 "declared_done": true,
                 "cost_usd": 0.5
             }
+        })
+    }
+
+    /// `agent_exit` (S2 contract, identity `bbs-agent-exit`): castle-authored physical-exit evidence, never `harness_result`.
+    fn exit_rec(
+        id: &str,
+        task: &str,
+        agent: &str,
+        spawn: &str,
+        launched: &str,
+        exited: &str,
+    ) -> Value {
+        json!({
+            "id": id, "category": "event", "scope": "repo",
+            "identity": "bbs-agent-exit", "instance": CASTLE,
+            "lifecycle": "furniture", "created_at": exited,
+            "payload": {
+                "schema_version": 1, "bbs_kind": AGENT_EXIT, "repo": "repo", "task": task,
+                "agent": agent, "spawn": spawn, "session": "sess-1",
+                "launched_at": launched, "exited_at": exited, "prior_state": null,
+                "crashed": false, "exit_code": 0, "stale_session": null,
+                "cost_coverage": FINAL_COST_COVERAGE
+            }
+        })
+    }
+
+    /// Replace one fixture payload field.
+    fn field(mut t: Value, key: &str, v: Value) -> Value {
+        t["payload"][key] = v;
+        t
+    }
+
+    /// `agent_final_usage` (S2 contract, identity `bbs-agent-final-usage`): castle-authored provider-cost evidence, keyed with `agent_exit` on `(spawn, session)`.
+    fn usage_rec(
+        id: &str,
+        task: &str,
+        spawn: &str,
+        state: Option<&str>,
+        cost_usd: Option<f64>,
+        observed: &str,
+    ) -> Value {
+        json!({
+            "id": id, "category": "event", "scope": "repo",
+            "identity": "bbs-agent-final-usage", "instance": CASTLE,
+            "lifecycle": "furniture", "created_at": observed,
+            "payload": {
+                "schema_version": 1, "bbs_kind": AGENT_FINAL_USAGE, "repo": "repo",
+                "task": task, "agent": spawn, "spawn": spawn, "session": "sess-1",
+                "provider_session": "ps-1", "state": state, "cost_usd": cost_usd,
+                "cost_basis": PROVIDER_COST_BASIS, "observed_at": observed
+            }
+        })
+    }
+
+    /// Native castle-authored Furniture `task_span`, from `PhaseSpan::to_payload()`.
+    fn span_full(id: &str, payload: Value) -> Value {
+        json!({
+            "id": id,
+            "category": "event",
+            "scope": "repo",
+            "identity": SPAN_IDENTITY,
+            "instance": "daemon",
+            "lifecycle": "furniture",
+            "created_at": "2026-01-01T00:00:00Z",
+            "payload": payload
         })
     }
 
@@ -3220,18 +4789,16 @@ mod tests {
         assert_eq!(r.mechanism.effects, 3);
         assert_eq!(r.mechanism.batches, 2);
         // The effect and batch counts clear the bar, and the goal STILL must
-        // not pass: the author-exit sub-goal cannot be evaluated in this
-        // evaluator version, and the previous one would have passed it here on
-        // a `harness_result` that establishes no physical exit. A goal that
-        // cannot be evaluated does not report as met.
+        // not pass: the only cited terminal evidence is a `harness_result`,
+        // which this evaluator version explicitly refuses as author-exit
+        // proof (task-completion evidence, not a physical exit). Unlike a
+        // truncated capture, this is not "cannot be evaluated" — it is simply
+        // not met, so `goal_blocked_reason` stays `None`.
         assert_eq!(r.mechanism.author_exit_effects, 0);
         assert!(!r.mechanism.goal_met);
-        assert!(r
-            .mechanism
-            .goal_blocked_reason
-            .as_ref()
-            .unwrap()
-            .contains("author-exit derivation is not implemented"));
+        assert!(r.mechanism.goal_blocked_reason.is_none());
+        assert_eq!(r.author_exit_unsupported.len(), 1);
+        assert!(r.author_exit_unsupported[0].reason.contains("still alive"));
     }
 
     #[test]
@@ -3387,10 +4954,7 @@ mod tests {
             "the verdict's evidence resolved out of the closure, not the page"
         );
         assert_eq!(r.outcome_classes.verified, 1);
-        assert!(
-            !r.mechanism.goal_met,
-            "full author-exit evaluation is a later slice"
-        );
+        assert!(r.mechanism.goal_blocked_reason.is_none());
     }
 
     /// The same envelope with the closure UNRESOLVED. An unresolvable
@@ -3487,6 +5051,129 @@ mod tests {
         assert_eq!(c.coverage.complete, None, "a scan makes no closure claim");
     }
 
+    /// Launch-only generations count as attempts even without completion, exit, or usage.
+    #[test]
+    fn a_generation_with_only_a_launch_event_is_still_an_enrolled_attempt() {
+        let m = task_manifest("TKT-live");
+        let spawned = json!({
+            "id": "e1", "category": "event", "scope": "repo", "identity": "agent_spawned",
+            "instance": CASTLE, "created_at": T0,
+            "payload": {"agent": "Live-1", "spawn": "gen-live", "task": "TKT-live"}
+        });
+        let r = compute(&m, &capture(vec![spawned], Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.generations.len(), 1, "the live generation is retained");
+        assert_eq!(d.generations[0].spawn, "gen-live");
+        assert_eq!(d.launches, 1, "a launch with no exit is still an attempt");
+        assert_eq!(d.exits, 0);
+        assert_eq!(d.generations[0].launches[0].session, None);
+        assert_eq!(d.generations[0].launches[0].observed_via, "launch_event");
+        assert!(
+            r.tasks_without_native_records.is_empty(),
+            "the task DOES have a native record"
+        );
+    }
+
+    /// Count an unexited second launch alongside the observed exited session.
+    #[test]
+    fn a_relaunch_with_no_exit_yet_is_counted_as_a_further_attempt() {
+        let m = task_manifest("TKT-relaunch");
+        let event = |id: &str, identity: &str, at: &str| {
+            json!({
+                "id": id, "category": "event", "scope": "repo", "identity": identity,
+                "instance": CASTLE, "created_at": at,
+                "payload": {"agent": "R-1", "spawn": "gen-r", "task": "TKT-relaunch"}
+            })
+        };
+        let tuples = vec![
+            event("e1", "agent_spawned", T0),
+            event("e2", "agent_respawned", T2),
+            exit_rec("x1", "TKT-relaunch", "R-1", "gen-r", T0, T1),
+        ];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.exits, 1);
+        assert_eq!(d.launches, 2, "the un-exited relaunch is not dropped");
+        let sessions: Vec<Option<String>> = d.generations[0]
+            .launches
+            .iter()
+            .map(|l| l.session.clone())
+            .collect();
+        assert_eq!(sessions, vec![None, Some("sess-1".into())]);
+    }
+
+    /// Cumulative cost follows persistence order even when producer timestamps disagree.
+    #[test]
+    fn cumulative_segment_total_comes_from_persistence_position_not_observed_at() {
+        let m = task_manifest("TKT-cost");
+        let usage = |id: &str, cost: f64, observed: &str| {
+            field(
+                usage_rec(
+                    id,
+                    "TKT-cost",
+                    "gen-c",
+                    Some("completed"),
+                    Some(cost),
+                    observed,
+                ),
+                "agent",
+                json!("C-1"),
+            )
+        };
+        let exit = field(
+            exit_rec("x1", "TKT-cost", "C-1", "gen-c", T0, T3),
+            "prior_state",
+            json!("completed"),
+        );
+        // The $2 total persisted last despite its earlier observed_at.
+        let page = vec![usage("u1", 1.00, T2), usage("u2", 2.00, T1), exit];
+        let c = parse_tuple_capture(&export_envelope(page.clone(), vec![], vec![])).unwrap();
+        assert_eq!(c.order, Order::PersistenceSequence);
+        let r = compute(&m, &c, &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(
+            d.reported_cost_estimate_usd,
+            Some(2.00),
+            "the last PERSISTED cumulative total, not the latest observed_at"
+        );
+
+        // Without persistence order, neither timestamp can establish the final total.
+        let unordered = compute(&m, &capture(page, Order::Unknown), &[]).unwrap();
+        let d = &unordered.deliveries[0];
+        assert_eq!(d.cost_coverage, "partial");
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert!(
+            d.unknown_cost
+                .iter()
+                .any(|u| u.contains("no validated persistence order")),
+            "{:?}",
+            d.unknown_cost
+        );
+    }
+
+    /// A single-row segment needs no persistence ordering claim.
+    #[test]
+    fn a_single_row_segment_stays_final_under_unknown_order() {
+        let m = task_manifest("TKT-one");
+        let tuples = vec![
+            field(
+                usage_rec("u1", "TKT-one", "gen-o", Some("completed"), Some(0.75), T1),
+                "agent",
+                json!("O-1"),
+            ),
+            field(
+                exit_rec("x1", "TKT-one", "O-1", "gen-o", T0, T2),
+                "prior_state",
+                json!("completed"),
+            ),
+        ];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(d.reported_cost_estimate_usd, Some(0.75));
+    }
+
     #[test]
     fn rejects_wrong_schema_version() {
         let mut m = manifest(vec![]);
@@ -3571,28 +5258,12 @@ mod tests {
         assert!(compute(&m, &c, &[r]).is_err());
     }
 
-    // ------------------------------------------------------------------
-    // Slice A reports cost/duration as UNSUPPORTED rather than estimating it.
-    // The six aggregation tests that used to live here asserted properties of
-    // a derivation that produced false positives — a provisional
-    // `harness_result` cost summed as a measured total, a `merge` span read as
-    // an accepted delivery, a phase-duration sum labelled active work. They
-    // return with the real derivation in TKT-bonik-vuruv-mivuh.
-    // ------------------------------------------------------------------
-
     #[test]
-    fn deliveries_come_from_frozen_scope_and_report_cost_as_unsupported() {
+    fn deliveries_come_from_frozen_scope_with_no_native_records_at_all() {
         // OMITTED DENOMINATOR the previous version had: deliveries were derived
         // from the pairs that survived evaluation, so a frozen task with no
         // eligible source and no receipt vanished along with its accounting.
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-lonely".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-lonely");
         let report = compute(&m, &capture(vec![], Order::Unknown), &[]).unwrap();
         assert_eq!(report.eligible, 0, "no pairs at all");
         assert_eq!(report.deliveries.len(), 1, "the frozen task still appears");
@@ -3600,17 +5271,532 @@ mod tests {
         assert_eq!(d.task, "TKT-lonely");
         assert_eq!(d.repo, "repo");
         assert_eq!(d.enrollment, "frozen_consumer_task");
-        assert_eq!(d.derivation_status, "unsupported");
-        // Every figure is an explicit unknown, never a manufactured zero.
-        assert_eq!(d.cost_usd, None);
+        // No native observations means unknown figures, never manufactured zeroes.
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert_eq!(d.cost_coverage, "none_observed");
         assert_eq!(d.active_work_ms, None);
         assert_eq!(d.process_lifetime_ms, None);
         assert_eq!(d.accepted, None);
-        assert_eq!(report.quality.interventions, None);
+        assert_eq!(
+            report.tasks_without_native_records,
+            vec!["repo/TKT-lonely".to_string()]
+        );
         assert!(report
             .quality
             .interventions_coverage
             .contains("lower bound"));
+    }
+
+    /// Only additive-tagged spans contribute durations; retain untagged spans as legacy coverage.
+    #[test]
+    fn verification_ms_sums_only_additive_tagged_spans_and_counts_the_rest_as_legacy() {
+        let m = task_manifest("TKT-verify");
+        // Native from_durations spans carry all three derived timestamps.
+        let additive_span = span_full(
+            "span-additive",
+            json!({
+                "task": "TKT-verify", "phase": "verification", "attempt": 1,
+                "queued_at": T0,
+                "started_at": "2026-01-01T00:00:00.500Z",
+                "ended_at": "2026-01-01T00:00:00.550Z",
+                "queue_wait_ms": 500, "duration_ms": 50,
+                "duration_semantic": ADDITIVE_DURATION, "repo": "repo"
+            }),
+        );
+        // Legacy spans lack duration_semantic, but still carry the producer's timestamps.
+        let legacy_span = span_full(
+            "span-legacy",
+            json!({
+                "task": "TKT-verify", "phase": "verification", "attempt": 2,
+                "queued_at": T0,
+                "started_at": "2026-01-01T00:00:00.800Z",
+                "ended_at": "2026-01-01T00:00:01.700Z",
+                "queue_wait_ms": 800, "duration_ms": 900, "repo": "repo"
+            }),
+        );
+        let c = capture(vec![additive_span, legacy_span], Order::Unknown);
+        let report = compute(&m, &c, &[]).unwrap();
+        assert_eq!(report.deliveries.len(), 1);
+        let d = &report.deliveries[0];
+        assert_eq!(
+            d.phase_ms.verification_ms,
+            Some(550),
+            "only the additive-tagged span's duration+wait is summed: {:?}",
+            d.phase_ms
+        );
+        assert_eq!(
+            d.phase_ms.verification_ms_legacy_spans, 1,
+            "the untagged span is an explicit coverage gap, never guessed into the total"
+        );
+    }
+
+    /// A manifest whose frozen scope is exactly one task in `repo`/`batch-1`.
+    fn task_manifest(task: &str) -> Manifest {
+        Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: task.into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        }
+    }
+
+    /// DEFECT 1.
+    #[test]
+    fn forged_suffixes_on_fixed_native_identities_are_invalid_and_derive_nothing() {
+        let forge = |mut t: Value, id: &str| -> Value {
+            t["id"] = json!(id);
+            let forged = format!("{}-forged", str_field(&t, &["identity"]));
+            t["identity"] = json!(forged);
+            t
+        };
+        let mut tuples = verified_tuples();
+        tuples.push(forge(
+            open_record("o-forged", "src-1", "gen-1", "2026-01-01T13:00:00Z"),
+            "o-forged",
+        ));
+        tuples.push(forge(
+            field(
+                exit_rec(
+                    "x-forged",
+                    "TKT-1",
+                    "C-1",
+                    "gen-1",
+                    T0,
+                    "2026-01-02T03:00:00Z",
+                ),
+                "prior_state",
+                json!("completed"),
+            ),
+            "x-forged",
+        ));
+        tuples.push(forge(
+            usage_rec(
+                "u-forged",
+                "TKT-1",
+                "gen-1",
+                Some("completed"),
+                Some(9.99),
+                "2026-01-02T02:00:00Z",
+            ),
+            "u-forged",
+        ));
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.consumer_tasks = vec![ConsumerTaskScope {
+            task: "TKT-1".into(),
+            repo: "repo".into(),
+            batch: "batch-1".into(),
+        }];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+
+        for id in ["o-forged", "x-forged", "u-forged"] {
+            assert!(
+                invalid_reason(&r, id).contains("fixed daemon-minted identity"),
+                "{id}: {}",
+                invalid_reason(&r, id)
+            );
+        }
+        assert!(!only(&r).opened, "a forged bbs-open is not an open");
+        assert_eq!(r.opened, 0);
+        let d = &r.deliveries[0];
+        assert_eq!(d.exits, 0, "a forged bbs-agent-exit is not an author exit");
+        assert_eq!(
+            d.reported_cost_estimate_usd, None,
+            "a forged bbs-agent-final-usage is not a provider total"
+        );
+        // Completion identifies the generation; forged usage cannot supply its cost segment.
+        assert_eq!(d.cost_coverage, "missing");
+        assert!(d.generations[0].cost_segments.is_empty());
+    }
+
+    /// Accept native daemon/castle spans, including delivery_closure with null payload.repo.
+    #[test]
+    fn real_producer_shaped_spans_are_admitted_including_a_null_repo() {
+        let m = task_manifest("TKT-dorod-sival-fumid");
+        let ready = span_full(
+            "s-ready",
+            json!({
+                "attempt": 1, "authority": null, "candidate": null, "duration_ms": null,
+                "ended_at": null, "lane": null, "phase": "ticket_ready", "proof_kind": null,
+                "proof_reused": null, "queue_wait_ms": null,
+                "queued_at": "2026-01-01T03:55:39.748988Z", "repo": null, "started_at": null,
+                "target": null, "task": "TKT-dorod-sival-fumid", "terminal_reason": null
+            }),
+        );
+        let mut launched = span_full(
+            "s-launched",
+            json!({
+                "attempt": 1, "authority": null, "candidate": null, "duration_ms": 1054,
+                "ended_at": "2026-01-01T04:02:49.900316Z", "lane": null,
+                "phase": "agent_launched", "proof_kind": null, "proof_reused": null,
+                "queue_wait_ms": null, "queued_at": null, "repo": "repo",
+                "started_at": "2026-01-01T04:02:48.846316Z", "target": "rat/x/tkt-y",
+                "task": "TKT-dorod-sival-fumid", "terminal_reason": null
+            }),
+        );
+        launched["instance"] = json!(CASTLE);
+        let closure = span_full(
+            "s-closure",
+            json!({
+                "attempt": 1, "phase": "delivery_closure", "repo": null,
+                "task": "TKT-dorod-sival-fumid", "ended_at": "2026-01-01T05:00:00Z",
+                "terminal_reason": "delivered"
+            }),
+        );
+        let r = compute(
+            &m,
+            &capture(vec![ready, launched, closure], Order::Unknown),
+            &[],
+        )
+        .unwrap();
+        assert!(r.invalid_records.is_empty(), "{:?}", r.invalid_records);
+        assert!(
+            r.tasks_without_native_records.is_empty(),
+            "all three spans are usable native evidence"
+        );
+    }
+
+    /// DEFECT 2.
+    #[test]
+    fn malformed_or_forged_spans_are_rejected_without_erasing_the_selected_task() {
+        let base = json!({
+            "task": "TKT-span", "phase": "verification", "attempt": 1,
+            "queued_at": T0, "started_at": "2026-01-01T00:00:00.500Z",
+            "ended_at": "2026-01-01T00:00:00.550Z", "queue_wait_ms": 500, "duration_ms": 50,
+            "duration_semantic": ADDITIVE_DURATION, "repo": "repo"
+        });
+        let mutate = |id: &str, f: &dyn Fn(&mut Value)| -> Value {
+            let mut payload = base.clone();
+            f(&mut payload);
+            span_full(id, payload)
+        };
+        // Native spans are castle-authored, never authored by the described worker.
+        let mut worker_authored = span_full("s-worker", base.clone());
+        worker_authored["instance"] = json!("Scritch-15");
+        let mut ephemeral = span_full("s-ephemeral", base.clone());
+        ephemeral["lifecycle"] = json!("ephemeral");
+
+        let cases: Vec<(Value, &str)> = vec![
+            (worker_authored, "is not a castle author"),
+            (ephemeral, "not furniture"),
+            (
+                mutate("s-phase", &|p| p["phase"] = json!("verification_extra")),
+                "is not a phase this daemon records",
+            ),
+            (
+                mutate("s-attempt", &|p| p["attempt"] = json!(0)),
+                "positive integer occurrence number",
+            ),
+            (
+                mutate("s-repo", &|p| p["repo"] = json!("other-repo")),
+                "disagrees with tuple scope",
+            ),
+            (
+                mutate("s-negative", &|p| {
+                    p["duration_ms"] = json!(-50);
+                }),
+                "not a non-negative duration",
+            ),
+            // Producer durations require both endpoints.
+            (
+                mutate("s-unanchored", &|p| {
+                    p["duration_ms"] = json!(9_000_000);
+                    p["started_at"] = Value::Null;
+                    p["ended_at"] = Value::Null;
+                }),
+                "are not both present",
+            ),
+            (
+                mutate("s-disagree", &|p| p["duration_ms"] = json!(9_000_000)),
+                "the producer derives one from the other",
+            ),
+            (
+                mutate("s-backwards", &|p| {
+                    p["ended_at"] = json!("2025-01-01T00:00:00Z");
+                }),
+                "cannot run backwards",
+            ),
+            (
+                mutate("s-semantic", &|p| p["duration_semantic"] = json!("total")),
+                "duration_semantic",
+            ),
+            (
+                mutate("s-authority", &|p| p["authority"] = json!("king")),
+                "not human or llm",
+            ),
+            (
+                mutate("s-fence", &|p| p["occurrence_key"] = json!("")),
+                "not a non-empty string",
+            ),
+        ];
+
+        let m = task_manifest("TKT-span");
+        for (span, expected) in cases {
+            let id = span["id"].as_str().unwrap().to_string();
+            let r = compute(&m, &capture(vec![span], Order::Unknown), &[]).unwrap();
+            assert!(
+                invalid_reason(&r, &id).contains(expected),
+                "{id}: expected {expected:?}, got {:?}",
+                invalid_reason(&r, &id)
+            );
+            assert_eq!(
+                r.deliveries.len(),
+                1,
+                "{id}: a malformed span must not erase the selected task from the denominator"
+            );
+            assert_eq!(
+                r.deliveries[0].phase_ms.verification_ms, None,
+                "{id}: a rejected span contributes no verification time"
+            );
+            assert_eq!(
+                r.tasks_without_native_records,
+                vec!["repo/TKT-span".to_string()],
+                "{id}: the task is reported as having no usable native record, not dropped"
+            );
+        }
+    }
+
+    /// DEFECT 3.
+    #[test]
+    fn a_matching_exit_state_is_not_a_final_cost_unless_coverage_says_final() {
+        let m = task_manifest("TKT-cost");
+        let delivery_for = |coverage: &Value| -> DeliveryCost {
+            // The old state-only check accepted this without cost coverage.
+            let exit = exit_rec("x1", "TKT-cost", "C-1", "gen-c", T0, T3);
+            let exit = field(exit, "prior_state", json!("completed"));
+            let exit = field(exit, "cost_coverage", coverage.clone());
+            let usage = field(
+                usage_rec("u1", "TKT-cost", "gen-c", Some("completed"), Some(2.00), T2),
+                "agent",
+                json!("C-1"),
+            );
+            let mut r = compute(&m, &capture(vec![usage, exit], Order::Unknown), &[]).unwrap();
+            r.deliveries.remove(0)
+        };
+
+        let d = delivery_for(&json!(FINAL_COST_COVERAGE));
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(d.reported_cost_estimate_usd, Some(2.00));
+        assert!(d.generations[0].cost_segments[0].final_cost);
+
+        for coverage in [
+            json!("partial_unknown"),
+            json!("none"),
+            json!("unknown"),
+            Value::Null,
+            json!("mostly"),
+        ] {
+            let d = delivery_for(&coverage);
+            assert_eq!(d.cost_coverage, "partial", "coverage={coverage}");
+            assert_eq!(
+                d.reported_cost_estimate_usd, None,
+                "coverage={coverage}: must never reach a provider total"
+            );
+            assert_eq!(
+                d.partial_reported_usd,
+                Some(2.00),
+                "coverage={coverage}: the supported partial amount is preserved"
+            );
+            assert_eq!(
+                d.unknown_cost.len(),
+                1,
+                "coverage={coverage}: the uncertainty is named, not silent"
+            );
+            // Unknown cost does not retract physical-exit evidence.
+            assert_eq!(
+                d.exits, 1,
+                "coverage={coverage}: a non-final cost does not retract the physical exit"
+            );
+            assert_eq!(d.launches, 1, "coverage={coverage}");
+        }
+    }
+
+    #[test]
+    fn author_exit_is_credited_from_a_valid_agent_exit_observation() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", T0),
+            reuse("r1", "src-1", "TKT-1", "gen-1", "used", T24),
+            assessment("a1", "r1", "verified", T48),
+            exit_rec("ax1", "TKT-source", "author", "author-gen", T0, T12),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![review_with_exit("p1", "ax1", false)];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert!(r.author_exit_unsupported.is_empty());
+        assert_eq!(r.author_exit_reuse, vec!["p1".to_string()]);
+        assert_eq!(r.mechanism.author_exit_effects, 1);
+        assert!(only(&r).author_terminal);
+        assert_eq!(only(&r).author_terminal_evidence, Some("ax1".to_string()));
+    }
+
+    #[test]
+    fn author_exit_is_not_credited_from_a_stale_session_exit() {
+        // A stale exit belongs to a superseded launch; its lifecycle fields are unknown.
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let tuples = vec![
+            finding("src-1", "author-gen", T0),
+            reuse("r1", "src-1", "TKT-1", "gen-1", "used", T24),
+            assessment("a1", "r1", "verified", T48),
+            field(
+                exit_rec("ax1", "TKT-source", "author", "author-gen", T0, T12),
+                "stale_session",
+                json!(true),
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let reviews = vec![review_with_exit("p1", "ax1", false)];
+        let r = compute(&m, &c, &reviews).unwrap();
+        assert!(r.author_exit_reuse.is_empty());
+        assert_eq!(r.author_exit_unsupported.len(), 1);
+        assert!(r.author_exit_unsupported[0]
+            .reason
+            .contains("stale-session"));
+    }
+
+    #[test]
+    fn cost_is_credited_when_a_segment_is_final_and_provider_reported() {
+        let m = task_manifest("TKT-1");
+        let tuples = vec![
+            field(
+                usage_rec("u1", "TKT-1", "gen-1", Some("completed"), Some(1.5), T11),
+                "provider_session",
+                json!("prov-1"),
+            ),
+            field(
+                exit_rec("ax1", "TKT-1", "gen-1", "gen-1", T10, T12),
+                "prior_state",
+                json!("completed"),
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.deliveries.len(), 1);
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(d.reported_cost_estimate_usd, Some(1.5));
+        assert_eq!(d.process_lifetime_ms, Some(2 * 60 * 60 * 1000));
+        assert!(d.unknown_cost.is_empty());
+    }
+
+    #[test]
+    fn cost_stays_partial_when_more_work_followed_the_last_result() {
+        // Running after the paused result means its reported cost is partial.
+        let m = task_manifest("TKT-1");
+        let tuples = vec![
+            field(
+                usage_rec("u1", "TKT-1", "gen-1", Some("paused"), Some(3.0), T11),
+                "provider_session",
+                json!("prov-1"),
+            ),
+            field(
+                exit_rec("ax1", "TKT-1", "gen-1", "gen-1", T10, T12),
+                "prior_state",
+                json!("running"),
+            ),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "partial");
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert_eq!(d.partial_reported_usd, Some(3.0));
+        assert_eq!(d.unknown_cost.len(), 1);
+    }
+
+    #[test]
+    fn an_exit_without_a_prior_state_cannot_confirm_a_final_cost() {
+        // Healthy otherwise: only prior_state is absent, so agreement is unmet.
+        let m = task_manifest("TKT-1");
+        let tuples = vec![
+            usage_rec("u1", "TKT-1", "gen-1", Some("completed"), Some(4.25), T11),
+            field(
+                exit_rec("ax1", "TKT-1", "gen-1", "gen-1", T10, T12),
+                "prior_state",
+                Value::Null,
+            ),
+        ];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "partial");
+        assert_eq!(d.reported_cost_estimate_usd, None, "never a provider total");
+        assert_eq!(
+            d.partial_reported_usd,
+            Some(4.25),
+            "partial amount preserved"
+        );
+        assert_eq!(d.unknown_cost.len(), 1, "the uncertainty is named");
+        assert!(
+            d.unknown_cost[0].contains("no prior_state"),
+            "{:?}",
+            d.unknown_cost[0]
+        );
+        // Bounding the cost does not retract the physical exit evidence.
+        assert_eq!(d.exits, 1);
+        assert_eq!(d.launches, 1);
+        assert_eq!(d.process_lifetime_ms, Some(2 * 60 * 60 * 1000));
+    }
+
+    #[test]
+    fn cost_is_missing_when_no_final_usage_observation_exists() {
+        let m = task_manifest("TKT-1");
+        let tuples = vec![harness_result("h1", "gen-1", "TKT-1", T12)];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "missing");
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert_eq!(d.completions, 1);
+        assert_eq!(d.failed_completions, 0);
+    }
+
+    #[test]
+    fn reviewed_annotation_counts_resolved_evidence_and_reports_bad_evidence() {
+        let mut m = task_manifest("TKT-1");
+        m.eligible_pairs = vec![];
+        let c = capture(vec![], Order::Unknown);
+        let annotations = vec![ReviewedAnnotation {
+            task: "TKT-1".into(),
+            repo: "repo".into(),
+            repeated_investigations: vec![AnnotatedEvidence {
+                evidence: "ev-1".into(),
+                reason: "same root cause chased twice".into(),
+            }],
+            rework: vec![],
+            interventions: vec![AnnotatedEvidence {
+                evidence: "not-in-capture".into(),
+                reason: "operator unblocked a stuck review".into(),
+            }],
+        }];
+        let r = compute_full(&m, &c, &[], &annotations).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.reviewed_repeated_investigations, vec!["ev-1".to_string()]);
+        assert_eq!(
+            d.reviewed_interventions.len(),
+            0,
+            "unresolved evidence is not counted"
+        );
+        assert_eq!(r.quality.reviewed_repeated_investigations, 1);
+        assert_eq!(r.quality.reviewed_interventions, 0);
+        assert!(r
+            .unresolved_records
+            .iter()
+            .any(|u| u.record == "not-in-capture" && u.kind == "reviewed_intervention"));
+    }
+
+    #[test]
+    fn reviewed_annotation_for_a_task_outside_frozen_scope_is_an_input_error() {
+        let m = manifest(vec![]);
+        let c = capture(vec![], Order::Unknown);
+        let annotations = vec![ReviewedAnnotation {
+            task: "TKT-not-frozen".into(),
+            repo: "repo".into(),
+            repeated_investigations: vec![],
+            rework: vec![],
+            interventions: vec![],
+        }];
+        assert!(compute_full(&m, &c, &[], &annotations).is_err());
     }
 
     #[test]
@@ -3630,25 +5816,30 @@ mod tests {
     fn unsupported_derivations_are_named_with_their_reason_and_tracking_ticket() {
         // An absent metric has to be legible as absent, in machine output as
         // well as human output, or a reader fills the gap with a zero.
+        // Version 3 derives exits and costs; remaining unsupported fields stay explicit.
         let report = compute(&manifest(vec![]), &capture(vec![], Order::Unknown), &[]).unwrap();
         let named: Vec<&str> = report
             .unsupported
             .iter()
             .map(|u| u.derivation.as_str())
             .collect();
-        assert_eq!(named, vec!["author_exit", "delivery_cost_and_duration"]);
+        assert_eq!(
+            named,
+            vec!["active_work_ms", "total_operator_interventions"]
+        );
         for u in &report.unsupported {
-            assert_eq!(u.status, "unsupported");
-            assert_eq!(u.tracked_by, "TKT-bonik-vuruv-mivuh");
             assert!(!u.reason.is_empty());
+            assert!(!u.tracked_by.is_empty());
         }
+        assert_eq!(report.unsupported[0].status, "unknown");
+        assert_eq!(report.unsupported[1].status, "lower_bound");
         let text = render(&report);
-        assert!(text.contains("UNSUPPORTED author_exit"), "{text}");
+        assert!(text.contains("UNSUPPORTED active_work_ms"), "{text}");
         assert!(
-            text.contains("UNSUPPORTED delivery_cost_and_duration"),
+            text.contains("UNSUPPORTED total_operator_interventions"),
             "{text}"
         );
-        assert!(text.contains("cost_usd=unknown") || report.deliveries.is_empty());
+        assert!(report.deliveries.is_empty());
     }
 
     #[test]
@@ -4107,6 +6298,54 @@ mod tests {
     }
 
     #[test]
+    fn assessment_window_cases_preserve_the_opportunity_and_only_credit_in_window() {
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some(T24.parse().unwrap()),
+            until: Some(T48.parse().unwrap()),
+        };
+        for (timestamp, expected) in [
+            (Some("2026-01-02T14:00:00Z"), 1),
+            (Some("2026-01-01T14:00:00Z"), 0),
+            (Some("2026-01-04T14:00:00Z"), 0),
+            (None, 0),
+        ] {
+            let mut verdict = assessment(
+                "a1",
+                "r1",
+                "verified",
+                timestamp.unwrap_or("2026-01-02T14:00:00Z"),
+            );
+            if timestamp.is_none() {
+                verdict.as_object_mut().unwrap().remove("created_at");
+            }
+            let c = capture(
+                vec![
+                    finding("src-1", "author-gen", T0),
+                    exposure("x1", "src-1", "gen-1", "2026-01-02T12:00:00Z"),
+                    reuse(
+                        "r1",
+                        "src-1",
+                        "TKT-1",
+                        "gen-1",
+                        "used",
+                        "2026-01-02T13:00:00Z",
+                    ),
+                    verdict,
+                ],
+                Order::Unknown,
+            );
+            let r = compute(&m, &c, &[]).unwrap();
+            assert_eq!(r.eligible, 1, "assessment timestamp {timestamp:?}");
+            assert_eq!(r.claimed, 1, "assessment timestamp {timestamp:?}");
+            assert_eq!(r.discovery.prepared_pairs, 1);
+            assert_eq!(r.assessed, expected, "assessment timestamp {timestamp:?}");
+            assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, expected);
+            assert!(!r.mechanism.goal_met);
+        }
+    }
+
+    #[test]
     fn an_operator_bound_exposure_is_not_agent_exposure() {
         let mut tuples = verified_tuples();
         tuples[3] = exposure_full(
@@ -4299,7 +6538,7 @@ mod tests {
         assert_eq!(r.verified_reuse.rate, None);
         let text = render(&r);
         assert!(text.contains("unknown (no denominator)"), "{text}");
-        assert!(text.contains("evaluator_version=2"), "{text}");
+        assert!(text.contains("evaluator_version=3"), "{text}");
     }
 
     #[test]
@@ -4339,6 +6578,7 @@ mod tests {
             .to_string()
             .contains("duplicate consumer_tasks"));
     }
+
     fn invalid_reason<'a>(r: &'a Report, record: &str) -> &'a str {
         r.invalid_records
             .iter()
@@ -4451,6 +6691,127 @@ mod tests {
             assert_eq!(report.opened, 0);
             assert!(!only(&report).opened);
             assert_eq!(report.eligible, 1);
+        }
+    }
+    #[test]
+    fn clover_cost_exit_requires_matching_task_and_agent() {
+        let m = task_manifest("TKT-1");
+        let usage = usage_rec("u", "TKT-1", "gen-1", Some("completed"), Some(4.25), T11);
+        let exit = field(
+            exit_rec("x", "TKT-1", "gen-1", "gen-1", T10, T12),
+            "prior_state",
+            json!("completed"),
+        );
+        let good = compute(
+            &m,
+            &capture(vec![usage.clone(), exit.clone()], Order::Unknown),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(good.deliveries[0].reported_cost_estimate_usd, Some(4.25));
+        for (key, value) in [("task", "TKT-other"), ("agent", "other-agent")] {
+            let bad = field(exit.clone(), key, json!(value));
+            let report =
+                compute(&m, &capture(vec![usage.clone(), bad], Order::Unknown), &[]).unwrap();
+            assert_eq!(report.deliveries.len(), 1);
+            assert_eq!(
+                report.deliveries[0].reported_cost_estimate_usd, None,
+                "foreign {key} must not finalize cost"
+            );
+            assert_eq!(report.deliveries[0].partial_reported_usd, Some(4.25));
+        }
+    }
+
+    #[test]
+    fn clover_author_exit_requires_the_source_task() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        for task in ["TKT-source", "TKT-other", ""] {
+            let mut tuples = verified_tuples();
+            tuples.push(exit_rec("x", task, "author", "author-gen", T0, T12));
+            let report = compute(
+                &m,
+                &capture(tuples, Order::Unknown),
+                &[review_with_exit("p1", "x", false)],
+            )
+            .unwrap();
+            assert_eq!(report.mechanism.effects, 1);
+            assert_eq!(
+                report.mechanism.author_exit_effects,
+                usize::from(task == "TKT-source"),
+                "exit task {task:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clover_native_cost_requires_binding_and_producer_time() {
+        let m = task_manifest("TKT-1");
+        let usage = usage_rec("u", "TKT-1", "gen-1", Some("completed"), Some(4.25), T11);
+        let exit = field(
+            exit_rec("x", "TKT-1", "gen-1", "gen-1", T10, T12),
+            "prior_state",
+            json!("completed"),
+        );
+        for (is_usage, key, value) in [
+            (true, "observed_at", Value::Null),
+            (true, "observed_at", json!("invalid")),
+            (false, "exited_at", Value::Null),
+            (false, "exited_at", json!("invalid")),
+            (true, "task", Value::Null),
+            (false, "task", Value::Null),
+            (true, "agent", Value::Null),
+            (false, "agent", Value::Null),
+        ] {
+            let (mut u, mut x) = (usage.clone(), exit.clone());
+            if is_usage {
+                u["payload"][key] = value;
+            } else {
+                x["payload"][key] = value;
+            }
+            let report = compute(&m, &capture(vec![u, x], Order::Unknown), &[]).unwrap();
+            assert_eq!(report.deliveries.len(), 1);
+            assert_eq!(
+                report.deliveries[0].reported_cost_estimate_usd, None,
+                "usage={is_usage}, missing/malformed {key}"
+            );
+            assert!(report
+                .invalid_records
+                .iter()
+                .chain(report.unresolved_records.iter())
+                .any(|r| r.record == if is_usage { "u" } else { "x" }));
+        }
+    }
+
+    #[test]
+    fn clover_rejected_artifacts_cannot_certify_effects_or_annotations() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut forged = finding("ev-2", "author-gen", T0);
+        forged["identity"] = json!("forged-finding");
+        let missing_receipt = assessment("ev-2", "", "verified", T0);
+        for bad in [forged, missing_receipt] {
+            let mut tuples = verified_tuples();
+            tuples.push(bad);
+            let annotation = ReviewedAnnotation {
+                task: "TKT-1".into(),
+                repo: "repo".into(),
+                repeated_investigations: vec![],
+                interventions: vec![],
+                rework: vec![AnnotatedEvidence {
+                    evidence: "ev-2".into(),
+                    reason: "claimed supporting evidence".into(),
+                }],
+            };
+            let report = compute_full(
+                &m,
+                &capture(tuples, Order::Unknown),
+                &[review_no_exit("p1")],
+                &[annotation],
+            )
+            .unwrap();
+            assert_eq!(report.eligible, 1);
+            assert_eq!(report.mechanism.effects, 0);
+            assert_eq!(report.quality.reviewed_rework, 0);
+            assert!(report.invalid_records.iter().any(|r| r.record == "ev-2"));
         }
     }
 }

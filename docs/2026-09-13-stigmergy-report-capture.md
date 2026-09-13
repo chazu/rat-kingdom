@@ -9,12 +9,6 @@ connection, worker credentials, model call or network. It has no dispatch,
 landing, repair or approval authority; it only renders evidence that
 already exists.
 
-Current delivery status: this identity-validation slice retains evaluator version
-2 and its explicit unsupported cost/exit results. The complete version-3
-contract below is the pending follow-on delivery, preserved at `fca4235`; it is
-not installed or qualified by this slice. S4 deployment requires that complete
-follow-on plus its normal MAIN checks and independent review.
-
 ## Evaluator version 3: author-exit and cost are real; two figures remain unsupported
 
 `evaluator_version` is `3` (`TKT-bonik-vuruv-mivuh`, slice B of
