@@ -231,21 +231,12 @@ const LAUNCH_EVENT_IDENTITIES: [&str; 2] = ["agent_spawned", "agent_respawned"];
 /// counted as attempts a session was never observed for.
 const LAUNCH_EVENT_KIND: &str = "launch_event";
 
-/// `AgentState` values that mean this launch produced its *last* provider
-/// result. A `paused` result may be followed by more model usage and then a
-/// budget kill with no further result, which makes the reported total a partial
-/// amount rather than a final cost for the launch.
+/// `AgentState` values that mean this launch produced its *last* provider result.
 const TERMINAL_USAGE_STATES: [&str; 3] = ["completed", "failed", "stopped"];
 
-/// The one `agent_exit.cost_coverage` value that means "a result was reported
-/// and no further usage followed it" — the producer's OWN statement that the
-/// last reported total actually covers the launch
-/// (`rk_daemon::supervisor::CostCoverage::Final`).
+/// Only the producer's `CostCoverage::Final` supports final cost.
 const FINAL_COST_COVERAGE: &str = "final";
-/// The non-final values the producer emits: `partial_unknown` (more model work
-/// ran past the last result), `none` (no result was ever reported), `unknown`
-/// (no watch survived). Enumerated so an UNRECOGNIZED value is reported as its
-/// own finding rather than folded in with a known one.
+/// The non-final values the producer emits: `partial_unknown` (more model work ran past the last result), `none` (no result was ever reported), `unknown` (no watch survived).
 const NON_FINAL_COST_COVERAGE: [&str; 3] = ["partial_unknown", "none", "unknown"];
 
 /// The only `cost_basis` a *provider-reported* total may carry. The daemon's
@@ -254,19 +245,13 @@ const NON_FINAL_COST_COVERAGE: [&str; 3] = ["partial_unknown", "none", "unknown"
 const PROVIDER_COST_BASIS: &str = "provider_reported_segment_total";
 const DAEMON_COST_BASIS: &str = "daemon_priced_increments";
 
-/// An `attention_hold` span count is a LOWER BOUND on operator interventions,
-/// not a total, and stays so regardless of `ReviewedAnnotation`: a reviewer's
-/// evidenced count is reported separately (`quality.reviewed_interventions`),
-/// never summed with this span-derived figure.
+/// Keep attention-hold spans separate from reviewed intervention counts.
 const INTERVENTIONS_LOWER_BOUND: &str =
     "lower bound: attention_hold spans only cover waits the daemon recorded; an operator \
      intervention that left no span is not counted here. A ReviewedAnnotation can supply \
      evidenced interventions separately (quality.reviewed_interventions).";
 
-/// No native observation distinguishes model-active time from a process sitting
-/// paused awaiting verification or the operator, so active work stays an
-/// explicit unknown rather than being aliased to process lifetime or to a
-/// phase-duration sum.
+/// Active work remains unknown; process lifetime and phase durations cannot establish it.
 const ACTIVE_WORK_UNKNOWN: &str =
     "unknown: launch-to-exit is process lifetime, and no native observation distinguishes \
      model-active time from a process paused awaiting verification or the operator.";
@@ -840,16 +825,7 @@ pub struct AnnotatedEvidence {
     pub reason: String,
 }
 
-/// A bounded, task-scoped operator judgment of repeated investigation,
-/// rework, or a real intervention that daemon telemetry alone does not
-/// establish end-to-end (design doc: "repeated investigations and rework,
-/// with reviewed evidence" — "do not turn an agent's estimate of time saved
-/// into measured savings"). `deny_unknown_fields` on both this and
-/// `AnnotatedEvidence` so no invented duration or savings figure can be
-/// smuggled in through an unknown key: only a COUNT of evidenced occurrences
-/// is ever reported, and each one is bound to a resolvable capture record,
-/// never trusted as a bare reviewer claim. Distinct from `Review`, which is
-/// scoped to one source/consumer pair rather than one task.
+/// An evidenced operator judgment, distinct from native telemetry and measured time savings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewedAnnotation {
@@ -863,11 +839,7 @@ pub struct ReviewedAnnotation {
     pub interventions: Vec<AnnotatedEvidence>,
 }
 
-/// A reviewed annotation may only speak about a task already frozen into
-/// delivery scope (`frozen_task_scope`) — the same rule a `Review.declares`
-/// pair must satisfy — and at most once per (task, repo): a retrospective
-/// annotation cannot introduce new scope or be silently duplicated to
-/// inflate a count.
+/// Annotations must belong to frozen task scope and cannot duplicate a (task, repo) entry.
 fn validate_reviewed_annotations(
     manifest: &Manifest,
     annotations: &[ReviewedAnnotation],
@@ -898,12 +870,7 @@ fn validate_reviewed_annotations(
     Ok(())
 }
 
-/// Parses the `--reviews` file as either a bare `Review` array (the existing,
-/// still-supported shape — `reviewed_annotations` defaults to empty) or an
-/// object `{"reviews": [...], "reviewed_annotations": [...]}`. Mirrors
-/// `parse_tuple_capture`'s bare-array-or-envelope pattern so the file format
-/// grows without breaking either an existing caller or the CLI acceptance
-/// tests that write a bare array today.
+/// Accept legacy review arrays or an envelope containing reviews and reviewed annotations.
 pub fn parse_reviews_file(raw: &Value) -> Result<(Vec<Review>, Vec<ReviewedAnnotation>)> {
     if raw.is_array() {
         let reviews: Vec<Review> = serde_json::from_value(raw.clone())
@@ -1201,20 +1168,9 @@ pub struct MechanismResult {
 pub struct PhaseDurations {
     /// Every phase that is neither verification admission nor a human wait.
     pub work_phases_ms: Option<i64>,
-    /// `verification` span duration plus its own queue wait — summed ONLY
-    /// for a span tagged `duration_semantic: "additive"`
-    /// (`rk_daemon::span::PhaseSpan::from_durations`): that tag is the only
-    /// way this report can tell `duration_ms` is disjoint from
-    /// `queue_wait_ms` rather than already including it. A span recorded
-    /// before that tag existed does not have its `duration_ms`/`queue_wait_ms`
-    /// summed here at all — see `verification_ms_legacy_spans`.
+    /// Sum verification duration and queue wait only for native spans explicitly tagged additive.
     pub verification_ms: Option<i64>,
-    /// Count of `verification` spans excluded from `verification_ms` because
-    /// they carry no `duration_semantic: "additive"` tag, so this report
-    /// cannot tell whether their `duration_ms` already includes the
-    /// admission wait `queue_wait_ms` also reports. Left as an explicit
-    /// coverage gap rather than guessed either way — never zeroed to hide it
-    /// and never summed on an assumption that could double- or under-count.
+    /// Retain untagged verification spans separately because their durations may overlap queue wait.
     pub verification_ms_legacy_spans: usize,
     /// `attention_hold` — waiting on a human.
     pub attention_hold_ms: Option<i64>,
@@ -1222,10 +1178,7 @@ pub struct PhaseDurations {
     pub queue_wait_ms: Option<i64>,
 }
 
-/// One observed provider-cost segment: a `(spawn, session, provider_session)`
-/// triple. The provider reports a CUMULATIVE total within one segment, so the
-/// last reported total is the segment's amount and repeated results must
-/// never be summed.
+/// One observed provider-cost segment: a `(spawn, session, provider_session)` triple.
 #[derive(Debug, Clone, Serialize)]
 pub struct CostSegment {
     pub spawn: String,
@@ -1235,11 +1188,7 @@ pub struct CostSegment {
     pub reported_usd: Option<f64>,
     pub cost_basis: String,
     pub state: Option<String>,
-    /// `true` only when the last result for this segment was terminal, the
-    /// launch's exit agrees with it, AND that exit reports
-    /// `cost_coverage: "final"`. A `paused` result followed by more work and a
-    /// kill leaves a partial amount, not a final cost — and so does a terminal
-    /// result the producer itself marks `partial_unknown`.
+    /// `true` only when the last result for this segment was terminal, the launch's exit agrees with it, AND that exit reports `cost_coverage: "final"`.
     pub final_cost: bool,
     pub finality_reason: String,
 }
@@ -1344,11 +1293,7 @@ pub struct DeliveryCost {
     /// absence is unknown, not a negative.
     pub accepted: Option<bool>,
     pub acceptance_evidence: Option<String>,
-    /// Resolved evidence ids from `ReviewedAnnotation` for this task. Operator
-    /// judgment, kept distinct from `rework_spans`/`attention_hold_spans`
-    /// (daemon-observed lower bounds) rather than summed with them — a
-    /// reviewer's count and a span count answer different questions and
-    /// silently adding them would misstate both.
+    /// Resolved evidence ids from `ReviewedAnnotation` for this task.
     pub reviewed_repeated_investigations: Vec<String>,
     pub reviewed_rework: Vec<String>,
     pub reviewed_interventions: Vec<String>,
@@ -1547,26 +1492,7 @@ fn is_task_span(t: &Value) -> bool {
     t["category"] == "event" && t["identity"] == SPAN_IDENTITY
 }
 
-/// Structural contract check for a native `task_span`, the record the critical
-/// path and every phase total are built from. Returns the reason it is NOT a
-/// span its producer could have written, or `None` when it is.
-///
-/// The invariants `crates/rk-daemon/src/span.rs` makes unconditional at write
-/// time: `record_phase_span` writes a `Furniture` Event under `SPAN_IDENTITY`
-/// authored by the CASTLE (every call site passes `"daemon"` or
-/// `&self.castle`, never an agent), into the ticket's repo scope, carrying
-/// `PhaseSpan::to_payload()`. Admitting a span on category+identity alone let
-/// a forged row name an unknown phase (pooled into `work_phases_ms` by the
-/// catch-all arm), an absurd `duration_ms`, or a second repo's task, and move
-/// `verification_ms`, the critical path and delivery acceptance with it.
-///
-/// NOT required, because the producer genuinely omits them: every timestamp,
-/// `repo`/`target`/`candidate`/`lane`/`occurrence_key`/`proof_kind`/
-/// `proof_reused`/`authority` (set only where the caller has them), and
-/// `duration_semantic` (absent before that tag existed). Those legacy spans
-/// stay supported where their weaker evidence is already explicit — an
-/// untagged `verification` span is counted under
-/// `verification_ms_legacy_spans` rather than summed.
+/// Validate native phase-span shape before it can affect delivery or timing.
 fn task_span_defect(t: &Value) -> Option<String> {
     if t["lifecycle"] != "furniture" {
         return Some(format!(
@@ -1574,14 +1500,7 @@ fn task_span_defect(t: &Value) -> Option<String> {
             t["lifecycle"].as_str().unwrap_or("absent")
         ));
     }
-    // `record_phase_span` names the castle as caller: `"daemon"` (every
-    // `landing.rs`/`managed_verification.rs` site) or the castle actor id
-    // (`supervisor.rs`/`tickets.rs`), both of which appear verbatim in the
-    // captured native records. NEVER the worker the span describes, so a
-    // worker-authored span is forged even when every other field is well
-    // formed. The `Furniture` check above is not sufficient alone: that is what
-    // the daemon refuses from an agent at WRITE time, and this module reads an
-    // offline export that never went through that path.
+    // Phase spans are authored by `daemon` or the castle actor, never the described worker.
     let instance = str_field(t, &["instance"]);
     if !is_castle_author(instance) {
         return Some(format!(
@@ -1658,13 +1577,7 @@ fn task_span_defect(t: &Value) -> Option<String> {
             },
         }
     }
-    // `to_payload` does not carry durations as independent data: it writes
-    // `queue_wait_ms()`/`duration_ms()`, each `Some` ONLY when both of its own
-    // endpoints are set and then exactly their millisecond difference. So a
-    // stated duration must have its endpoints and equal them; `null` durations
-    // are normal and stay supported. Checking agreement only when all three
-    // happened to be present let a forged duration with NO endpoints
-    // contribute fabricated time.
+    // Each native duration requires both endpoints and equals their millisecond difference.
     for (field, from, to) in [
         ("queue_wait_ms", "queued_at", "started_at"),
         ("duration_ms", "started_at", "ended_at"),
@@ -1829,11 +1742,7 @@ fn check_evidence(evidence: &Value, by_id: &BTreeMap<&str, &Value>, repo: &str) 
     }
 }
 
-/// Resolves one `ReviewedAnnotation` evidence list (repeated-investigation,
-/// rework or intervention) against the capture, reusing `check_evidence`'s
-/// artifact/repo/non-string rules so a reviewed annotation is held to the same
-/// bar as a finding's own evidence. `Unknown` and `Invalid` are reported, never
-/// silently dropped or silently trusted; only `Resolved` items are counted.
+/// Resolve annotation evidence with the same artifact, repository, and type checks as findings.
 fn resolve_annotated_evidence(
     items: &[AnnotatedEvidence],
     by_id: &BTreeMap<&str, &Value>,
@@ -1930,19 +1839,9 @@ struct ExitRow {
     exit_code: Option<i64>,
     crashed: Option<bool>,
     prior_state: Option<String>,
-    /// `true` when this launch had already been superseded by a later one
-    /// under the same `spawn` by the time this exit was recorded. When set,
-    /// `prior_state`/`crashed` describe the SUCCESSOR, not this launch, and
-    /// are nulled out at the source rather than defaulted — so a stale exit
-    /// must never be read as "nothing happened after the last result"
-    /// (`s2-stale-event-observation-contract`, `TKT-tulir-kotah-gisub`).
-    /// Absent on records predating that contract; treated as not-stale.
+    /// `true` when this launch had already been superseded by a later one under the same `spawn` by the time this exit was recorded.
     stale_session: Option<bool>,
-    /// The producer's own measurement of how completely the last reported cost
-    /// covers this launch (`rk_daemon::bbs::record_exit`). Kept as the raw
-    /// string so an unrecognized value stays reportable instead of collapsing
-    /// into a boolean. `None` = a record predating the field, which is not
-    /// evidence of finality either.
+    /// The producer's own measurement of how completely the last reported cost covers this launch (`rk_daemon::bbs::record_exit`).
     cost_coverage: Option<String>,
     record: String,
 }
@@ -1957,11 +1856,7 @@ struct UsageRow {
     cost_usd: Option<f64>,
     cost_basis: String,
     observed_at: Option<DateTime<Utc>>,
-    /// Position in the merged capture. Meaningful as persistence position
-    /// ONLY when the capture's order claim was validated; a provider reports
-    /// a CUMULATIVE total per segment, so picking the segment's last record
-    /// by `observed_at` is picking it by a field the producer stamps, not by
-    /// the order the daemon persisted them in.
+    /// Position in the merged capture.
     position: usize,
     record: String,
 }
@@ -2026,12 +1921,7 @@ impl Index<'_> {
             .any(|l| l.repo == repo && l.spawn == spawn)
     }
 
-    /// The earliest observed launch of `spawn` strictly after `after` and no
-    /// later than `until` — i.e. a relaunch that invalidates treating an
-    /// earlier exit as permanent. `agent_spawned`/`agent_respawned` and
-    /// authored records do not carry a session, so this is a time test, not a
-    /// session-identity test; a record belonging to the already-exited
-    /// session is excluded by `exclude_session`.
+    /// The earliest observed launch of `spawn` strictly after `after` and no later than `until` — i.e.
     fn relaunch_between(
         &self,
         repo: &str,
@@ -2433,12 +2323,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
 
         // --- task_span ------------------------------------------------
         if is_task_span(t) {
-            // Validated BEFORE indexing: an indexed span reaches
-            // `build_critical_path`, the phase totals and delivery acceptance,
-            // and nothing downstream re-checks it. Rejecting one never removes
-            // a selected task from the denominator — `deliveries` is built by
-            // iterating `frozen_task_scope(manifest)`, so the task still gets
-            // a row and simply reports no usable native span.
+            // Validated BEFORE indexing: an indexed span reaches `build_critical_path`, the phase totals and delivery acceptance, and nothing downstream re-checks it.
             if let Some(reason) = task_span_defect(t) {
                 idx.invalid.push(InvalidRecord {
                     record: record_id(t),
@@ -2558,21 +2443,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     idx
 }
 
-/// Validates a review's `author_terminal_evidence` id against the capture.
-///
-/// Only an `agent_exit` observation can establish this, and only for the
-/// source author's exact `(spawn, session)` in the pair's repo, no later than
-/// the reuse, with no relaunch of that generation in between. The two
-/// tempting alternatives are both refused with an explicit reason:
-///
-/// * `harness_result` is task-completion evidence. `Supervisor::route_completion`
-///   emits it when the agent routes `rk done`; the OS process is still alive
-///   until `HarnessEvent::Exited`, and the provider may still report a later,
-///   different total for the same query.
-/// * `agent_lifecycle` carries no `spawn` field at all (its identity fields
-///   are `agent` and `generation`), is not repo-bound, and its `change` may be
-///   `started` — so it cannot identify a terminal generation even in
-///   principle.
+/// Resolve exact physical exit with launch, repository, and decision-time fences.
 fn resolve_author_exit(
     evidence_id: &str,
     idx: &Index<'_>,
@@ -2637,12 +2508,7 @@ fn resolve_author_exit(
             exit.agent
         ));
     }
-    // `stale_session: true` means a LATER launch of this same generation
-    // already existed by the time this exit was recorded: the daemon nulls
-    // out prior_state/crashed because they would describe that successor,
-    // not this launch. The exit is real, but it is direct proof a relaunch
-    // already happened, so it cannot establish the terminal generation state
-    // at the time of the reuse (`TKT-tulir-kotah-gisub`).
+    // Reject stale-session exits: their lifecycle state describes a successor launch.
     if exit.stale_session == Some(true) {
         return Err(format!(
             "{evidence_id} is a stale-session exit: a later launch of generation {source_spawn} \
@@ -2725,13 +2591,7 @@ fn frozen_task_scope(manifest: &Manifest) -> Vec<TaskScope> {
     scopes.into_values().collect()
 }
 
-/// Per-segment cost finality. A `paused` provider result can be followed by
-/// more model usage and then a budget kill with no further result; the earlier
-/// cumulative total is then a partial amount, not this launch's final cost.
-/// Finality therefore needs an observed exit for the same launch AND a
-/// terminal last result AND an exit whose `prior_state` agrees with it AND
-/// that exit's own `cost_coverage: "final"` — the producer's measurement that
-/// no further usage followed the result. State agreement alone is not it.
+/// Per-segment cost finality.
 fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
     let state = last.state.as_deref().unwrap_or("");
     if !TERMINAL_USAGE_STATES.contains(&state) {
@@ -2751,11 +2611,7 @@ fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
                 .into(),
         );
     };
-    // A stale-session exit's `prior_state` is nulled at the SOURCE because it
-    // would otherwise describe a successor launch, not this one — it is not
-    // "nothing happened between", it is "unknown". Only a non-stale absent
-    // `prior_state` (legacy shape, or genuinely nothing recorded) is read as a
-    // match (`TKT-tulir-kotah-gisub`).
+    // A stale exit's missing prior state denotes uncertainty about the superseded launch.
     if exit.prior_state.is_none() && exit.stale_session == Some(true) {
         return (
             false,
@@ -2767,13 +2623,7 @@ fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
             ),
         );
     }
-    // Coverage is measured by the producer, not inferred here. A terminal
-    // result and an agreeing `prior_state` say the lifecycle state matched;
-    // they do NOT say no further model usage ran past that result, which is
-    // what `CostCoverage` tracks and what the state-only check got wrong.
-    // Everything but `final` fails closed, preserving the amount as a
-    // partial/unknown figure. Bounds COST only — the exit stays valid
-    // physical-exit evidence.
+    // Coverage is measured by the producer, not inferred here.
     match exit.cost_coverage.as_deref() {
         Some(FINAL_COST_COVERAGE) => {}
         None => {
@@ -2840,11 +2690,7 @@ fn opt_sum(acc: &mut Option<i64>, v: Option<i64>) {
     }
 }
 
-/// Computes the deterministic report with no reviewed task-scoped annotations
-/// (repeated-investigation/rework/intervention). Equivalent to
-/// `compute_full(manifest, capture, reviews, &[])`. Test-only: every real
-/// caller (the CLI) goes through `compute_full` directly so it can pass
-/// parsed reviewed annotations.
+/// Computes the deterministic report with no reviewed task-scoped annotations (repeated-investigation/rework/intervention).
 #[cfg(test)]
 fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) -> Result<Report> {
     compute_full(manifest, capture, reviews, &[])
@@ -3197,11 +3043,7 @@ pub fn compute_full(
             pair.consumer_generation.clone(),
         ));
 
-        // Author exit, derived. Only an `agent_exit` observation for the source
-        // author's exact `(spawn, session)` can establish it, and only with no
-        // relaunch of that generation before the consuming decision — a manual
-        // respawn keeps the SpawnId, so an earlier exit is not proof the author
-        // was gone when the consumer decided.
+        // Author exit, derived.
         let mut author_terminal = false;
         let mut author_terminal_evidence = None;
         if let Some(evidence_id) = review.and_then(|r| r.author_terminal_evidence.as_deref()) {
@@ -3473,14 +3315,7 @@ pub fn compute_full(
                 let wait = phase["queue_wait_ms"].as_i64();
                 match phase["phase"].as_str().unwrap_or("") {
                     "verification" => {
-                        // Admission/check queue AND its own run time both count
-                        // as verification time, never as work — but only when
-                        // this span's own producer declares the two disjoint
-                        // (`duration_semantic: "additive"`). A span recorded
-                        // by the pre-fix landing-gate producer measured
-                        // `duration_ms` from before admission was requested,
-                        // so it already included `queue_wait_ms`; summing both
-                        // for such a span here double-counted the wait.
+                        // Verification includes admission and execution time only when the producer declares them disjoint.
                         if phase["duration_semantic"] == ADDITIVE_DURATION {
                             opt_sum(&mut phase_ms.verification_ms, dur);
                             opt_sum(&mut phase_ms.verification_ms, wait);
@@ -3517,12 +3352,7 @@ pub fn compute_full(
             .min();
         let accepted = acceptance_evidence.as_ref().map(|_| true);
 
-        // Every native generation observed for this task, whether or not it
-        // ever produced an eligible pair or a receipt. Launch rows are
-        // included, not just completions/exits/usage: a generation that was
-        // spawned and is still running — or crashed before any of the other
-        // three were emitted — has only a launch event, and omitting it drops
-        // the whole delivery.
+        // Every native generation observed for this task, whether or not it ever produced an eligible pair or a receipt.
         let mut spawns: BTreeSet<&str> = BTreeSet::new();
         for c in &idx.completions {
             if c.repo == scope.repo && c.task == scope.task {
@@ -3603,11 +3433,7 @@ pub fn compute_full(
                     .map(|e| e.agent.clone());
             }
 
-            // ATTEMPTS, not exits. An exit is the richest evidence of a
-            // launch but not the only one: a live generation reports usage
-            // with no exit, and one whose exit fell outside the capture has
-            // only its launch event. Counting exits alone undercounts every
-            // generation that is still running or crashed unobserved.
+            // ATTEMPTS, not exits.
             let mut launches = Vec::new();
             let mut sessioned: BTreeSet<&str> = BTreeSet::new();
             for e in idx
@@ -3659,11 +3485,7 @@ pub fn compute_full(
                     process_lifetime_ms: None,
                 });
             }
-            // Launch events carry no session, so they cannot be matched to
-            // the attempts above one-for-one. Only the EXCESS over the
-            // sessions already accounted for is counted as further attempts:
-            // treating each event as its own would double-count the ordinary
-            // case where a spawn both emitted an event and later exited.
+            // Launch events carry no session, so they cannot be matched to the attempts above one-for-one.
             let mut launch_events: Vec<&LaunchRow> = idx
                 .launches
                 .iter()
@@ -3717,13 +3539,7 @@ pub fn compute_full(
             let ordered = capture.order == Order::PersistenceSequence;
             for ((session, provider_session), mut rows) in by_segment {
                 any_segment = true;
-                // WHICH record is the segment's last is a persistence-order
-                // question, and `observed_at` is a producer-stamped field,
-                // not persistence order. Sort by capture position when the
-                // capture's order claim was validated; otherwise the pick
-                // below is presentational only and the segment is refused
-                // finality rather than resolved by a field that cannot
-                // answer it.
+                // WHICH record is the segment's last is a persistence-order question, and `observed_at` is a producer-stamped field, not persistence order.
                 if ordered {
                     rows.sort_by(|a, b| (a.position, &a.record).cmp(&(b.position, &b.record)));
                 } else {
@@ -4446,14 +4262,7 @@ mod tests {
         })
     }
 
-    /// `agent_exit` (S2 contract, identity `bbs-agent-exit`): castle-authored
-    /// physical-exit evidence, never `harness_result`. Repo `"repo"`, session
-    /// `"sess-1"`, exit code 0, not crashed, not stale, `created_at` =
-    /// `exited` and `cost_coverage: "final"` are defaulted; `field` restates
-    /// whichever one a test is actually about. `stale_session: true` models a
-    /// delayed exit for a launch already superseded under the same `spawn`,
-    /// whose `prior_state`/`crashed` are nulled at the source
-    /// (`TKT-tulir-kotah-gisub`), not because nothing happened.
+    /// `agent_exit` (S2 contract, identity `bbs-agent-exit`): castle-authored physical-exit evidence, never `harness_result`.
     fn exit_rec(
         id: &str,
         task: &str,
@@ -4483,13 +4292,7 @@ mod tests {
         t
     }
 
-    /// `agent_final_usage` (S2 contract, identity `bbs-agent-final-usage`):
-    /// castle-authored provider-cost evidence, keyed with `agent_exit` on
-    /// `(spawn, session)`. Repo `"repo"`, session `"sess-1"`, provider session
-    /// `"ps-1"`, `created_at` = `observed` and `cost_basis` are defaulted —
-    /// `cost_basis` is the ONLY field that gates whether a figure may be
-    /// pooled as a provider-reported total, so a test varying it says so with
-    /// `field`.
+    /// `agent_final_usage` (S2 contract, identity `bbs-agent-final-usage`): castle-authored provider-cost evidence, keyed with `agent_exit` on `(spawn, session)`.
     fn usage_rec(
         id: &str,
         task: &str,
@@ -5509,15 +5312,7 @@ mod tests {
             .contains("lower bound"));
     }
 
-    /// A `verification` `task_span` is only summed into `verification_ms`
-    /// (duration plus its own admission wait) when it carries
-    /// `duration_semantic: "additive"` — the tag
-    /// `rk_daemon::span::PhaseSpan::from_durations` stamps once its
-    /// `duration_ms` is guaranteed disjoint from `queue_wait_ms`. A span with
-    /// no such tag (recorded before the tag existed) cannot be trusted either
-    /// way — it might already include the wait — so it is excluded from the
-    /// total and counted separately as an explicit coverage gap, never
-    /// guessed into the sum.
+    /// Only additive-tagged spans contribute durations; retain untagged spans as legacy coverage.
     #[test]
     fn verification_ms_sums_only_additive_tagged_spans_and_counts_the_rest_as_legacy() {
         let m = task_manifest("TKT-verify");
@@ -5576,27 +5371,7 @@ mod tests {
         }
     }
 
-    fn invalid_reason<'a>(r: &'a Report, record: &str) -> &'a str {
-        r.invalid_records
-            .iter()
-            .find(|i| i.record == record)
-            .map_or_else(
-                || {
-                    panic!(
-                        "{record} was not retained as invalid: {:?}",
-                        r.invalid_records
-                    )
-                },
-                |i| i.reason.as_str(),
-            )
-    }
-
-    /// DEFECT 1. `reserved_prefix` matched EVERY kind with `starts_with`, but
-    /// `bbs-open`, `bbs-agent-exit` and `bbs-agent-final-usage` are minted as
-    /// fixed, bare identities. Appending anything to one produced a record
-    /// this module accepted as native. Each forged row must be retained as
-    /// invalid WITH a reason, and must not contribute the effect its kind
-    /// carries: a false open, a false author exit, or a false final cost.
+    /// DEFECT 1.
     #[test]
     fn forged_suffixes_on_fixed_native_identities_are_invalid_and_derive_nothing() {
         let forge = |mut t: Value, id: &str| -> Value {
@@ -5665,82 +5440,7 @@ mod tests {
         assert!(d.generations[0].cost_segments.is_empty());
     }
 
-    /// DEFECT 1, variable identities. Their contract is preserved — any
-    /// genuine key is accepted — but it must actually BE the key the producer
-    /// mints. `canonical_digest` returns a 64-character lowercase hex SHA-256,
-    /// so a short readable suffix is not something a real export can carry;
-    /// and an exposure's suffix is one of four `ExposureSurface` values, so a
-    /// forged surface is refused even when the payload agrees with it.
-    #[test]
-    fn variable_native_identities_must_carry_a_real_digest_or_a_real_surface() {
-        let mut short_digest = finding("src-2", "author-gen", "2026-01-01T00:00:00Z");
-        short_digest["identity"] = json!("bbs-finding-x");
-        let mut uppercase_digest = finding("src-3", "author-gen", "2026-01-01T00:00:00Z");
-        uppercase_digest["identity"] =
-            json!(format!("bbs-finding-{}", digest_key("s").to_uppercase()));
-        let mut forged_surface = exposure("x-forged", "src-1", "gen-1", "2026-01-01T12:00:00Z");
-        forged_surface["identity"] = json!("bbs-exposure-forged");
-        forged_surface["payload"]["surface"] = json!("forged");
-        let mut mismatched = exposure("x-mismatch", "src-1", "gen-1", "2026-01-01T12:00:00Z");
-        mismatched["identity"] = json!("bbs-exposure-brief");
-
-        let mut tuples = verified_tuples();
-        tuples.extend([short_digest, uppercase_digest, forged_surface, mismatched]);
-        let r = compute(
-            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-            &capture(tuples, Order::Unknown),
-            &[],
-        )
-        .unwrap();
-
-        for id in ["src-2", "src-3"] {
-            assert!(
-                invalid_reason(&r, id).contains("canonical_digest"),
-                "{id}: {}",
-                invalid_reason(&r, id)
-            );
-        }
-        assert!(invalid_reason(&r, "x-forged").contains("not an exposure surface"));
-        assert!(invalid_reason(&r, "x-mismatch").contains("payload.surface"));
-        // The real records alongside them are untouched.
-        assert_eq!(
-            only(&r).coverage_status,
-            "prepared",
-            "the genuine spawn exposure still establishes native coverage"
-        );
-    }
-
-    /// DEFECT 1, positive baseline. Every real `ExposureSurface` must stay
-    /// admissible: the rule is "the suffix is the surface the payload names",
-    /// not a hardcoded preference for `spawn`.
-    #[test]
-    fn every_real_exposure_surface_is_still_native_coverage() {
-        for surface in EXPOSURE_SURFACES {
-            let mut x = exposure("x1", "src-1", "gen-1", "2026-01-01T12:00:00Z");
-            x["identity"] = json!(format!("bbs-exposure-{surface}"));
-            x["payload"]["surface"] = json!(surface);
-            let mut tuples = verified_tuples();
-            tuples[3] = x;
-            let r = compute(
-                &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
-                &capture(tuples, Order::Unknown),
-                &[],
-            )
-            .unwrap();
-            assert!(
-                r.invalid_records.is_empty(),
-                "surface={surface}: {:?}",
-                r.invalid_records
-            );
-            assert_eq!(only(&r).coverage_status, "prepared", "surface={surface}");
-        }
-    }
-
-    /// DEFECT 2, positive baseline: spans shaped exactly as the captured
-    /// native records are, including the two real author forms (`"daemon"`
-    /// and a `castle-<hex>` actor) and a `delivery_closure` whose
-    /// `payload.repo` is `null` — that one is bound to its repo through the
-    /// tuple SCOPE and must stay supported.
+    /// Accept native daemon/castle spans, including delivery_closure with null payload.repo.
     #[test]
     fn real_producer_shaped_spans_are_admitted_including_a_null_repo() {
         let m = task_manifest("TKT-dorod-sival-fumid");
@@ -5787,12 +5487,7 @@ mod tests {
         );
     }
 
-    /// DEFECT 2. `task_span` was admitted on category+identity alone. Each of
-    /// these rows is otherwise well formed and would have been indexed, where
-    /// it could move the critical path, the phase totals and delivery
-    /// acceptance. Rejecting them must be HONEST rather than lossy: the
-    /// selected task keeps its row in the denominator and simply reports no
-    /// usable native record.
+    /// DEFECT 2.
     #[test]
     fn malformed_or_forged_spans_are_rejected_without_erasing_the_selected_task() {
         let base = json!({
@@ -5894,13 +5589,7 @@ mod tests {
         }
     }
 
-    /// DEFECT 3. The old check called a segment final on lifecycle state
-    /// alone: a terminal last result, an observed exit, and a `prior_state`
-    /// AGREEING with it. That says the launch's state matched — not that no
-    /// further model usage ran past the result, which is precisely what the
-    /// producer measures and states as `cost_coverage`. Every non-`final`
-    /// coverage must fail closed, and the reported amount must survive as a
-    /// PARTIAL rather than being pooled into a provider total or discarded.
+    /// DEFECT 3.
     #[test]
     fn a_matching_exit_state_is_not_a_final_cost_unless_coverage_says_final() {
         let m = task_manifest("TKT-cost");
@@ -6965,5 +6654,120 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("duplicate consumer_tasks"));
+    }
+
+    fn invalid_reason<'a>(r: &'a Report, record: &str) -> &'a str {
+        r.invalid_records
+            .iter()
+            .find(|i| i.record == record)
+            .map_or_else(
+                || {
+                    panic!(
+                        "{record} was not retained as invalid: {:?}",
+                        r.invalid_records
+                    )
+                },
+                |i| i.reason.as_str(),
+            )
+    }
+
+    /// DEFECT 1, variable identities. Their contract is preserved — any
+    /// genuine key is accepted — but it must actually BE the key the producer
+    /// mints. `canonical_digest` returns a 64-character lowercase hex SHA-256,
+    /// so a short readable suffix is not something a real export can carry;
+    /// and an exposure's suffix is one of four `ExposureSurface` values, so a
+    /// forged surface is refused even when the payload agrees with it.
+    #[test]
+    fn variable_native_identities_must_carry_a_real_digest_or_a_real_surface() {
+        let mut short_digest = finding("src-2", "author-gen", "2026-01-01T00:00:00Z");
+        short_digest["identity"] = json!("bbs-finding-x");
+        let mut uppercase_digest = finding("src-3", "author-gen", "2026-01-01T00:00:00Z");
+        uppercase_digest["identity"] =
+            json!(format!("bbs-finding-{}", digest_key("s").to_uppercase()));
+        let mut forged_surface = exposure("x-forged", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+        forged_surface["identity"] = json!("bbs-exposure-forged");
+        forged_surface["payload"]["surface"] = json!("forged");
+        let mut mismatched = exposure("x-mismatch", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+        mismatched["identity"] = json!("bbs-exposure-brief");
+
+        let mut tuples = verified_tuples();
+        tuples.extend([short_digest, uppercase_digest, forged_surface, mismatched]);
+        let r = compute(
+            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+            &capture(tuples, Order::Unknown),
+            &[],
+        )
+        .unwrap();
+
+        for id in ["src-2", "src-3"] {
+            assert!(
+                invalid_reason(&r, id).contains("canonical_digest"),
+                "{id}: {}",
+                invalid_reason(&r, id)
+            );
+        }
+        assert!(invalid_reason(&r, "x-forged").contains("not an exposure surface"));
+        assert!(invalid_reason(&r, "x-mismatch").contains("payload.surface"));
+        // The real records alongside them are untouched.
+        assert_eq!(
+            only(&r).coverage_status,
+            "prepared",
+            "the genuine spawn exposure still establishes native coverage"
+        );
+    }
+
+    /// DEFECT 1, positive baseline. Every real `ExposureSurface` must stay
+    /// admissible: the rule is "the suffix is the surface the payload names",
+    /// not a hardcoded preference for `spawn`.
+    #[test]
+    fn every_real_exposure_surface_is_still_native_coverage() {
+        for surface in EXPOSURE_SURFACES {
+            let mut x = exposure("x1", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+            x["identity"] = json!(format!("bbs-exposure-{surface}"));
+            x["payload"]["surface"] = json!(surface);
+            let mut tuples = verified_tuples();
+            tuples[3] = x;
+            let r = compute(
+                &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+                &capture(tuples, Order::Unknown),
+                &[],
+            )
+            .unwrap();
+            assert!(
+                r.invalid_records.is_empty(),
+                "surface={surface}: {:?}",
+                r.invalid_records
+            );
+            assert_eq!(only(&r).coverage_status, "prepared", "surface={surface}");
+        }
+    }
+
+    #[test]
+    fn forged_open_and_worker_authored_open_do_not_establish_read_evidence() {
+        for worker_author in [false, true] {
+            let mut open = open_record("bad-open", "src-1", "gen-1", "2026-01-01T13:00:00Z");
+            if worker_author {
+                open["instance"] = json!("consumer");
+            } else {
+                open["identity"] = json!("bbs-open-forged");
+            }
+            let mut tuples = verified_tuples();
+            tuples.push(open);
+            let report = compute(
+                &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+                &capture(tuples, Order::Unknown),
+                &[],
+            )
+            .unwrap();
+            let reason = invalid_reason(&report, "bad-open");
+            assert!(reason.contains(if worker_author {
+                "castle author"
+            } else {
+                "fixed daemon-minted identity"
+            }));
+            assert_eq!(report.opened, 0);
+            assert!(!only(&report).opened);
+            assert_eq!(report.eligible, 1);
+        }
     }
 }
