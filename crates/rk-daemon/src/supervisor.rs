@@ -1851,7 +1851,14 @@ impl Supervisor {
             permission_mode: effective.permission_mode.clone(),
         });
         let spawn = spawning.spawn_id();
-        if let Err(e) = self.lock_registry().insert(spawning) {
+        // Bound the guard to this statement rather than matching on it
+        // directly in the `if let` scrutinee: a guard temporary there is
+        // lifetime-extended through the whole block (TKT-kovik-libiv-dotiz),
+        // so the error branch's own `self.lock_registry()` below would
+        // self-deadlock on this same, non-reentrant mutex on every
+        // persistence failure at `insert`.
+        let inserted = self.lock_registry().insert(spawning);
+        if let Err(e) = inserted {
             let mut reg = self.lock_registry();
             reg.release_name(&name);
             reg.release_wip(fleet_wip_cap);
@@ -10496,6 +10503,103 @@ mod respawn_tests {
             .await
             .expect("the failed attempt's reservation must have been released");
         assert!(record.state.is_live());
+    }
+
+    /// A failed registry persist must return its IO error and release the name,
+    /// WIP, lane and task reservations. Run the real path in a child because a
+    /// regression can deadlock Tokio's blocking pool, whose runtime teardown
+    /// is not bounded by an in-process `tokio::time::timeout`.
+    #[tokio::test]
+    async fn a_registry_persistence_failure_at_insert_returns_promptly_and_releases_every_reservation(
+    ) {
+        const CHILD: &str = "RK_REGISTRY_PERSIST_FAILURE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let completion = tempfile::NamedTempFile::new().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::respawn_tests::a_registry_persistence_failure_at_insert_returns_promptly_and_releases_every_reservation",
+                    "--nocapture",
+                ])
+                .env(CHILD, completion.path())
+                .spawn()
+                .expect("start the registry regression child");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll registry regression child") {
+                    assert!(
+                        status.success(),
+                        "registry regression child failed: {status}"
+                    );
+                    assert_eq!(std::fs::read(completion.path()).unwrap(), b"passed\n");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // This exact child is owned by this test. Reap it before
+                    // failing so a blocking-pool deadlock cannot hang the suite.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("registry regression child exceeded its 40s process deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let task = "persistence-failure-task";
+        let cap = 1;
+
+        // Sabotage the NEXT persist only: `write_atomic` renames its temp
+        // file onto `agents.json`, which fails once that path is a
+        // directory — the least invasive way to force a REAL
+        // `Registry::insert` error without touching permissions the
+        // worktree/branch creation steps ahead of it also depend on.
+        std::fs::create_dir_all(home.path().join("agents.json")).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sup.spawn_async(spawn_params(repo.path(), task), cap),
+        )
+        .await
+        .expect(
+            "on the CORRECTED path a persistence failure at insert must return \
+             promptly, not deadlock the blocking pool",
+        );
+        let error = result.expect_err("a sabotaged persist must surface as a spawn error");
+        assert!(
+            error.to_string().starts_with("io:"),
+            "the original io error must survive unreplaced: {error}"
+        );
+        assert_eq!(
+            sup.list().len(),
+            0,
+            "a failed insert must leave no phantom live row behind: {:?}",
+            sup.list()
+        );
+
+        // Un-sabotage and retry the EXACT SAME task under the SAME positive
+        // cap: a leaked live row (defect 2) or a stuck task-ownership/lane
+        // reservation would refuse this, since nothing about a different
+        // task or a disabled cap would have exercised either.
+        std::fs::remove_dir_all(home.path().join("agents.json")).unwrap();
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sup.spawn_async(spawn_params(repo.path(), task), cap),
+        )
+        .await
+        .expect("the registry must still be responsive after a sabotaged insert");
+        let record = recovered
+            .expect("the failed attempt's WIP/lane/task reservations must be fully released");
+        assert!(record.state.is_live());
+        assert_eq!(
+            sup.list().len(),
+            1,
+            "exactly the recovered spawn should have a registry row"
+        );
+        // A zero-test child or an early return is not a successful regression.
+        std::fs::write(std::env::var_os(CHILD).unwrap(), b"passed\n").unwrap();
     }
 
     /// TKT-pumod-hubir-robik: two `agent.spawn` calls for the identical
