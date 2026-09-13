@@ -1902,11 +1902,7 @@ impl Supervisor {
                 &repo_name,
                 Some(&params.task),
                 rk_core::bbs::ExposureSurface::Spawn,
-                &crate::bbs::ConsumerBinding::agent(
-                    &name,
-                    &spawn.to_string(),
-                    Some(&params.task),
-                ),
+                &crate::bbs::ConsumerBinding::agent(&name, &spawn.to_string(), Some(&params.task)),
             ),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),

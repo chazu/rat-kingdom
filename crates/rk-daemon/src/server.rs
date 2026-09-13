@@ -3286,18 +3286,17 @@ impl Daemon {
                         // Only a request that was actually SERVED is recorded:
                         // a lookup that errored above never reaches here, so a
                         // failed read never manufactures an open.
-                        let capture = serde_json::from_value::<rk_core::tuple::Tuple>(
-                            post["tuple"].clone(),
-                        )
-                        .map(|source| {
-                            crate::bbs::record_open(
-                                &self.space,
-                                &self.castle,
-                                &self.consumer_binding(&req.caller),
-                                &source,
-                            )
-                        })
-                        .unwrap_or_else(|_| crate::bbs::Capture::failed());
+                        let capture =
+                            serde_json::from_value::<rk_core::tuple::Tuple>(post["tuple"].clone())
+                                .map(|source| {
+                                    crate::bbs::record_open(
+                                        &self.space,
+                                        &self.castle,
+                                        &self.consumer_binding(&req.caller),
+                                        &source,
+                                    )
+                                })
+                                .unwrap_or_else(|_| crate::bbs::Capture::failed());
                         post["telemetry"] = json!(capture.status);
                         post["open"] = json!(capture.record);
                         Response::ok(id, post)
@@ -3306,8 +3305,8 @@ impl Daemon {
                 })
             }
             "bbs.export" => {
-                let result = parse_params::<crate::bbs::ExportParams>(&req.params).and_then(
-                    |params| {
+                let result =
+                    parse_params::<crate::bbs::ExportParams>(&req.params).and_then(|params| {
                         // A worker may capture only its own repository; the
                         // operator may name any. Export is a read of a whole
                         // scope, so this is enforced here rather than left to
@@ -3320,8 +3319,7 @@ impl Daemon {
                             }
                         }
                         crate::bbs::export(&self.space, &params).map_err(|e| e.to_string())
-                    },
-                );
+                    });
                 reply(match result {
                     Ok(export) => Response::ok(id, export),
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),

@@ -150,7 +150,10 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
         }
         BbsCommand::Export { repo, after, limit } => {
             let result = client
-                .call("bbs.export", json!({"repo":repo,"after":after,"limit":limit}))
+                .call(
+                    "bbs.export",
+                    json!({"repo":repo,"after":after,"limit":limit}),
+                )
                 .await?;
             if as_json {
                 println!("{result}");

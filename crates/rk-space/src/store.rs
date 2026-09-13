@@ -1094,7 +1094,10 @@ impl Store {
         let rows = statement
             .query_map(
                 params_from_iter::<[&dyn rusqlite::ToSql; 4]>([
-                    &scope, &after, &boundary_sql, &probe,
+                    &scope,
+                    &after,
+                    &boundary_sql,
+                    &probe,
                 ]),
                 |row| {
                     let sequence: i64 = row.get(0)?;
