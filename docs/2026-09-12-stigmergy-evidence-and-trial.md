@@ -108,13 +108,17 @@ human output use the same result. Reports preserve record IDs and reasons for
 excluded/unknown observations instead of silently manufacturing zeroes.
 
 The versioned manifest freezes experiment ID, arms/batches, repository scopes,
-consumer task and generation IDs, build/model/harness/check/WIP identity, window,
-quality criteria, and goals. An eligible opportunity is an independently reviewed
+selected consumer task IDs, build/model/harness/check/WIP identity, window,
+quality criteria, eligibility rules and goals. Native generations are enrolled
+from actual spawn evidence after dispatch; a frozen plan cannot predict a future
+spawn or source tuple ID. An eligible opportunity is an independently reviewed
 source/consumer pair: source existed before the relevant decision, applies to the
 task, and is not the consumer's own work. Reviews record relevant source IDs,
-decision/effect evidence, author-terminal evidence and missing coverage. Review
-annotations are explicitly operator judgments, not daemon facts. Freeze selection
-rules before each batch; retrospective annotations cannot change those rules.
+decision/effect evidence, author-terminal evidence and missing coverage. Reviews
+may annotate newly discovered source/consumer pairs under the frozen task scope
+and eligibility rules. Predeclared pairs remain useful for fixtures and replays.
+Review annotations are explicitly operator judgments, not daemon facts. Freeze
+selection rules before each batch; retrospective annotations cannot change them.
 
 The exporter saves native tuples and lifecycle/delivery/cost evidence with a
 bounded scope and explicit coverage metadata. Immutable snapshots identify their
