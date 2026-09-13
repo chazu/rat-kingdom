@@ -24,6 +24,16 @@ Attribution is frozen at launch, keyed by session token. A delayed event from a
 superseded launch is attributed to the launch it came from, or skipped — never
 to whichever record holds the name now.
 
+Identity is not the only thing the name-keyed `AgentRecord` would leak.
+Lifecycle state lives there too, so anything read from it is **omitted** on a
+superseded launch's late event rather than borrowed from the successor: both
+kinds carry `stale_session: true`, and `state`/`declared_done` (result) and
+`prior_state`/`crashed` (exit) are `null`. `null` means unknown, never a value
+of its own. The event's own provider total is still that launch's and survives;
+the daemon's running priced total is the successor's and does not, so a stale
+result with no provider figure is `cost_basis: unknown`, not a daemon-priced
+final cost.
+
 ## `agent_final_usage` (identity `bbs-agent-final-usage`)
 
 Authored from the fenced `Completed` handler at **every** result path,
@@ -32,8 +42,8 @@ That path is the done-before-final-result case: without it the only surviving
 cost record is the provisional one routed at `rk done`.
 
 Fields: `repo`, `task`, `agent`, `spawn`, `session`, `provider_session`,
-`observed_at`, `state`, `declared_done`, `cost_usd`, `cost_basis`,
-`cost_provenance`, `usage`.
+`observed_at`, `state`, `declared_done`, `stale_session`, `cost_usd`,
+`cost_basis`, `cost_provenance`, `usage`.
 
 `cost_basis` distinguishes three genuinely different situations:
 

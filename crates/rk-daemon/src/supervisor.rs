@@ -3087,13 +3087,21 @@ impl Supervisor {
                         None => CostCoverage::Unknown,
                     };
                     if let Some(w) = &watch {
+                        // Identity is frozen on the watch, but `crashed` and
+                        // the pre-exit state are NOT: both are read off the
+                        // name-keyed `AgentRecord`, which the SUCCESSOR owns
+                        // once it takes the name. For a superseded launch's
+                        // late exit they describe the successor, so they are
+                        // omitted rather than misattributed — `null` reads as
+                        // unknown, and "unknown" is the true finding here.
+                        let prior = format!("{pre_exit_state:?}").to_lowercase();
                         let capture = crate::bbs::record_exit(
                             &self.space,
                             &self.castle,
                             &w.binding(session),
                             code,
-                            crashed_now,
-                            &format!("{pre_exit_state:?}").to_lowercase(),
+                            live.then_some(crashed_now),
+                            live.then_some(prior.as_str()),
                             Some(w.launched_at.to_rfc3339()),
                             coverage.as_str(),
                             !live,
@@ -3510,7 +3518,11 @@ impl Supervisor {
     /// instead of only the provisional one.
     ///
     /// Attribution comes from the launch's own frozen watch. With no watch the
-    /// observation is skipped rather than attributed to the current record.
+    /// observation is skipped rather than attributed to the current record; and
+    /// when the launch has already been SUPERSEDED, everything that lives on
+    /// the name-keyed `AgentRecord` — record state, `declared_done`, the
+    /// daemon's running priced total — is omitted rather than borrowed from the
+    /// successor. Only the event's own provider total survives that way.
     fn observe_final_usage(
         &self,
         session: rk_core::id::SpawnId,
@@ -3529,6 +3541,12 @@ impl Supervisor {
             );
             return;
         };
+        // Whether this result still belongs to the launch that holds the name.
+        // A superseded launch's delayed result must not be labelled with the
+        // successor's record state or priced off the successor's running total:
+        // the event's own provider figure is this launch's, everything read
+        // from the name-keyed `AgentRecord` is not.
+        let live = self.lock_session_tokens().get(&watch.name) == Some(&session);
         // Three genuinely different situations, kept apart on purpose:
         //
         //  * this result carries a provider total -> that total, for THIS
@@ -3551,11 +3569,19 @@ impl Supervisor {
                 None,
                 "a provider total was reported earlier in this launch but not for this result; the running figure mixes bases, so no final launch cost is provable",
             )
-        } else if usage.total() > 0 && self.pricing_known(&watch) {
+        } else if live && usage.total() > 0 && self.pricing_known(&watch) {
             (
                 rk_core::bbs::CostBasis::DaemonPricedIncrements,
                 Some(record_cost_usd),
                 "daemon-priced TokenUsage increments; this harness never self-reported USD for this launch",
+            )
+        } else if !live {
+            (
+                rk_core::bbs::CostBasis::Unknown,
+                None,
+                "this result arrived for a superseded launch and carried no provider total of its \
+                 own; the daemon's running total belongs to the successor holding the name, so no \
+                 cost is attributable to this launch",
             )
         } else {
             (
@@ -3573,8 +3599,11 @@ impl Supervisor {
                 basis,
                 provenance: provenance.to_string(),
                 usage: serde_json::to_value(usage).ok(),
-                state: state.to_string(),
-                declared_done,
+                // Omitted for a superseded launch: the state came from the
+                // record the SUCCESSOR now owns, not from this launch.
+                state: live.then(|| state.to_string()),
+                declared_done: live.then_some(declared_done),
+                stale_session: !live,
             },
         );
         if capture.is_failed() {
@@ -12189,8 +12218,72 @@ mod native_observation_tests {
             exits[0]["stale_session"], true,
             "the exit belongs to a launch that is no longer the live one"
         );
+        // Identity was already frozen; OBSERVATION STATE was not. `crashed`
+        // and the pre-exit state are read off the name-keyed record, which the
+        // successor owns, so a stale exit must omit them rather than report the
+        // successor's condition as this launch's.
+        assert!(
+            exits[0]["prior_state"].is_null(),
+            "a superseded launch's exit must not be labelled with the state of \
+             whichever record holds the name now: {:?}",
+            exits[0]["prior_state"]
+        );
+        assert!(
+            exits[0]["crashed"].is_null(),
+            "`crashed` lives on the successor's record too: {:?}",
+            exits[0]["crashed"]
+        );
         // The successor's watch survives: a stale exit must not retire it.
         assert!(sup.attempt_watch(new).is_some());
+    }
+
+    /// The result half of the same defect. A stale RESULT had no observation
+    /// guard at all: its `state`/`declared_done` came from the successor's
+    /// record, and with no provider total on the event the daemon-priced
+    /// fallback billed it the SUCCESSOR's running total.
+    #[test]
+    fn a_delayed_predecessor_result_omits_the_successor_state_and_total() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, old) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        // A successor takes the name and runs up a total of its own.
+        let new = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), new);
+        sup.begin_launch("Nibble", new);
+        sup.lock_registry()
+            .update("Nibble", |r| r.cost_usd = 9.75)
+            .unwrap();
+
+        // Only now does the predecessor's result arrive, with no provider
+        // total of its own.
+        sup.handle_event("Nibble", rec.created_at, spawn, old, completed(None, None));
+
+        let usage = observations(&sup, "agent_final_usage");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0]["session"], old.to_string());
+        assert_eq!(
+            usage[0]["stale_session"], true,
+            "a result for a superseded launch must say so"
+        );
+        assert!(
+            usage[0]["state"].is_null() && usage[0]["declared_done"].is_null(),
+            "both are derived from the successor's record: {:?}",
+            usage[0]
+        );
+        assert_eq!(
+            usage[0]["cost_basis"], "unknown",
+            "the daemon's running total belongs to the successor, so it is not \
+             this launch's final daemon-priced cost"
+        );
+        assert!(
+            usage[0]["cost_usd"].is_null(),
+            "9.75 is the successor's spend: {:?}",
+            usage[0]["cost_usd"]
+        );
     }
 
     /// A provider total reported earlier, then a result with none, leaves a

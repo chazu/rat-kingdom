@@ -507,8 +507,16 @@ pub struct FinalUsage {
     pub basis: rk_core::bbs::CostBasis,
     pub provenance: String,
     pub usage: Option<serde_json::Value>,
-    pub state: String,
-    pub declared_done: bool,
+    /// The record state this result settled, or `None` when it cannot be
+    /// attributed to this launch. Lifecycle state lives on the NAME-keyed
+    /// `AgentRecord`, so a result arriving for a superseded launch would read
+    /// the successor's state; omitted rather than misattributed.
+    pub state: Option<String>,
+    /// Whether the launch declared its own `rk done` — also read off the
+    /// name-keyed record, so also `None` for a superseded launch.
+    pub declared_done: Option<bool>,
+    /// This result arrived for a launch that had already been superseded.
+    pub stale_session: bool,
 }
 
 /// Record the final reported usage/cost for one `(spawn, session)` attempt.
@@ -537,8 +545,13 @@ pub fn record_final_usage(
         "session": binding.session,
         "provider_session": binding.provider_session,
         "observed_at": chrono::Utc::now().to_rfc3339(),
+        // `null` = not attributable to this launch (see `FinalUsage::state`);
+        // a consumer must read that as unknown, never as a state of its own.
         "state": final_usage.state,
         "declared_done": final_usage.declared_done,
+        // This result arrived after the launch was superseded, so nothing that
+        // lives on the name-keyed record is attributed to it.
+        "stale_session": final_usage.stale_session,
         "cost_usd": final_usage.cost_usd,
         "cost_basis": final_usage.basis.as_str(),
         "cost_provenance": final_usage.provenance,
@@ -574,8 +587,8 @@ pub fn record_exit(
     castle: &str,
     binding: &AttemptBinding,
     exit_code: Option<i32>,
-    crashed: bool,
-    prior_state: &str,
+    crashed: Option<bool>,
+    prior_state: Option<&str>,
     launched_at: Option<String>,
     cost_coverage: &str,
     stale_session: bool,
@@ -592,6 +605,10 @@ pub fn record_exit(
         "exited_at": chrono::Utc::now().to_rfc3339(),
         // `null` means signal-terminated, which is NOT the same as exit 0.
         "exit_code": exit_code,
+        // Both are read off the NAME-keyed `AgentRecord`, which a successor
+        // launch owns once it takes the name. For a superseded launch's late
+        // exit they are therefore `null` — omitted rather than borrowed from
+        // whichever record holds the name now.
         "crashed": crashed,
         "prior_state": prior_state,
         "launched_at": launched_at,
@@ -2712,149 +2729,13 @@ mod export_snapshot_tests {
     }
 }
 
-#[cfg(test)]
-mod surface_coverage_tests {
-    use super::*;
-    use rk_core::bbs::{ExposureSurface, TelemetryStatus};
-    use serde_json::json;
-
-    fn events(space: &Space, kind: &str) -> Vec<Tuple> {
-        space
-            .scan(&rk_core::tuple::Pattern {
-                category: Some(Category::Event),
-                scope: Some("repo".into()),
-                ..Default::default()
-            })
-            .unwrap()
-            .into_iter()
-            .filter(|t| t.payload["bbs_kind"] == kind)
-            .collect()
-    }
-
-    /// Resume and recovery are separate surfaces from spawn, and a resume
-    /// binds to the SAME generation it is resuming.
-    #[test]
-    fn every_surface_records_itself_and_its_exact_binding() {
-        let space = Space::open_in_memory().unwrap();
-        let tickets = Tickets::new(space.clone(), "castle".into());
-        let briefing = brief(&space, &tickets, &BriefParams::for_task("repo", "TKT-1")).unwrap();
-        let agent = ConsumerBinding::agent("Nibble", "spawn-1", Some("TKT-1"));
-
-        for surface in [
-            ExposureSurface::Spawn,
-            ExposureSurface::Resume,
-            ExposureSurface::Recovery,
-            ExposureSurface::Brief,
-        ] {
-            assert_eq!(
-                record_exposure(&space, "castle", surface, &agent, &briefing).status,
-                TelemetryStatus::Recorded
-            );
-        }
-        let recorded = events(&space, "exposure");
-        // Compared as a SET: `scan` returns ULID order, which is not
-        // persistence order and can invert for tuples minted in one
-        // millisecond — the exact ambiguity `bbs.export` exists to resolve.
-        let mut surfaces: Vec<&str> = recorded
-            .iter()
-            .map(|t| t.payload["surface"].as_str().unwrap())
-            .collect();
-        surfaces.sort_unstable();
-        assert_eq!(surfaces, vec!["brief", "recovery", "resume", "spawn"]);
-        for tuple in &recorded {
-            // Daemon-authored, never attributed to the agent it describes.
-            assert_eq!(tuple.instance, "castle");
-            assert_eq!(tuple.payload["spawn"], "spawn-1");
-            assert_eq!(tuple.payload["bound"], "agent");
-        }
-
-        // An operator read cannot be attributed to any generation, and says so
-        // rather than being silently counted as an agent exposure.
-        record_exposure(
-            &space,
-            "castle",
-            ExposureSurface::Brief,
-            &ConsumerBinding::operator(),
-            &briefing,
-        );
-        let operator_reads: Vec<_> = events(&space, "exposure")
-            .into_iter()
-            .filter(|t| t.payload["bound"] == "operator")
-            .collect();
-        assert_eq!(operator_reads.len(), 1);
-        assert!(operator_reads[0].payload["spawn"].is_null());
-    }
-
-    /// An `open` is requested, not comprehended, and dedups on the
-    /// source/consumer-GENERATION pair while retaining every request.
-    #[test]
-    fn opens_retain_repeats_but_dedup_on_source_and_generation() {
-        let space = Space::open_in_memory().unwrap();
-        let source = Tuple::new(
-            Category::Artifact,
-            "repo",
-            "bbs-finding-a",
-            "peer",
-            json!({"bbs_kind":"finding","text":"t"}),
-        )
-        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
-        space.out(source.clone()).unwrap();
-        let agent = ConsumerBinding::agent("Nibble", "spawn-1", Some("TKT-1"));
-        record_open(&space, "castle", &agent, &source);
-        record_open(&space, "castle", &agent, &source);
-
-        let opens = events(&space, "open");
-        assert_eq!(opens.len(), 2, "a re-read stays visible as a re-read");
-        let keys: Vec<&str> = opens
-            .iter()
-            .map(|t| t.payload["dedup_key"].as_str().unwrap())
-            .collect();
-        assert_eq!(keys[0], keys[1], "both carry ONE dedup key");
-        assert!(keys[0].ends_with("spawn-1"));
-        assert_eq!(opens[0].payload["semantics"], "requested");
-    }
-
-    /// Measurement metadata must never reach a surface a peer or the King
-    /// reads as a useful finding — including the two native record kinds.
-    #[test]
-    fn no_telemetry_kind_is_discoverable_as_a_peer_finding() {
-        for kind in [
-            "exposure",
-            "open",
-            "telemetry_gap",
-            "agent_final_usage",
-            "agent_exit",
-        ] {
-            let tuple = Tuple::new(
-                Category::Event,
-                "repo",
-                format!("bbs-{kind}"),
-                "castle",
-                json!({"bbs_kind": kind}),
-            )
-            .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
-            assert!(
-                rk_core::bbs::is_telemetry(&tuple),
-                "{kind} must count as telemetry"
-            );
-            assert!(
-                rk_core::bbs::is_excluded_from_discovery(&tuple),
-                "{kind} must never surface in a briefing"
-            );
-        }
-    }
-
-    /// BBS read authorization is not authority to author the measurement
-    /// records about those reads.
-    #[test]
-    fn native_observation_identities_are_reserved_against_agent_authorship() {
-        for identity in ["bbs-agent-final-usage", "bbs-agent-exit"] {
-            assert!(
-                rk_core::bbs::RESERVED_IDENTITY_PREFIXES
-                    .iter()
-                    .any(|p| identity.starts_with(p)),
-                "{identity} must be refused from an agent caller"
-            );
-        }
-    }
-}
+// The four shallow `surface_coverage_tests` that lived here were RETIRED by
+// TKT-zutap-zavor-zuloj: they called `record_exposure` in a loop over the
+// surface enum, `record_open` directly, and asserted the reserved-identity
+// constant — which tests the serializers, not the wiring or the authorization.
+// Real entrypoint coverage supersedes them: the spawn/resume/recovery surfaces
+// and the native producers in `tests/bbs_native_observation.rs`, and the brief
+// surface, the `open` dedup pair, empty-versus-missing capture, nonfatal
+// capture on both the read and the launch path, and authenticated forgery of
+// every telemetry kind and both bare native identities in
+// `rk-cli/tests/bbs_capture_export_cli.rs`.
