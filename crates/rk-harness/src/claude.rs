@@ -96,7 +96,7 @@ impl Harness for ClaudeHarness {
 
         let session = runner::launch(runner::Wiring {
             command: cmd,
-            parse: parse_event_line,
+            parse: Box::new(dedup_usage_parser()),
             steer_line: Some(control_message_line),
             resume: None,
         })?;
@@ -143,9 +143,20 @@ fn usage_from(value: &Value) -> TokenUsage {
 /// forward compatibility over strictness (the `capabilities` array in
 /// `system/init` is the place to detect protocol growth).
 pub(crate) fn parse_event_line(line: &str) -> Vec<HarnessEvent> {
+    parse_event_line_with_message_id(line).0
+}
+
+/// Same mapping as [`parse_event_line`], plus the assistant message id the
+/// line belongs to (when the line is an `assistant` record). Split out so
+/// [`dedup_usage_parser`] can key on the id without re-parsing the line's
+/// JSON a second time; `parse_event_line` itself stays a plain, stateless fn
+/// — the `fake` adapter's test harness reuses it directly and must keep
+/// emitting one `Usage` per line, unchanged.
+fn parse_event_line_with_message_id(line: &str) -> (Vec<HarnessEvent>, Option<String>) {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
+    let message_id = v["message"]["id"].as_str().map(String::from);
     let mut events = Vec::new();
     match v["type"].as_str() {
         Some("system") => match v["subtype"].as_str() {
@@ -192,7 +203,57 @@ pub(crate) fn parse_event_line(line: &str) -> Vec<HarnessEvent> {
         }),
         _ => {}
     }
-    events
+    (events, message_id)
+}
+
+/// Per-launch usage dedup for the Claude stream-json protocol. One assistant
+/// turn can be split across several stdout lines — one per content block
+/// (text, tool_use, ...) — and the CLI repeats that turn's full usage
+/// snapshot on every one of those lines. Counting `Usage` once per line (as
+/// [`parse_event_line`] does on its own) multiplies a turn's real usage by
+/// its content-block count. This wrapper forwards every event untouched
+/// except a repeated `Usage` for a `message.id` already seen, which it
+/// drops; `AssistantText`/`ToolUse`/everything else still comes through for
+/// every line, so no observed output is lost. The final `result` line's
+/// `Completed { usage, cost_usd, .. }` is a separate accounting scope (the
+/// session-level total, reported once by the CLI already) and is never
+/// touched here.
+///
+/// The seen-id set is a plain `HashSet`, not an evicting cache: an eviction
+/// policy would let a forgotten id's usage be recorded again on a later
+/// repeat, silently re-inflating the exact total this exists to fix. Its
+/// size is bounded by one launch's distinct assistant turns, not by session
+/// length, so it does not need one. Per-launch scope also matters in the
+/// other direction — this closure is built fresh inside
+/// [`ClaudeHarness::launch`] for every call, so a resumed or freshly spawned
+/// generation always starts with an empty set and never inherits another
+/// launch's seen ids.
+///
+/// A line whose assistant message carries no `id` (or that fails to parse
+/// one) is never deduped — with nothing to key on, under-counting real usage
+/// would be the worse failure mode, so the conservative default is to keep
+/// every such `Usage` event rather than risk dropping one that was never
+/// actually a repeat.
+fn dedup_usage_parser() -> impl FnMut(&str) -> Vec<HarnessEvent> + Send {
+    let mut seen_usage_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    move |line: &str| {
+        let (mut events, message_id) = parse_event_line_with_message_id(line);
+        let carries_usage = events
+            .iter()
+            .any(|event| matches!(event, HarnessEvent::Usage { .. }));
+        // Only mark an id "seen" once a Usage for it has actually been kept —
+        // never on bare id-sighting — so a message whose first line happens
+        // to omit usage can't poison a later line that carries the real
+        // snapshot into being wrongly treated as a repeat.
+        if carries_usage {
+            if let Some(id) = message_id {
+                if !seen_usage_ids.insert(id) {
+                    events.retain(|event| !matches!(event, HarnessEvent::Usage { .. }));
+                }
+            }
+        }
+        events
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +434,204 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
         assert_eq!(*cost_usd, Some(0.4523));
         assert_eq!(session_id.as_deref(), Some("abc-123"));
         assert_eq!(usage.output, 900);
+    }
+
+    /// The bug this ticket fixes: the real Claude CLI splits one assistant
+    /// turn across multiple stream-json lines (one per content block) and
+    /// repeats that turn's full usage snapshot on every line. Without dedup,
+    /// `parse_event_line` alone (what `dedup_usage_parser` wraps) would
+    /// report Usage twice here — this asserts that duplicated-fixture
+    /// behavior directly, so the case this ticket exists to fix is pinned
+    /// even though `parse_event_line` itself must stay stateless and
+    /// unchanged for `fake.rs`.
+    #[test]
+    fn undeduped_parser_double_counts_a_repeated_message_id() {
+        let text_line = r#"{"type":"assistant","message":{"id":"msg-dup","content":[{"type":"text","text":"first"}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704}}}"#;
+        let tool_line = r#"{"type":"assistant","message":{"id":"msg-dup","content":[{"type":"tool_use","name":"Bash","id":"t1","input":{}}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704}}}"#;
+        let usage_count = |events: &[HarnessEvent]| {
+            events
+                .iter()
+                .filter(|e| matches!(e, HarnessEvent::Usage { .. }))
+                .count()
+        };
+        let mut all = parse_event_line(text_line);
+        all.extend(parse_event_line(tool_line));
+        assert_eq!(
+            usage_count(&all),
+            2,
+            "documents the pre-fix bug: the stateless parser has no way to know these two lines belong to the same turn"
+        );
+    }
+
+    #[test]
+    fn dedup_parser_collapses_repeated_message_id_usage_but_keeps_all_content() {
+        let text_line = r#"{"type":"assistant","message":{"id":"msg-dup","content":[{"type":"text","text":"first"}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704}}}"#;
+        let tool_line = r#"{"type":"assistant","message":{"id":"msg-dup","content":[{"type":"tool_use","name":"Bash","id":"t1","input":{}}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704}}}"#;
+
+        let mut parse = dedup_usage_parser();
+        let first = parse(text_line);
+        let second = parse(tool_line);
+
+        assert!(
+            first
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::AssistantText { text } if text == "first")),
+            "text block must still come through"
+        );
+        assert_eq!(
+            first
+                .iter()
+                .filter(|e| matches!(e, HarnessEvent::Usage { .. }))
+                .count(),
+            1,
+            "first sighting of the id must keep its Usage"
+        );
+        assert!(
+            second
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::ToolUse { name } if name == "Bash")),
+            "tool block must still come through"
+        );
+        assert!(
+            !second.iter().any(|e| matches!(e, HarnessEvent::Usage { .. })),
+            "repeat sighting of the same id must drop its duplicate Usage"
+        );
+    }
+
+    #[test]
+    fn dedup_parser_counts_distinct_message_ids_separately() {
+        let first_line = r#"{"type":"assistant","message":{"id":"msg-a","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        let second_line = r#"{"type":"assistant","message":{"id":"msg-b","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+
+        let mut parse = dedup_usage_parser();
+        let first = parse(first_line);
+        let second = parse(second_line);
+
+        assert!(first.iter().any(|e| matches!(e, HarnessEvent::Usage { .. })));
+        assert!(
+            second.iter().any(|e| matches!(e, HarnessEvent::Usage { .. })),
+            "a different message id is a distinct turn, not a repeat"
+        );
+    }
+
+    #[test]
+    fn dedup_parser_never_inherits_state_across_a_fresh_launch() {
+        let line = r#"{"type":"assistant","message":{"id":"msg-shared","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+
+        let mut first_launch = dedup_usage_parser();
+        assert!(first_launch(line)
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::Usage { .. })));
+        assert!(
+            !first_launch(line)
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::Usage { .. })),
+            "same parser, same id repeated: usage must be dropped"
+        );
+
+        // A fresh call to dedup_usage_parser() — what ClaudeHarness::launch
+        // does on every invocation — starts a brand new seen-id set. The
+        // same message id that was already a "repeat" to `first_launch` must
+        // still be counted fresh here.
+        let mut second_launch = dedup_usage_parser();
+        assert!(
+            second_launch(line)
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::Usage { .. })),
+            "a new launch's parser must not inherit a previous launch's seen ids"
+        );
+    }
+
+    #[test]
+    fn dedup_parser_never_drops_usage_when_message_id_is_missing() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"no id here"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+
+        let mut parse = dedup_usage_parser();
+        for _ in 0..3 {
+            let events = parse(line);
+            assert!(
+                events.iter().any(|e| matches!(e, HarnessEvent::Usage { .. })),
+                "with no id to key on, the conservative choice is to never drop a Usage event"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_parser_leaves_the_final_result_usage_and_cost_untouched() {
+        let text_line = r#"{"type":"assistant","message":{"id":"msg-dup","content":[{"type":"text","text":"work"}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704}}}"#;
+        let tool_line = r#"{"type":"assistant","message":{"id":"msg-dup","content":[{"type":"tool_use","name":"Bash","id":"t1","input":{}}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704}}}"#;
+        let result_line = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"abc-123","total_cost_usd":0.4523,"usage":{"input_tokens":2000,"output_tokens":900,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+
+        let mut parse = dedup_usage_parser();
+        let _ = parse(text_line);
+        let _ = parse(tool_line);
+        let result_events = parse(result_line);
+
+        let [HarnessEvent::Completed {
+            cost_usd, usage, ..
+        }] = &result_events[..]
+        else {
+            panic!("expected Completed, got {result_events:?}");
+        };
+        assert_eq!(*cost_usd, Some(0.4523));
+        assert_eq!(usage.output, 900);
+    }
+
+    /// End-to-end through the real runner: a fake `claude` binary emits one
+    /// assistant turn as two stream-json lines sharing a message id (mirroring
+    /// the actual CLI's per-content-block framing) each carrying the full
+    /// turn usage, then a distinct second turn, then the result line. Exercises
+    /// `ClaudeHarness::launch` -> `runner::launch` -> the boxed dedup closure,
+    /// not just the pure parser function.
+    #[tokio::test]
+    async fn real_subprocess_stream_deduplicates_usage_through_the_runner() {
+        let events = run_fake(
+            r#"echo '{"type":"system","subtype":"init","session_id":"s-1"}'
+read -r _first_message
+echo '{"type":"assistant","message":{"id":"msg-1","content":[{"type":"text","text":"working"}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704}}}'
+echo '{"type":"assistant","message":{"id":"msg-1","content":[{"type":"tool_use","name":"Bash","id":"t1","input":{}}],"usage":{"input_tokens":2,"output_tokens":183,"cache_read_input_tokens":10019,"cache_creation_input_tokens":54704}}}'
+echo '{"type":"assistant","message":{"id":"msg-2","content":[{"type":"text","text":"done thinking"}],"usage":{"input_tokens":5,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s-1","total_cost_usd":0.4523,"usage":{"input_tokens":2000,"output_tokens":900,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'"#,
+        )
+        .await;
+
+        let text_count = events
+            .iter()
+            .filter(|e| matches!(e, HarnessEvent::AssistantText { .. }))
+            .count();
+        let tool_count = events
+            .iter()
+            .filter(|e| matches!(e, HarnessEvent::ToolUse { .. }))
+            .count();
+        let usage_events: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::Usage { usage } => Some(usage),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(text_count, 2, "both AssistantText blocks must still arrive");
+        assert_eq!(tool_count, 1, "the ToolUse block must still arrive");
+        assert_eq!(
+            usage_events.len(),
+            2,
+            "msg-1's usage counted once despite two lines, plus msg-2's own usage"
+        );
+        assert_eq!(usage_events[0].output, 183, "msg-1's usage, kept once");
+        assert_eq!(usage_events[1].output, 10, "msg-2's distinct usage");
+
+        let completed = events.iter().find_map(|e| match e {
+            HarnessEvent::Completed {
+                cost_usd, usage, ..
+            } => Some((*cost_usd, usage.output)),
+            _ => None,
+        });
+        assert_eq!(
+            completed,
+            Some((Some(0.4523), 900)),
+            "the final result's own usage/cost is untouched by turn-level dedup"
+        );
     }
 
     #[test]

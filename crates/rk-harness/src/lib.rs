@@ -395,8 +395,12 @@ pub(crate) mod runner {
 
     pub struct Wiring {
         pub command: Command,
-        /// Parse one stdout line into zero or more events.
-        pub parse: fn(&str) -> Vec<HarnessEvent>,
+        /// Parse one stdout line into zero or more events. Boxed (rather than
+        /// a bare fn pointer) so an adapter can close over per-launch state —
+        /// e.g. Claude's usage-dedup id set — without a wiring-level cache
+        /// keyed by adapter kind. A stateless adapter just boxes its plain fn;
+        /// `Box<dyn FnMut>` calls through to it exactly as a fn pointer would.
+        pub parse: Box<dyn FnMut(&str) -> Vec<HarnessEvent> + Send>,
         /// Map a steer message to a stdin line, if the adapter supports it.
         pub steer_line: Option<fn(&ControlEnvelope) -> String>,
         /// Optional safe-turn handoff for adapters whose live process has no
@@ -457,7 +461,7 @@ pub(crate) mod runner {
     #[allow(clippy::too_many_arguments)]
     async fn drain_stdout(
         stdout: &mut Option<tokio::io::Lines<BufReader<ChildStdout>>>,
-        parse: fn(&str) -> Vec<HarnessEvent>,
+        parse: &mut (dyn FnMut(&str) -> Vec<HarnessEvent> + Send),
         event_tx: &mpsc::Sender<HarnessEvent>,
         awaiting_ack: &mut Option<ControlEnvelope>,
         awaiting_ack_started: &mut bool,
@@ -600,7 +604,7 @@ pub(crate) mod runner {
         let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
         let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
 
-        let parse = wiring.parse;
+        let mut parse = wiring.parse;
         let steer_line = wiring.steer_line;
 
         // Drained on its own task, mirroring stdout: stderr is diagnostic
@@ -787,7 +791,7 @@ pub(crate) mod runner {
         let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
         let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
         let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
-        let parse = wiring.parse;
+        let mut parse = wiring.parse;
         let resume_command = resume.command;
 
         tokio::spawn(async move {
@@ -914,7 +918,7 @@ pub(crate) mod runner {
                                 async {
                                     drain_stdout(
                                         &mut stdout,
-                                        parse,
+                                        &mut parse,
                                         &event_tx,
                                         &mut awaiting_ack,
                                         &mut awaiting_ack_started,
@@ -945,7 +949,7 @@ pub(crate) mod runner {
                             async {
                                 drain_stdout(
                                     &mut stdout,
-                                    parse,
+                                    &mut parse,
                                     &event_tx,
                                     &mut awaiting_ack,
                                     &mut awaiting_ack_started,

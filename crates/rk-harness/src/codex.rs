@@ -93,7 +93,7 @@ impl Harness for CodexHarness {
 
         let session = runner::launch(runner::Wiring {
             command: cmd,
-            parse: parse_event_line,
+            parse: Box::new(parse_event_line),
             steer_line: None,
             resume: Some(runner::ResumeWiring {
                 command: Arc::new(move |session_id, envelope| {
@@ -475,7 +475,7 @@ echo '{"type":"item.completed","item":{"item_type":"agent_message","text":"final
         cmd.args(["-c", script]);
         let session = runner::launch(runner::Wiring {
             command: cmd,
-            parse: parse_event_line,
+            parse: Box::new(parse_event_line),
             steer_line: None,
             resume: None,
         })
