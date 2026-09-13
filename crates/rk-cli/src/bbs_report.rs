@@ -4125,8 +4125,11 @@ mod tests {
         }
         TupleCapture {
             order,
+            order_claim_rejected: None,
             tuples,
+            references: Vec::new(),
             truncated: false,
+            coverage: CaptureCoverage::default(),
             source: None,
         }
     }
@@ -4645,6 +4648,380 @@ mod tests {
         });
         let parsed = parse_tuple_capture(&envelope).unwrap();
         assert_eq!(parsed.order, Order::PersistenceSequence);
+    }
+
+    /// Stamps `commit_sequence` the way the daemon does, so an `order`
+    /// claim has something to be checked against.
+    fn sequenced(records: Vec<Value>, start: u64) -> Vec<Value> {
+        records
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r["commit_sequence"] = json!(start + i as u64);
+                r
+            })
+            .collect()
+    }
+
+    /// A real `bbs.export` envelope, shaped as `rk-daemon`'s `bbs.rs`
+    /// emits it: the page in `tuples`, the resolved evidence closure in
+    /// `references` (id-sorted, each carrying its own AS-OF sequence), and a
+    /// `coverage` block stating whether that closure is complete.
+    fn export_envelope(page: Vec<Value>, references: Vec<Value>, missing: Vec<&str>) -> Value {
+        let complete = missing.is_empty();
+        json!({
+            "schema_version": 1,
+            "kind": "bbs.export",
+            "repo": "repo",
+            "order": "persistence_sequence",
+            "order_provenance": "tuple_persistence_events.commit_sequence ascending",
+            "source": "space.persistence_page",
+            "truncated": false,
+            "tuples": sequenced(page, 1),
+            "references": sequenced(references, 1_000),
+            "coverage": {
+                "missing_references": missing,
+                "complete": complete,
+                "reference_budget_exhausted": false,
+                "scope": "repo",
+            },
+        })
+    }
+
+    /// The evidence a receipt and a verdict name does not have to be on the
+    /// page: the daemon resolves it into `references`. A reporter that reads
+    /// only `tuples` treats that evidence as ABSENT and throws the verdict
+    /// away — the whole point of shipping the closure.
+    #[test]
+    fn export_references_are_merged_so_linked_evidence_resolves() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let evidence: Vec<Value> = ["ev-1", "ev-2", "ev-3"]
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id, "category": "artifact", "scope": "repo", "identity": id,
+                    "instance": "x", "created_at": "2026-01-01T00:00:00Z", "payload": {}
+                })
+            })
+            .collect();
+        let envelope = export_envelope(verified_tuples(), evidence, vec![]);
+        let c = parse_tuple_capture(&envelope).unwrap();
+        assert_eq!(c.order, Order::PersistenceSequence);
+        assert_eq!(c.references.len(), 3);
+
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(c.tuples.len(), 5, "the evidence is NOT on the page");
+        assert_eq!(r.capture.references_merged, 3);
+        assert_eq!(r.capture.duplicate_references, 0);
+        assert_eq!(r.capture.closure_complete, Some(true));
+        assert_eq!(
+            r.pairs[0].assessed_verdict.as_deref(),
+            Some("verified"),
+            "the verdict's evidence resolved out of the closure, not the page"
+        );
+        assert_eq!(r.outcome_classes.verified, 1);
+        assert!(r.mechanism.goal_blocked_reason.is_none());
+    }
+
+    /// The same envelope with the closure UNRESOLVED. An unresolvable
+    /// reference is a hole in the capture, not proof the evidence never
+    /// existed: the verdict drops to unresolved, the hole is named, and the
+    /// mechanism goal is blocked exactly as truncation blocks it.
+    #[test]
+    fn incomplete_closure_is_reported_and_blocks_the_mechanism_goal() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let envelope = export_envelope(verified_tuples(), vec![], vec!["ev-2"]);
+        let c = parse_tuple_capture(&envelope).unwrap();
+        let r = compute(&m, &c, &[]).unwrap();
+
+        assert_eq!(r.capture.closure_complete, Some(false));
+        assert_eq!(r.capture.missing_references, vec!["ev-2".to_string()]);
+        assert!(
+            r.unresolved_records
+                .iter()
+                .any(|u| u.record == "ev-2" && u.kind == "missing_reference"),
+            "the hole is named: {:?}",
+            r.unresolved_records
+        );
+        let blocked = r
+            .mechanism
+            .goal_blocked_reason
+            .expect("an incomplete closure cannot certify the goal");
+        assert!(blocked.contains("incomplete evidence closure"), "{blocked}");
+        assert!(!r.mechanism.goal_met);
+    }
+
+    /// `order: "persistence_sequence"` is a string anyone can write into an
+    /// envelope. It is accepted only when the records carry the ascending
+    /// `commit_sequence` positions that make it true — otherwise the capture
+    /// is downgraded to unknown order WITH the refusal reason, rather than
+    /// silently resolving supersession off an unproven claim.
+    #[test]
+    fn unsubstantiated_persistence_order_claim_is_refused() {
+        let bare = json!({
+            "order": "persistence_sequence",
+            "tuples": [finding("src-1", "author-gen", "2026-01-01T00:00:00Z")],
+        });
+        let c = parse_tuple_capture(&bare).unwrap();
+        assert_eq!(c.order, Order::Unknown, "no commit_sequence to check");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("no numeric commit_sequence")));
+
+        let mut out_of_order = export_envelope(
+            vec![
+                finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+                finding("src-2", "author-gen", "2026-01-01T00:00:00Z"),
+            ],
+            vec![],
+            vec![],
+        );
+        out_of_order["tuples"][1]["commit_sequence"] = json!(1);
+        let c = parse_tuple_capture(&out_of_order).unwrap();
+        assert_eq!(c.order, Order::Unknown, "not ascending");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("not in ascending persistence order")));
+
+        let mut unplaced = export_envelope(
+            vec![finding("src-1", "author-gen", "2026-01-01T00:00:00Z")],
+            vec![json!({
+                "id": "ev-1", "category": "artifact", "scope": "repo", "identity": "ev-1",
+                "instance": "x", "created_at": "2026-01-01T00:00:00Z", "payload": {}
+            })],
+            vec![],
+        );
+        unplaced["references"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("commit_sequence");
+        let c = parse_tuple_capture(&unplaced).unwrap();
+        assert_eq!(c.order, Order::Unknown, "a reference has no position");
+        assert!(c
+            .order_claim_rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("reference record")));
+    }
+
+    /// A legacy raw `rk --json scan` object still parses, still reports
+    /// unknown order, and is NOT refused: compatibility without inventing a
+    /// persistence order the shape cannot supply.
+    #[test]
+    fn legacy_raw_scan_is_unknown_order_without_a_refusal() {
+        let scan = json!({"tuples": [], "truncated": false});
+        let c = parse_tuple_capture(&scan).unwrap();
+        assert_eq!(c.order, Order::Unknown);
+        assert_eq!(c.order_claim_rejected, None);
+        assert_eq!(c.coverage.complete, None, "a scan makes no closure claim");
+    }
+
+    /// A generation observed ONLY through its launch event — spawned and
+    /// still running, or crashed before any completion, exit or usage was
+    /// recorded — is a real enrolled attempt. Seeding deliveries from
+    /// completions/exits/usage alone dropped it entirely.
+    #[test]
+    fn a_generation_with_only_a_launch_event_is_still_an_enrolled_attempt() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-live".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let spawned = json!({
+            "id": "e1", "category": "event", "scope": "repo", "identity": "agent_spawned",
+            "instance": CASTLE, "created_at": "2026-01-01T00:00:00Z",
+            "payload": {"agent": "Live-1", "spawn": "gen-live", "task": "TKT-live"}
+        });
+        let r = compute(&m, &capture(vec![spawned], Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.generations.len(), 1, "the live generation is retained");
+        assert_eq!(d.generations[0].spawn, "gen-live");
+        assert_eq!(d.launches, 1, "a launch with no exit is still an attempt");
+        assert_eq!(d.exits, 0);
+        assert_eq!(d.generations[0].launches[0].session, None);
+        assert_eq!(d.generations[0].launches[0].observed_via, "launch_event");
+        assert!(
+            r.tasks_without_native_records.is_empty(),
+            "the task DOES have a native record"
+        );
+    }
+
+    /// Two launches, one exited and one still live. Counting exits reported
+    /// one attempt; the second launch event is the excess over the sessions
+    /// already accounted for and is counted as the attempt it is.
+    #[test]
+    fn a_relaunch_with_no_exit_yet_is_counted_as_a_further_attempt() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-relaunch".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let event = |id: &str, identity: &str, at: &str| {
+            json!({
+                "id": id, "category": "event", "scope": "repo", "identity": identity,
+                "instance": CASTLE, "created_at": at,
+                "payload": {"agent": "R-1", "spawn": "gen-r", "task": "TKT-relaunch"}
+            })
+        };
+        let tuples = vec![
+            event("e1", "agent_spawned", "2026-01-01T00:00:00Z"),
+            event("e2", "agent_respawned", "2026-01-01T02:00:00Z"),
+            agent_exit(
+                "x1",
+                "repo",
+                "TKT-relaunch",
+                "R-1",
+                "gen-r",
+                "sess-1",
+                Some("2026-01-01T00:00:00Z"),
+                Some("2026-01-01T01:00:00Z"),
+                None,
+                false,
+                None,
+                "2026-01-01T01:00:00Z",
+            ),
+        ];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.exits, 1);
+        assert_eq!(d.launches, 2, "the un-exited relaunch is not dropped");
+        let sessions: Vec<Option<String>> = d.generations[0]
+            .launches
+            .iter()
+            .map(|l| l.session.clone())
+            .collect();
+        assert_eq!(sessions, vec![None, Some("sess-1".into())]);
+    }
+
+    /// Within one provider segment the reported cost is CUMULATIVE, so the
+    /// segment's total is whichever record persisted last. `observed_at` is
+    /// stamped by the producer and can disagree with persistence order; under
+    /// a validated capture the position decides.
+    #[test]
+    fn cumulative_segment_total_comes_from_persistence_position_not_observed_at() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-cost".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let usage = |id: &str, cost: f64, observed: &str| {
+            agent_final_usage(
+                id,
+                "repo",
+                "TKT-cost",
+                "gen-c",
+                "sess-1",
+                Some("ps-1"),
+                Some("completed"),
+                Some(cost),
+                PROVIDER_COST_BASIS,
+                observed,
+                observed,
+            )
+        };
+        let exit = agent_exit(
+            "x1",
+            "repo",
+            "TKT-cost",
+            "C-1",
+            "gen-c",
+            "sess-1",
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-01T03:00:00Z"),
+            Some("completed"),
+            false,
+            None,
+            "2026-01-01T03:00:00Z",
+        );
+        // Page order (= persistence order) puts the 2.00 total LAST, while
+        // its observed_at is EARLIER than the 1.00 row's.
+        let page = vec![
+            usage("u1", 1.00, "2026-01-01T02:00:00Z"),
+            usage("u2", 2.00, "2026-01-01T01:00:00Z"),
+            exit,
+        ];
+        let c = parse_tuple_capture(&export_envelope(page.clone(), vec![], vec![])).unwrap();
+        assert_eq!(c.order, Order::PersistenceSequence);
+        let r = compute(&m, &c, &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(
+            d.reported_cost_estimate_usd,
+            Some(2.00),
+            "the last PERSISTED cumulative total, not the latest observed_at"
+        );
+
+        // The same records with no order claim: the last row is genuinely
+        // unidentifiable, so the segment is refused finality instead of
+        // being resolved by a field that cannot answer the question.
+        let unordered = compute(&m, &capture(page, Order::Unknown), &[]).unwrap();
+        let d = &unordered.deliveries[0];
+        assert_eq!(d.cost_coverage, "partial");
+        assert_eq!(d.reported_cost_estimate_usd, None);
+        assert!(
+            d.unknown_cost
+                .iter()
+                .any(|u| u.contains("no validated persistence order")),
+            "{:?}",
+            d.unknown_cost
+        );
+    }
+
+    /// A single-row segment IS its own last record whatever the order, so an
+    /// unordered capture must not manufacture a finality gap for it.
+    #[test]
+    fn a_single_row_segment_stays_final_under_unknown_order() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-one".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let tuples = vec![
+            agent_final_usage(
+                "u1",
+                "repo",
+                "TKT-one",
+                "gen-o",
+                "sess-1",
+                Some("ps-1"),
+                Some("completed"),
+                Some(0.75),
+                PROVIDER_COST_BASIS,
+                "2026-01-01T01:00:00Z",
+                "2026-01-01T01:00:00Z",
+            ),
+            agent_exit(
+                "x1",
+                "repo",
+                "TKT-one",
+                "O-1",
+                "gen-o",
+                "sess-1",
+                Some("2026-01-01T00:00:00Z"),
+                Some("2026-01-01T02:00:00Z"),
+                Some("completed"),
+                false,
+                None,
+                "2026-01-01T02:00:00Z",
+            ),
+        ];
+        let r = compute(&m, &capture(tuples, Order::Unknown), &[]).unwrap();
+        let d = &r.deliveries[0];
+        assert_eq!(d.cost_coverage, "complete");
+        assert_eq!(d.reported_cost_estimate_usd, Some(0.75));
     }
 
     #[test]
