@@ -507,8 +507,16 @@ pub struct FinalUsage {
     pub basis: rk_core::bbs::CostBasis,
     pub provenance: String,
     pub usage: Option<serde_json::Value>,
-    pub state: String,
-    pub declared_done: bool,
+    /// The record state this result settled, or `None` when it cannot be
+    /// attributed to this launch. Lifecycle state lives on the NAME-keyed
+    /// `AgentRecord`, so a result arriving for a superseded launch would read
+    /// the successor's state; omitted rather than misattributed.
+    pub state: Option<String>,
+    /// Whether the launch declared its own `rk done` — also read off the
+    /// name-keyed record, so also `None` for a superseded launch.
+    pub declared_done: Option<bool>,
+    /// This result arrived for a launch that had already been superseded.
+    pub stale_session: bool,
 }
 
 /// Record the final reported usage/cost for one `(spawn, session)` attempt.
@@ -537,8 +545,13 @@ pub fn record_final_usage(
         "session": binding.session,
         "provider_session": binding.provider_session,
         "observed_at": chrono::Utc::now().to_rfc3339(),
+        // `null` = not attributable to this launch (see `FinalUsage::state`);
+        // a consumer must read that as unknown, never as a state of its own.
         "state": final_usage.state,
         "declared_done": final_usage.declared_done,
+        // This result arrived after the launch was superseded, so nothing that
+        // lives on the name-keyed record is attributed to it.
+        "stale_session": final_usage.stale_session,
         "cost_usd": final_usage.cost_usd,
         "cost_basis": final_usage.basis.as_str(),
         "cost_provenance": final_usage.provenance,
@@ -574,8 +587,8 @@ pub fn record_exit(
     castle: &str,
     binding: &AttemptBinding,
     exit_code: Option<i32>,
-    crashed: bool,
-    prior_state: &str,
+    crashed: Option<bool>,
+    prior_state: Option<&str>,
     launched_at: Option<String>,
     cost_coverage: &str,
     stale_session: bool,
@@ -592,6 +605,10 @@ pub fn record_exit(
         "exited_at": chrono::Utc::now().to_rfc3339(),
         // `null` means signal-terminated, which is NOT the same as exit 0.
         "exit_code": exit_code,
+        // Both are read off the NAME-keyed `AgentRecord`, which a successor
+        // launch owns once it takes the name. For a superseded launch's late
+        // exit they are therefore `null` — omitted rather than borrowed from
+        // whichever record holds the name now.
         "crashed": crashed,
         "prior_state": prior_state,
         "launched_at": launched_at,
