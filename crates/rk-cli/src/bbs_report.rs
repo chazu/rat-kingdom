@@ -1342,6 +1342,14 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
+            // The frozen window is enforced here exactly as it is for every
+            // other native observation (exposure/open/launch events): a
+            // receipt created outside it is excluded and counted under
+            // `observations_out_of_window`, not silently admitted as a valid
+            // claim (review 01M2CS8FMFPCPZKFPM65VGV5BH, TKT-figil-fobud-niluk).
+            if !admit(&mut idx, t) {
+                continue;
+            }
             // A receipt authored by a generation is itself proof the
             // generation ran, so it also serves as launch evidence.
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
@@ -1367,6 +1375,11 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                     kind: ASSESSMENT.into(),
                     reason,
                 });
+                continue;
+            }
+            // Same window enforcement as REUSE above: an out-of-window verdict
+            // must not be admitted as a valid assessment.
+            if !admit(&mut idx, t) {
                 continue;
             }
             let receipt = str_field(t, &["payload", "receipt"]).to_string();
@@ -3428,6 +3441,129 @@ mod tests {
         let r = compute(&m, &capture(verified_tuples(), Order::Unknown), &[]).unwrap();
         assert_eq!(only(&r).coverage_status, "unknown");
         assert!(r.capture.observations_out_of_window >= 1);
+    }
+
+    /// `build_index` validates a REUSE/ASSESSMENT record's shape but must also
+    /// apply the SAME frozen window used for every other native observation
+    /// (exposure/open/launch events) — otherwise a receipt or verdict from
+    /// outside the batch window is silently admitted as a valid claim
+    /// (review 01M2CS8FMFPCPZKFPM65VGV5BH, TKT-figil-fobud-niluk).
+    #[test]
+    fn reuse_created_before_the_frozen_window_does_not_count_as_a_claim() {
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some("2026-01-02T00:00:00Z".parse().unwrap()),
+            until: None,
+        };
+        // The reuse itself is dated BEFORE the frozen window opened.
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-01T12:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let before = c.tuples.len();
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(before, c.tuples.len(), "sanity: capture untouched");
+        assert_eq!(r.claimed, 0, "the out-of-window reuse must not be a claim");
+        assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, 0);
+        assert_eq!(only(&r).claimed_outcome, None);
+        assert!(r.capture.observations_out_of_window >= 1);
+        // The eligible opportunity itself is untouched — only the bad claim is
+        // dropped, matching the excluded/rejected_claims split elsewhere.
+        assert_eq!(r.eligible, 1);
+    }
+
+    #[test]
+    fn reuse_created_after_the_frozen_window_does_not_count_as_a_claim() {
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: None,
+            until: Some("2026-01-01T18:00:00Z".parse().unwrap()),
+        };
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-01T12:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.claimed, 0);
+        assert_eq!(only(&r).claimed_outcome, None);
+        assert!(r.capture.observations_out_of_window >= 1);
+        assert_eq!(r.eligible, 1);
+    }
+
+    #[test]
+    fn assessment_outside_the_frozen_window_does_not_certify_a_verdict() {
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some("2026-01-02T12:00:00Z".parse().unwrap()),
+            until: None,
+        };
+        let tuples = vec![
+            finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+            // The reuse is inside the window; only the assessment is not.
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T13:00:00Z",
+            ),
+            assessment("a1", "r1", "verified", "2026-01-02T00:00:00Z"),
+        ];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.claimed, 1, "the reuse itself is a valid, in-window claim");
+        assert_eq!(
+            r.assessed, 0,
+            "the out-of-window assessment must not certify a verdict"
+        );
+        assert_eq!(only(&r).assessed_verdict, None);
+        assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, 0);
+        assert!(r.capture.observations_out_of_window >= 1);
+    }
+
+    #[test]
+    fn an_undated_reuse_or_assessment_is_unresolved_not_silently_admitted() {
+        // Undated only differs from Inside once a window is actually
+        // declared — an undeclared window treats everything as Inside, same
+        // as every other native observation.
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            until: None,
+        };
+        let mut r1 = reuse(
+            "r1",
+            "src-1",
+            "TKT-1",
+            "gen-1",
+            "used",
+            "2026-01-02T00:00:00Z",
+        );
+        r1.as_object_mut().unwrap().remove("created_at");
+        let tuples = vec![finding("src-1", "author-gen", "2026-01-01T00:00:00Z"), r1];
+        let c = capture(tuples, Order::Unknown);
+        let r = compute(&m, &c, &[]).unwrap();
+        assert_eq!(r.claimed, 0);
+        assert_eq!(r.capture.observations_undated, 1);
     }
 
     #[test]
