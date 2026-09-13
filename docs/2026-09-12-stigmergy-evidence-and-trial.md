@@ -108,13 +108,17 @@ human output use the same result. Reports preserve record IDs and reasons for
 excluded/unknown observations instead of silently manufacturing zeroes.
 
 The versioned manifest freezes experiment ID, arms/batches, repository scopes,
-consumer task and generation IDs, build/model/harness/check/WIP identity, window,
-quality criteria, and goals. An eligible opportunity is an independently reviewed
+selected consumer task IDs, build/model/harness/check/WIP identity, window,
+quality criteria, eligibility rules and goals. Native generations are enrolled
+from actual spawn evidence after dispatch; a frozen plan cannot predict a future
+spawn or source tuple ID. An eligible opportunity is an independently reviewed
 source/consumer pair: source existed before the relevant decision, applies to the
 task, and is not the consumer's own work. Reviews record relevant source IDs,
-decision/effect evidence, author-terminal evidence and missing coverage. Review
-annotations are explicitly operator judgments, not daemon facts. Freeze selection
-rules before each batch; retrospective annotations cannot change those rules.
+decision/effect evidence, author-terminal evidence and missing coverage. Reviews
+may annotate newly discovered source/consumer pairs under the frozen task scope
+and eligibility rules. Predeclared pairs remain useful for fixtures and replays.
+Review annotations are explicitly operator judgments, not daemon facts. Freeze
+selection rules before each batch; retrospective annotations cannot change them.
 
 The exporter saves native tuples and lifecycle/delivery/cost evidence with a
 bounded scope and explicit coverage metadata. Immutable snapshots identify their
@@ -122,6 +126,13 @@ capture time/build and tuple persistence sequence. The report accepts the actual
 native tuple-list JSON shape; it must not require hand-transcribed synthetic
 events in order to evaluate a live run. Run-specific annotations supply consumer
 outcomes and independently checked eligibility, each with evidence references.
+
+S2 supplies `rk bbs export --repo REPO` / `bbs.export` as the bounded native
+capture surface, using the existing persistence-ordered read. The envelope names
+its order, boundary and truncation/coverage explicitly. Plain legacy `rk scan`
+output remains readable, but its tuple-ID order cannot establish which of two
+assessments was persisted last; retain that ambiguity. Export source/evidence
+artifacts along with BBS records or mark incomplete references explicitly.
 
 Required results:
 
@@ -180,6 +191,15 @@ rework and interference. Small samples yield descriptive evidence, not a broad
 statistical productivity claim. A null/negative result is an honest completed
 experiment and must be retained, investigated and reported, not relabeled green.
 
+For this comparison, both arms run the same installed candidate. An isolated,
+operator-owned harness wrapper removes only the distinctly headed `Reusable
+findings` guidance fragment for the baseline arm; treatment preserves it. The
+wrapper must match exactly one fragment, preserve every authority/task/BBS
+instruction outside it, retain argv and stdin/stdout, and record prompt/fragment
+hashes. It is never installed as the production harness. This measures the
+incremental effect of early-publication/reuse guidance with identical product
+capabilities, not the total effect of having any shared memory.
+
 ## Implementation tickets and ordering
 
 1. **S1 — Findings and independently assessed artifact reuse.** Complete core,
@@ -231,3 +251,11 @@ The execution ledger and ticket IDs are appended below as work proceeds.
 
 Initial source: `8e0cccf`; installed daemon: `72911dd1d382`. No live
 workers and no landing queue entries at preflight. Artifact directory: `/Users/chazu/.codex/artifacts/rk-stigmergy-20260913T022353Z`.
+
+- S1 test tracking: `TKT-lakir-sosit-novug` — created by the first worker at its committed checkpoint; the operator resumed S1 to finish these same acceptance tests before delivery. It is not independent delivered work.
+- S3 correction: `TKT-nonub-pugar-pilid` — operator review found incomplete native identity/scope validation and experiment denominators. Required before S4; retains the existing experiment criteria.
+
+S1 checkpoint `4f8cfb1` was committed with unit checks but lacked real-CLI
+integration/restart/authority coverage; resumed in its preserved worktree. S3
+checkpoint `43faffe` passed scoped checks and entered the normal landing gate.
+The operator review above is a deployment prerequisite, not a passing trial.

@@ -1165,6 +1165,43 @@ impl Store {
             .map_err(sql_err)
     }
 
+    /// Bounded, indexed lookup of the live commit sequence for a small,
+    /// known set of ids — `id` is the `tuples` table's primary key and
+    /// `commit_sequence` is populated on every row by the assignment
+    /// trigger, so this is `O(len(ids))` work regardless of total journal
+    /// size. Use this instead of scanning `persistence_delta`/the immutable
+    /// journal to order a handful of records by actual persistence order.
+    pub fn commit_sequences(
+        &self,
+        ids: &[RecordId],
+    ) -> rk_core::Result<std::collections::HashMap<RecordId, u64>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, commit_sequence FROM tuples \
+             WHERE id IN ({placeholders}) AND commit_sequence IS NOT NULL"
+        );
+        let mut statement = self.conn.prepare(&sql).map_err(sql_err)?;
+        let params: Vec<String> = ids.iter().map(RecordId::to_string).collect();
+        let rows = statement
+            .query_map(params_from_iter(params.iter()), |row| {
+                let id: String = row.get(0)?;
+                let sequence: i64 = row.get(1)?;
+                Ok((id, sequence))
+            })
+            .map_err(sql_err)?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, sequence) = row.map_err(sql_err)?;
+            if let Ok(id) = id.parse::<RecordId>() {
+                out.insert(id, sequence as u64);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn delete(&self, id: RecordId) -> rk_core::Result<bool> {
         let n = self
             .conn
