@@ -393,14 +393,16 @@ pub(crate) mod runner {
     /// the child's stderr pipe never stalls.
     const STDERR_BACKLOG_CAP: usize = 256;
 
+    /// Parse one stdout line into zero or more events. Boxed (rather than a
+    /// bare fn pointer) so an adapter can close over per-launch state — e.g.
+    /// Claude's usage-dedup id set — without a wiring-level cache keyed by
+    /// adapter kind. A stateless adapter just boxes its plain fn; `ParseFn`
+    /// calls through to it exactly as a fn pointer would.
+    pub type ParseFn = Box<dyn FnMut(&str) -> Vec<HarnessEvent> + Send>;
+
     pub struct Wiring {
         pub command: Command,
-        /// Parse one stdout line into zero or more events. Boxed (rather than
-        /// a bare fn pointer) so an adapter can close over per-launch state —
-        /// e.g. Claude's usage-dedup id set — without a wiring-level cache
-        /// keyed by adapter kind. A stateless adapter just boxes its plain fn;
-        /// `Box<dyn FnMut>` calls through to it exactly as a fn pointer would.
-        pub parse: Box<dyn FnMut(&str) -> Vec<HarnessEvent> + Send>,
+        pub parse: ParseFn,
         /// Map a steer message to a stdin line, if the adapter supports it.
         pub steer_line: Option<fn(&ControlEnvelope) -> String>,
         /// Optional safe-turn handoff for adapters whose live process has no
