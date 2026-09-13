@@ -153,14 +153,19 @@ async fn try_connect_or_report_still_times_out_when_the_daemon_neither_connects_
 async fn race_attempt_or_report_lets_a_slow_but_healthy_attempt_finish_instead_of_cancelling_it() {
     // Regression for a real defect caught in review: an earlier version
     // wrapped each individual attempt in its own `poll_interval`-sized
-    // `tokio::time::timeout`, which would cancel a real connect/auth
-    // handshake that is merely slow under load (exactly the condition this
-    // instrumentation exists to survive) before it ever got a chance to
-    // succeed. This fake attempt only ever returns `Some` on its FIRST call,
-    // and only after sleeping well past `poll_interval` — under the buggy
-    // per-attempt-timeout design, that first attempt would have been
+    // `tokio::time::timeout`, which would cancel a real connect attempt that
+    // is merely pending/slow under load before it ever got a chance to
+    // succeed. `Client::connect_as_operator` itself does no server
+    // handshake (it opens the socket and reads local identity), so this
+    // fake attempt is a simulated pending attempt, not a reproduced
+    // production round trip — it only ever returns `Some` on its FIRST
+    // call, and only after sleeping well past `poll_interval`. Under the
+    // buggy per-attempt-timeout design, that first attempt would have been
     // cancelled and every subsequent call would return `None` immediately,
     // spinning until `deadline` and reporting `TimedOut` instead of success.
+    // The existing five-test journey in verification_saturation_regression.rs
+    // already exercises the real `Client`/Unix-socket connect path via
+    // `connect_or_report`, so this is deliberately not duplicated here.
     let mut handle: tokio::task::JoinHandle<rk_core::Result<()>> =
         tokio::spawn(async { std::future::pending().await });
 

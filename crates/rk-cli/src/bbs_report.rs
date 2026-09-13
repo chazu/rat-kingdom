@@ -61,24 +61,138 @@ const ASSESSMENT: &str = "assessment";
 const EXPOSURE: &str = "exposure";
 const OPEN: &str = "open";
 
-/// The identity each BBS record kind is actually minted with by
-/// `crates/rk-daemon/src/bbs.rs`. A record whose identity does not carry its
-/// kind's prefix was not written by the BBS write path.
-///
-/// Read off the producers rather than off
-/// `rk_core::bbs::RESERVED_IDENTITY_PREFIXES`: the digest-suffixed kinds match
-/// that list, but `record_open` mints the fixed identity `"bbs-open"` with no
-/// trailing dash. Acceptance here has to match what is actually emitted.
-fn reserved_prefix(bbs_kind: &str) -> Option<&'static str> {
+// The two native observation kinds S2's published contract adds
+// (docs/2026-09-13-s2-native-observation-and-export-contract.md, consumed via
+// BBS artifact 01M2CF3RJHX58HH085WKZBJD9A).
+const AGENT_EXIT: &str = "agent_exit";
+const AGENT_FINAL_USAGE: &str = "agent_final_usage";
+
+/// `rk_core::action::canonical_digest` is a lowercase hex SHA-256, so every
+/// digest-keyed identity suffix is exactly this many lowercase hex characters.
+const DIGEST_HEX_LEN: usize = 64;
+/// Every `rk_daemon::bbs::ExposureSurface::as_str()` value.
+const EXPOSURE_SURFACES: [&str; 4] = ["spawn", "resume", "recovery", "brief"];
+/// A castle's wire author id is `castle-<first 16 hex of its Ed25519 key>`
+/// (`rk_core::identity::actor_from_pubkey`); a configured `castle_name` is a
+/// presentation-only alias `server.rs` never lets become the wire id.
+/// `"daemon"` is the literal author every non-supervisor span call site passes.
+const DAEMON_AUTHOR: &str = "daemon";
+const CASTLE_ACTOR_PREFIX: &str = "castle-";
+const CASTLE_ACTOR_HEX_LEN: usize = 16;
+
+fn is_lower_hex(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether `instance` has the shape of a daemon-side author. A SHAPE check
+/// over an offline export, NOT cryptographic proof — this module verifies no
+/// signature and cannot say so. What it does buy: a worker generation
+/// (`Scritch-15`) can never be mistaken for the castle that is the only
+/// legitimate author, and an unrecognized author stays a reported finding.
+fn is_castle_author(instance: &str) -> bool {
+    instance == DAEMON_AUTHOR
+        || instance
+            .strip_prefix(CASTLE_ACTOR_PREFIX)
+            .is_some_and(|hex| hex.len() == CASTLE_ACTOR_HEX_LEN && is_lower_hex(hex))
+}
+
+/// How a BBS record kind's identity is actually MINTED by
+/// `crates/rk-daemon/src/bbs.rs`. Flattening these three contracts into one
+/// `starts_with` is what let forged records in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeIdentity {
+    /// `format!("{prefix}{key}")` with `key` a `canonical_digest` over the
+    /// record's content, so the suffix is exactly [`DIGEST_HEX_LEN`] lowercase
+    /// hex characters — never a short readable token.
+    Digest(&'static str),
+    /// `format!("bbs-exposure-{}", surface.as_str())`: a closed four-value
+    /// suffix, and the SAME value the producer writes to `payload.surface`.
+    Surface(&'static str),
+    /// One FIXED identity, written bare and complete (`bbs-open`,
+    /// `bbs-agent-exit`, `bbs-agent-final-usage`). No producer appends
+    /// anything, so any longer string is forged authority, not a variant.
+    Exact(&'static str),
+}
+
+/// Read off the producers, not off `rk_core::bbs::RESERVED_IDENTITY_PREFIXES`:
+/// that list is a `starts_with` DENY list for the agent write path, where
+/// matching too much is safe. Reusing it as an ACCEPT rule is the defect this
+/// fixes — `bbs-agent-exit-forged` is correctly refused a write by the deny
+/// list and was then wrongly admitted here as an `agent_exit`.
+fn native_identity(bbs_kind: &str) -> Option<NativeIdentity> {
+    use NativeIdentity::{Digest, Exact, Surface};
     match bbs_kind {
-        FINDING => Some("bbs-finding-"),
-        ANSWER => Some("bbs-answer-"),
-        REUSE => Some("bbs-reuse-"),
-        ASSESSMENT => Some("bbs-assessment-"),
-        EXPOSURE => Some("bbs-exposure-"),
-        OPEN => Some("bbs-open"),
+        FINDING => Some(Digest("bbs-finding-")),
+        ANSWER => Some(Digest("bbs-answer-")),
+        REUSE => Some(Digest("bbs-reuse-")),
+        ASSESSMENT => Some(Digest("bbs-assessment-")),
+        EXPOSURE => Some(Surface("bbs-exposure-")),
+        OPEN => Some(Exact("bbs-open")),
+        AGENT_EXIT => Some(Exact("bbs-agent-exit")),
+        AGENT_FINAL_USAGE => Some(Exact("bbs-agent-final-usage")),
         _ => None,
     }
+}
+
+/// Why `t`'s identity is not one this `bbs_kind`'s producer could have minted.
+/// Each family keeps exactly its own producer's contract, so no real exported
+/// record is rejected: `Digest` still accepts ANY digest, but it must actually
+/// be one (`bbs-finding-x` is not something `canonical_digest` can return);
+/// `Surface` requires agreement between suffix and `payload.surface`, which
+/// one `as_str()` call makes unconditional, so it can only ever refuse a
+/// forgery; `Exact` is byte equality, having no variants to preserve.
+fn identity_defect(t: &Value, bbs_kind: &str) -> Option<String> {
+    let identity = str_field(t, &["identity"]);
+    let strip = |prefix: &str| -> Result<&str, String> {
+        identity.strip_prefix(prefix).ok_or_else(|| {
+            format!("identity {identity:?} does not carry the daemon-minted {prefix}* prefix")
+        })
+    };
+    match native_identity(bbs_kind)? {
+        NativeIdentity::Exact(exact) => {
+            if identity != exact {
+                return Some(format!(
+                    "identity {identity:?} is not the fixed daemon-minted identity {exact:?}; \
+                     this kind is written bare, so a suffixed variant is forged"
+                ));
+            }
+        }
+        NativeIdentity::Digest(prefix) => {
+            let key = match strip(prefix) {
+                Ok(key) => key,
+                Err(reason) => return Some(reason),
+            };
+            if key.len() != DIGEST_HEX_LEN || !is_lower_hex(key) {
+                return Some(format!(
+                    "identity {identity:?} suffix is not a canonical_digest: a native key is \
+                     {DIGEST_HEX_LEN} lowercase hex characters, this one is {} character(s)",
+                    key.len()
+                ));
+            }
+        }
+        NativeIdentity::Surface(prefix) => {
+            let key = match strip(prefix) {
+                Ok(key) => key,
+                Err(reason) => return Some(reason),
+            };
+            if !EXPOSURE_SURFACES.contains(&key) {
+                return Some(format!(
+                    "identity {identity:?} names surface {key:?}, which is not an exposure \
+                     surface this daemon prepares"
+                ));
+            }
+            let surface = str_field(t, &["payload", "surface"]);
+            if key != surface {
+                return Some(format!(
+                    "identity {identity:?} names surface {key:?} but payload.surface is \
+                     {surface:?}; the producer renders both from one value"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Native events that prove an agent generation actually started a process, so
@@ -1073,13 +1187,8 @@ fn artifact_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if bbs_kind != ANSWER && t["payload"]["schema_version"] != 1 {
         return Some("payload.schema_version is not 1".into());
     }
-    if let Some(prefix) = reserved_prefix(bbs_kind) {
-        let identity = str_field(t, &["identity"]);
-        if !identity.starts_with(prefix) {
-            return Some(format!(
-                "identity {identity:?} does not carry the daemon-minted {prefix}* prefix"
-            ));
-        }
+    if let Some(reason) = identity_defect(t, bbs_kind) {
+        return Some(reason);
     }
     let instance = str_field(t, &["instance"]);
     let agent = str_field(t, &["payload", "agent"]);
@@ -1101,7 +1210,9 @@ fn artifact_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
 /// `payload.agent`/`payload.spawn`/`payload.bound`. Reading `instance` as the
 /// consumer generation attributes the record to the wrong party. What is
 /// checked instead is that the tuple's scope agrees with the `repo` the daemon
-/// wrote into the payload.
+/// wrote into the payload, and that the author has the shape of a castle at
+/// all — otherwise a worker-authored row with a correct fixed identity could
+/// still manufacture an open, an author exit or a final cost.
 fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if t["category"] != "event" {
         return Some(format!(
@@ -1121,13 +1232,16 @@ fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
     if t["payload"]["schema_version"] != 1 {
         return Some("payload.schema_version is not 1".into());
     }
-    if let Some(prefix) = reserved_prefix(bbs_kind) {
-        let identity = str_field(t, &["identity"]);
-        if !identity.starts_with(prefix) {
-            return Some(format!(
-                "identity {identity:?} does not carry the daemon-minted {prefix}* prefix"
-            ));
-        }
+    if let Some(reason) = identity_defect(t, bbs_kind) {
+        return Some(reason);
+    }
+    let instance = str_field(t, &["instance"]);
+    if !is_castle_author(instance) {
+        return Some(format!(
+            "instance {instance:?} is not a castle author ({DAEMON_AUTHOR} or \
+             {CASTLE_ACTOR_PREFIX}<hex>); daemon telemetry is authored by the castle, never by \
+             the generation it describes"
+        ));
     }
     let scope = str_field(t, &["scope"]);
     let repo = str_field(t, &["payload", "repo"]);
@@ -2493,7 +2607,7 @@ mod tests {
             "id": id,
             "category": "artifact",
             "scope": "repo",
-            "identity": format!("bbs-finding-{id}"),
+            "identity": format!("bbs-finding-{}", digest_key(id)),
             "instance": "author",
             "lifecycle": "furniture",
             "created_at": created,
@@ -2524,7 +2638,7 @@ mod tests {
             "id": id,
             "category": "artifact",
             "scope": "repo",
-            "identity": format!("bbs-reuse-{id}"),
+            "identity": format!("bbs-reuse-{}", digest_key(id)),
             "instance": "consumer",
             "lifecycle": "furniture",
             "created_at": created,
@@ -2547,7 +2661,7 @@ mod tests {
             "id": id,
             "category": "artifact",
             "scope": "repo",
-            "identity": format!("bbs-assessment-{id}"),
+            "identity": format!("bbs-assessment-{}", digest_key(id)),
             "instance": "operator",
             "lifecycle": "furniture",
             "created_at": created,
@@ -2565,7 +2679,24 @@ mod tests {
         })
     }
 
-    const CASTLE: &str = "castle-1";
+    /// A real castle wire author id: `castle-<16 lowercase hex>`
+    /// (`rk_core::identity::actor_from_pubkey`). Taken from the captured
+    /// native records rather than shortened, because the author SHAPE is now
+    /// part of what a native record has to prove.
+    const CASTLE: &str = "castle-48451de05dc5e21a";
+
+    /// A producer-shaped identity key. `canonical_digest` returns a lowercase
+    /// hex SHA-256, so every native `bbs-finding-`/`bbs-answer-`/`bbs-reuse-`/
+    /// `bbs-assessment-` suffix is exactly 64 lowercase hex characters. Tests
+    /// derive a stable one per seed instead of a short readable stand-in the
+    /// real producer could never mint.
+    fn digest_key(seed: &str) -> String {
+        let mut key = String::with_capacity(DIGEST_HEX_LEN);
+        for (i, b) in seed.bytes().cycle().take(DIGEST_HEX_LEN / 2).enumerate() {
+            key.push_str(&format!("{:02x}", b ^ (i as u8)));
+        }
+        key
+    }
 
     /// `record_exposure`'s exact payload (crates/rk-daemon/src/bbs.rs on
     /// rat/scurry-15/tkt-tapip-puhot-sitih): castle-authored, so `instance` is
@@ -4207,5 +4338,119 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("duplicate consumer_tasks"));
+    }
+    fn invalid_reason<'a>(r: &'a Report, record: &str) -> &'a str {
+        r.invalid_records
+            .iter()
+            .find(|i| i.record == record)
+            .map_or_else(
+                || {
+                    panic!(
+                        "{record} was not retained as invalid: {:?}",
+                        r.invalid_records
+                    )
+                },
+                |i| i.reason.as_str(),
+            )
+    }
+
+    /// DEFECT 1, variable identities. Their contract is preserved — any
+    /// genuine key is accepted — but it must actually BE the key the producer
+    /// mints. `canonical_digest` returns a 64-character lowercase hex SHA-256,
+    /// so a short readable suffix is not something a real export can carry;
+    /// and an exposure's suffix is one of four `ExposureSurface` values, so a
+    /// forged surface is refused even when the payload agrees with it.
+    #[test]
+    fn variable_native_identities_must_carry_a_real_digest_or_a_real_surface() {
+        let mut short_digest = finding("src-2", "author-gen", "2026-01-01T00:00:00Z");
+        short_digest["identity"] = json!("bbs-finding-x");
+        let mut uppercase_digest = finding("src-3", "author-gen", "2026-01-01T00:00:00Z");
+        uppercase_digest["identity"] =
+            json!(format!("bbs-finding-{}", digest_key("s").to_uppercase()));
+        let mut forged_surface = exposure("x-forged", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+        forged_surface["identity"] = json!("bbs-exposure-forged");
+        forged_surface["payload"]["surface"] = json!("forged");
+        let mut mismatched = exposure("x-mismatch", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+        mismatched["identity"] = json!("bbs-exposure-brief");
+
+        let mut tuples = verified_tuples();
+        tuples.extend([short_digest, uppercase_digest, forged_surface, mismatched]);
+        let r = compute(
+            &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+            &capture(tuples, Order::Unknown),
+            &[],
+        )
+        .unwrap();
+
+        for id in ["src-2", "src-3"] {
+            assert!(
+                invalid_reason(&r, id).contains("canonical_digest"),
+                "{id}: {}",
+                invalid_reason(&r, id)
+            );
+        }
+        assert!(invalid_reason(&r, "x-forged").contains("not an exposure surface"));
+        assert!(invalid_reason(&r, "x-mismatch").contains("payload.surface"));
+        // The real records alongside them are untouched.
+        assert_eq!(
+            only(&r).coverage_status,
+            "prepared",
+            "the genuine spawn exposure still establishes native coverage"
+        );
+    }
+
+    /// DEFECT 1, positive baseline. Every real `ExposureSurface` must stay
+    /// admissible: the rule is "the suffix is the surface the payload names",
+    /// not a hardcoded preference for `spawn`.
+    #[test]
+    fn every_real_exposure_surface_is_still_native_coverage() {
+        for surface in EXPOSURE_SURFACES {
+            let mut x = exposure("x1", "src-1", "gen-1", "2026-01-01T12:00:00Z");
+            x["identity"] = json!(format!("bbs-exposure-{surface}"));
+            x["payload"]["surface"] = json!(surface);
+            let mut tuples = verified_tuples();
+            tuples[3] = x;
+            let r = compute(
+                &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+                &capture(tuples, Order::Unknown),
+                &[],
+            )
+            .unwrap();
+            assert!(
+                r.invalid_records.is_empty(),
+                "surface={surface}: {:?}",
+                r.invalid_records
+            );
+            assert_eq!(only(&r).coverage_status, "prepared", "surface={surface}");
+        }
+    }
+
+    #[test]
+    fn forged_open_and_worker_authored_open_do_not_establish_read_evidence() {
+        for worker_author in [false, true] {
+            let mut open = open_record("bad-open", "src-1", "gen-1", "2026-01-01T13:00:00Z");
+            if worker_author {
+                open["instance"] = json!("consumer");
+            } else {
+                open["identity"] = json!("bbs-open-forged");
+            }
+            let mut tuples = verified_tuples();
+            tuples.push(open);
+            let report = compute(
+                &manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]),
+                &capture(tuples, Order::Unknown),
+                &[],
+            )
+            .unwrap();
+            let reason = invalid_reason(&report, "bad-open");
+            assert!(reason.contains(if worker_author {
+                "castle author"
+            } else {
+                "fixed daemon-minted identity"
+            }));
+            assert_eq!(report.opened, 0);
+            assert!(!only(&report).opened);
+            assert_eq!(report.eligible, 1);
+        }
     }
 }
