@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-use support::connect;
+use support::{connect, connect_or_report};
 
 // `RK_FAKE_HARNESS_CMD` is a process-global env var and `#[tokio::test]`
 // bodies in one binary run concurrently by default — without this lock, a
@@ -841,8 +841,8 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
     // Daemon A: genuinely on-disk (`Daemon::new`), so daemon B below
     // actually inherits its durable state rather than starting empty.
     let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
-    let handle_a = tokio::spawn(daemon_a.run());
-    let mut client = connect(&layout).await;
+    let mut handle_a = tokio::spawn(daemon_a.run());
+    let mut client = connect_or_report(&layout, &mut handle_a).await;
 
     client
         .call(
@@ -964,8 +964,8 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
 
     // Daemon B: a fresh `Daemon::new` over the SAME on-disk home.
     let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
-    let handle_b = tokio::spawn(daemon_b.run());
-    let mut client = connect(&layout).await;
+    let mut handle_b = tokio::spawn(daemon_b.run());
+    let mut client = connect_or_report(&layout, &mut handle_b).await;
 
     let mut drained = false;
     for _ in 0..300 {

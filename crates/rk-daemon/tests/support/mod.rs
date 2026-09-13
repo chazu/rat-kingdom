@@ -169,17 +169,149 @@ where
 /// just because individual polls ran slower under load.
 #[allow(dead_code)]
 pub async fn connect(layout: &Layout) -> Client {
-    const DEADLINE: Duration = Duration::from_secs(30);
-    const POLL_INTERVAL: Duration = Duration::from_millis(20);
-    match poll_until(DEADLINE, POLL_INTERVAL, || async {
+    match poll_until(CONNECT_DEADLINE, CONNECT_POLL_INTERVAL, || async {
         Client::connect_as_operator(layout).await.ok()
     })
     .await
     {
         Ok(client) => client,
         Err(elapsed) => {
-            panic!("daemon did not come up: {elapsed:?} elapsed against a {DEADLINE:?} deadline")
+            panic!(
+                "daemon did not come up: {elapsed:?} elapsed against a {CONNECT_DEADLINE:?} \
+                 deadline"
+            )
         }
+    }
+}
+
+/// Why [`connect_or_report`]'s race ended without a client. Kept distinct
+/// from the panic message itself so the racing logic (deadline exhaustion
+/// vs. an already-finished handle) can be unit tested against a fake,
+/// near-instant task instead of a real daemon socket and a
+/// production-sized deadline — mirroring how [`poll_until`] is tested apart
+/// from [`connect`].
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum StartupFailure {
+    TimedOut(Duration),
+    DaemonExited(rk_core::Result<()>),
+    DaemonJoinError(tokio::task::JoinError),
+}
+
+impl std::fmt::Display for StartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupFailure::TimedOut(elapsed) => write!(
+                f,
+                "daemon did not come up: {elapsed:?} elapsed against a {CONNECT_DEADLINE:?} \
+                 deadline"
+            ),
+            StartupFailure::DaemonExited(Ok(())) => write!(
+                f,
+                "daemon task exited cleanly before its socket ever became connectable"
+            ),
+            StartupFailure::DaemonExited(Err(error)) => write!(
+                f,
+                "daemon failed to start: {error} — a stopped daemon, not a slow one"
+            ),
+            StartupFailure::DaemonJoinError(join_error) => write!(
+                f,
+                "daemon task panicked or was cancelled before its socket became connectable: \
+                 {join_error}"
+            ),
+        }
+    }
+}
+
+const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Diagnostic instrumentation, not a confirmed fix: races a connect attempt
+/// against `handle`'s completion and the `deadline`, so that IF a daemon's
+/// `run()` future has already resolved — lost the singleton-lock race,
+/// failed its bind, or hit any other startup error — that actual result is
+/// reported instead of only ever seeing "daemon did not come up" with no
+/// cause. Whether that scenario (an early-finished `run()`) is what actually
+/// produces the intermittent `restart_mid_queue_replays_fifo_order_*`
+/// failure under TKT-mukos-pogim-lopis is NOT yet established — no run
+/// observed under this instrumentation has yet captured a `DaemonExited` or
+/// `DaemonJoinError` outcome. Treat the underlying cause as unknown until an
+/// actual failing run under this instrumentation produces that evidence.
+///
+/// Each connect attempt is individually bounded via `tokio::select!` against
+/// `handle` and a per-attempt timeout capped at `poll_interval` (or the
+/// remaining budget, if smaller) — a stalled `connect`/auth handshake can
+/// therefore never prevent this loop from re-observing `handle` or
+/// `deadline`. A version of this that plainly `.await`ed the connect attempt
+/// before ever checking `handle` or the elapsed time would not actually race
+/// anything: a stall in that connect step would block both checks
+/// indefinitely, which is not "bounded" in any meaningful sense.
+///
+/// The trailing `sleep(poll_interval)` is not just pacing: a `connect`
+/// attempt against a socket nobody is listening on typically fails
+/// synchronously (no real await point), so without an unconditional real
+/// timer yield each iteration, a single-threaded runtime could keep this
+/// loop always immediately ready and never actually hand control back to the
+/// executor — starving `handle`'s task of a chance to be polled to
+/// completion at all, which would misreport a genuinely stopped daemon as a
+/// plain timeout. `poll_until`'s loop has the same unconditional-sleep shape
+/// for the same reason.
+///
+/// `handle` is taken by `&mut` rather than by value so callers that still
+/// need it afterwards (e.g. to `abort()` a daemon that DID come up) keep
+/// ownership. It is safe to poll repeatedly via `&mut *handle` inside the
+/// loop because a `select!` branch that resolves the handle to `Ready`
+/// immediately returns from this function — the handle is never polled again
+/// after it has yielded its result.
+#[allow(dead_code)]
+pub async fn try_connect_or_report(
+    layout: &Layout,
+    handle: &mut tokio::task::JoinHandle<rk_core::Result<()>>,
+    deadline: Duration,
+    poll_interval: Duration,
+) -> Result<Client, StartupFailure> {
+    let start = Instant::now();
+    loop {
+        tokio::select! {
+            biased;
+            join_result = &mut *handle => {
+                return Err(match join_result {
+                    Ok(result) => StartupFailure::DaemonExited(result),
+                    Err(join_error) => StartupFailure::DaemonJoinError(join_error),
+                });
+            }
+            connect_result = tokio::time::timeout(
+                poll_interval,
+                Client::connect_as_operator(layout),
+            ) => {
+                if let Ok(Ok(client)) = connect_result {
+                    return Ok(client);
+                }
+                // Either the attempt timed out (bounded by `poll_interval`)
+                // or connected and was refused/failed — either way, fall
+                // through to the deadline check and retry below.
+            }
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            return Err(StartupFailure::TimedOut(elapsed));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Panicking wrapper over [`try_connect_or_report`] using the same
+/// production-sized budget as [`connect`]. See [`try_connect_or_report`] for
+/// what this actually races and why.
+#[allow(dead_code)]
+pub async fn connect_or_report(
+    layout: &Layout,
+    handle: &mut tokio::task::JoinHandle<rk_core::Result<()>>,
+) -> Client {
+    match try_connect_or_report(layout, handle, CONNECT_DEADLINE, CONNECT_POLL_INTERVAL).await {
+        Ok(client) => client,
+        Err(failure) => panic!("{failure}"),
     }
 }
 
