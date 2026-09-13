@@ -591,13 +591,12 @@ struct OwnedResult<'a> {
 /// Immutable per-LAUNCH attribution, plus what that launch has been observed
 /// to do. Measurement only: nothing here gates lifecycle.
 ///
-/// Keyed by the launch's session token, never by agent name. Keying by name
-/// let a resume overwrite its predecessor's watch, so a delayed event from the
-/// older launch resolved against the SUCCESSOR's record and silently borrowed
-/// its provider session and launch time. The identity fields below are frozen
-/// at launch for exactly that reason: a late event is attributed to the launch
-/// it actually came from, or reported as missing coverage — never to whoever
-/// happens to hold the name now.
+/// Keyed by the launch's session token, never by agent name: name-keying let a
+/// resume overwrite its predecessor's watch, so a delayed event from the older
+/// launch resolved against the SUCCESSOR's record and borrowed its provider
+/// session and launch time. The identity fields below are frozen at launch for
+/// that reason — a late event is attributed to the launch it came from, or
+/// reported as missing coverage, never to whoever holds the name now.
 #[derive(Debug, Clone)]
 struct AttemptWatch {
     name: String,
@@ -615,13 +614,12 @@ struct AttemptWatch {
     /// A provider-reported USD total has been seen for this launch, so a later
     /// result without one leaves a MIXED total that cannot be called final.
     saw_provider_cost: bool,
-    /// `AgentRecord.cost_usd` at the moment this launch began. `cost_usd` is
-    /// generation-cumulative — a same-generation respawn keeps it — so a
-    /// relaunch whose OWN result never reports provider USD must not price
-    /// itself off the raw running total, which can still carry an earlier
-    /// launch's provider-reported spend. Subtracting this baseline isolates
-    /// only what accrued from THIS launch's own `HarnessEvent::Usage`
-    /// increments.
+    /// `AgentRecord.cost_usd` when this launch began. `cost_usd` is
+    /// generation-cumulative (a same-generation respawn keeps it), so a relaunch
+    /// whose OWN result never reports provider USD must not price itself off the
+    /// raw running total, which can still carry an earlier launch's
+    /// provider-reported spend. Subtracting this isolates what accrued from THIS
+    /// launch's own `HarnessEvent::Usage` increments.
     baseline_cost_usd: f64,
 }
 
@@ -2220,17 +2218,10 @@ impl Supervisor {
                 "role": params.role,
                 "attached": true,
                 "workflow_instance": params.workflow_instance,
-                // Exact native launch token for THIS process, so the launch
-                // joins its own final_usage/exit records; `spawn` cannot,
-                // because a respawn deliberately keeps it. `null` marks a
-                // path that registers no session rather than inventing one.
+                // See `agent_spawned` above for why both of these are the
+                // launch's own and why `provider_session` is an explicit null.
                 "session": launch_session,
                 "launched_at": launch_time,
-                // The harness's own session id is learned only at `Started`,
-                // which has not fired yet for this launch. Explicit `null`,
-                // not an omitted field: the contract never promises a
-                // provider id before one exists, and this must never be
-                // filled in from a previous launch's value.
                 "provider_session": null,
             }),
         );
@@ -2543,17 +2534,10 @@ impl Supervisor {
                 "task": updated.task,
                 "role": updated.role,
                 "workflow_instance": updated.workflow_instance,
-                // Exact native launch token for THIS process, so the launch
-                // joins its own final_usage/exit records; `spawn` cannot,
-                // because a respawn deliberately keeps it. `null` marks a
-                // path that registers no session rather than inventing one.
+                // See `agent_spawned` above for why both of these are the
+                // launch's own and why `provider_session` is an explicit null.
                 "session": launch_session,
                 "launched_at": launch_time,
-                // The harness's own session id is learned only at `Started`,
-                // which has not fired yet for this launch. Explicit `null`,
-                // not an omitted field: the contract never promises a
-                // provider id before one exists, and this must never be
-                // filled in from a previous launch's value.
                 "provider_session": null,
             }),
         );
@@ -2679,17 +2663,10 @@ impl Supervisor {
                 "role": updated.role,
                 "attached": true,
                 "workflow_instance": updated.workflow_instance,
-                // Exact native launch token for THIS process, so the launch
-                // joins its own final_usage/exit records; `spawn` cannot,
-                // because a respawn deliberately keeps it. `null` marks a
-                // path that registers no session rather than inventing one.
+                // See `agent_spawned` above for why both of these are the
+                // launch's own and why `provider_session` is an explicit null.
                 "session": launch_session,
                 "launched_at": launch_time,
-                // The harness's own session id is learned only at `Started`,
-                // which has not fired yet for this launch. Explicit `null`,
-                // not an omitted field: the contract never promises a
-                // provider id before one exists, and this must never be
-                // filled in from a previous launch's value.
                 "provider_session": null,
             }),
         );
@@ -2918,13 +2895,12 @@ impl Supervisor {
                             r.session_id = session_id.clone();
                         }
                     });
-                    // This path exists precisely because the disposition was
-                    // decided elsewhere — a budget stop, or `rk done` already
-                    // routed by `reconcile_task_done`. That is exactly the
-                    // done-before-final-result case: the completion is already
-                    // published and THIS is the later, authoritative total. It
-                    // must be observed, or the only surviving cost record is
-                    // the provisional one.
+                    // This path exists because the disposition was decided
+                    // elsewhere — a budget stop, or `rk done` already routed by
+                    // `reconcile_task_done`. That is the done-before-final-result
+                    // case: the completion is published and THIS is the later,
+                    // authoritative total, which must be observed or the only
+                    // surviving cost record is the provisional one.
                     if let Ok(Some(record)) = merged {
                         let state = if completed_via_reconcile {
                             "completed"
@@ -3038,19 +3014,13 @@ impl Supervisor {
                 let live = owned.is_some();
                 if live {
                     self.lock_controls().remove(name);
-                    // The harness process behind this generation is provably
-                    // gone — clean exit, crash, or kill alike. Any `verify.run`
-                    // execution it still has in flight will never be read by a
-                    // caller that no longer exists, so its managed child must not
-                    // keep running under the daemon alone
-                    // (TKT-01M0PA6C5WYRWS757R1SS2F2GR).
-                    //
-                    // Fenced on `live`, not just `spawn`: `spawn` is the
-                    // generation's stable id and does NOT change across a
-                    // respawn (see the `handle_event` doc comment), so a
-                    // stale predecessor's exit sharing the successor's
-                    // `spawn` would otherwise cancel the successor's own
-                    // in-flight managed verification.
+                    // The process behind this generation is provably gone, so
+                    // any `verify.run` it still has in flight will never be read
+                    // by a caller that exists; its managed child must not keep
+                    // running under the daemon alone
+                    // (TKT-01M0PA6C5WYRWS757R1SS2F2GR). Fenced on ownership, not
+                    // `spawn`: a respawn keeps `spawn`, so a stale predecessor's
+                    // exit shares it and would cancel the SUCCESSOR's run.
                     self.cancel_managed_verification_for_agent(
                         name,
                         Some(spawn),
@@ -3068,26 +3038,20 @@ impl Supervisor {
                 } else {
                     self.lock_registry().update(name, |r| {
                         r.pid = None;
-                        // A paused agent is live, but it is not mid-turn: its
-                        // harness DID report, the result was merely withheld for
-                        // want of a `rk done`. So it terminalizes here like any
-                        // other live record — the process is gone, nothing will
-                        // resume it — but it must not be marked `crashed`, and its
-                        // withheld turn text must survive: that text is exactly
-                        // what `flush_withheld_completion` is about to publish.
+                        // A paused agent is live but not mid-turn: its harness
+                        // DID report, the result was merely withheld for want of
+                        // a `rk done`. It still terminalizes (the process is
+                        // gone), but must not be marked `crashed`, and its
+                        // withheld text must survive — that text is what
+                        // `flush_withheld_completion` is about to publish.
                         let paused = r.state == AgentState::Paused;
                         // Exit without a Completed event = crash/kill.
                         if r.state.is_live() {
                             r.state = AgentState::Failed;
-                            // ...except for a PAUSED record, which is live but not
-                            // mid-turn. Its harness did report; the result was
-                            // merely withheld for want of a `rk done`. It still
-                            // terminalizes (the process is gone, nothing will
-                            // resume it), but the two crash markers below are both
-                            // false for it: a verdict WAS reported, and the
-                            // withheld turn text is exactly what
-                            // `flush_withheld_completion` is about to publish, so
-                            // overwriting `result` here would destroy it.
+                            // Both crash markers stay false for a PAUSED record
+                            // (see above): a verdict WAS reported, and
+                            // overwriting `result` would destroy the withheld
+                            // text about to be published.
                             if !paused {
                                 // The one place that knows the harness never reported a
                                 // verdict for this generation, so no `harness_result`
@@ -3169,12 +3133,11 @@ impl Supervisor {
                 // published its turn when it ended — which is what keeps this
                 // from collapsing into "every fake-harness agent fails".
                 // Physical exit for THIS launch. Emitted before the withheld-
-                // completion flush below so the exit fact is durable even if
-                // that routing fails, and deliberately NOT fenced on the live
-                // session token: a superseded launch's exit is still a true
-                // fact about that launch, and the record names the session it
-                // belongs to. (The recovery fence above stays session-fenced,
-                // because that one WRITES active generation state.)
+                // completion flush so the exit fact is durable even if that
+                // routing fails, and deliberately NOT gated on ownership: a
+                // superseded launch's exit is still a true fact about it, and the
+                // record names the session it belongs to. (The recovery probe
+                // above stays fenced — that one WRITES active generation state.)
                 let crashed_now = self.status(name).is_some_and(|r| r.crashed);
                 if updated.is_ok() {
                     // Attribution comes from THIS launch's frozen watch. A
@@ -3193,13 +3156,12 @@ impl Supervisor {
                         None => CostCoverage::Unknown,
                     };
                     if let Some(w) = &watch {
-                        // Identity is frozen on the watch, but `crashed` and
-                        // the pre-exit state are NOT: both are read off the
-                        // name-keyed `AgentRecord`, which the SUCCESSOR owns
-                        // once it takes the name. For a superseded launch's
-                        // late exit they describe the successor, so they are
-                        // omitted rather than misattributed — `null` reads as
-                        // unknown, and "unknown" is the true finding here.
+                        // Identity is frozen on the watch, but `crashed` and the
+                        // pre-exit state are NOT: both come off the name-keyed
+                        // `AgentRecord`, which the SUCCESSOR owns once it takes
+                        // the name. For a superseded launch's late exit they
+                        // describe the successor, so they are omitted — `null`
+                        // reads as unknown, which is the true finding here.
                         let prior = format!("{pre_exit_state:?}").to_lowercase();
                         let capture = crate::bbs::record_exit(
                             &self.space,
@@ -3227,14 +3189,11 @@ impl Supervisor {
                     // Retire only this launch's own watch.
                     self.lock_attempts().remove(&session);
                 }
-                // Still under `owned`: `generation` alone cannot tell a stale
-                // predecessor's exit apart from the successor's, because a
-                // respawn keeps the same generation and only mints a fresh
-                // session token. Unfenced, a predecessor's late `Exited` could
-                // match a currently-PAUSED successor's own withheld
-                // `CompletionState` (same generation, `withheld: true`) and
-                // falsely flush/route its held-back turn as a failure — a
-                // completion the successor never earned.
+                // Still under `owned`. `generation` alone cannot tell a stale
+                // predecessor's exit from the successor's (a respawn keeps it),
+                // so unfenced, a predecessor's late `Exited` would match a
+                // currently-PAUSED successor's withheld `CompletionState` and
+                // flush/route its held-back turn as a failure it never earned.
                 if live {
                     if let Ok(Some(record)) = updated {
                         if self.flush_withheld_completion(name, generation) {
@@ -3643,12 +3602,10 @@ impl Supervisor {
     ///
     /// Emitted on launch/resume events so a launch can be joined to the
     /// `agent_final_usage`/`agent_exit` observations for the SAME launch —
-    /// `spawn` alone cannot do that, because a respawn keeps it. Both are
-    /// `None` on a path that registers no observable session (an attach),
-    /// recorded as unobservable rather than filled with a fresh `now()` that
-    /// would silently disagree with the watch.
+    /// `spawn` alone cannot, because a respawn keeps it.
     ///
-    /// The WATCH decides that, not the token: an attach launch is fenced with a
+    /// Both are `None` on a path that registers no observable session, and the
+    /// WATCH decides that, not the token: an attach launch is fenced with a
     /// token of its own so the predecessor's events stop reaching it, and that
     /// token has no watch precisely because nothing will ever observe the
     /// launch. A token whose watch belongs to some OTHER launch must never be
@@ -3682,19 +3639,16 @@ impl Supervisor {
 
     /// Record the reported usage/cost observed at one result event.
     ///
-    /// Never raises and never changes lifecycle: a capture failure is logged
-    /// and reported as a telemetry gap, exactly like exposure/open capture.
-    /// Emitted at EVERY result path — including the ones that return early
-    /// because the disposition was already decided — so a `rk done` that
-    /// precedes the provider's final total leaves both observations behind
-    /// instead of only the provisional one.
+    /// Never raises and never changes lifecycle: a capture failure is logged and
+    /// reported as a telemetry gap, exactly like exposure/open capture. Emitted
+    /// at EVERY result path — including the ones that return early because the
+    /// disposition was already decided — so a `rk done` that precedes the
+    /// provider's final total leaves both observations behind, not just the
+    /// provisional one.
     ///
-    /// Attribution comes from the launch's own frozen watch. With no watch the
-    /// observation is skipped rather than attributed to the current record; and
-    /// when the launch has already been SUPERSEDED, everything that lives on
-    /// the name-keyed `AgentRecord` — record state, `declared_done`, the
-    /// daemon's running priced total — is omitted rather than borrowed from the
-    /// successor. Only the event's own provider total survives that way.
+    /// Attribution comes from the launch's own frozen watch; with none, the
+    /// observation is skipped rather than bound to the current record. See
+    /// [`OwnedResult`] for what a SUPERSEDED launch omits.
     fn observe_final_usage(
         &self,
         session: rk_core::id::SpawnId,
@@ -3711,16 +3665,12 @@ impl Supervisor {
             );
             return;
         };
-        // Three genuinely different situations, kept apart on purpose:
-        //
-        //  * this result carries a provider total -> that total, for THIS
-        //    segment (cumulative within its query; never summed with others);
-        //  * this result carries none but an earlier one did -> the running
-        //    figure is a MIX of a provider total and daemon pricing, and no
-        //    honest final value can be named for the launch: unknown;
-        //  * no provider total was ever reported and the harness does not
-        //    self-report USD -> the daemon's own priced increments, labelled
-        //    as the weaker estimate they are.
+        // Three genuinely different situations, kept apart on purpose: a
+        // provider total on THIS result (cumulative within its query, never
+        // summed with others); none here but one earlier in the launch (the
+        // running figure MIXES bases, so no honest final value exists:
+        // unknown); or no provider total ever, leaving the daemon's own priced
+        // increments, labelled as the weaker estimate they are.
         let (basis, cost, provenance) = if let Some(total) = cost_usd {
             (
                 rk_core::bbs::CostBasis::ProviderReportedSegmentTotal,
@@ -5395,12 +5345,11 @@ impl Supervisor {
     /// exactly as any other crashed launch does; this only adds the typed,
     /// durable retry bookkeeping on top.
     ///
-    /// `live` gates only the per-record retry episode: a stale predecessor's
-    /// transport failure must never seed the successor's `transport_outage`
-    /// (a `detect_post_commit_outage`/respawn-sweep recovery INPUT keyed on
-    /// whichever record currently holds `name`), even though the failure
-    /// itself is a true, provider-wide fact — the breaker feed below stays
-    /// unconditional.
+    /// The fence gates only the per-record retry episode: a stale predecessor's
+    /// transport failure must never seed the successor's `transport_outage` (a
+    /// `detect_post_commit_outage`/respawn-sweep recovery INPUT keyed on
+    /// whichever record holds `name`), even though the failure itself is a true
+    /// provider-wide fact — the breaker feed below stays unconditional.
     fn record_transport_outage(
         &self,
         name: &str,
@@ -12970,15 +12919,13 @@ mod native_observation_tests {
         );
     }
 
-    /// The completion-ROUTING half of the same defect (severer than the
-    /// telemetry/state cases above): `generation` alone cannot tell a stale
-    /// predecessor's `Exited` apart from the live successor's, because a
-    /// respawn keeps the same generation and mints only a fresh session
-    /// token. Before the `live` fence, a late predecessor exit could flip a
-    /// still-`Paused` successor straight to `Failed` (previous test) and
-    /// then `flush_withheld_completion` would match it — same generation,
-    /// `withheld: true` — and publish the successor's held-back turn as a
-    /// completed failure it never earned.
+    /// The completion-ROUTING half of the same defect, severer than the
+    /// telemetry/state cases above. `generation` alone cannot tell a stale
+    /// predecessor's `Exited` from the live successor's — a respawn keeps the
+    /// generation and mints only a fresh session token — so unfenced, a late
+    /// predecessor exit flips a still-`Paused` successor to `Failed` and then
+    /// `flush_withheld_completion` matches it (same generation, `withheld:
+    /// true`), publishing a completed failure the successor never earned.
     #[test]
     fn a_stale_predecessor_exit_must_not_fail_or_flush_the_successors_paused_turn() {
         let home = tempfile::tempdir().unwrap();
@@ -13302,16 +13249,13 @@ mod native_observation_tests {
     }
 
     /// The interleaving. `handle_event` used to read a `live` boolean, DROP the
-    /// `session_tokens` guard, and only then perform its name-keyed mutation; a
-    /// respawn stamping its replacement token in that window left a superseded
-    /// launch writing over its successor's record.
-    ///
-    /// Driven deterministically rather than by racing: holding the registry
-    /// parks the handler provably BETWEEN its ownership check and its write.
-    /// Stamping a replacement token is exactly `session_tokens.lock()`, so
-    /// `try_lock` there answers whether that window is open. Before the fix it
-    /// succeeded at once; now it is refused for as long as the mutation is
-    /// pending, which is what makes check-and-mutate one step.
+    /// `session_tokens` guard, then perform its name-keyed mutation; a respawn
+    /// stamping its token in that window left a superseded launch writing over
+    /// its successor's record. Deterministic, not raced: holding the registry
+    /// parks the handler provably BETWEEN check and write, and stamping a token
+    /// is exactly `session_tokens.lock()`, so `try_lock` there answers whether
+    /// the window is open. Pre-fix it succeeded at once; now it is refused for
+    /// as long as the mutation is pending.
     #[test]
     fn a_respawn_cannot_stamp_its_token_while_an_event_is_mid_mutation() {
         let home = tempfile::tempdir().unwrap();
@@ -13371,13 +13315,11 @@ mod native_observation_tests {
     /// The other half of the same interleaving, at the ACTUAL transition seam:
     /// a launch used to reset the record to `Running` and install its control
     /// handle BEFORE the token changed hands, so a predecessor's late `Exited`
-    /// landing in that window passed its ownership check against the old token
-    /// and then re-terminalized the successor's freshly reset record.
-    ///
-    /// Ordered deterministically, not raced: holding the registry parks the
-    /// publication mid-takeover, and the exiting predecessor is only released
-    /// once the publication is provably holding the ownership guard — so the
-    /// old event cannot reach its check until the takeover has completed.
+    /// landing there passed its ownership check against the old token and then
+    /// re-terminalized the successor's freshly reset record. Ordered, not raced:
+    /// holding the registry parks the publication mid-takeover, and the exiting
+    /// predecessor is released only once the publication provably holds the
+    /// guard, so the old event cannot check until the takeover has completed.
     #[test]
     fn a_predecessors_late_exit_cannot_land_inside_a_launchs_takeover() {
         let home = tempfile::tempdir().unwrap();
@@ -13443,12 +13385,11 @@ mod native_observation_tests {
     }
 
     /// Headless-to-attach respawn. `respawn_attached` registers no session of
-    /// its own, so the predecessor's headless token used to survive it: the
-    /// `agent_respawned` event published that launch's native session and
-    /// borrowed its `AttemptWatch` launch time as the attach launch's own, and
-    /// every late event the dead headless process still emitted counted as
-    /// owning the name. The launch itself needs a live herdr server, so this
-    /// drives the two production helpers it composes.
+    /// its own, so the predecessor's headless token used to survive it:
+    /// `agent_respawned` published that launch's native session and borrowed its
+    /// `AttemptWatch` launch time as the attach launch's own, and every late
+    /// event the dead headless process emitted still counted as owning the name.
+    /// The launch needs a live herdr server, so this drives what it composes.
     #[tokio::test]
     async fn an_attach_respawn_publishes_no_session_and_evicts_the_headless_one() {
         let home = tempfile::tempdir().unwrap();

@@ -1,154 +1,96 @@
 # S2 native observation and bounded export contract
 
-Ticket `TKT-dorod-sival-fumid` (S2 continuation of `TKT-tapip-puhot-sitih`).
-Consumer: the evaluator correction `TKT-nonub-pugar-pilid`, which owns
-evaluation — these are the producers only.
+Ticket `TKT-dorod-sival-fumid` continues `TKT-tapip-puhot-sitih`. These producers supply
+the evaluator owned by `TKT-nonub-pugar-pilid`.
 
-## Identity: join on `(spawn, session)`
+## Identity and lifecycle ownership
 
-| field | source | changes on respawn? |
-| --- | --- | --- |
-| `spawn` | `AgentRecord::spawn_id` | **no** — a respawn CONTINUES the generation |
-| `session` | the supervisor's per-launch token | **yes** — one per physical launch |
-| `provider_session` | the harness's own session id | yes, and on a provider reset |
+Join attempts on `(spawn, session)`. `spawn` is `AgentRecord::spawn_id` and survives a
+respawn; `session` is a fresh supervisor token for each physical launch.
+`provider_session` is the harness identity, which may also change on provider reset. It
+cannot substitute for either native identity or prove two queries share one cumulative
+cost total.
 
-`spawn` alone **cannot** identify an attempt: two launches of one generation
-share it. Every join, dedup and aggregation key is the pair `(spawn, session)`.
-`provider_session` is a third identity with its own lifetime and is never a
-substitute for either. All three are emitted on `agent_spawned`/
-`agent_respawned` as well as on the observations, so a launch joins its own
-records; a path that registers no session emits `session: null` rather than
-inventing one. `provider_session` is learned only at `Started`, which has not
-fired yet at spawn/respawn time — `agent_spawned`/`agent_respawned` therefore
-always emit `provider_session: null` at launch, an explicit "not yet known"
-rather than an omitted field or a value borrowed from a previous launch.
+Initial spawn, ordinary respawn and managed recovery continuation publish their launch
+identity in `agent_spawned` or `agent_respawned`. Provider identity is learned at
+`Started`, so the launch event explicitly carries `provider_session: null`. An
+unobservable attach launch publishes null session and launch time; it never borrows a
+predecessor watch.
 
-Every launch path publishes `agent_respawned` (or `agent_spawned`) with this
-identity, INCLUDING `continue_recovery`'s managed continuation of a
-post-commit `RecoveryRecord` — previously the one launch path that tracked a
-session (so cost/exit observations attributed correctly) without ever
-publishing it, leaving a managed recovery launch joinless from lifecycle
-evidence alone.
+Attribution is frozen per launch. Delayed predecessor events retain their own identity
+and provider totals. Record-derived fields describe the successor and therefore become
+null: result `state`/`declared_done`, exit `prior_state`/`crashed`, and unprovable
+daemon-priced cost. Both observations mark `stale_session: true`. Null always means
+unknown.
 
-Attribution is frozen at launch, keyed by session token. A delayed event from a
-superseded launch is attributed to the launch it came from, or skipped — never
-to whichever record holds the name now.
+Ownership checking and mutation share a held session-token guard. Launch publication
+changes the record, control, token and completion bookkeeping under that same guard.
+Late predecessor events cannot resume, fail or overwrite the successor, charge its
+budget, change liveness/stderr/recovery/transport state, cancel its verification,
+acknowledge its control message, claim completion or flush/route a withheld turn.
+Per-launch telemetry and the generation-bound transcript remain attributed to their
+originating event.
 
-Identity is not the only thing the name-keyed `AgentRecord` would leak.
-Lifecycle state lives there too, so anything read from it is **omitted** on a
-superseded launch's late event rather than borrowed from the successor: both
-kinds carry `stale_session: true`, and `state`/`declared_done` (result) and
-`prior_state`/`crashed` (exit) are `null`. `null` means unknown, never a value
-of its own. The event's own provider total is still that launch's and survives;
-the daemon's running priced total is the successor's and does not, so a stale
-result with no provider figure is `cost_basis: unknown`, not a daemon-priced
-final cost.
+Attach takeover replaces the old token with a watch-less token rather than deleting it.
+An absent entry is treated as owned for an unregistered event context; it must never let
+a superseded headless launch regain ownership. Lock order and callback constraints are
+documented at `Supervisor::own` and `publish_launch`.
 
-The same fence also gates `handle_event`'s effects on the LIVE `AgentRecord`
-and adjacent supervisor state, not just what these two observations report.
-Session-fenced telemetry had previously shipped decoupled from unfenced
-lifecycle mutation: a stale predecessor's `Started`/`Usage`/`Completed`/
-`Exited` could still resume a paused successor, overwrite its
-`session_id`/`transport_outage`/`recovery`, add to its `usage`/`cost_usd` and
-consume its budget floor, claim or route a completion on its behalf, fail it
-outright, cancel its in-flight managed verification (the generation-stable
-`spawn` id a respawn keeps cannot tell the two launches apart; only the
-session token can), or falsely flush/route its withheld turn. The chattier
-events (`AssistantText`/`ToolUse`/`Retry`/`Stderr`) and the two side-channel
-ones (`TransportFailure`/`ControlDelivered`) had the same gap against the
-successor's liveness fingerprint, `stderr_tail`, `transport_outage`, and
-durable control acknowledgement. All of the above are now gated on the same
-per-call `live` check (current session token for `name` == this event's own
-token; an unclaimed name with no registered token yet is treated as live, not
-stale, so this never engages before a first launch's `track_session` call)
-while per-launch telemetry and the generation-bound transcript log — both
-already keyed on the event's own launch — are unaffected.
+## Final usage: `bbs-agent-final-usage`
 
-## `agent_final_usage` (identity `bbs-agent-final-usage`)
+The fenced `Completed` handler emits `agent_final_usage` on every result path, including
+a result arriving after `rk done` has already settled disposition. Fields: `repo`,
+`task`, `agent`, `spawn`, `session`, `provider_session`, `observed_at`, `state`,
+`declared_done`, `stale_session`, `cost_usd`, `cost_basis`, `cost_provenance`, `usage`.
 
-Authored from the fenced `Completed` handler at **every** result path,
-including the early-return one taken when the disposition was already decided.
-That path is the done-before-final-result case: without it the only surviving
-cost record is the provisional one routed at `rk done`.
+`provider_reported_segment_total` means this result carried a provider total. It is
+cumulative within its query: use the last total for each segment rather than summing
+repeated totals. A later result without USD after a provider-priced result in that
+launch has `cost_basis: unknown` and null cost; mixed bases do not establish final cost.
 
-Fields: `repo`, `task`, `agent`, `spawn`, `session`, `provider_session`,
-`observed_at`, `state`, `declared_done`, `stale_session`, `cost_usd`,
-`cost_basis`, `cost_provenance`, `usage`.
+`daemon_priced_increments` applies only when that launch never reported USD. The
+generation-wide record accumulates across respawns, so `begin_launch` freezes a baseline
+and only a provable positive delta belongs to this launch. A non-positive delta is
+unknown, not an invented zero or negative total. Stale events cannot borrow the
+successor's running total. All costs are client estimates, not billed charges.
 
-`cost_basis` distinguishes three genuinely different situations:
+## Physical exit: `bbs-agent-exit`
 
-- `provider_reported_segment_total` — this result carried a provider total.
-  Cumulative **within its query**: take the last per segment, never the sum.
-- `unknown` — no total on this result, but an earlier one in the same launch
-  had one. The running figure mixes bases, so no final launch cost is provable
-  and `cost_usd` is null.
-- `daemon_priced_increments` — the provider never reported USD for this launch
-  and the daemon priced `TokenUsage` itself. A weaker estimate; never pooled
-  with a provider total. `AgentRecord.cost_usd` is generation-cumulative (a
-  same-generation respawn inherits it), so this is never the raw cumulative
-  figure: each launch freezes its own `cost_usd` baseline at `begin_launch`,
-  and only the delta accrued since that baseline is reported — otherwise a
-  provider total from an earlier launch of the same generation would leak
-  into a later, unrelated launch's daemon-priced estimate. A non-positive
-  delta is `unknown`, not a manufactured zero-or-negative final cost.
+The fenced `Exited` handler emits `agent_exit`. Completion is separate from physical
+process exit. Fields include the identity block, `exited_at`, `exit_code`, `crashed`,
+`prior_state`, `launched_at`, `cost_coverage`, `stale_session`, `duration_semantics`. A
+null exit code denotes a signal, not success.
 
-All values are **client-side estimates, not billed charges**. An unprovable
-total stays null; it is never manufactured as zero. The same provider session
-alone does not prove two queries are one cumulative total.
+Cost coverage is `final` when a result has no later work; `partial_unknown` when more
+model usage follows the last result before exit; `none` when no result was reported; or
+`unknown` when attribution is missing. Finding some earlier result alone does not
+establish finality. Launch-to-exit duration is process lifetime, never measured active
+work: the harness can be paused for checks or the operator.
 
-## `agent_exit` (identity `bbs-agent-exit`)
+## Capture failure and authorization
 
-Authored from the fenced `Exited` handler. Completion is **not** physical exit:
-the `Completed` handler returns while the process is still alive.
+Both kinds are daemon-authored immutable Furniture Events registered by
+`rk_core::bbs::is_telemetry`. They cannot be minted by workers and never enter briefings
+or `bbs show` threads. Failed observation capture is logged and recorded as
+`telemetry_gap`; it cannot change completion, delivery, state or budget behavior.
 
-Fields: the identity block plus `exited_at`, `exit_code` (null = signal, which
-is not exit 0), `crashed`, `prior_state`, `launched_at`, `cost_coverage`,
-`stale_session`, `duration_semantics`.
+## Bounded historical export
 
-`cost_coverage` is `final` (a result, nothing after it), `partial_unknown` (a
-result, then more model usage, then an end with no later result — the known
-total is partial and the rest stays **unknown**), `none` (no result was ever
-reported) or `unknown` (no attribution survives; "we know there was none" and
-"we cannot say" are different findings). Finality is never inferred from merely
-finding some result before an exit.
+`bbs.export` / `rk bbs export --repo` emits `order: "persistence_sequence"`; SQL
+implementation detail belongs in `order_provenance`. Other order values establish no
+known ordering.
 
-`launched_at`→`exited_at` is **process lifetime, not active model work**: a
-harness can sit paused on a verification run or on the operator. No claim is
-made about how much of the span was productive.
+`boundary` pins one snapshot across pages. A future boundary is refused, never clamped.
+References use `Store::get_as_of(id, boundary, scope)` so post-boundary changes cannot
+leak into the snapshot; absent references appear in `missing_references`.
 
-## Failure behaviour
+The SQL predicate fences scope, ID and sequence using `idx_tuple_persistence_scope_id
+(scope, id, commit_sequence)`. Resolution is a bounded index seek before
+deserialization, including for foreign references. Each exported reference carries its
+matched journal row's commit sequence, not the current live row's. Historical references
+remain resolvable after a later deletion.
 
-Both kinds are daemon-authored immutable `Furniture` Events joining
-`rk_core::bbs::is_telemetry`, so neither reaches a briefing or a `bbs show`
-thread, and an agent caller cannot mint one. A capture failure is logged and
-recorded as a `telemetry_gap`; it never raises and never touches completion,
-delivery, state or budget behaviour.
-
-## Bounded export
-
-`bbs.export` / `rk bbs export --repo` emits `order: "persistence_sequence"` —
-the S3 capture contract's enum. The SQL detail lives in `order_provenance` so
-the wire value survives a column rename. A consumer that does not see exactly
-that `order` must treat ordering as unknown.
-
-- `boundary` pins one snapshot across pages. Without it each page captures a
-  fresh boundary and a concurrent write appears mid-paging. A boundary ahead of
-  the store is **refused, not clamped**.
-- References resolve at the frozen boundary via `Store::get_as_of`, not through
-  the live row, so a post-boundary tuple cannot leak into an earlier snapshot;
-  absent-at-boundary is reported under `missing_references`.
-- `get_as_of(id, boundary, scope)` fences `scope` into the same SQL predicate
-  as `id` and the sequence bound, driven by `idx_tuple_persistence_scope_id
-  (scope, id, commit_sequence)`: a bounded index seek regardless of journal
-  size, and a foreign-scope row is never read off disk to be checked in Rust
-  afterward, let alone deserialized. It returns the matched journal row's own
-  `commit_sequence` alongside the tuple; the export attaches THAT sequence to
-  the reference, never the live `tuples` row's — which can be absent (a
-  deletion made after the boundary leaves nothing for a live-row lookup to
-  find) even though the immutable journal still proves the reference's exact
-  historical order.
-- Reference closure traverses nested `source`/`evidence` to a finite depth.
-  `coverage.complete` is false whenever **any** hop is unresolved, the page
-  truncated, or the budget was exhausted.
-- Scope, cursor and limit are pushed into SQL before deserialization, and a
-  foreign-scope reference is reported, never exported.
+Nested source/evidence traversal has finite depth and budget. `coverage.complete` is
+false for any unresolved hop, truncation or exhausted budget. Scope, cursor and limits
+apply in SQL before deserialization; foreign-scope references are reported but never
+exported.
