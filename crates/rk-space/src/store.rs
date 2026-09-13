@@ -2229,7 +2229,9 @@ mod tests {
             "expected the scope/id/commit_sequence index to drive this lookup: {detail}"
         );
         assert!(
-            !detail.to_uppercase().contains("SCAN TUPLE_PERSISTENCE_EVENTS"),
+            !detail
+                .to_uppercase()
+                .contains("SCAN TUPLE_PERSISTENCE_EVENTS"),
             "must not fall back to a full journal scan: {detail}"
         );
     }
