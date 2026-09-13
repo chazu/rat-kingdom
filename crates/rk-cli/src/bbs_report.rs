@@ -109,13 +109,14 @@ const TERMINAL_USAGE_STATES: [&str; 3] = ["completed", "failed", "stopped"];
 const PROVIDER_COST_BASIS: &str = "provider_reported_segment_total";
 const DAEMON_COST_BASIS: &str = "daemon_priced_increments";
 
-/// Still reported as unknown, and still not this ticket's to derive: an
-/// `attention_hold` span count is a LOWER BOUND on operator interventions, not
-/// a total. Reviewed task-scoped annotations are the parent's scope.
+/// An `attention_hold` span count is a LOWER BOUND on operator interventions,
+/// not a total, and stays so regardless of `ReviewedAnnotation`: a reviewer's
+/// evidenced count is reported separately (`quality.reviewed_interventions`),
+/// never summed with this span-derived figure.
 const INTERVENTIONS_LOWER_BOUND: &str =
     "lower bound: attention_hold spans only cover waits the daemon recorded; an operator \
-     intervention that left no span is not counted here. Reviewed annotations are \
-     TKT-nonub-pugar-pilid's scope.";
+     intervention that left no span is not counted here. A ReviewedAnnotation can supply \
+     evidenced interventions separately (quality.reviewed_interventions).";
 
 /// No native observation distinguishes model-active time from a process sitting
 /// paused awaiting verification or the operator, so active work stays an
@@ -3172,7 +3173,9 @@ pub fn compute_full(
                 derivation: "total_operator_interventions".into(),
                 status: "lower_bound".into(),
                 reason: INTERVENTIONS_LOWER_BOUND.into(),
-                tracked_by: "TKT-nonub-pugar-pilid".into(),
+                tracked_by: "no native observation can close this gap; ReviewedAnnotation \
+                             supplies a separate, evidenced figure rather than closing it"
+                    .into(),
             },
         ],
         eligible,
