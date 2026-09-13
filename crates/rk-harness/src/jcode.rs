@@ -67,7 +67,7 @@ impl Harness for JcodeHarness {
 
         let session = runner::launch(runner::Wiring {
             command: cmd,
-            parse: parse_event_line,
+            parse: Box::new(parse_event_line),
             steer_line: None,
             resume: None,
         })?;
