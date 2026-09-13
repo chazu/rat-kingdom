@@ -3047,53 +3047,54 @@ impl Supervisor {
                     Ok(self.lock_registry().get(name).cloned())
                 } else {
                     self.lock_registry().update(name, |r| {
-                    r.pid = None;
-                    // A paused agent is live, but it is not mid-turn: its
-                    // harness DID report, the result was merely withheld for
-                    // want of a `rk done`. So it terminalizes here like any
-                    // other live record — the process is gone, nothing will
-                    // resume it — but it must not be marked `crashed`, and its
-                    // withheld turn text must survive: that text is exactly
-                    // what `flush_withheld_completion` is about to publish.
-                    let paused = r.state == AgentState::Paused;
-                    // Exit without a Completed event = crash/kill.
-                    if r.state.is_live() {
-                        r.state = AgentState::Failed;
-                        // ...except for a PAUSED record, which is live but not
-                        // mid-turn. Its harness did report; the result was
-                        // merely withheld for want of a `rk done`. It still
-                        // terminalizes (the process is gone, nothing will
-                        // resume it), but the two crash markers below are both
-                        // false for it: a verdict WAS reported, and the
-                        // withheld turn text is exactly what
-                        // `flush_withheld_completion` is about to publish, so
-                        // overwriting `result` here would destroy it.
-                        if !paused {
-                            // The one place that knows the harness never reported a
-                            // verdict for this generation, so no `harness_result`
-                            // exists or ever will. Recorded as data rather than
-                            // left to be inferred from the result string, because a
-                            // workflow `wait`/`evaluate` has to be able to tell a
-                            // rat that produced nothing from one that ran (TKT-147).
-                            r.crashed = true;
-                            let base = format!("process exited (code {code:?}) without completing");
-                            // A starved/misconfigured harness (rate limit, queueing,
-                            // auth refresh, model unavailable) can produce zero
-                            // protocol output and die silently — stderr is the only
-                            // trace of why, so fold its tail into the published
-                            // result rather than leaving this message as the whole
-                            // story wherever `result` is read (inbox, harness_result).
-                            r.result = Some(match r.stderr_snippet() {
-                                Some(snippet) => format!("{base} — stderr: {snippet}"),
-                                None => base,
-                            });
+                        r.pid = None;
+                        // A paused agent is live, but it is not mid-turn: its
+                        // harness DID report, the result was merely withheld for
+                        // want of a `rk done`. So it terminalizes here like any
+                        // other live record — the process is gone, nothing will
+                        // resume it — but it must not be marked `crashed`, and its
+                        // withheld turn text must survive: that text is exactly
+                        // what `flush_withheld_completion` is about to publish.
+                        let paused = r.state == AgentState::Paused;
+                        // Exit without a Completed event = crash/kill.
+                        if r.state.is_live() {
+                            r.state = AgentState::Failed;
+                            // ...except for a PAUSED record, which is live but not
+                            // mid-turn. Its harness did report; the result was
+                            // merely withheld for want of a `rk done`. It still
+                            // terminalizes (the process is gone, nothing will
+                            // resume it), but the two crash markers below are both
+                            // false for it: a verdict WAS reported, and the
+                            // withheld turn text is exactly what
+                            // `flush_withheld_completion` is about to publish, so
+                            // overwriting `result` here would destroy it.
+                            if !paused {
+                                // The one place that knows the harness never reported a
+                                // verdict for this generation, so no `harness_result`
+                                // exists or ever will. Recorded as data rather than
+                                // left to be inferred from the result string, because a
+                                // workflow `wait`/`evaluate` has to be able to tell a
+                                // rat that produced nothing from one that ran (TKT-147).
+                                r.crashed = true;
+                                let base =
+                                    format!("process exited (code {code:?}) without completing");
+                                // A starved/misconfigured harness (rate limit, queueing,
+                                // auth refresh, model unavailable) can produce zero
+                                // protocol output and die silently — stderr is the only
+                                // trace of why, so fold its tail into the published
+                                // result rather than leaving this message as the whole
+                                // story wherever `result` is read (inbox, harness_result).
+                                r.result = Some(match r.stderr_snippet() {
+                                    Some(snippet) => format!("{base} — stderr: {snippet}"),
+                                    None => base,
+                                });
+                            }
                         }
-                    }
-                    // Consumes the floor even when a `Completed` event already
-                    // did (a harmless no-op then), so a budget-killed agent
-                    // that never reports a `Completed` at all still lands its
-                    // true cost/usage on the terminal record.
-                    self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
+                        // Consumes the floor even when a `Completed` event already
+                        // did (a harmless no-op then), so a budget-killed agent
+                        // that never reports a `Completed` at all still lands its
+                        // true cost/usage on the terminal record.
+                        self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
                     })
                 };
                 // Fenced to the session that actually died: a late `Exited`
@@ -5381,7 +5382,12 @@ impl Supervisor {
     /// whichever record currently holds `name`), even though the failure
     /// itself is a true, provider-wide fact — the breaker feed below stays
     /// unconditional.
-    fn record_transport_outage(&self, name: &str, outcome: &rk_harness::TransportOutcome, live: bool) {
+    fn record_transport_outage(
+        &self,
+        name: &str,
+        outcome: &rk_harness::TransportOutcome,
+        live: bool,
+    ) {
         let now = Utc::now();
         if live {
             let _ = self.lock_registry().update(name, |r| {
@@ -12803,7 +12809,10 @@ mod native_observation_tests {
             .update("Nibble", |r| r.pid = Some(4242))
             .unwrap();
 
-        let (_id, mut rx) = sup.verification.runs.register("Nibble", Some(spawn), "req-1");
+        let (_id, mut rx) = sup
+            .verification
+            .runs
+            .register("Nibble", Some(spawn), "req-1");
 
         sup.handle_event(
             "Nibble",
