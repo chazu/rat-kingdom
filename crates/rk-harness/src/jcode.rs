@@ -81,6 +81,7 @@ fn usage_from_tokens(value: &Value) -> TokenUsage {
         output: value["output"].as_u64().unwrap_or(0),
         cache_read: value["cache_read_input"].as_u64().unwrap_or(0),
         cache_creation: value["cache_creation_input"].as_u64().unwrap_or(0),
+        ..Default::default()
     }
 }
 
@@ -90,6 +91,7 @@ fn usage_from_done(value: &Value) -> TokenUsage {
         output: value["output_tokens"].as_u64().unwrap_or(0),
         cache_read: value["cache_read_input_tokens"].as_u64().unwrap_or(0),
         cache_creation: value["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        ..Default::default()
     }
 }
 
@@ -327,6 +329,7 @@ mod tests {
                 output: 20,
                 cache_read: 30,
                 cache_creation: 5,
+                ..Default::default()
             }
         );
 
@@ -414,6 +417,7 @@ echo '{"type":"done","session_id":"jcode-session-1","text":"working done","usage
                 output: 5,
                 cache_read: 5,
                 cache_creation: 0,
+                ..Default::default()
             }
         );
         assert_eq!(session_id.as_deref(), Some("jcode-session-1"));

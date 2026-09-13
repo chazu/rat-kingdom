@@ -307,7 +307,7 @@ exit 1
     assert_eq!(exhausted["agent"]["cost_usd"], json!(7.25));
     assert_eq!(
         exhausted["agent"]["usage"],
-        json!({"input":41,"output":17,"cache_read":13,"cache_creation":5})
+        json!({"input":41,"output":17,"cache_read":13,"cache_creation":5,"cache_creation_5m":0,"cache_creation_1h":0})
     );
     assert_eq!(transport_rows(&mut client, &name).await.len(), 1);
 
