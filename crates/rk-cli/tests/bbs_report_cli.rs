@@ -15,15 +15,25 @@ fn write_json(dir: &std::path::Path, name: &str, value: &Value) -> std::path::Pa
     path
 }
 
-fn cli(args: &[&str]) -> Output {
+fn cli_in_home(home: &std::path::Path, args: &[&str], agent: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rk"));
     command.args(args);
-    // No RK_HOME, no daemon: this command must never try to connect.
     for key in rk_core::review::STRIPPED_RK_SPAWN_ENV {
         command.env_remove(key);
     }
-    command.env_remove("RK_HOME");
+    // An empty RK_HOME with no daemon in it. Falling back to the developer's
+    // real ~/.rat-kingdom would let a live daemon answer a connection this
+    // command must never open, so the no-daemon invariant would go untested.
+    command.env("RK_HOME", home);
+    if let Some(agent) = agent {
+        command.env("RK_AGENT", agent);
+    }
     command.output().unwrap()
+}
+
+fn cli(args: &[&str]) -> Output {
+    let home = tempfile::tempdir().unwrap();
+    cli_in_home(home.path(), args, None)
 }
 
 fn manifest() -> Value {
@@ -290,4 +300,53 @@ fn accepts_a_bare_tuple_array_as_well_as_the_scan_envelope() {
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["tuples_order"], "unknown");
     assert_eq!(report["claimed"], 1);
+}
+
+/// The acceptance criterion the report exists for: no daemon connection is
+/// required to render saved evidence. Both spellings of "no daemon" are
+/// checked, because they fail differently — as a rat (`RK_AGENT` set) a
+/// connect errors outright, while unset it silently spawns a whole detached
+/// daemon (space.db/rk.sock/rk.pid/castle.key/auth.token/worktrees) as a side
+/// effect of a pure offline aggregation.
+#[test]
+fn renders_offline_against_a_fresh_home_without_creating_daemon_artifacts() {
+    for agent in [None, Some("Whisker-15")] {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = write_json(dir.path(), "manifest.json", &manifest());
+        let tuples_path = write_json(dir.path(), "tuples.json", &tuples_envelope());
+        let reviews_path = write_json(dir.path(), "reviews.json", &reviews());
+
+        let home = tempfile::tempdir().unwrap();
+        let out = cli_in_home(
+            home.path(),
+            &[
+                "--json",
+                "bbs",
+                "report",
+                "--manifest",
+                manifest_path.to_str().unwrap(),
+                "--tuples",
+                tuples_path.to_str().unwrap(),
+                "--reviews",
+                reviews_path.to_str().unwrap(),
+            ],
+            agent,
+        );
+        assert!(
+            out.status.success(),
+            "agent={agent:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["eligible"], 1);
+
+        let leaked: Vec<String> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "agent={agent:?} left daemon state in RK_HOME: {leaked:?}"
+        );
+    }
 }
