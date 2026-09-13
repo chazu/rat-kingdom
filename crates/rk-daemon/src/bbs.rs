@@ -463,6 +463,149 @@ fn write_telemetry(
     }
 }
 
+/// Exactly which attempt an observation describes.
+///
+/// `spawn` is the GENERATION and is deliberately not enough on its own: a
+/// manual respawn continues the same `SpawnId`, so two attempts of one
+/// generation would alias into a single key. `session` is the native launch
+/// token, which changes per physical process launch, so `(spawn, session)` is
+/// the only safe join/aggregation key. `provider_session` is the harness's own
+/// session id — a THIRD identity with its own lifetime (a provider-side reset
+/// mints a new one under an unchanged `session`); it is recorded beside the
+/// other two and is never a substitute for either.
+#[derive(Debug, Clone)]
+pub struct AttemptBinding {
+    pub agent: String,
+    pub repo: String,
+    pub task: Option<String>,
+    pub spawn: String,
+    pub session: String,
+    pub provider_session: Option<String>,
+}
+
+impl AttemptBinding {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent": self.agent,
+            "repo": self.repo,
+            "task": self.task,
+            "spawn": self.spawn,
+            "session": self.session,
+            "provider_session": self.provider_session,
+        })
+    }
+}
+
+/// The final provider-reported usage/cost the daemon observed for one attempt.
+///
+/// `cost_usd` is `None` whenever the basis is [`CostBasis::Unknown`]: an
+/// absent provider total is reported as unknown, never invented and never
+/// rendered as zero.
+#[derive(Debug, Clone)]
+pub struct FinalUsage {
+    pub cost_usd: Option<f64>,
+    pub basis: rk_core::bbs::CostBasis,
+    pub provenance: String,
+    pub usage: Option<serde_json::Value>,
+    pub state: String,
+    pub declared_done: bool,
+}
+
+/// Record the final reported usage/cost for one `(spawn, session)` attempt.
+///
+/// Authored from the supervisor's already-fenced `Completed` handler, at every
+/// result path it can take, so a `rk done` that precedes the provider's final
+/// total leaves BOTH records behind rather than only the provisional one.
+///
+/// Reported cost is a client-side ESTIMATE, not a billed charge, and a
+/// streaming result total is cumulative within one query: a consumer takes the
+/// last total per proven segment and never sums them. The record states its
+/// own basis so two different kinds of estimate cannot be pooled.
+pub fn record_final_usage(
+    space: &Space,
+    castle: &str,
+    binding: &AttemptBinding,
+    final_usage: &FinalUsage,
+) -> Capture {
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "bbs_kind": "agent_final_usage",
+        "repo": binding.repo,
+        "task": binding.task,
+        "agent": binding.agent,
+        "spawn": binding.spawn,
+        "session": binding.session,
+        "provider_session": binding.provider_session,
+        "observed_at": chrono::Utc::now().to_rfc3339(),
+        "state": final_usage.state,
+        "declared_done": final_usage.declared_done,
+        "cost_usd": final_usage.cost_usd,
+        "cost_basis": final_usage.basis.as_str(),
+        "cost_provenance": final_usage.provenance,
+        "usage": final_usage.usage,
+        // Stated in the record so no consumer has to rediscover it: a
+        // completion is not a physical exit, and this total is an estimate.
+        "semantics": "reported_estimate_not_billed",
+    });
+    write_telemetry(
+        space,
+        castle,
+        &binding.repo,
+        "bbs-agent-final-usage",
+        payload,
+        serde_json::json!({
+            "surface": "final_usage",
+            "binding": binding.json(),
+        }),
+    )
+}
+
+/// Record that the harness PROCESS for one `(spawn, session)` attempt exited.
+///
+/// `launched_at` is echoed from this session's launch event so a report can
+/// compute active execution duration as `exited_at - launched_at` for one
+/// attempt, without joining across event kinds and without mistaking queue or
+/// verification-admission time for execution.
+#[allow(clippy::too_many_arguments)]
+pub fn record_exit(
+    space: &Space,
+    castle: &str,
+    binding: &AttemptBinding,
+    exit_code: Option<i32>,
+    crashed: bool,
+    prior_state: &str,
+    launched_at: Option<String>,
+) -> Capture {
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "bbs_kind": "agent_exit",
+        "repo": binding.repo,
+        "task": binding.task,
+        "agent": binding.agent,
+        "spawn": binding.spawn,
+        "session": binding.session,
+        "provider_session": binding.provider_session,
+        "exited_at": chrono::Utc::now().to_rfc3339(),
+        // `null` means signal-terminated, which is NOT the same as exit 0.
+        "exit_code": exit_code,
+        "crashed": crashed,
+        "prior_state": prior_state,
+        "launched_at": launched_at,
+        "semantics": "physical_exit",
+    });
+    write_telemetry(
+        space,
+        castle,
+        &binding.repo,
+        "bbs-agent-exit",
+        payload,
+        serde_json::json!({
+            "surface": "exit",
+            "binding": binding.json(),
+        }),
+    )
+}
+
 fn refers_to(tuple: &Tuple, ids: &HashSet<String>) -> bool {
     // Match complete ticket tokens, including legacy aliases embedded in a
     // branch, rather than allowing TKT-1 to match TKT-10.
