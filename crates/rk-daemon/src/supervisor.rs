@@ -2611,12 +2611,11 @@ impl Supervisor {
                 true,
             )
         };
-        // `None`: this launch lives in a herdr pane and registers no session
-        // of its own, so it takes a watch-less token. Retiring the
-        // predecessor's token is not optional — left in place it would stand in
-        // for one, published below as this launch's `session`/`launched_at` off
-        // a watch belonging to the headless process, and still accepted as the
-        // owner of `name` by every late event that process has yet to emit.
+        // `None`: this launch lives in a herdr pane and registers no session of
+        // its own, so it takes a watch-less token. Retiring the predecessor's is
+        // not optional — left in place it stands in for one, published below as
+        // this launch's `session`/`launched_at` off the headless process's own
+        // watch, and still owning `name` for every late event it has yet to emit.
         let (updated, _) = self.publish_launch(&record.name, None, |current| {
             current.state = AgentState::Running;
             current.pid = None;
@@ -2702,15 +2701,14 @@ impl Supervisor {
         session: rk_core::id::SpawnId,
         event: HarnessEvent,
     ) {
-        // Every name-keyed mutation below is made under a HELD [`own`] guard,
-        // so the ownership check and the mutation it authorises are one step. A
-        // respawn publishes its replacement token under the same lock, so it is
-        // ordered strictly before the check (and the stale launch mutates
-        // nothing) or strictly after the mutation — never between them, which
-        // is where a bare `live` boolean let a predecessor's event resume,
-        // fail, overwrite, claim or route its successor's record. Only this
-        // launch's own frozen per-session watch (`lock_attempts`,
-        // `observe_final_usage`) stays writable from a stale event.
+        // Every name-keyed mutation below is made under a HELD `own` guard, so
+        // the ownership check and the mutation it authorises are one step; a
+        // launch publishes its takeover under the same lock (`publish_launch`).
+        // A bare `live` boolean could not do that — it dropped the guard at the
+        // check, leaving the window where a predecessor's event still resumed,
+        // failed, overwrote, claimed or routed its successor's record. Only this
+        // launch's own frozen watch (`lock_attempts`, `observe_final_usage`)
+        // stays writable from a stale event.
         //
         // A harness that speaks again has resumed the turn it paused on.
         // `Completed`/`Exited` are excluded because they decide their own
@@ -2836,12 +2834,11 @@ impl Supervisor {
                 cost_usd,
                 session_id,
             } => {
-                // Held for the whole disposition: the claim, the record write
-                // it authorises, and the routing that follows are one step. A
-                // superseded launch is observed under its own frozen watch
-                // (cost/usage only) and must never claim completion for
+                // Held for the whole disposition — claim, record write, routing
+                // — so they are one step. A superseded launch is observed under
+                // its own frozen watch (cost/usage only) and must never claim
                 // `name`'s `CompletionState`, mutate the successor's record, or
-                // route a completion/delivery on its behalf.
+                // route a completion on its behalf.
                 let Some(_owned) = self.own(name, session) else {
                     self.observe_final_usage(
                         session, 0.0, cost_usd, &usage, "unknown", false, false,
@@ -3020,11 +3017,10 @@ impl Supervisor {
                     .unwrap_or(AgentState::Failed);
 
                 // Held across this whole arm, so every change it makes under
-                // `name` — dropping the control handle, cancelling the managed
-                // verification, terminalizing the record, the recovery probe,
-                // and the withheld-turn flush/route at the bottom — is made
-                // under the same proof of ownership it was decided on. `live`
-                // is a readback of that proof, never a second lookup.
+                // `name` — control handle, managed verification, the record
+                // itself, the recovery probe, the withheld-turn flush/route at
+                // the bottom — is made under the proof it was decided on.
+                // `live` reads that proof back; it is never a second lookup.
                 let owned = self.own(name, session);
                 let live = owned.is_some();
                 if live {
@@ -3639,13 +3635,12 @@ impl Supervisor {
     /// recorded as unobservable rather than filled with a fresh `now()` that
     /// would silently disagree with the watch.
     ///
-    /// The WATCH decides that, not the token. An attach launch is fenced with a
-    /// token of its own ([`fence_unobservable_session`](Self::fence_unobservable_session))
-    /// so the predecessor's events stop reaching it, and that token has no
-    /// watch precisely because nothing will ever observe the launch. A token
-    /// whose watch belongs to some OTHER launch must never be published here —
-    /// that is how a headless predecessor's session and launch time used to be
-    /// reported as an attach launch's own.
+    /// The WATCH decides that, not the token: an attach launch is fenced with a
+    /// token of its own so the predecessor's events stop reaching it, and that
+    /// token has no watch precisely because nothing will ever observe the
+    /// launch. A token whose watch belongs to some OTHER launch must never be
+    /// published here — that is how a headless predecessor's session and launch
+    /// time used to be reported as an attach launch's own.
     fn launch_identity(&self, name: &str) -> (Option<String>, Option<String>) {
         let watched = self
             .lock_session_tokens()
@@ -3706,12 +3701,12 @@ impl Supervisor {
             );
             return;
         };
-        // `live` comes from the caller's held ownership guard, not a second
+        // `live` comes from the caller's HELD ownership guard, not a second
         // unsynchronised read that could disagree with the fence the record
-        // write was made under. A superseded launch's delayed result must not
-        // be labelled with the successor's record state or priced off the
-        // successor's running total: the event's own provider figure is this
-        // launch's, everything read from the name-keyed `AgentRecord` is not.
+        // write was made under. A superseded launch's delayed result must not be
+        // labelled with the successor's record state or priced off its running
+        // total: the event's own provider figure belongs to this launch,
+        // anything read from the name-keyed `AgentRecord` does not.
         // Three genuinely different situations, kept apart on purpose:
         //
         //  * this result carries a provider total -> that total, for THIS
@@ -8299,28 +8294,25 @@ impl Supervisor {
     /// `name` — or `None`, holding nothing, when it has been superseded.
     ///
     /// Holding it is the point: it makes an ownership check and the name-keyed
-    /// mutation it authorises one step. A respawn publishes its replacement
-    /// token under this same lock ([`track_session`](Self::track_session), or
-    /// [`fence_unobservable_session`](Self::fence_unobservable_session) for a
-    /// launch that registers no session of its own), so every launch or
-    /// replacement transition is ordered strictly before the check or strictly
-    /// after the mutation — never between them, which is exactly where a bare
-    /// `live` boolean let a predecessor's event land on its successor's record.
-    /// Bind the guard (`let Some(_owned) = ...`); a bare `.is_some()` in an
-    /// `if` condition drops it before the block and proves nothing.
+    /// mutation it authorises ONE step. Every launch publishes its replacement
+    /// token under this same lock ([`publish_launch`](Self::publish_launch)),
+    /// so a takeover is ordered strictly before the check or strictly after the
+    /// mutation — never between, which is exactly where a bare `live` boolean
+    /// let a predecessor's event land on its successor's record. Bind the guard
+    /// (`let Some(_owned) = ...`); a bare `.is_some()` in an `if` condition
+    /// drops it before the block and proves nothing.
     ///
     /// An absent entry counts as OWNED: a launch stamps `name` before its
-    /// harness can speak, so an empty map means nothing ever claimed `name`
-    /// (a test driving events directly), not a launch this map forgot.
+    /// harness can speak, so an empty map means nothing ever claimed `name` (a
+    /// test driving events directly), not a launch this map forgot.
     ///
     /// LOCK ORDER: `session_tokens` first, then `registry`/`controls`/
-    /// `completions`; never the reverse, and no path takes `session_tokens`
-    /// while holding one of those. Nothing may re-enter `session_tokens` while
-    /// a guard is held — `std::sync::Mutex` is not reentrant — so
-    /// [`launch_identity`](Self::launch_identity),
+    /// `completions`/`attempts`; never the reverse. Nothing may re-enter
+    /// `session_tokens` while a guard is held (`std::sync::Mutex` is not
+    /// reentrant), so [`launch_identity`](Self::launch_identity),
     /// [`gather_liveness_evidence`](Self::gather_liveness_evidence),
     /// [`update_stuck_ceiling`](Self::update_stuck_ceiling) and
-    /// [`session_generation`](Self::session_generation) stay outside, and
+    /// [`session_generation`](Self::session_generation) stay outside it, and
     /// [`observe_final_usage`](Self::observe_final_usage) takes the answer as
     /// an argument instead of reading the map a second time.
     fn own(
@@ -8336,21 +8328,19 @@ impl Supervisor {
     }
 
     /// Hand `name` over to a new launch as ONE step under the same guard
-    /// [`own`](Self::own) checks: the record reset, the control handle, the
-    /// fresh session token and the predecessor's stale completion bookkeeping
-    /// all change while that guard is held. Returns the reset record and this
-    /// launch's token.
+    /// [`own`](Self::own) checks: record reset, control handle, fresh session
+    /// token and the predecessor's stale completion bookkeeping all change
+    /// while it is held. Returns the reset record and this launch's token.
     ///
-    /// This is the publishing half of the fence, and it matters as much as the
-    /// handler half. Every launch path used to reset the record to `Running`
-    /// and install its new control handle BEFORE the token changed hands, and
-    /// [`track_session`](Self::track_session) itself inserted the control
-    /// before the token — so a predecessor's late event arriving anywhere in
-    /// those windows still passed its ownership check against the OLD token and
-    /// went on to terminalize the successor's freshly reset record, remove the
-    /// successor's control handle, or flush its completion state. Holding the
-    /// guard across the whole takeover leaves a handler only two observable
-    /// orderings: entirely before it, or entirely after it.
+    /// The publishing half of the fence, and it matters as much as the handler
+    /// half. Every launch path used to reset the record to `Running` and
+    /// install its new control handle BEFORE the token changed hands (and
+    /// [`track_session`](Self::track_session) inserted the control before the
+    /// token), so a predecessor's late event arriving in those windows still
+    /// passed its ownership check against the OLD token and then re-terminalized
+    /// the successor's freshly reset record, removed its control handle, or
+    /// flushed its completion state. Holding the guard across the whole takeover
+    /// leaves a handler two orderings: entirely before it, or entirely after.
     ///
     /// `control` is `None` for a launch that registers no observable session of
     /// its own (an attach), which gets a watch-less token — see
@@ -8388,12 +8378,11 @@ impl Supervisor {
     /// Replaces rather than removes, and both halves matter. Removing the entry
     /// would read as OWNED in [`own`](Self::own), so every late event the dead
     /// headless process still emits would go on mutating the record this attach
-    /// launch now holds. Keeping the predecessor's token would publish that
-    /// headless launch's native session — and borrow its [`AttemptWatch`] for a
-    /// launch time this launch never had — as THIS launch's identity, and would
-    /// let a grace timer armed for it match here. A token with no watch is what
-    /// [`launch_identity`](Self::launch_identity) reports as unobservable,
-    /// which is the honest answer for an attach launch.
+    /// launch holds. Keeping the predecessor's token would publish that headless
+    /// launch's session — and borrow its [`AttemptWatch`] launch time — as THIS
+    /// launch's identity, and would let a grace timer armed for it match here. A
+    /// token with no watch is what [`launch_identity`](Self::launch_identity)
+    /// reports as unobservable: the honest answer for an attach launch.
     fn fence_unobservable_session(
         &self,
         tokens: &mut HashMap<String, rk_core::id::SpawnId>,
