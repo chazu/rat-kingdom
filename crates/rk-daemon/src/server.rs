@@ -3229,7 +3229,8 @@ impl Daemon {
                 self.supervisor.set_dispatch_paused(false);
                 reply(Response::ok(id, json!({"paused": false})))
             }
-            "bbs.ask" | "bbs.answer" | "bbs.accept" | "bbs.publish" | "bbs.reuse" | "bbs.assess" => {
+            "bbs.ask" | "bbs.answer" | "bbs.accept" | "bbs.publish" | "bbs.reuse"
+            | "bbs.assess" => {
                 let _guard = self
                     .bbs_write_lock
                     .lock()
@@ -10679,8 +10680,8 @@ impl Daemon {
                     "bbs-reuse-",
                     "bbs-assessment-",
                 ]
-                    .iter()
-                    .any(|prefix| params.identity.starts_with(prefix)))
+                .iter()
+                .any(|prefix| params.identity.starts_with(prefix)))
         {
             return Response::err(
                 req.id,

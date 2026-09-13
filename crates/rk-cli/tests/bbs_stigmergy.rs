@@ -12,7 +12,12 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -34,12 +39,19 @@ fn cli(layout: &Layout, agent: Option<&str>, args: &[&str]) -> Output {
 }
 
 fn success(output: Output) -> Value {
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn failure(output: Output) -> String {
-    assert!(!output.status.success(), "expected failure, got: {output:?}");
+    assert!(
+        !output.status.success(),
+        "expected failure, got: {output:?}"
+    );
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
@@ -73,26 +85,38 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     std::fs::write(repo_dir.path().join(".rk/repo.cue"), "repo: {}\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
-    std::env::set_var("RK_FAKE_HARNESS_CMD", format!("{FAKE_HARNESS}{RESULT_LINE}\n"));
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        format!("{FAKE_HARNESS}{RESULT_LINE}\n"),
+    );
 
     let layout = Layout::at(home.path());
     let (mut client, handle) = start(&layout).await;
     client
-        .call("repo.add", json!({"name": "myrepo", "path": repo_dir.path()}))
+        .call(
+            "repo.add",
+            json!({"name": "myrepo", "path": repo_dir.path()}),
+        )
         .await
         .unwrap();
 
     // Two distinct repo-scoped tasks: alice's real assignment, and a second
     // task she must NOT be able to claim a finding/receipt against.
     let mine = client
-        .call("ticket.new", json!({"title": "parser work", "scope": "myrepo"}))
+        .call(
+            "ticket.new",
+            json!({"title": "parser work", "scope": "myrepo"}),
+        )
         .await
         .unwrap()["ticket"]["identity"]
         .as_str()
         .unwrap()
         .to_string();
     let not_mine = client
-        .call("ticket.new", json!({"title": "unrelated work", "scope": "myrepo"}))
+        .call(
+            "ticket.new",
+            json!({"title": "unrelated work", "scope": "myrepo"}),
+        )
         .await
         .unwrap()["ticket"]["identity"]
         .as_str()
@@ -104,7 +128,10 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     // actual, different native `SpawnId`s and task identities — the exact
     // source-to-consumer generation proof the offline report must replay.
     let consumer_task = client
-        .call("ticket.new", json!({"title": "consumer work", "scope": "myrepo"}))
+        .call(
+            "ticket.new",
+            json!({"title": "consumer work", "scope": "myrepo"}),
+        )
         .await
         .unwrap()["ticket"]["identity"]
         .as_str()
@@ -119,7 +146,10 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
         ));
         let name = spawned["name"].as_str().unwrap().to_string();
         for _ in 0..250 {
-            let status = client.call("agent.status", json!({"name": name})).await.unwrap();
+            let status = client
+                .call("agent.status", json!({"name": name}))
+                .await
+                .unwrap();
             if status["state"] == "completed" {
                 break;
             }
@@ -160,14 +190,22 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
 
     let publish_args = |task: &str, revision: &str, evidence: &str| -> Vec<String> {
         vec![
-            "--json".into(), "bbs".into(), "publish".into(),
+            "--json".into(),
+            "bbs".into(),
+            "publish".into(),
             "Delimiters must be escaped".into(),
-            "--repo".into(), "myrepo".into(),
-            "--task".into(), task.into(),
-            "--area".into(), "src/parser.rs".into(),
-            "--revision".into(), revision.into(),
-            "--evidence".into(), evidence.into(),
-            "--limitations".into(), "only checked ASCII input".into(),
+            "--repo".into(),
+            "myrepo".into(),
+            "--task".into(),
+            task.into(),
+            "--area".into(),
+            "src/parser.rs".into(),
+            "--revision".into(),
+            revision.into(),
+            "--evidence".into(),
+            evidence.into(),
+            "--limitations".into(),
+            "only checked ASCII input".into(),
         ]
     };
     let sha = "a".repeat(40);
@@ -185,7 +223,9 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     // Hostile: cross-repo evidence is rejected.
     let cross_repo_owned = publish_args(&mine, &sha, &foreign_ev);
     let cross_repo_args: Vec<&str> = cross_repo_owned.iter().map(String::as_str).collect();
-    assert!(!cli(&layout, Some(&alice), &cross_repo_args).status.success());
+    assert!(!cli(&layout, Some(&alice), &cross_repo_args)
+        .status
+        .success());
 
     // Hostile: a supervised agent cannot publish against a task she was not
     // assigned — this is the real `AgentRecord.task` path, not a bare caller.
@@ -200,8 +240,18 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     // design's `rk bbs reuse SOURCE --outcome ... --text TEXT --evidence
     // ARTIFACT` syntax exactly.
     let reuse_args = [
-        "--json", "bbs", "reuse", &f, "--task", &consumer_task, "--outcome", "used",
-        "--text", "Applied it to my case", "--evidence", &ev,
+        "--json",
+        "bbs",
+        "reuse",
+        &f,
+        "--task",
+        &consumer_task,
+        "--outcome",
+        "used",
+        "--text",
+        "Applied it to my case",
+        "--evidence",
+        &ev,
     ];
     let receipt = success(cli(&layout, Some(&bob), &reuse_args));
     let r = receipt["id"].as_str().unwrap().to_string();
@@ -216,8 +266,14 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     // report must later replay to attribute reuse across real generations.
     let shown_f = success(cli(&layout, Some("carol"), &["--json", "bbs", "show", &f]));
     let shown_r = success(cli(&layout, Some("carol"), &["--json", "bbs", "show", &r]));
-    let finding_spawn = shown_f["tuple"]["payload"]["spawn"].as_str().unwrap().to_string();
-    let receipt_spawn = shown_r["tuple"]["payload"]["spawn"].as_str().unwrap().to_string();
+    let finding_spawn = shown_f["tuple"]["payload"]["spawn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let receipt_spawn = shown_r["tuple"]["payload"]["spawn"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_ne!(
         finding_spawn, receipt_spawn,
         "the publisher's and consumer's native SpawnIds must be genuinely distinct"
@@ -233,8 +289,18 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
 
     // Hostile: reuse SOURCE cannot be another receipt.
     let bad_source = [
-        "--json", "bbs", "reuse", &r, "--task", &consumer_task, "--outcome", "used",
-        "--text", "Trying to reuse a receipt", "--evidence", &ev,
+        "--json",
+        "bbs",
+        "reuse",
+        &r,
+        "--task",
+        &consumer_task,
+        "--outcome",
+        "used",
+        "--text",
+        "Trying to reuse a receipt",
+        "--evidence",
+        &ev,
     ];
     assert!(!cli(&layout, Some("carol"), &bad_source).status.success());
 
@@ -243,18 +309,34 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     // this needs a REAL ticket in a different repo scope to be a genuine
     // cross-repo claim rather than an unresolved alias.
     let other_repo_task = client
-        .call("ticket.new", json!({"title": "other repo work", "scope": "otherrepo"}))
+        .call(
+            "ticket.new",
+            json!({"title": "other repo work", "scope": "otherrepo"}),
+        )
         .await
         .unwrap()["ticket"]["identity"]
         .as_str()
         .unwrap()
         .to_string();
     let cross_repo_task_args = [
-        "--json", "bbs", "reuse", &f, "--task", &other_repo_task,
-        "--outcome", "used", "--text", "cross-repo task claim", "--evidence", &ev,
+        "--json",
+        "bbs",
+        "reuse",
+        &f,
+        "--task",
+        &other_repo_task,
+        "--outcome",
+        "used",
+        "--text",
+        "cross-repo task claim",
+        "--evidence",
+        &ev,
     ];
     let cross_repo_task_err = failure(cli(&layout, Some("carol"), &cross_repo_task_args));
-    assert!(cross_repo_task_err.contains("different repository"), "{cross_repo_task_err}");
+    assert!(
+        cross_repo_task_err.contains("different repository"),
+        "{cross_repo_task_err}"
+    );
 
     // Two DIFFERENT consuming tasks genuinely reusing the same source the
     // same way must get two DISTINCT receipts, not collide into one retry —
@@ -262,15 +344,28 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     // unbound identity so an operator-style caller (no assigned task to
     // enforce) is exactly what is exercised here.
     let second_task = client
-        .call("ticket.new", json!({"title": "a second consumer", "scope": "myrepo"}))
+        .call(
+            "ticket.new",
+            json!({"title": "a second consumer", "scope": "myrepo"}),
+        )
         .await
         .unwrap()["ticket"]["identity"]
         .as_str()
         .unwrap()
         .to_string();
     let reuse_for_second_task = [
-        "--json", "bbs", "reuse", &f, "--task", &second_task, "--outcome", "used",
-        "--text", "Applied it to my case", "--evidence", &ev,
+        "--json",
+        "bbs",
+        "reuse",
+        &f,
+        "--task",
+        &second_task,
+        "--outcome",
+        "used",
+        "--text",
+        "Applied it to my case",
+        "--evidence",
+        &ev,
     ];
     let receipt_for_second_task = success(cli(&layout, Some("carol"), &reuse_for_second_task));
     assert_ne!(
@@ -278,8 +373,14 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
         "a different consuming task must get its own receipt, not the first task's"
     );
     let shown_second = success(cli(
-        &layout, Some("carol"),
-        &["--json", "bbs", "show", receipt_for_second_task["id"].as_str().unwrap()],
+        &layout,
+        Some("carol"),
+        &[
+            "--json",
+            "bbs",
+            "show",
+            receipt_for_second_task["id"].as_str().unwrap(),
+        ],
     ));
     assert_eq!(shown_second["tuple"]["payload"]["task"], second_task);
 
@@ -298,10 +399,22 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
         .unwrap()
         .to_string();
     let reuse_of_forged_finding = [
-        "--json", "bbs", "reuse", &forged_finding, "--task", &consumer_task, "--outcome", "used",
-        "--text", "trying to reuse a forged finding", "--evidence", &ev,
+        "--json",
+        "bbs",
+        "reuse",
+        &forged_finding,
+        "--task",
+        &consumer_task,
+        "--outcome",
+        "used",
+        "--text",
+        "trying to reuse a forged finding",
+        "--evidence",
+        &ev,
     ];
-    assert!(!cli(&layout, Some("carol"), &reuse_of_forged_finding).status.success());
+    assert!(!cli(&layout, Some("carol"), &reuse_of_forged_finding)
+        .status
+        .success());
     let non_string_kind = client
         .call(
             "space.out",
@@ -313,15 +426,35 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
         .unwrap()
         .to_string();
     let reuse_of_non_string_kind = [
-        "--json", "bbs", "reuse", &non_string_kind, "--task", &consumer_task, "--outcome", "used",
-        "--text", "trying to reuse a non-string bbs_kind", "--evidence", &ev,
+        "--json",
+        "bbs",
+        "reuse",
+        &non_string_kind,
+        "--task",
+        &consumer_task,
+        "--outcome",
+        "used",
+        "--text",
+        "trying to reuse a non-string bbs_kind",
+        "--evidence",
+        &ev,
     ];
-    assert!(!cli(&layout, Some("carol"), &reuse_of_non_string_kind).status.success());
+    assert!(!cli(&layout, Some("carol"), &reuse_of_non_string_kind)
+        .status
+        .success());
 
     // Ordinary workers cannot assess or self-grant authority.
     let assess_args = [
-        "--json", "bbs", "assess", &r, "--verdict", "verified", "--reason",
-        "Confirmed independently", "--evidence", &ev,
+        "--json",
+        "bbs",
+        "assess",
+        &r,
+        "--verdict",
+        "verified",
+        "--reason",
+        "Confirmed independently",
+        "--evidence",
+        &ev,
     ];
     let denied = failure(cli(&layout, Some(&bob), &assess_args));
     assert!(denied.contains("not authorized for bbs.assess"), "{denied}");
@@ -362,7 +495,10 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     let shown = success(cli(&layout, Some("carol"), &["--json", "bbs", "show", &f]));
     assert_eq!(shown["reuse"].as_array().unwrap().len(), 2);
     let bobs_entry = find_receipt(&shown, &r);
-    assert_eq!(bobs_entry["current_assessment"]["payload"]["verdict"], "verified");
+    assert_eq!(
+        bobs_entry["current_assessment"]["payload"]["verdict"],
+        "verified"
+    );
 
     // Restart: everything survives, re-publishing/re-reusing stays idempotent
     // against the durable record rather than a fresh duplicate, and the
@@ -384,9 +520,12 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     let post_restart_reuse = success(cli(&layout, Some(&bob), &reuse_args));
     assert_eq!(post_restart_reuse["id"], r);
     assert_eq!(post_restart_reuse["written"], false);
-    let shown_r_after_restart = success(cli(&layout, Some("carol"), &["--json", "bbs", "show", &r]));
+    let shown_r_after_restart =
+        success(cli(&layout, Some("carol"), &["--json", "bbs", "show", &r]));
     assert_eq!(
-        shown_r_after_restart["tuple"]["payload"]["spawn"].as_str().unwrap(),
+        shown_r_after_restart["tuple"]["payload"]["spawn"]
+            .as_str()
+            .unwrap(),
         receipt_spawn,
         "the consumer's native SpawnId is durable across a restart"
     );
@@ -396,11 +535,19 @@ async fn early_finding_to_receipt_to_assessment_survives_restart_and_rejects_hos
     let brief = success(cli(
         &layout,
         Some("carol"),
-        &["--json", "bbs", "brief", "--repo", "myrepo", "--task", &mine],
+        &[
+            "--json", "bbs", "brief", "--repo", "myrepo", "--task", &mine,
+        ],
     ));
     let entries = brief["entries"].as_array().unwrap();
-    assert!(entries.iter().any(|e| e["id"] == f), "the finding must be discoverable");
-    assert!(!entries.iter().any(|e| e["id"] == r), "a reuse receipt must not appear in discovery");
+    assert!(
+        entries.iter().any(|e| e["id"] == f),
+        "the finding must be discoverable"
+    );
+    assert!(
+        !entries.iter().any(|e| e["id"] == r),
+        "a reuse receipt must not appear in discovery"
+    );
     assert!(
         !entries.iter().any(|e| e["id"] == assessment["id"]),
         "an assessment must not appear in discovery"

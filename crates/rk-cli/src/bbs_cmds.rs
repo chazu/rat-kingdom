@@ -171,7 +171,12 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
                 // Linked reuse threads onto any rendering above: an ordinary
                 // artifact, a finding, an answer (also a question reply), or a
                 // reuse receipt showing its own assessments.
-                for receipt in result.get("reuse").and_then(|r| r.as_array()).into_iter().flatten() {
+                for receipt in result
+                    .get("reuse")
+                    .and_then(|r| r.as_array())
+                    .into_iter()
+                    .flatten()
+                {
                     let r = &receipt["receipt"];
                     println!(
                         "\nreuse {} by {} — {}\n{}",

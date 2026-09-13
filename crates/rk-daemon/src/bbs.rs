@@ -298,8 +298,7 @@ pub fn show(space: &Space, id: &str) -> rk_core::Result<serde_json::Value> {
             let mut assessments: Vec<Tuple> = artifacts
                 .iter()
                 .filter(|t| {
-                    rk_core::bbs::is_assessment(t)
-                        && t.payload["receipt"] == receipt.id.to_string()
+                    rk_core::bbs::is_assessment(t) && t.payload["receipt"] == receipt.id.to_string()
                 })
                 .cloned()
                 .collect();
@@ -450,9 +449,7 @@ fn check_artifact(space: &Space, id: Option<&str>, scope: &str) -> Result<(), Wr
 fn check_areas(areas: &[String]) -> Result<(), WriteError> {
     if areas.is_empty()
         || areas.len() > 20
-        || areas
-            .iter()
-            .any(|a| a.trim().is_empty() || a.len() > 512)
+        || areas.iter().any(|a| a.trim().is_empty() || a.len() > 512)
     {
         return Err(invalid(
             "at least one and at most 20 nonempty areas (512 bytes each) are required",
@@ -619,9 +616,7 @@ pub fn write(
                     .as_ref()
                     .is_some_and(|k| k.is_empty() || k.len() > 256)
             {
-                return Err(invalid(
-                    "repo/task required; key must be 1..256 bytes",
-                ));
+                return Err(invalid("repo/task required; key must be 1..256 bytes"));
             }
             check_repo(record, &p.repo)?;
             check_evidence(space, &p.evidence, &p.repo)?;
@@ -658,7 +653,10 @@ pub fn write(
         "bbs.reuse" => {
             let p: ReuseParams = parse(params)?;
             check_text(&p.text)?;
-            if !matches!(p.outcome.as_str(), "used" | "adapted" | "confirmed" | "rejected") {
+            if !matches!(
+                p.outcome.as_str(),
+                "used" | "adapted" | "confirmed" | "rejected"
+            ) {
                 return Err(invalid(
                     "outcome must be used, adapted, confirmed, or rejected",
                 ));
@@ -696,7 +694,10 @@ pub fn write(
             check_repo(record, &source.scope)?;
             check_evidence(space, &p.evidence, &source.scope)?;
             let task_ticket = tickets.resolve(&p.task)?;
-            if task_ticket.as_ref().is_some_and(|t| t.scope != source.scope) {
+            if task_ticket
+                .as_ref()
+                .is_some_and(|t| t.scope != source.scope)
+            {
                 return Err(invalid("task belongs to a different repository"));
             }
             let task = task_ticket.map_or(p.task.clone(), |t| t.identity);
@@ -986,12 +987,27 @@ mod tests {
         let space = Space::open_in_memory().unwrap();
         let tickets = Tickets::new(space.clone(), "castle".into());
         let ev = evidence_artifact(&space, "repo", "ev1");
-        let ok = write(&space, &tickets, "alice", None, "bbs.publish", &publish_params(&ev))
-            .unwrap_or_else(|e| panic!("{}", e.message));
+        let ok = write(
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
         assert_eq!(ok["kind"], "finding");
         assert_eq!(ok["written"], true);
         // Exact retry is idempotent: same content, same tuple.
-        let retry = write(&space, &tickets, "alice", None, "bbs.publish", &publish_params(&ev)).unwrap();
+        let retry = write(
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap();
         assert_eq!(retry["id"], ok["id"]);
         assert_eq!(retry["written"], false);
         // At least one area is required.
@@ -1001,7 +1017,15 @@ mod tests {
         // Evidence must exist.
         let mut bad_evidence = publish_params(&ev);
         bad_evidence["evidence"] = json!([rk_core::id::RecordId::new().to_string()]);
-        assert!(write(&space, &tickets, "alice", None, "bbs.publish", &bad_evidence).is_err());
+        assert!(write(
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.publish",
+            &bad_evidence
+        )
+        .is_err());
         // Evidence must be in the same repository.
         let foreign = evidence_artifact(&space, "other", "ev-foreign");
         let mut cross_repo = publish_params(&ev);
@@ -1040,26 +1064,59 @@ mod tests {
         )
         .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
         space.out(furniture_ordinary.clone()).unwrap();
-        let finding = write(&space, &tickets, "alice", None, "bbs.publish", &publish_params(&ev)).unwrap();
+        let finding = write(
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap();
         let question = write(
-            &space, &tickets, "alice", None, "bbs.ask",
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.ask",
             &json!({"repo":"repo","task":"parser","text":"Which delimiter?"}),
-        ).unwrap();
+        )
+        .unwrap();
         let answer = write(
-            &space, &tickets, "bob", None, "bbs.answer",
+            &space,
+            &tickets,
+            "bob",
+            None,
+            "bbs.answer",
             &json!({"question":question["id"],"text":"Use a newline","artifact":null}),
-        ).unwrap();
+        )
+        .unwrap();
         let reuse_of_ordinary = |source: &str| {
-            write(&space, &tickets, "carol", None, "bbs.reuse",
-                &json!({"source":source,"task":"parser","outcome":"used","text":"Applied it","evidence":[ev]}))
+            write(
+                &space,
+                &tickets,
+                "carol",
+                None,
+                "bbs.reuse",
+                &json!({"source":source,"task":"parser","outcome":"used","text":"Applied it","evidence":[ev]}),
+            )
         };
-        assert!(reuse_of_ordinary(&ordinary).is_ok(), "ordinary Session artifact must be reusable");
+        assert!(
+            reuse_of_ordinary(&ordinary).is_ok(),
+            "ordinary Session artifact must be reusable"
+        );
         assert!(
             reuse_of_ordinary(&furniture_ordinary.id.to_string()).is_ok(),
             "ordinary Furniture artifact (no bbs_kind) must be reusable regardless of lifecycle"
         );
-        assert!(reuse_of_ordinary(finding["id"].as_str().unwrap()).is_ok(), "a finding must be reusable");
-        assert!(reuse_of_ordinary(answer["id"].as_str().unwrap()).is_ok(), "an answer must be reusable");
+        assert!(
+            reuse_of_ordinary(finding["id"].as_str().unwrap()).is_ok(),
+            "a finding must be reusable"
+        );
+        assert!(
+            reuse_of_ordinary(answer["id"].as_str().unwrap()).is_ok(),
+            "an answer must be reusable"
+        );
         let receipt = reuse_of_ordinary(&ordinary).unwrap();
         assert!(
             reuse_of_ordinary(receipt["id"].as_str().unwrap()).is_err(),
@@ -1089,18 +1146,30 @@ mod tests {
         // must be rejected exactly like a non-string `bbs_kind`, not waved
         // through because the string happens to read "finding".
         let forged_finding = Tuple::new(
-            Category::Artifact, "repo", "forged", "someone",
+            Category::Artifact,
+            "repo",
+            "forged",
+            "someone",
             json!({"bbs_kind":"finding","text":"not a real finding"}),
         );
         space.out(forged_finding.clone()).unwrap();
         let non_string_kind = Tuple::new(
-            Category::Artifact, "repo", "non-string-kind", "someone",
+            Category::Artifact,
+            "repo",
+            "non-string-kind",
+            "someone",
             json!({"bbs_kind":123}),
         );
         space.out(non_string_kind.clone()).unwrap();
         let reuse = |source: &str, task: &str| {
-            write(&space, &tickets, "operator", None, "bbs.reuse",
-                &json!({"source":source,"task":task,"outcome":"used","text":"x","evidence":[ev]}))
+            write(
+                &space,
+                &tickets,
+                "operator",
+                None,
+                "bbs.reuse",
+                &json!({"source":source,"task":task,"outcome":"used","text":"x","evidence":[ev]}),
+            )
         };
         assert!(
             reuse(&forged_finding.id.to_string(), "task-a").is_err(),
@@ -1115,10 +1184,20 @@ mod tests {
         // DIFFERENT repository than the source, must be rejected — not just
         // an unresolvable string (which harmlessly falls back to itself).
         let ordinary = evidence_artifact(&space, "repo", "ordinary");
-        let foreign_task = Tuple::new(Category::Task, "otherrepo", "OTHER-1", "operator", json!({"title":"x"}));
+        let foreign_task = Tuple::new(
+            Category::Task,
+            "otherrepo",
+            "OTHER-1",
+            "operator",
+            json!({"title":"x"}),
+        );
         space.out(foreign_task.clone()).unwrap();
         let cross_repo = reuse(&ordinary, "OTHER-1").unwrap_err();
-        assert!(cross_repo.message.contains("different repository"), "{}", cross_repo.message);
+        assert!(
+            cross_repo.message.contains("different repository"),
+            "{}",
+            cross_repo.message
+        );
 
         // The consuming TASK is part of the receipt's logical identity: two
         // different tasks reusing the same source the same way (identical
@@ -1126,7 +1205,10 @@ mod tests {
         // exact retry under the SAME task must still collapse.
         let for_task_a = reuse(&ordinary, "task-a").unwrap();
         let retry_task_a = reuse(&ordinary, "task-a").unwrap();
-        assert_eq!(retry_task_a["id"], for_task_a["id"], "same task, same content: idempotent");
+        assert_eq!(
+            retry_task_a["id"], for_task_a["id"],
+            "same task, same content: idempotent"
+        );
         assert_eq!(retry_task_a["written"], false);
         let for_task_b = reuse(&ordinary, "task-b").unwrap();
         assert_ne!(
@@ -1147,14 +1229,25 @@ mod tests {
             &json!({"source":ordinary,"task":"parser","outcome":"used","text":"Applied it","evidence":[ev]}),
         ).unwrap();
         let assess = |caller: &str, verdict: &str, reason: &str| {
-            write(&space, &tickets, caller, None, "bbs.assess",
-                &json!({"receipt":receipt["id"],"verdict":verdict,"reason":reason,"evidence":[ev]}))
+            write(
+                &space,
+                &tickets,
+                caller,
+                None,
+                "bbs.assess",
+                &json!({"receipt":receipt["id"],"verdict":verdict,"reason":reason,"evidence":[ev]}),
+            )
         };
         let denied = assess("bob", "verified", "trying to self-grant authority").unwrap_err();
         assert_eq!(denied.code, crate::proto::codes::FORBIDDEN);
         assert!(denied.message.contains("operator"));
         assert!(
-            assess("", "unsupported", "the operator can call with an empty caller too").is_ok(),
+            assess(
+                "",
+                "unsupported",
+                "the operator can call with an empty caller too"
+            )
+            .is_ok(),
             "empty caller normalizes to operator, matching the rest of BBS"
         );
         let first = assess("operator", "unsupported", "not enough evidence yet").unwrap();
@@ -1186,7 +1279,15 @@ mod tests {
         let space = Space::open_in_memory().unwrap();
         let tickets = Tickets::new(space.clone(), "castle".into());
         let ev = evidence_artifact(&space, "repo", "ev1");
-        let finding = write(&space, &tickets, "alice", None, "bbs.publish", &publish_params(&ev)).unwrap();
+        let finding = write(
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap();
         let err = write(
             &space, &tickets, "operator", None, "bbs.assess",
             &json!({"receipt":finding["id"],"verdict":"verified","reason":"not a receipt","evidence":[ev]}),
@@ -1213,11 +1314,38 @@ mod tests {
             "test fixture must use distinct generations"
         );
 
-        let first = write(&space, &tickets, "alice", Some(&original_generation), "bbs.publish", &publish_params(&ev)).unwrap();
-        let retry_same_gen = write(&space, &tickets, "alice", Some(&original_generation), "bbs.publish", &publish_params(&ev)).unwrap();
-        assert_eq!(retry_same_gen["id"], first["id"], "a retry from the same generation (incl. after `rk respawn`) is idempotent");
+        let first = write(
+            &space,
+            &tickets,
+            "alice",
+            Some(&original_generation),
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap();
+        let retry_same_gen = write(
+            &space,
+            &tickets,
+            "alice",
+            Some(&original_generation),
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap();
+        assert_eq!(
+            retry_same_gen["id"], first["id"],
+            "a retry from the same generation (incl. after `rk respawn`) is idempotent"
+        );
         assert_eq!(retry_same_gen["written"], false);
-        let other_gen = write(&space, &tickets, "alice", Some(&replacement_generation), "bbs.publish", &publish_params(&ev)).unwrap();
+        let other_gen = write(
+            &space,
+            &tickets,
+            "alice",
+            Some(&replacement_generation),
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap();
         assert_ne!(
             other_gen["id"], first["id"],
             "a byte-identical publish from a REPLACEMENT generation must not inherit the predecessor's tuple"
@@ -1231,9 +1359,28 @@ mod tests {
         // same-`SpawnId` `rk respawn` — survive without creating a duplicate
         // question).
         let ask_params = json!({"repo":"repo","task":"parser","text":"Which grammar?"});
-        let q1 = write(&space, &tickets, "alice", Some(&original_generation), "bbs.ask", &ask_params).unwrap();
-        let q2 = write(&space, &tickets, "alice", Some(&replacement_generation), "bbs.ask", &ask_params).unwrap();
-        assert_eq!(q1["id"], q2["id"], "ask must still collapse across generations");
+        let q1 = write(
+            &space,
+            &tickets,
+            "alice",
+            Some(&original_generation),
+            "bbs.ask",
+            &ask_params,
+        )
+        .unwrap();
+        let q2 = write(
+            &space,
+            &tickets,
+            "alice",
+            Some(&replacement_generation),
+            "bbs.ask",
+            &ask_params,
+        )
+        .unwrap();
+        assert_eq!(
+            q1["id"], q2["id"],
+            "ask must still collapse across generations"
+        );
         assert_eq!(q2["written"], false);
     }
 
@@ -1244,11 +1391,23 @@ mod tests {
         let ev = evidence_artifact(&space, "repo", "ev1");
         let ordinary = evidence_artifact(&space, "repo", "ordinary");
         let alice = agent_record("alice", "parser");
-        let honest = write(&space, &tickets, "alice", Some(&alice), "bbs.reuse",
-            &json!({"source":ordinary,"task":"parser","outcome":"used","text":"Applied it","evidence":[ev]}));
+        let honest = write(
+            &space,
+            &tickets,
+            "alice",
+            Some(&alice),
+            "bbs.reuse",
+            &json!({"source":ordinary,"task":"parser","outcome":"used","text":"Applied it","evidence":[ev]}),
+        );
         assert!(honest.is_ok());
-        let dishonest = write(&space, &tickets, "alice", Some(&alice), "bbs.reuse",
-            &json!({"source":ordinary,"task":"someone-elses-task","outcome":"used","text":"Applied it","evidence":[ev]}));
+        let dishonest = write(
+            &space,
+            &tickets,
+            "alice",
+            Some(&alice),
+            "bbs.reuse",
+            &json!({"source":ordinary,"task":"someone-elses-task","outcome":"used","text":"Applied it","evidence":[ev]}),
+        );
         let err = dishonest.unwrap_err();
         assert_eq!(err.code, crate::proto::codes::FORBIDDEN);
     }
@@ -1271,14 +1430,31 @@ mod tests {
             "verified"
         );
 
-        let question = write(&space, &tickets, "alice", None, "bbs.ask",
-            &json!({"repo":"repo","task":"parser","text":"Which delimiter?"})).unwrap();
-        let answer = write(&space, &tickets, "bob", None, "bbs.answer",
-            &json!({"question":question["id"],"text":"Use a newline","artifact":null})).unwrap();
+        let question = write(
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.ask",
+            &json!({"repo":"repo","task":"parser","text":"Which delimiter?"}),
+        )
+        .unwrap();
+        let answer = write(
+            &space,
+            &tickets,
+            "bob",
+            None,
+            "bbs.answer",
+            &json!({"question":question["id"],"text":"Use a newline","artifact":null}),
+        )
+        .unwrap();
         write(&space, &tickets, "carol", None, "bbs.reuse",
             &json!({"source":answer["id"],"task":"parser","outcome":"confirmed","text":"Matched my case","evidence":[ev]})).unwrap();
         let shown_answer = show(&space, answer["id"].as_str().unwrap()).unwrap();
-        assert_eq!(shown_answer["status"], "open", "reuse threading must not fabricate acceptance");
+        assert_eq!(
+            shown_answer["status"], "open",
+            "reuse threading must not fabricate acceptance"
+        );
         assert_eq!(shown_answer["reuse"].as_array().unwrap().len(), 1);
     }
 
@@ -1291,22 +1467,31 @@ mod tests {
         let receipt = write(&space, &tickets, "carol", None, "bbs.reuse",
             &json!({"source":ordinary,"task":"parser","outcome":"used","text":"Applied it","evidence":[ev]})).unwrap();
         let receipt_id = receipt["id"].as_str().unwrap().to_string();
-        // `minted_first` is created (and so gets a lower/earlier RecordId)
-        // before `minted_second`, but is PERSISTED after it — the exact
-        // inversion a delayed concurrent writer can produce. `current` must
-        // follow real commit order, not RecordId order.
-        let minted_first = Tuple::new(
-            Category::Artifact, "repo", "bbs-assessment-a", "operator",
+        // Fix the IDs so this inversion does not depend on the clock or
+        // random ordering of ULIDs minted within the same millisecond.
+        // The lower ID is persisted last, as a delayed writer can cause.
+        let mut minted_first = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-assessment-a",
+            "operator",
             json!({"schema_version":1,"bbs_kind":"assessment","agent":"operator","spawn":null,
                    "task":"parser","receipt":receipt_id,"verdict":"unsupported",
                    "reason":"minted first, persisted second","evidence":[ev]}),
-        ).with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
-        let minted_second = Tuple::new(
-            Category::Artifact, "repo", "bbs-assessment-b", "operator",
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        let mut minted_second = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-assessment-b",
+            "operator",
             json!({"schema_version":1,"bbs_kind":"assessment","agent":"operator","spawn":null,
                    "task":"parser","receipt":receipt_id,"verdict":"verified",
                    "reason":"minted second, persisted first","evidence":[ev]}),
-        ).with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        minted_first.id = "01ARZ3NDEKTSV4RRFFQ69G5FA0".parse().unwrap();
+        minted_second.id = "01ARZ3NDEKTSV4RRFFQ69G5FA1".parse().unwrap();
         assert!(minted_first.id < minted_second.id);
         space.out(minted_second.clone()).unwrap();
         space.out(minted_first.clone()).unwrap();
