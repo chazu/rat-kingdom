@@ -2710,7 +2710,19 @@ impl Supervisor {
         // per-session watch (`self.lock_attempts()`/`observe_final_usage`)
         // may still be updated from a stale event below — nothing keyed on
         // `name` may be resumed, mutated, claimed, or routed for it.
-        let live = self.lock_session_tokens().get(name) == Some(&session);
+        //
+        // No entry at all counts as live, not stale: `track_session` stamps
+        // `name`'s token before its harness can produce a single event, so a
+        // real predecessor/successor race always has SOME current token to
+        // compare against — an empty map means nothing has ever claimed
+        // ownership of `name` to be superseded from (an attach-mode launch
+        // that never calls `track_session`, or a caller driving this event
+        // directly without going through a launch path), not a stale event
+        // from a launch this map no longer remembers.
+        let live = self
+            .lock_session_tokens()
+            .get(name)
+            .is_none_or(|current| *current == session);
         // A harness that speaks again has resumed the turn it paused on.
         // `Completed`/`Exited` are excluded because they decide their own
         // state below (a fresh pause, a completion, or a death). A stale
