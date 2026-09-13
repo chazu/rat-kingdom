@@ -12,18 +12,39 @@
 //!
 //! # Idempotency and restart safety
 //!
-//! A span is a fact keyed on `(task, phase, attempt)`. [`record_phase_span`]
-//! scans for an existing span on that exact key before writing a new one, so
-//! calling it twice for the same underlying occurrence — a retried caller, a
-//! duplicate event replay, or the same durable store reopened after a daemon
-//! restart — writes the tuple exactly once. This mirrors the dedup idiom
-//! already used by `verification_proof` (`workflow_exec.rs`) and the
-//! conflict/rework dispatch markers (`landing.rs`): a composite business key,
-//! scanned before a write, rather than a distinct sequence counter to
-//! reconcile. No open/close pairing is needed: every producer this module is
-//! wired into already knows its full timing (or can derive it from a
-//! duration it already tracked) at the single point it settles, so there is
-//! no "started but never closed" state for a restart to strand.
+//! A span is a fact keyed on `(task, phase, attempt)`, additionally fenced by
+//! `candidate`, `lane` and `occurrence_key` when a producer sets them.
+//! [`record_phase_span`] scans for an existing span on that exact key before
+//! writing a new one, so calling it twice for the same underlying occurrence
+//! — a retried caller, a duplicate event replay, or the same durable store
+//! reopened after a daemon restart — writes the tuple exactly once. This
+//! mirrors the dedup idiom already used by `verification_proof`
+//! (`workflow_exec.rs`) and the conflict/rework dispatch markers
+//! (`landing.rs`): a composite business key, scanned before a write, rather
+//! than a distinct sequence counter to reconcile. No open/close pairing is
+//! needed: every producer this module is wired into already knows its full
+//! timing (or can derive it from a duration it already tracked) at the
+//! single point it settles, so there is no "started but never closed" state
+//! for a restart to strand.
+//!
+//! The `candidate`/`lane`/`occurrence_key` fence exists for one reason: a
+//! landing gate's per-check `VerificationQueued` span numbers `attempt` by
+//! the check's position in that round's plan (1, 2, 3, ...), the same small
+//! ordinal a LATER round over the same task reuses for its own checks
+//! against a genuinely new candidate. Keying dedup on `(task, phase,
+//! attempt)` alone would make the later round's real occurrence collide with
+//! — and be silently dropped by — the earlier round's, even though both
+//! actually ran. Every such per-check span already carries `candidate` (the
+//! tested sha), `lane` (the check name) and `occurrence_key` (a digest over
+//! what actually executed — command/toolchain/environment policy — so a
+//! check whose PLAN changed at the SAME candidate and plan position is also
+//! never confused with whatever ran there before), so folding all three into
+//! the key distinguishes a new occurrence from an exact replay of the same
+//! one: identical on every field on a retry (idempotent, no-op), different
+//! on at least one for a genuinely new occurrence (recorded, never
+//! shadowed). A phase that never sets these fields (all `None`) keeps
+//! exactly its old `(task, phase, attempt)` behavior, since `None == None`
+//! on every side changes nothing.
 
 use chrono::{DateTime, Utc};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
@@ -124,9 +145,32 @@ pub struct PhaseSpan {
     pub target: Option<String>,
     pub candidate: Option<String>,
     pub lane: Option<String>,
+    /// Opaque, producer-supplied digest over whatever this producer
+    /// considers "did the same thing actually execute again" — e.g. a
+    /// landing gate's per-check span sets this to
+    /// `verification_proof_key(repo, candidate, check)`, the digest already
+    /// covering the check's command/toolchain/environment policy, so a check
+    /// whose PLAN changed at the exact same candidate and plan position is
+    /// fenced from an earlier, different execution recorded there (module
+    /// doc). Never a fresh/random value minted per replay: an exact replay
+    /// of the identical occurrence must recompute the identical digest.
+    pub occurrence_key: Option<String>,
     pub proof_kind: Option<String>,
     pub proof_reused: Option<bool>,
     pub authority: Option<Authority>,
+    /// Provenance tag for the `queue_wait_ms`/`duration_ms` pair, set only by
+    /// [`PhaseSpan::from_durations`]. `Some("additive")` means the two are
+    /// disjoint, non-overlapping intervals (admission wait, then execution)
+    /// so `queue_wait_ms + duration_ms` is a sound total elapsed; `None`
+    /// covers every span built before this field existed (or via direct
+    /// timestamps, where `duration_ms`/`queue_wait_ms` are exact derived
+    /// differences and need no provenance tag at all). A consumer must never
+    /// treat `None` as "additive" by default — that was the earlier bug this
+    /// tag exists to make impossible to repeat silently: a producer passing
+    /// an already wait-inclusive `duration_ms` into `from_durations` made the
+    /// derived `queued_at` double-count the wait when added back. Old rows
+    /// are left exactly as recorded rather than retroactively reinterpreted.
+    pub duration_semantic: Option<&'static str>,
 }
 
 impl PhaseSpan {
@@ -143,9 +187,11 @@ impl PhaseSpan {
             target: None,
             candidate: None,
             lane: None,
+            occurrence_key: None,
             proof_kind: None,
             proof_reused: None,
             authority: None,
+            duration_semantic: None,
         }
     }
 
@@ -194,6 +240,11 @@ impl PhaseSpan {
         self
     }
 
+    pub fn occurrence_key(mut self, key: impl Into<String>) -> Self {
+        self.occurrence_key = Some(key.into());
+        self
+    }
+
     pub fn proof_kind(mut self, kind: impl Into<String>) -> Self {
         self.proof_kind = Some(kind.into());
         self
@@ -226,6 +277,20 @@ impl PhaseSpan {
     /// restart to reconstruct a real wall-clock `queued_at`. Good enough for
     /// percentile aggregation without inventing a wall-clock-tracking
     /// replacement for `Instant` inside `run_check_in`.
+    ///
+    /// Contract: `queue_wait_ms` and `duration_ms` MUST be disjoint,
+    /// non-overlapping intervals — admission wait, then execution — never
+    /// two measurements of overlapping spans (e.g. one timer started before
+    /// admission and never reset once execution began would make
+    /// `duration_ms` already include the wait `queue_wait_ms` also reports).
+    /// Violating this makes the derived `queued_at` double-count the wait
+    /// the moment anything adds `queue_wait_ms + duration_ms` back for a
+    /// total. Every call site is expected to measure `duration_ms` from the
+    /// point execution itself began (e.g. `RunProgress::execution_started_at`),
+    /// not from before admission was requested. The returned span is tagged
+    /// [`PhaseSpan::duration_semantic`] `"additive"` so a consumer can tell
+    /// it followed this contract, as opposed to an older row with no such
+    /// tag at all.
     pub fn from_durations(
         task: impl Into<String>,
         phase: Phase,
@@ -248,6 +313,7 @@ impl PhaseSpan {
         if let Some(q) = queued_at {
             span = span.queued_at(q);
         }
+        span.duration_semantic = Some("additive");
         span
     }
 
@@ -261,11 +327,13 @@ impl PhaseSpan {
             "ended_at": self.ended_at,
             "queue_wait_ms": self.queue_wait_ms(),
             "duration_ms": self.duration_ms(),
+            "duration_semantic": self.duration_semantic,
             "terminal_reason": self.terminal_reason,
             "repo": self.repo,
             "target": self.target,
             "candidate": self.candidate,
             "lane": self.lane,
+            "occurrence_key": self.occurrence_key,
             "proof_kind": self.proof_kind,
             "proof_reused": self.proof_reused,
             "authority": self.authority.map(Authority::as_str),
@@ -273,10 +341,12 @@ impl PhaseSpan {
     }
 }
 
-/// Record `span` once. Idempotent on `(task, phase, attempt)`: if a span
-/// already exists on that exact key (a retried caller, a duplicate event
-/// replay, or this same durable store reopened after a daemon restart),
-/// this is a no-op returning `Ok(false)`; otherwise the span is written as a
+/// Record `span` once. Idempotent on `(task, phase, attempt)`, additionally
+/// fenced by `candidate`/`lane`/`occurrence_key` when `span` sets them
+/// (module doc): if a span already exists on that exact key (a retried
+/// caller, a duplicate event replay, or this same durable store reopened
+/// after a daemon restart), this is a no-op returning `Ok(false)`; otherwise
+/// the span is written as a
 /// `Furniture` Event and this returns `Ok(true)`.
 pub fn record_phase_span(
     space: &Space,
@@ -284,7 +354,7 @@ pub fn record_phase_span(
     castle: &str,
     span: &PhaseSpan,
 ) -> rk_core::Result<bool> {
-    if span_exists(space, scope, &span.task, span.phase, span.attempt)? {
+    if span_exists(space, scope, span)? {
         return Ok(false);
     }
     let tuple = Tuple::new(
@@ -299,22 +369,19 @@ pub fn record_phase_span(
     Ok(true)
 }
 
-fn span_exists(
-    space: &Space,
-    scope: &str,
-    task: &str,
-    phase: Phase,
-    attempt: u32,
-) -> rk_core::Result<bool> {
+fn span_exists(space: &Space, scope: &str, span: &PhaseSpan) -> rk_core::Result<bool> {
     let mut pattern = Pattern::category(Category::Event)
         .identity(SPAN_IDENTITY)
         .scope(scope);
-    pattern.payload_search = Some(format!("\"task\":\"{task}\""));
-    pattern.payload_search_and = Some(format!("\"phase\":\"{}\"", phase.as_str()));
-    Ok(space
-        .scan(&pattern)?
-        .into_iter()
-        .any(|t| t.payload.get("attempt").and_then(Value::as_u64) == Some(u64::from(attempt))))
+    pattern.payload_search = Some(format!("\"task\":\"{}\"", span.task));
+    pattern.payload_search_and = Some(format!("\"phase\":\"{}\"", span.phase.as_str()));
+    Ok(space.scan(&pattern)?.into_iter().any(|t| {
+        t.payload.get("attempt").and_then(Value::as_u64) == Some(u64::from(span.attempt))
+            && t.payload.get("candidate").and_then(Value::as_str) == span.candidate.as_deref()
+            && t.payload.get("lane").and_then(Value::as_str) == span.lane.as_deref()
+            && t.payload.get("occurrence_key").and_then(Value::as_str)
+                == span.occurrence_key.as_deref()
+    }))
 }
 
 /// All recorded spans for `task`, oldest first — the read side a later
@@ -523,5 +590,74 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A landing gate's per-check span reuses its plan position as `attempt`
+    /// every round (module doc): a later round's real occurrence — a new
+    /// candidate, same check, same small ordinal — must never be shadowed by
+    /// an earlier round's, while an exact replay of the SAME round (same
+    /// candidate) still dedups.
+    #[test]
+    fn a_new_candidate_reusing_an_earlier_rounds_attempt_is_recorded_not_shadowed() {
+        let space = space();
+        let task = "TKT-round";
+        let round_one =
+            PhaseSpan::from_durations(task, Phase::VerificationQueued, None, Some(10), Utc::now())
+                .attempt(1)
+                .candidate("sha-a")
+                .lane("verify");
+        let round_two =
+            PhaseSpan::from_durations(task, Phase::VerificationQueued, None, Some(12), Utc::now())
+                .attempt(1)
+                .candidate("sha-b")
+                .lane("verify");
+        assert!(record_phase_span(&space, SYSTEM_SCOPE, "daemon", &round_one).unwrap());
+        assert!(
+            record_phase_span(&space, SYSTEM_SCOPE, "daemon", &round_two).unwrap(),
+            "a genuinely new candidate at the same attempt must still be recorded"
+        );
+        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 2);
+
+        // Exact replay of round two (a crash-resume re-run against the
+        // identical candidate) stays idempotent.
+        assert!(
+            !record_phase_span(&space, SYSTEM_SCOPE, "daemon", &round_two).unwrap(),
+            "a replay of the same candidate/lane/attempt must not duplicate"
+        );
+        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 2);
+    }
+
+    /// A check whose PLAN changed (a different command/toolchain/environment
+    /// policy) at the exact same candidate and plan position — `attempt` and
+    /// `candidate` both unchanged, only `occurrence_key` differs — must still
+    /// be recorded as a distinct occurrence, not shadowed by whatever ran
+    /// there before at that candidate.
+    #[test]
+    fn a_changed_plan_at_the_same_candidate_is_recorded_not_shadowed() {
+        let space = space();
+        let task = "TKT-replan";
+        let before =
+            PhaseSpan::from_durations(task, Phase::VerificationQueued, None, Some(10), Utc::now())
+                .attempt(1)
+                .candidate("sha-a")
+                .lane("verify")
+                .occurrence_key("cmd-v1-digest");
+        let after =
+            PhaseSpan::from_durations(task, Phase::VerificationQueued, None, Some(10), Utc::now())
+                .attempt(1)
+                .candidate("sha-a")
+                .lane("verify")
+                .occurrence_key("cmd-v2-digest");
+        assert!(record_phase_span(&space, SYSTEM_SCOPE, "daemon", &before).unwrap());
+        assert!(
+            record_phase_span(&space, SYSTEM_SCOPE, "daemon", &after).unwrap(),
+            "a changed command/toolchain/environment at the same candidate and attempt \
+             must still be recorded, not treated as the same occurrence"
+        );
+        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 2);
+
+        // Exact replay (identical occurrence_key) stays idempotent.
+        assert!(!record_phase_span(&space, SYSTEM_SCOPE, "daemon", &after).unwrap());
+        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 2);
     }
 }

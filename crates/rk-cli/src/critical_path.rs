@@ -58,10 +58,14 @@ pub async fn show(layout: &Layout, task: &str, as_json: bool) -> Result<()> {
 /// Build the critical-path summary from raw `task_span` tuples (as returned
 /// by `space.scan`, each carrying `id`, `payload`, ... — the wire shape, not
 /// the daemon-internal `PhaseSpan`). Pure and deterministic: sorts oldest
-/// first by `id`, then dedups on `(phase, attempt)` keeping the first
-/// occurrence, so a duplicate replay or reordering never double-counts a
-/// phase. Never invents a value: every metric that has no supporting span in
-/// `tuples` comes out `null`, not `0`.
+/// first by `id`, then dedups on `(phase, attempt, candidate, lane)` keeping
+/// the first occurrence — the same key `rk_daemon::span::record_phase_span`
+/// dedups on durably (`span.rs` module doc) — so a duplicate replay or
+/// reordering never double-counts a phase, but a landing gate's later round
+/// reusing an earlier round's small plan-position `attempt` against a
+/// genuinely new `candidate` is never collapsed into the earlier round's
+/// occurrence either. Never invents a value: every metric that has no
+/// supporting span in `tuples` comes out `null`, not `0`.
 pub fn build_critical_path(task: &str, tuples: &[Value]) -> Value {
     let mut rows = tuples.to_vec();
     rows.sort_by(|a, b| {
@@ -71,13 +75,15 @@ pub fn build_critical_path(task: &str, tuples: &[Value]) -> Value {
             .cmp(b["id"].as_str().unwrap_or(""))
     });
 
-    let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+    let mut seen: BTreeSet<(String, u64, Option<String>, Option<String>)> = BTreeSet::new();
     let mut phases: Vec<Value> = Vec::new();
     for t in rows {
         let p = t["payload"].clone();
         let phase = p["phase"].as_str().unwrap_or("?").to_string();
         let attempt = p["attempt"].as_u64().unwrap_or(1);
-        if !seen.insert((phase, attempt)) {
+        let candidate = p["candidate"].as_str().map(str::to_string);
+        let lane = p["lane"].as_str().map(str::to_string);
+        if !seen.insert((phase, attempt, candidate, lane)) {
             continue;
         }
         phases.push(p);
@@ -362,6 +368,36 @@ mod tests {
         assert_eq!(cp["phases"].as_array().unwrap().len(), 2);
         assert_eq!(cp["proof_reuse"]["total"], 2);
         assert_eq!(cp["proof_reuse"]["reused"], 1);
+    }
+
+    /// A landing gate's per-check span numbers `attempt` by plan position
+    /// (1, 2, 3, ...), the same small ordinal a LATER round reuses for its
+    /// own checks against a genuinely new candidate. Deduping on `(phase,
+    /// attempt)` alone would collapse the later round's real occurrence into
+    /// the earlier one's — exactly the loss this reproduces: two distinct
+    /// `verification` spans sharing an `attempt` but naming different
+    /// candidates must both survive.
+    #[test]
+    fn a_new_candidates_occurrence_is_not_collapsed_into_an_earlier_rounds_same_attempt() {
+        let tuples = vec![
+            span(
+                "verification",
+                1,
+                json!({"candidate": "sha-a", "lane": "verify", "duration_ms": 10}),
+            ),
+            span(
+                "verification",
+                1,
+                json!({"candidate": "sha-b", "lane": "verify", "duration_ms": 20}),
+            ),
+        ];
+        let cp = build_critical_path("TKT-x", &tuples);
+        assert_eq!(
+            cp["phases"].as_array().unwrap().len(),
+            2,
+            "a later round's occurrence must survive even though it reuses an earlier \
+             round's attempt number: {cp}"
+        );
     }
 
     #[test]

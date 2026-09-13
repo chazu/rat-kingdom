@@ -877,8 +877,21 @@ pub struct MechanismResult {
 pub struct PhaseDurations {
     /// Every phase that is neither verification admission nor a human wait.
     pub work_phases_ms: Option<i64>,
-    /// `verification` span duration plus its own queue wait.
+    /// `verification` span duration plus its own queue wait — summed ONLY
+    /// for a span tagged `duration_semantic: "additive"`
+    /// (`rk_daemon::span::PhaseSpan::from_durations`): that tag is the only
+    /// way this report can tell `duration_ms` is disjoint from
+    /// `queue_wait_ms` rather than already including it. A span recorded
+    /// before that tag existed does not have its `duration_ms`/`queue_wait_ms`
+    /// summed here at all — see `verification_ms_legacy_spans`.
     pub verification_ms: Option<i64>,
+    /// Count of `verification` spans excluded from `verification_ms` because
+    /// they carry no `duration_semantic: "additive"` tag, so this report
+    /// cannot tell whether their `duration_ms` already includes the
+    /// admission wait `queue_wait_ms` also reports. Left as an explicit
+    /// coverage gap rather than guessed either way — never zeroed to hide it
+    /// and never summed on an assumption that could double- or under-count.
+    pub verification_ms_legacy_spans: usize,
     /// `attention_hold` — waiting on a human.
     pub attention_hold_ms: Option<i64>,
     /// Pre-phase queue wait on every other phase.
@@ -2811,9 +2824,19 @@ pub fn compute_full(
                 match phase["phase"].as_str().unwrap_or("") {
                     "verification" => {
                         // Admission/check queue AND its own run time both count
-                        // as verification time, never as work.
-                        opt_sum(&mut phase_ms.verification_ms, dur);
-                        opt_sum(&mut phase_ms.verification_ms, wait);
+                        // as verification time, never as work — but only when
+                        // this span's own producer declares the two disjoint
+                        // (`duration_semantic: "additive"`). A span recorded
+                        // by the pre-fix landing-gate producer measured
+                        // `duration_ms` from before admission was requested,
+                        // so it already included `queue_wait_ms`; summing both
+                        // for such a span here double-counted the wait.
+                        if phase["duration_semantic"] == "additive" {
+                            opt_sum(&mut phase_ms.verification_ms, dur);
+                            opt_sum(&mut phase_ms.verification_ms, wait);
+                        } else if dur.is_some() || wait.is_some() {
+                            phase_ms.verification_ms_legacy_spans += 1;
+                        }
                     }
                     "attention_hold" => {
                         attention_hold_spans += 1;
@@ -3381,10 +3404,11 @@ pub fn render(report: &Report) -> String {
             let _ = writeln!(
                 out,
                 "    time: process_lifetime_ms={:?} active_work_ms=unknown work_phases_ms={:?} \
-                 verification_ms={:?} attention_hold_ms={:?} queue_wait_ms={:?}",
+                 verification_ms={:?} (legacy_spans={}) attention_hold_ms={:?} queue_wait_ms={:?}",
                 d.process_lifetime_ms,
                 d.phase_ms.work_phases_ms,
                 d.phase_ms.verification_ms,
+                d.phase_ms.verification_ms_legacy_spans,
                 d.phase_ms.attention_hold_ms,
                 d.phase_ms.queue_wait_ms
             );
@@ -4361,6 +4385,68 @@ mod tests {
             .quality
             .interventions_coverage
             .contains("lower bound"));
+    }
+
+    /// A `verification` `task_span` is only summed into `verification_ms`
+    /// (duration plus its own admission wait) when it carries
+    /// `duration_semantic: "additive"` — the tag
+    /// `rk_daemon::span::PhaseSpan::from_durations` stamps once its
+    /// `duration_ms` is guaranteed disjoint from `queue_wait_ms`. A span with
+    /// no such tag (recorded before the tag existed) cannot be trusted either
+    /// way — it might already include the wait — so it is excluded from the
+    /// total and counted separately as an explicit coverage gap, never
+    /// guessed into the sum.
+    #[test]
+    fn verification_ms_sums_only_additive_tagged_spans_and_counts_the_rest_as_legacy() {
+        let m = Manifest {
+            consumer_tasks: vec![ConsumerTaskScope {
+                task: "TKT-verify".into(),
+                repo: "repo".into(),
+                batch: "batch-1".into(),
+            }],
+            ..manifest(vec![])
+        };
+        let additive_span = json!({
+            "id": "span-additive",
+            "category": "event",
+            "scope": "repo",
+            "identity": "task_span",
+            "instance": "daemon",
+            "lifecycle": "furniture",
+            "created_at": "2026-01-01T00:00:00Z",
+            "payload": {
+                "task": "TKT-verify", "phase": "verification", "attempt": 1,
+                "queue_wait_ms": 500, "duration_ms": 50,
+                "duration_semantic": "additive"
+            }
+        });
+        let legacy_span = json!({
+            "id": "span-legacy",
+            "category": "event",
+            "scope": "repo",
+            "identity": "task_span",
+            "instance": "daemon",
+            "lifecycle": "furniture",
+            "created_at": "2026-01-01T00:00:00Z",
+            "payload": {
+                "task": "TKT-verify", "phase": "verification", "attempt": 2,
+                "queue_wait_ms": 800, "duration_ms": 900
+            }
+        });
+        let c = capture(vec![additive_span, legacy_span], Order::Unknown);
+        let report = compute(&m, &c, &[]).unwrap();
+        assert_eq!(report.deliveries.len(), 1);
+        let d = &report.deliveries[0];
+        assert_eq!(
+            d.phase_ms.verification_ms,
+            Some(550),
+            "only the additive-tagged span's duration+wait is summed: {:?}",
+            d.phase_ms
+        );
+        assert_eq!(
+            d.phase_ms.verification_ms_legacy_spans, 1,
+            "the untagged span is an explicit coverage gap, never guessed into the total"
+        );
     }
 
     #[test]
