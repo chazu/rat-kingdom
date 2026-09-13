@@ -1765,7 +1765,9 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
         idx.unresolved.push(InvalidRecord {
             record: id.clone(),
             kind: "missing_reference".into(),
-            reason: "named by a captured record but absent from the export's evidence closure                      (coverage.missing_references): unresolvable in this capture, not proven                      absent"
+            reason: "named by a captured record but absent from the export's evidence closure \
+                     (coverage.missing_references): unresolvable in this capture, not proven \
+                     absent"
                 .into(),
         });
     }
@@ -3350,7 +3352,9 @@ pub fn compute_full(
                     (
                         false,
                         format!(
-                            "{} cumulative usage results in this segment but the capture declares                              no validated persistence order, so the last one — the segment's                              actual total — cannot be identified",
+                            "{} cumulative usage results in this segment but the capture declares \
+                             no validated persistence order, so the last one — the \
+                             segment's actual total — cannot be identified",
                             rows.len()
                         ),
                     )
