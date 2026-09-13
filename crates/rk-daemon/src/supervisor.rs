@@ -13251,6 +13251,138 @@ mod native_observation_tests {
         );
     }
 
+    /// The interleaving. `handle_event` used to read a `live` boolean, DROP the
+    /// `session_tokens` guard, and only then perform its name-keyed mutation; a
+    /// respawn stamping its replacement token in that window left a superseded
+    /// launch writing over its successor's record.
+    ///
+    /// Driven deterministically rather than by racing: holding the registry
+    /// parks the handler provably BETWEEN its ownership check and its write.
+    /// Stamping a replacement token is exactly `session_tokens.lock()`, so
+    /// `try_lock` there answers whether that window is open. Before the fix it
+    /// succeeded at once; now it is refused for as long as the mutation is
+    /// pending, which is what makes check-and-mutate one step.
+    #[test]
+    fn a_respawn_cannot_stamp_its_token_while_an_event_is_mid_mutation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, session) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        let registry = sup.lock_registry();
+        std::thread::scope(|scope| {
+            let handler = scope.spawn(|| {
+                sup.handle_event(
+                    "Nibble",
+                    rec.created_at,
+                    spawn,
+                    session,
+                    HarnessEvent::Usage {
+                        usage: TokenUsage {
+                            input: 1000,
+                            output: 400,
+                            ..Default::default()
+                        },
+                    },
+                );
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while sup.session_tokens.try_lock().is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the handler never took the ownership guard at all"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // ...and keeps holding it for as long as the write is pending. A
+            // momentary read caught in flight would clear within a tick.
+            for _ in 0..50 {
+                assert!(
+                    sup.session_tokens.try_lock().is_err(),
+                    "a respawn could stamp its token between the ownership \
+                     check and the mutation that check authorised"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            drop(registry);
+            handler.join().unwrap();
+        });
+
+        assert_eq!(
+            sup.lock_registry().get("Nibble").unwrap().usage.total(),
+            1400,
+            "the owning launch's own usage must still land"
+        );
+    }
+
+    /// Headless-to-attach respawn. `respawn_attached` registers no session of
+    /// its own, so the predecessor's headless token used to survive it: the
+    /// `agent_respawned` event published that launch's native session and
+    /// borrowed its `AttemptWatch` launch time as the attach launch's own, and
+    /// every late event the dead headless process still emitted counted as
+    /// owning the name. The launch itself needs a live herdr server, so this
+    /// drives the two production helpers it composes.
+    #[test]
+    fn an_attach_respawn_publishes_no_session_and_evicts_the_headless_one() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, headless) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+        assert_eq!(
+            sup.launch_identity("Nibble").0.as_deref(),
+            Some(headless.to_string().as_str()),
+            "the headless launch is observable and publishes its own token"
+        );
+
+        sup.fence_unobservable_session("Nibble");
+
+        assert_eq!(
+            sup.launch_identity("Nibble"),
+            (None, None),
+            "an attach launch observes nothing of its own, so it must publish \
+             explicit nulls rather than the headless predecessor's session and \
+             its watch's launch time"
+        );
+        assert!(
+            sup.lock_session_tokens().contains_key("Nibble"),
+            "the token is REPLACED, not removed: an absent entry counts as owned"
+        );
+
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            headless,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+
+        let after = sup.lock_registry().get("Nibble").unwrap().clone();
+        assert_eq!(
+            after.state,
+            AgentState::Running,
+            "the dead headless process must not terminalize the record the \
+             attach launch now holds"
+        );
+        assert!(!after.crashed, "nor mark the attach launch crashed");
+        let exits = observations(&sup, "agent_exit");
+        assert_eq!(exits.len(), 1, "the headless exit is still a true fact");
+        assert_eq!(
+            exits[0]["session"],
+            headless.to_string(),
+            "attributed to the launch that died, never to the attach launch"
+        );
+        assert_eq!(exits[0]["stale_session"], true);
+        assert!(
+            exits[0]["crashed"].is_null() && exits[0]["prior_state"].is_null(),
+            "record-derived fields describe the successor, so they stay unknown"
+        );
+    }
+
     /// With no prior launch, this launch's baseline is 0.0, so the full
     /// priced total IS this launch's own. Guards the baseline-subtraction fix
     /// against regressing the ordinary, non-relaunch case.
