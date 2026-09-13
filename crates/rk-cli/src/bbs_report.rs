@@ -5124,6 +5124,52 @@ mod tests {
     }
 
     #[test]
+    fn assessment_window_cases_preserve_the_opportunity_and_only_credit_in_window() {
+        let mut m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        m.window = Window {
+            since: Some("2026-01-02T00:00:00Z".parse().unwrap()),
+            until: Some("2026-01-03T00:00:00Z".parse().unwrap()),
+        };
+        for (timestamp, expected) in [
+            (Some("2026-01-02T14:00:00Z"), 1),
+            (Some("2026-01-01T14:00:00Z"), 0),
+            (Some("2026-01-04T14:00:00Z"), 0),
+            (None, 0),
+        ] {
+            let mut verdict = assessment(
+                "a1",
+                "r1",
+                "verified",
+                timestamp.unwrap_or("2026-01-02T14:00:00Z"),
+            );
+            if timestamp.is_none() {
+                verdict.as_object_mut().unwrap().remove("created_at");
+            }
+            let c = capture(
+                vec![
+                    finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
+                    reuse(
+                        "r1",
+                        "src-1",
+                        "TKT-1",
+                        "gen-1",
+                        "used",
+                        "2026-01-02T13:00:00Z",
+                    ),
+                    verdict,
+                ],
+                Order::Unknown,
+            );
+            let r = compute(&m, &c, &[]).unwrap();
+            assert_eq!(r.eligible, 1, "assessment timestamp {timestamp:?}");
+            assert_eq!(r.claimed, 1, "assessment timestamp {timestamp:?}");
+            assert_eq!(r.assessed, expected, "assessment timestamp {timestamp:?}");
+            assert_eq!(r.verified_reuse.verified_used_or_adapted_tasks, expected);
+            assert!(!r.mechanism.goal_met);
+        }
+    }
+
+    #[test]
     fn an_operator_bound_exposure_is_not_agent_exposure() {
         let mut tuples = verified_tuples();
         tuples[3] = exposure_full(
