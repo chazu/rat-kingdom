@@ -58,7 +58,7 @@ fn tuples_envelope() -> Value {
         "tuples": [
             {
                 "id": "src-1", "category": "artifact", "scope": "repo",
-                "identity": "finding-1", "instance": "author", "lifecycle": "furniture",
+                "identity": "bbs-finding-cli1", "instance": "author", "lifecycle": "furniture",
                 "created_at": "2026-01-01T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "finding", "agent": "author",
@@ -74,7 +74,7 @@ fn tuples_envelope() -> Value {
             },
             {
                 "id": "r1", "category": "artifact", "scope": "repo",
-                "identity": "reuse-1", "instance": "consumer", "lifecycle": "furniture",
+                "identity": "bbs-reuse-cli1", "instance": "consumer", "lifecycle": "furniture",
                 "created_at": "2026-01-02T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "reuse", "agent": "consumer",
@@ -89,7 +89,7 @@ fn tuples_envelope() -> Value {
             },
             {
                 "id": "a1", "category": "artifact", "scope": "repo",
-                "identity": "assessment-1", "instance": "operator", "lifecycle": "furniture",
+                "identity": "bbs-assessment-cli1", "instance": "operator", "lifecycle": "furniture",
                 "created_at": "2026-01-03T00:00:00Z",
                 "payload": {
                     "schema_version": 1, "bbs_kind": "assessment", "agent": "operator",
