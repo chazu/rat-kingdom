@@ -15,7 +15,7 @@
 
 mod store;
 
-pub use store::{PersistenceDelta, SdlcTransitionRecord};
+pub use store::{PersistenceDelta, PersistencePage, SdlcTransitionRecord};
 
 use rk_core::sdlc::{ConfiguredSourceName, SignalEnvelope, SignalReceipt, SignalSourcePrincipal};
 use rk_core::tuple::{Lifecycle, Pattern, Tuple};
@@ -114,6 +114,10 @@ pub struct Space {
     events: broadcast::Sender<Tuple>,
     coordinator_events: broadcast::Sender<CoordinatorEvent>,
     sdlc_rollback_injection: Arc<AtomicBool>,
+    /// Test-only: refuse BBS telemetry writes so the nonfatal-capture contract
+    /// can be exercised against a store that genuinely fails. See
+    /// [`Space::fail_bbs_telemetry_writes_for_tests`].
+    bbs_telemetry_write_failure: Arc<AtomicBool>,
 }
 
 impl Space {
@@ -137,6 +141,7 @@ impl Space {
             events,
             coordinator_events,
             sdlc_rollback_injection: Arc::new(AtomicBool::new(false)),
+            bbs_telemetry_write_failure: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -199,6 +204,37 @@ impl Space {
         self.lock().store.persistence_delta(after)
     }
 
+    /// One bounded, scope-filtered, persistence-ordered page of the immutable
+    /// journal. Scope, cursor and limit are pushed into SQL before any payload
+    /// is deserialized, so the cost is the page, not the journal. Prefer this
+    /// over [`Space::persistence_delta`] for any capture surface that must stay
+    /// bounded on a production-sized store, and read `more` to report
+    /// truncation explicitly.
+    /// `pin` freezes the boundary across pages so a concurrent write cannot
+    /// slip into a later page of the same snapshot; a pin ahead of the store's
+    /// current sequence is refused, never clamped.
+    pub fn persistence_page(
+        &self,
+        scope: &str,
+        after: Option<u64>,
+        limit: usize,
+        pin: Option<u64>,
+    ) -> rk_core::Result<PersistencePage> {
+        self.lock().store.persistence_page(scope, after, limit, pin)
+    }
+
+    /// Resolve one tuple as of a frozen persistence boundary, so an export's
+    /// references cannot pull in rows written after its snapshot. `None` means
+    /// the tuple did not exist at that boundary and must be reported as
+    /// missing rather than resolved through the live row.
+    pub fn get_as_of(
+        &self,
+        id: rk_core::id::RecordId,
+        boundary: u64,
+    ) -> rk_core::Result<Option<rk_core::tuple::Tuple>> {
+        self.lock().store.get_as_of(id, boundary)
+    }
+
     /// Whether this local store ever persisted the tuple id, even if the live row
     /// was later consumed or deleted.
     pub fn has_persistence_event(&self, id: rk_core::id::RecordId) -> rk_core::Result<bool> {
@@ -221,6 +257,30 @@ impl Space {
         self.lock().store.legacy_persistence_sequence(id)
     }
 
+    /// Test-only fault injection for the BBS nonfatal-capture contract: refuse
+    /// daemon-authored telemetry records while leaving everything else — the
+    /// briefing, the launch, the `bbs show` the record describes — working.
+    ///
+    /// The `telemetry_gap` fallback is deliberately still accepted. A store that
+    /// refuses the record but can still take the gap is the case the capture
+    /// path documents as worth distinguishing; a store that refuses both leaves
+    /// only the in-process return value, which is why that value, not the gap
+    /// tuple, is the reliable signal.
+    pub fn fail_bbs_telemetry_writes_for_tests(&self, enabled: bool) {
+        self.bbs_telemetry_write_failure
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    fn refuses_telemetry(&self, tuple: &Tuple) -> bool {
+        self.bbs_telemetry_write_failure.load(Ordering::SeqCst)
+            && tuple.lifecycle == rk_core::tuple::Lifecycle::Furniture
+            && tuple
+                .payload
+                .get("bbs_kind")
+                .and_then(|kind| kind.as_str())
+                .is_some_and(|kind| kind != "telemetry_gap")
+    }
+
     pub fn enable_sdlc_rollback_injection_for_tests(&self, enabled: bool) {
         self.sdlc_rollback_injection
             .store(enabled, Ordering::SeqCst);
@@ -230,6 +290,11 @@ impl Space {
     /// feed. If a destructive waiter consumes the tuple it is removed again
     /// before the lock is released; `rd` waiters observing it still get it.
     pub fn out(&self, tuple: Tuple) -> rk_core::Result<()> {
+        if self.refuses_telemetry(&tuple) {
+            return Err(rk_core::Error::other(
+                "injected BBS telemetry write failure (tests only)",
+            ));
+        }
         let mut inner = self.lock();
         inner.insert_and_offer(&tuple, false)?;
         drop(inner);

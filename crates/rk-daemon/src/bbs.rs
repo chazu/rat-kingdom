@@ -217,7 +217,427 @@ pub fn brief(space: &Space, tickets: &Tickets, params: &BriefParams) -> rk_core:
         since: params.since,
         entries,
         omitted,
+        // `brief` computes the selection; capture is the caller's decision,
+        // because only the caller knows which surface and which generation
+        // this selection was prepared for.
+        telemetry: None,
+        exposure: None,
     })
+}
+
+/// Who a prepared selection or explicit read was prepared FOR.
+///
+/// The daemon derives this from its own authenticated view of the caller — an
+/// agent process never supplies it. When an exact agent generation cannot be
+/// established the binding is recorded explicitly as operator/unbound rather
+/// than guessed, so a report can exclude it from agent exposure rates instead
+/// of silently attributing it to someone.
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerBinding {
+    pub agent: Option<String>,
+    pub spawn: Option<String>,
+    pub task: Option<String>,
+}
+
+impl ConsumerBinding {
+    pub fn operator() -> Self {
+        Self::default()
+    }
+
+    pub fn agent(name: &str, spawn: &str, task: Option<&str>) -> Self {
+        Self {
+            agent: Some(name.to_string()),
+            spawn: Some(spawn.to_string()),
+            task: task.map(str::to_string),
+        }
+    }
+
+    /// `agent` only when BOTH a name and an exact generation are known. A name
+    /// without a `SpawnId` cannot distinguish a namesake predecessor from this
+    /// generation, so it is deliberately not agent-bound.
+    fn bound(&self) -> &'static str {
+        match (&self.agent, &self.spawn) {
+            (Some(_), Some(_)) => "agent",
+            (Some(_), None) => "unbound",
+            (None, _) => "operator",
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent": self.agent,
+            "spawn": self.spawn,
+            "bound": self.bound(),
+        })
+    }
+}
+
+/// The outcome of a telemetry capture. A failure NEVER propagates into the
+/// read or launch it describes; it is reported so the gap is known-missing
+/// rather than mistaken for a known-negative.
+#[derive(Debug, Clone)]
+pub struct Capture {
+    pub status: rk_core::bbs::TelemetryStatus,
+    pub record: Option<String>,
+}
+
+impl Capture {
+    fn recorded(id: rk_core::id::RecordId) -> Self {
+        Self {
+            status: rk_core::bbs::TelemetryStatus::Recorded,
+            record: Some(id.to_string()),
+        }
+    }
+
+    pub fn failed() -> Self {
+        Self {
+            status: rk_core::bbs::TelemetryStatus::Failed,
+            record: None,
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.status == rk_core::bbs::TelemetryStatus::Failed
+    }
+}
+
+/// Record that this exact bounded selection was PREPARED for `binding` at
+/// `surface`. Returns a capture outcome; it never returns an error, because no
+/// telemetry failure may turn a successful briefing or launch into a failure.
+///
+/// An empty selection is recorded as an exposure with zero entries, which is
+/// what makes "nothing relevant was available" distinguishable from "no record
+/// was ever written" — the first is an empty `entries` array, the second is
+/// the absence of any exposure tuple (or, when capture itself failed, a
+/// `telemetry_gap`).
+pub fn record_exposure(
+    space: &Space,
+    castle: &str,
+    surface: rk_core::bbs::ExposureSurface,
+    binding: &ConsumerBinding,
+    briefing: &Briefing,
+) -> Capture {
+    let entries: Vec<_> = briefing
+        .entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "source": entry.id,
+                "reason": entry.reason,
+                "kind": entry.kind,
+                "category": entry.category,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "bbs_kind": "exposure",
+        "surface": surface.as_str(),
+        "repo": briefing.repo,
+        "task": briefing.task,
+        "agent": binding.agent,
+        "spawn": binding.spawn,
+        "bound": binding.bound(),
+        "entries": entries,
+        "prepared": briefing.entries.len(),
+        "omitted": briefing.omitted,
+        "cursor": briefing.cursor,
+        "since": briefing.since,
+        // Stated in the record itself so no consumer has to rediscover it:
+        // preparing a selection is not delivering it to a model.
+        "semantics": "prepared",
+    });
+    write_telemetry(
+        space,
+        castle,
+        &briefing.repo,
+        &format!("bbs-exposure-{}", surface.as_str()),
+        payload,
+        serde_json::json!({
+            "surface": surface.as_str(),
+            "repo": briefing.repo,
+            "task": briefing.task,
+            "binding": binding.json(),
+        }),
+    )
+}
+
+/// Record that an authenticated caller's explicit `bbs show` request for
+/// `source` was served. Requested/prepared, never comprehended.
+///
+/// `dedup_key` pairs the source with the consumer GENERATION, which is exactly
+/// the pair the report deduplicates on: a generation that opens the same source
+/// five times leaves five retained records carrying one dedup key.
+pub fn record_open(
+    space: &Space,
+    castle: &str,
+    binding: &ConsumerBinding,
+    source: &Tuple,
+) -> Capture {
+    let dedup_key = format!(
+        "{}:{}",
+        source.id,
+        binding.spawn.clone().unwrap_or_else(|| format!(
+            "unbound:{}",
+            binding.agent.as_deref().unwrap_or("operator")
+        ))
+    );
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "bbs_kind": "open",
+        "source": source.id.to_string(),
+        "source_kind": source.payload["bbs_kind"],
+        "repo": source.scope,
+        "agent": binding.agent,
+        "spawn": binding.spawn,
+        "task": binding.task,
+        "bound": binding.bound(),
+        "dedup_key": dedup_key,
+        "semantics": "requested",
+    });
+    write_telemetry(
+        space,
+        castle,
+        &source.scope,
+        "bbs-open",
+        payload,
+        serde_json::json!({
+            "surface": "show",
+            "repo": source.scope,
+            "source": source.id.to_string(),
+            "binding": binding.json(),
+        }),
+    )
+}
+
+/// Commit one daemon-authored telemetry record, falling back to a durable
+/// `telemetry_gap` when the record itself cannot be written.
+///
+/// Records are immutable `Furniture` Events authored by the castle, never by
+/// the agent whose context they describe, and each write mints a fresh tuple:
+/// repeats are RETAINED (the report deduplicates on source/generation) rather
+/// than collapsed into one, so a re-read is visible as a re-read.
+fn write_telemetry(
+    space: &Space,
+    castle: &str,
+    scope: &str,
+    identity: &str,
+    payload: serde_json::Value,
+    gap_context: serde_json::Value,
+) -> Capture {
+    let tuple = Tuple::new(
+        rk_core::tuple::Category::Event,
+        scope.to_string(),
+        identity.to_string(),
+        castle.to_string(),
+        payload,
+    )
+    .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+    let id = tuple.id;
+    match space.out(tuple) {
+        Ok(()) => Capture::recorded(id),
+        Err(error) => {
+            tracing::warn!(%error, identity, "BBS telemetry capture failed; work is unaffected");
+            let gap = Tuple::new(
+                rk_core::tuple::Category::Event,
+                scope.to_string(),
+                "bbs-telemetry-gap",
+                castle.to_string(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "bbs_kind": "telemetry_gap",
+                    "missing": identity,
+                    "error": error.to_string(),
+                    "context": gap_context,
+                }),
+            )
+            .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+            // The store that just refused the record will usually refuse this
+            // too; the in-process return value is the reliable signal and the
+            // gap tuple is the durable one when it survives.
+            if let Err(error) = space.out(gap) {
+                tracing::warn!(%error, "BBS telemetry gap record could not be persisted either");
+            }
+            Capture::failed()
+        }
+    }
+}
+
+/// Exactly which attempt an observation describes.
+///
+/// `spawn` is the GENERATION and is deliberately not enough on its own: a
+/// manual respawn continues the same `SpawnId`, so two attempts of one
+/// generation would alias into a single key. `session` is the native launch
+/// token, which changes per physical process launch, so `(spawn, session)` is
+/// the only safe join/aggregation key. `provider_session` is the harness's own
+/// session id — a THIRD identity with its own lifetime (a provider-side reset
+/// mints a new one under an unchanged `session`); it is recorded beside the
+/// other two and is never a substitute for either.
+#[derive(Debug, Clone)]
+pub struct AttemptBinding {
+    pub agent: String,
+    pub repo: String,
+    pub task: Option<String>,
+    pub spawn: String,
+    pub session: String,
+    pub provider_session: Option<String>,
+}
+
+impl AttemptBinding {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent": self.agent,
+            "repo": self.repo,
+            "task": self.task,
+            "spawn": self.spawn,
+            "session": self.session,
+            "provider_session": self.provider_session,
+        })
+    }
+}
+
+/// The final provider-reported usage/cost the daemon observed for one attempt.
+///
+/// `cost_usd` is `None` whenever the basis is [`CostBasis::Unknown`]: an
+/// absent provider total is reported as unknown, never invented and never
+/// rendered as zero.
+#[derive(Debug, Clone)]
+pub struct FinalUsage {
+    pub cost_usd: Option<f64>,
+    pub basis: rk_core::bbs::CostBasis,
+    pub provenance: String,
+    pub usage: Option<serde_json::Value>,
+    /// The record state this result settled, or `None` when it cannot be
+    /// attributed to this launch. Lifecycle state lives on the NAME-keyed
+    /// `AgentRecord`, so a result arriving for a superseded launch would read
+    /// the successor's state; omitted rather than misattributed.
+    pub state: Option<String>,
+    /// Whether the launch declared its own `rk done` — also read off the
+    /// name-keyed record, so also `None` for a superseded launch.
+    pub declared_done: Option<bool>,
+    /// This result arrived for a launch that had already been superseded.
+    pub stale_session: bool,
+}
+
+/// Record the final reported usage/cost for one `(spawn, session)` attempt.
+///
+/// Authored from the supervisor's already-fenced `Completed` handler, at every
+/// result path it can take, so a `rk done` that precedes the provider's final
+/// total leaves BOTH records behind rather than only the provisional one.
+///
+/// Reported cost is a client-side ESTIMATE, not a billed charge, and a
+/// streaming result total is cumulative within one query: a consumer takes the
+/// last total per proven segment and never sums them. The record states its
+/// own basis so two different kinds of estimate cannot be pooled.
+pub fn record_final_usage(
+    space: &Space,
+    castle: &str,
+    binding: &AttemptBinding,
+    final_usage: &FinalUsage,
+) -> Capture {
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "bbs_kind": "agent_final_usage",
+        "repo": binding.repo,
+        "task": binding.task,
+        "agent": binding.agent,
+        "spawn": binding.spawn,
+        "session": binding.session,
+        "provider_session": binding.provider_session,
+        "observed_at": chrono::Utc::now().to_rfc3339(),
+        // `null` = not attributable to this launch (see `FinalUsage::state`);
+        // a consumer must read that as unknown, never as a state of its own.
+        "state": final_usage.state,
+        "declared_done": final_usage.declared_done,
+        // This result arrived after the launch was superseded, so nothing that
+        // lives on the name-keyed record is attributed to it.
+        "stale_session": final_usage.stale_session,
+        "cost_usd": final_usage.cost_usd,
+        "cost_basis": final_usage.basis.as_str(),
+        "cost_provenance": final_usage.provenance,
+        "usage": final_usage.usage,
+        // Stated in the record so no consumer has to rediscover it: a
+        // completion is not a physical exit, and this total is an estimate.
+        "semantics": "reported_estimate_not_billed",
+    });
+    write_telemetry(
+        space,
+        castle,
+        &binding.repo,
+        "bbs-agent-final-usage",
+        payload,
+        serde_json::json!({
+            "surface": "final_usage",
+            "binding": binding.json(),
+        }),
+    )
+}
+
+/// Record that the harness PROCESS for one `(spawn, session)` attempt exited.
+///
+/// `launched_at` is this launch's own start time, so a report can bound the
+/// PROCESS against it. That span is process lifetime, not active model work: a
+/// harness can sit paused waiting on a verification run or on the operator,
+/// and this record makes no claim about how much of the span was productive.
+/// Active/paused phase attribution and verification-admission waits are
+/// deliberately left to evidence that can actually establish them.
+#[allow(clippy::too_many_arguments)]
+pub fn record_exit(
+    space: &Space,
+    castle: &str,
+    binding: &AttemptBinding,
+    exit_code: Option<i32>,
+    crashed: Option<bool>,
+    prior_state: Option<&str>,
+    launched_at: Option<String>,
+    cost_coverage: &str,
+    stale_session: bool,
+) -> Capture {
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "bbs_kind": "agent_exit",
+        "repo": binding.repo,
+        "task": binding.task,
+        "agent": binding.agent,
+        "spawn": binding.spawn,
+        "session": binding.session,
+        "provider_session": binding.provider_session,
+        "exited_at": chrono::Utc::now().to_rfc3339(),
+        // `null` means signal-terminated, which is NOT the same as exit 0.
+        "exit_code": exit_code,
+        // Both are read off the NAME-keyed `AgentRecord`, which a successor
+        // launch owns once it takes the name. For a superseded launch's late
+        // exit they are therefore `null` — omitted rather than borrowed from
+        // whichever record holds the name now.
+        "crashed": crashed,
+        "prior_state": prior_state,
+        "launched_at": launched_at,
+        // How completely the last reported cost covers this launch:
+        // `final` | `partial_unknown` | `none`. Finality is NEVER inferred
+        // from merely finding some result before an exit — a paused result
+        // that more model usage ran past is `partial_unknown`, and the
+        // remainder stays unknown rather than being treated as zero.
+        "cost_coverage": cost_coverage,
+        // This exit arrived for a launch that had already been superseded.
+        "stale_session": stale_session,
+        // Process lifetime, NOT active model work: a Claude process can sit
+        // paused waiting on verification or the operator. `launched_at` to
+        // `exited_at` bounds the process, and active/paused phase attribution
+        // and verification-admission waits are deliberately NOT claimed here.
+        "duration_semantics": "process_lifetime_not_active_work",
+        "semantics": "physical_exit",
+    });
+    write_telemetry(
+        space,
+        castle,
+        &binding.repo,
+        "bbs-agent-exit",
+        payload,
+        serde_json::json!({
+            "surface": "exit",
+            "binding": binding.json(),
+        }),
+    )
 }
 
 fn refers_to(tuple: &Tuple, ids: &HashSet<String>) -> bool {
@@ -331,6 +751,234 @@ fn get_post(space: &Space, id: &str) -> rk_core::Result<Tuple> {
     space
         .get(id)?
         .ok_or_else(|| rk_core::Error::other("BBS post not found"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportParams {
+    pub repo: String,
+    /// Resume point: the last `commit_sequence` a prior page returned.
+    #[serde(default)]
+    pub after: Option<u64>,
+    #[serde(default = "default_export_limit")]
+    pub limit: usize,
+    /// Caller-pinned snapshot boundary, echoed from a prior page's `boundary`.
+    /// Without it every page captures a NEW boundary, so a row written between
+    /// pages appears in the later page and the "snapshot" silently spans two
+    /// different states. A boundary ahead of the store's current sequence is
+    /// refused rather than clamped.
+    #[serde(default)]
+    pub boundary: Option<u64>,
+}
+
+fn default_export_limit() -> usize {
+    500
+}
+
+const MAX_EXPORT_LIMIT: usize = 2000;
+/// References are resolved with bounded, indexed `get`s. The cap keeps a page
+/// of densely cross-linked records from turning into an unbounded fan-out.
+const MAX_EXPORT_REFERENCES: usize = 4000;
+/// How many hops of source/evidence linkage the closure follows. Finite by
+/// construction so a cyclic or deeply chained graph cannot make an export
+/// unbounded; exceeding it sets `reference_budget_exhausted` rather than
+/// letting `coverage.complete` claim a closure that never finished.
+const MAX_EXPORT_REFERENCE_DEPTH: usize = 4;
+
+/// The exact `order` value the accepted S3 capture contract defines. Only a
+/// persistence-sequence-ordered read may emit it.
+const ORDER_PERSISTENCE_SEQUENCE: &str = "persistence_sequence";
+
+/// Payload keys that name another tuple in the same repository. Every one of
+/// these must either appear in the exported page, be resolved and appended as
+/// a reference, or be reported under `missing_references` — a reference is
+/// never silently dropped.
+const REFERENCE_KEYS: &[&str] = &[
+    "source",
+    "receipt",
+    "question",
+    "answer",
+    "contribution",
+    "source_artifact",
+];
+
+/// A bounded, read-only capture of one repository's records in ACTUAL
+/// persistence order, for the offline evidence report.
+///
+/// Why this exists rather than `rk scan`: a scan returns `{"tuples": [...]}`
+/// in `RecordId`/ULID order, which a delayed writer can invert, so it cannot
+/// establish which of two assessments was persisted last. This reads the
+/// immutable journal's `commit_sequence` and says so in the envelope. The
+/// historical `tuples` array is retained as the record list so an existing
+/// consumer keeps working; `order` is what makes the ordering claim
+/// authoritative, and a consumer must not infer persistence order from a plain
+/// scan that lacks it.
+///
+/// Bounded by construction: scope, cursor and limit are pushed into SQL before
+/// any payload is deserialized (see [`Space::persistence_page`]), so a 371k
+/// event journal costs a page, not a journal. Truncation is always reported.
+pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_json::Value> {
+    if params.repo.trim().is_empty() || !(1..=MAX_EXPORT_LIMIT).contains(&params.limit) {
+        return Err(rk_core::Error::other(format!(
+            "repo is required and limit must be 1..{MAX_EXPORT_LIMIT}"
+        )));
+    }
+    let page = space.persistence_page(&params.repo, params.after, params.limit, params.boundary)?;
+    let boundary = page.boundary;
+    let present: HashSet<_> = page.entries.iter().map(|(_, t)| t.id).collect();
+    let mut missing: Vec<String> = Vec::new();
+    let mut resolved: HashMap<rk_core::id::RecordId, Tuple> = HashMap::new();
+    let mut seen: HashSet<rk_core::id::RecordId> = HashSet::new();
+    let mut reference_budget_exhausted = false;
+
+    // Multi-hop closure under an explicit finite budget. One hop is not
+    // enough: a receipt names a finding, and that finding names evidence of
+    // its own, which a single pass would leave unresolved while still
+    // reporting `complete`. Each newly resolved BBS record is re-scanned, so
+    // nested evidence is either carried or named — never silently absent.
+    let mut frontier: Vec<Tuple> = page.entries.iter().map(|(_, t)| t.clone()).collect();
+    let mut depth = 0usize;
+    while !frontier.is_empty() && depth < MAX_EXPORT_REFERENCE_DEPTH {
+        let mut next: Vec<Tuple> = Vec::new();
+        for tuple in &frontier {
+            if !is_bbs_record(tuple) {
+                continue;
+            }
+            for id in reference_ids(tuple) {
+                match id.parse::<rk_core::id::RecordId>() {
+                    // Already in the page: nothing to resolve.
+                    Ok(parsed) if present.contains(&parsed) => {}
+                    Ok(parsed) => {
+                        if !seen.insert(parsed) {
+                            continue;
+                        }
+                        if resolved.len() >= MAX_EXPORT_REFERENCES {
+                            reference_budget_exhausted = true;
+                            missing.push(id);
+                            continue;
+                        }
+                        // Fenced to the FROZEN boundary, not read through the
+                        // live row: a tuple persisted after this snapshot did
+                        // not exist in it and must be reported, not exported.
+                        match space.get_as_of(parsed, boundary)? {
+                            Some(found) if found.scope == params.repo => {
+                                next.push(found.clone());
+                                resolved.insert(parsed, found);
+                            }
+                            // Foreign scope, or absent at this boundary.
+                            Some(_) | None => missing.push(id),
+                        }
+                    }
+                    // A malformed reference cannot be resolved; report it
+                    // rather than dropping it or failing the whole export.
+                    Err(_) => missing.push(id),
+                }
+            }
+        }
+        frontier = next;
+        depth += 1;
+    }
+    // The loop stopped with work still queued: say so rather than let
+    // `complete` imply the closure was exhausted.
+    if !frontier.is_empty() {
+        reference_budget_exhausted = true;
+        for tuple in &frontier {
+            missing.push(tuple.id.to_string());
+        }
+    }
+
+    let references: Vec<Tuple> = resolved.into_values().collect();
+    let sequences = space.commit_sequences(&references.iter().map(|t| t.id).collect::<Vec<_>>())?;
+    let records: Vec<serde_json::Value> = page
+        .entries
+        .iter()
+        .map(|(sequence, tuple)| {
+            let mut value = serde_json::to_value(tuple).unwrap_or(serde_json::Value::Null);
+            value["commit_sequence"] = serde_json::json!(sequence);
+            value
+        })
+        .collect();
+    let mut reference_records: Vec<serde_json::Value> = references
+        .iter()
+        .map(|tuple| {
+            let mut value = serde_json::to_value(tuple).unwrap_or(serde_json::Value::Null);
+            // A live row a reference resolved to always has a commit sequence;
+            // `null` means the row exists but its order is unknown, which a
+            // consumer must treat as unordered rather than as sequence zero.
+            value["commit_sequence"] = serde_json::json!(sequences.get(&tuple.id));
+            value
+        })
+        .collect();
+    // Deterministic output so a replay of the same snapshot is byte-stable.
+    reference_records.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    missing.sort();
+    missing.dedup();
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "kind": "bbs.export",
+        "repo": params.repo,
+        "build": rk_core::version::BUILD_VERSION,
+        "captured_at": chrono::Utc::now().to_rfc3339(),
+        // The ordering claim this surface exists to make, spelled exactly as
+        // the accepted S3 capture contract names it. A consumer that does not
+        // see this exact value must treat the order as unknown.
+        "order": ORDER_PERSISTENCE_SEQUENCE,
+        // Implementation provenance, kept OUT of `order` so the wire enum
+        // stays stable if the underlying column or table is ever renamed.
+        "order_provenance": "tuple_persistence_events.commit_sequence ascending",
+        "source": "space.persistence_page",
+        "boundary": boundary,
+        "after": params.after.unwrap_or(0),
+        // S3 capture-envelope aliases for the same two numbers.
+        "since": params.after.unwrap_or(0),
+        "cursor": page.next_cursor,
+        "next_cursor": page.next_cursor,
+        // Echo this back as `boundary` on the next page to keep one snapshot.
+        "pinned_boundary": boundary,
+        "limit": params.limit,
+        "truncated": page.more,
+        // Historical `rk scan` shape: an object carrying a `tuples` array.
+        "tuples": records,
+        "references": reference_records,
+        "coverage": {
+            "tuples": records.len(),
+            "references": reference_records.len(),
+            "missing_references": missing,
+            "reference_depth": MAX_EXPORT_REFERENCE_DEPTH,
+            // Never true while a reference — at ANY hop — is unresolved.
+            "complete": !page.more && missing.is_empty() && !reference_budget_exhausted,
+            "reference_budget_exhausted": reference_budget_exhausted,
+            "scope": params.repo,
+        },
+    }))
+}
+
+/// Every tuple id named by one record's payload: the scalar reference keys
+/// plus its `evidence` array.
+fn reference_ids(tuple: &Tuple) -> Vec<String> {
+    let mut raw: Vec<String> = REFERENCE_KEYS
+        .iter()
+        .filter_map(|key| tuple.payload[*key].as_str().map(str::to_string))
+        .collect();
+    if let Some(evidence) = tuple.payload["evidence"].as_array() {
+        raw.extend(
+            evidence
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string)),
+        );
+    }
+    raw
+}
+
+/// Whether a tuple is one of the BBS record kinds whose payload may name other
+/// tuples that the export must carry or report.
+fn is_bbs_record(tuple: &Tuple) -> bool {
+    rk_core::bbs::is_question(tuple)
+        || rk_core::bbs::is_answer(tuple)
+        || rk_core::bbs::is_acceptance(tuple)
+        || rk_core::bbs::is_finding(tuple)
+        || rk_core::bbs::is_reuse(tuple)
+        || rk_core::bbs::is_assessment(tuple)
 }
 
 #[derive(Debug)]
@@ -1502,4 +2150,592 @@ mod tests {
             "the record persisted LAST is current, even though it has the SMALLER RecordId"
         );
     }
+
+    use rk_core::bbs::{ExposureSurface, TelemetryStatus};
+
+    fn exposures(space: &Space) -> Vec<Tuple> {
+        space
+            .scan(&Pattern::category(Category::Event).scope("repo"))
+            .unwrap()
+            .into_iter()
+            .filter(rk_core::bbs::is_exposure)
+            .collect()
+    }
+
+    #[test]
+    fn exposure_records_the_exact_selection_and_distinguishes_empty_from_absent() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        let task = Tuple::new(
+            Category::Task,
+            "repo",
+            format!("TKT-{}", rk_core::id::RecordId::new()),
+            "operator",
+            json!({"title":"Parser grammar","status":"open"}),
+        );
+        space.out(task.clone()).unwrap();
+
+        // Before anything relevant exists, the selection is genuinely EMPTY.
+        let params = BriefParams::for_task("repo", &task.identity);
+        let empty = brief(&space, &tickets, &params).unwrap();
+        assert!(empty.entries.is_empty());
+        let binding = ConsumerBinding::agent("Scurry-15", "spawn-1", Some(&task.identity));
+        let capture = record_exposure(&space, "castle", ExposureSurface::Spawn, &binding, &empty);
+        assert_eq!(capture.status, TelemetryStatus::Recorded);
+
+        let recorded = exposures(&space);
+        assert_eq!(recorded.len(), 1, "an empty selection is still an exposure");
+        let payload = &recorded[0].payload;
+        assert_eq!(payload["bbs_kind"], "exposure");
+        assert_eq!(payload["surface"], "spawn");
+        assert_eq!(payload["semantics"], "prepared");
+        assert_eq!(payload["spawn"], "spawn-1");
+        assert_eq!(payload["bound"], "agent");
+        assert_eq!(payload["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["prepared"], 0);
+        assert_eq!(
+            recorded[0].instance, "castle",
+            "the castle authors the record, never the agent it describes"
+        );
+
+        // A real peer post makes the next selection non-empty, and the record
+        // names the exact source id and the exact reason that selected it.
+        let post = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "peer-note",
+            "peer",
+            json!({"task":task.identity,"summary":"a reproduction"}),
+        );
+        space.out(post.clone()).unwrap();
+        let filled = brief(&space, &tickets, &params).unwrap();
+        record_exposure(&space, "castle", ExposureSurface::Brief, &binding, &filled);
+        let brief_record = exposures(&space)
+            .into_iter()
+            .find(|t| t.payload["surface"] == "brief")
+            .expect("brief surface recorded");
+        let entries = brief_record.payload["entries"].as_array().unwrap().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["source"], post.id.to_string());
+        assert_eq!(entries[0]["reason"], "task or dependency");
+
+        // An exposure is measurement metadata: it must never come back as a
+        // peer finding, however well it matches the task.
+        let after = brief(&space, &tickets, &params).unwrap();
+        assert!(
+            after
+                .entries
+                .iter()
+                .all(|e| e.id != brief_record.id.to_string()),
+            "telemetry must not surface as a useful peer post"
+        );
+    }
+
+    #[test]
+    fn open_binds_the_caller_and_deduplicates_by_source_and_generation() {
+        let space = Space::open_in_memory().unwrap();
+        let source = Tuple::new(Category::Artifact, "repo", "note", "peer", json!({}));
+        space.out(source.clone()).unwrap();
+
+        let agent = ConsumerBinding::agent("Scurry-15", "spawn-1", Some("TKT-a"));
+        let first = record_open(&space, "castle", &agent, &source);
+        let second = record_open(&space, "castle", &agent, &source);
+        assert_ne!(
+            first.record, second.record,
+            "repeat reads are retained as separate records"
+        );
+
+        let opens: Vec<_> = space
+            .scan(&Pattern::category(Category::Event).scope("repo"))
+            .unwrap()
+            .into_iter()
+            .filter(rk_core::bbs::is_open)
+            .collect();
+        assert_eq!(opens.len(), 2);
+        let keys: HashSet<_> = opens
+            .iter()
+            .map(|t| t.payload["dedup_key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "both retained reads share one source/generation dedup key"
+        );
+        assert_eq!(opens[0].payload["semantics"], "requested");
+        assert_eq!(opens[0].payload["source"], source.id.to_string());
+
+        // A different generation of the SAME agent name is a different
+        // consumer and must not collapse into the first one's key.
+        let successor = ConsumerBinding::agent("Scurry-15", "spawn-2", Some("TKT-a"));
+        record_open(&space, "castle", &successor, &source);
+        // An operator read is recorded explicitly as unbound, so a report can
+        // exclude it from agent exposure rates rather than misattribute it.
+        record_open(&space, "castle", &ConsumerBinding::operator(), &source);
+        let opens: Vec<_> = space
+            .scan(&Pattern::category(Category::Event).scope("repo"))
+            .unwrap()
+            .into_iter()
+            .filter(rk_core::bbs::is_open)
+            .collect();
+        let keys: HashSet<_> = opens
+            .iter()
+            .map(|t| t.payload["dedup_key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys.len(), 3);
+        assert!(opens
+            .iter()
+            .any(|t| t.payload["bound"] == "operator" && t.payload["agent"].is_null()));
+    }
+
+    #[test]
+    fn export_states_its_order_boundary_truncation_and_reference_coverage() {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        let ev = evidence_artifact(&space, "repo", "evidence");
+        let finding = write(
+            &space,
+            &tickets,
+            "alice",
+            None,
+            "bbs.publish",
+            &publish_params(&ev),
+        )
+        .unwrap();
+        let finding_id = finding["id"].as_str().unwrap().to_string();
+        // A record in ANOTHER repository must never appear in this capture.
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "other-repo",
+                "foreign",
+                "peer",
+                json!({}),
+            ))
+            .unwrap();
+
+        let full = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 500,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            // The accepted S3 capture contract's enum, NOT the SQL detail:
+            // a consumer keys on this exact value to decide whether it may
+            // trust persistence order at all.
+            full["order"],
+            "persistence_sequence",
+            "the envelope makes its ordering claim explicit"
+        );
+        assert_eq!(
+            full["order_provenance"], "tuple_persistence_events.commit_sequence ascending",
+            "implementation provenance stays readable but out of the wire enum"
+        );
+        assert_eq!(full["truncated"], false);
+        assert_eq!(full["coverage"]["complete"], true);
+        assert!(full["boundary"].as_u64().unwrap() > 0);
+        let tuples = full["tuples"].as_array().unwrap();
+        assert!(
+            tuples.iter().all(|t| t["scope"] == "repo"),
+            "a bounded per-repo capture never leaks a foreign scope"
+        );
+        assert!(tuples.iter().any(|t| t["id"] == finding_id.as_str()));
+        // Persistence order is carried per record, ascending.
+        let sequences: Vec<u64> = tuples
+            .iter()
+            .map(|t| t["commit_sequence"].as_u64().unwrap())
+            .collect();
+        assert!(sequences.windows(2).all(|w| w[0] < w[1]));
+
+        // A page smaller than the scope reports truncation and a resume point
+        // rather than letting a short page imply completeness.
+        let page = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 1,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(page["truncated"], true);
+        assert_eq!(page["coverage"]["complete"], false);
+        assert_eq!(page["tuples"].as_array().unwrap().len(), 1);
+        let next = page["next_cursor"].as_u64().unwrap();
+        let second = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(next),
+                limit: 1,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        assert_ne!(second["tuples"][0]["id"], page["tuples"][0]["id"]);
+
+        // A finding whose evidence points outside the page must have that
+        // reference resolved and carried, never silently dropped.
+        let narrow = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(next),
+                limit: 500,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        let carried = narrow["tuples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(narrow["references"].as_array().unwrap())
+            .any(|t| t["id"] == ev.as_str());
+        assert!(carried, "evidence is exported or reported, never dropped");
+
+        // An unresolvable reference is reported explicitly.
+        let dangling = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-reuse-dangling",
+            "peer",
+            json!({"schema_version":1,"bbs_kind":"reuse","agent":"peer","task":"t",
+                   "source":finding_id,"outcome":"used","text":"x",
+                   "evidence":["01ARZ3NDEKTSV4RRFFQ69G5FAV"]}),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(dangling).unwrap();
+        let with_gap = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 500,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        assert!(with_gap["coverage"]["missing_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert_eq!(with_gap["coverage"]["complete"], false);
+
+        // Limits are bounded, and an out-of-range request is refused rather
+        // than silently clamped into an unbounded read.
+        assert!(export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 0,
+                boundary: None,
+            },
+        )
+        .is_err());
+    }
 }
+
+#[cfg(test)]
+mod export_snapshot_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn artifact(space: &Space, scope: &str, name: &str, payload: serde_json::Value) -> Tuple {
+        let tuple = Tuple::new(Category::Artifact, scope, name, "peer", payload);
+        space.out(tuple.clone()).unwrap();
+        tuple
+    }
+
+    fn params(repo: &str, limit: usize) -> ExportParams {
+        ExportParams {
+            repo: repo.to_string(),
+            after: None,
+            limit,
+            boundary: None,
+        }
+    }
+
+    /// The ordering claim is the entire reason this surface exists: a consumer
+    /// keys on `order`, so the wire value must be the contract's enum and the
+    /// SQL detail must live somewhere it cannot be mistaken for it.
+    #[test]
+    fn order_is_the_contract_enum_with_provenance_held_separately() {
+        let space = Space::open_in_memory().unwrap();
+        artifact(&space, "repo", "a", json!({"summary":"one"}));
+        let out = export(&space, &params("repo", 10)).unwrap();
+        assert_eq!(out["order"], "persistence_sequence");
+        assert_eq!(
+            out["order_provenance"],
+            "tuple_persistence_events.commit_sequence ascending"
+        );
+        assert_eq!(out["source"], "space.persistence_page");
+    }
+
+    /// Paging without a pinned boundary silently spans two different states.
+    /// With one, a row written between pages must NOT appear in page two.
+    #[test]
+    fn pinned_boundary_excludes_writes_made_between_pages() {
+        let space = Space::open_in_memory().unwrap();
+        artifact(&space, "repo", "first", json!({"summary":"1"}));
+        artifact(&space, "repo", "second", json!({"summary":"2"}));
+
+        let page1 = export(&space, &params("repo", 1)).unwrap();
+        assert_eq!(page1["truncated"], true);
+        let boundary = page1["boundary"].as_u64().unwrap();
+        let cursor = page1["next_cursor"].as_u64().unwrap();
+
+        // A concurrent writer lands a row AFTER the snapshot was frozen.
+        let intruder = artifact(&space, "repo", "intruder", json!({"summary":"late"}));
+
+        let page2 = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(cursor),
+                limit: 10,
+                boundary: Some(boundary),
+            },
+        )
+        .unwrap();
+        let ids: Vec<String> = page2["tuples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !ids.contains(&intruder.id.to_string()),
+            "a row written after the pinned boundary leaked into a later page: {ids:?}"
+        );
+
+        // Control: without the pin, the same second page DOES see it — which
+        // is precisely the defect the pin exists to close.
+        let unpinned = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(cursor),
+                limit: 10,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        let unpinned_ids: Vec<String> = unpinned["tuples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(unpinned_ids.contains(&intruder.id.to_string()));
+    }
+
+    /// Clamping a future boundary would hand back a different snapshot than
+    /// the caller asked for while calling it the same one.
+    #[test]
+    fn boundary_ahead_of_the_store_is_refused_not_clamped() {
+        let space = Space::open_in_memory().unwrap();
+        artifact(&space, "repo", "a", json!({"summary":"one"}));
+        let live = space.latest_persistence_sequence().unwrap();
+        let error = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 10,
+                boundary: Some(live + 5_000),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("ahead of the store"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Resolving a reference through the LIVE row lets a tuple that did not
+    /// exist at the boundary appear inside a snapshot of that boundary.
+    #[test]
+    fn references_are_fenced_to_the_frozen_boundary() {
+        let space = Space::open_in_memory().unwrap();
+        // Mint the evidence id first, but persist it only AFTER the boundary.
+        let future_evidence = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "evidence",
+            "peer",
+            json!({"summary":"written later"}),
+        );
+        let finding = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-finding-x",
+            "peer",
+            json!({
+                "bbs_kind":"finding",
+                "text":"t",
+                "areas":["a"],
+                "revision":"abc",
+                "evidence":[future_evidence.id.to_string()],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(finding.clone()).unwrap();
+        let boundary = space.latest_persistence_sequence().unwrap();
+        space.out(future_evidence.clone()).unwrap();
+
+        let out = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: None,
+                limit: 50,
+                boundary: Some(boundary),
+            },
+        )
+        .unwrap();
+        let refs: Vec<String> = out["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !refs.contains(&future_evidence.id.to_string()),
+            "a post-boundary row leaked in as a reference"
+        );
+        let missing: Vec<String> = out["coverage"]["missing_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(missing.contains(&future_evidence.id.to_string()));
+        assert_eq!(out["coverage"]["complete"], false);
+    }
+
+    /// A receipt names a finding; that finding names evidence of its own. A
+    /// single-hop closure resolves the finding, misses the evidence, and still
+    /// reports `complete` — which is the failure this guards.
+    #[test]
+    fn nested_evidence_is_followed_and_never_silently_dropped() {
+        let space = Space::open_in_memory().unwrap();
+        let evidence = artifact(&space, "repo", "deep-evidence", json!({"summary":"deep"}));
+        let finding = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-finding-y",
+            "peer",
+            json!({
+                "bbs_kind":"finding",
+                "text":"t",
+                "areas":["a"],
+                "revision":"abc",
+                "evidence":[evidence.id.to_string()],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(finding.clone()).unwrap();
+        let receipt = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-reuse-z",
+            "consumer",
+            json!({
+                "bbs_kind":"reuse",
+                "source": finding.id.to_string(),
+                "outcome":"used",
+                "text":"t",
+                "evidence":[],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(receipt.clone()).unwrap();
+
+        // Page holding ONLY the receipt, so both hops must be traversed.
+        let receipt_seq = space
+            .commit_sequences(&[receipt.id])
+            .unwrap()
+            .get(&receipt.id)
+            .copied()
+            .unwrap();
+        let out = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(receipt_seq - 1),
+                limit: 1,
+                boundary: None,
+            },
+        )
+        .unwrap();
+        let refs: Vec<String> = out["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            refs.contains(&finding.id.to_string()),
+            "first hop missing: {refs:?}"
+        );
+        assert!(
+            refs.contains(&evidence.id.to_string()),
+            "SECOND hop missing — coverage.complete would be a lie: {refs:?}"
+        );
+    }
+
+    /// A bounded per-repo capture must not leak a foreign scope, and must say
+    /// that it did not rather than dropping the reference.
+    #[test]
+    fn foreign_scope_reference_is_reported_never_exported() {
+        let space = Space::open_in_memory().unwrap();
+        let foreign = artifact(&space, "other-repo", "foreign", json!({"summary":"x"}));
+        let finding = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-finding-f",
+            "peer",
+            json!({
+                "bbs_kind":"finding",
+                "text":"t",
+                "areas":["a"],
+                "revision":"abc",
+                "evidence":[foreign.id.to_string()],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(finding).unwrap();
+        let out = export(&space, &params("repo", 50)).unwrap();
+        for tuple in out["references"].as_array().unwrap() {
+            assert_ne!(tuple["scope"], "other-repo");
+        }
+        let missing: Vec<String> = out["coverage"]["missing_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(missing.contains(&foreign.id.to_string()));
+        assert_eq!(out["coverage"]["complete"], false);
+    }
+}
+
+// The four shallow `surface_coverage_tests` that lived here were RETIRED by
+// TKT-zutap-zavor-zuloj: they called `record_exposure` in a loop over the
+// surface enum, `record_open` directly, and asserted the reserved-identity
+// constant — which tests the serializers, not the wiring or the authorization.
+// Real entrypoint coverage supersedes them: the spawn/resume/recovery surfaces
+// and the native producers in `tests/bbs_native_observation.rs`, and the brief
+// surface, the `open` dedup pair, empty-versus-missing capture, nonfatal
+// capture on both the read and the launch path, and authenticated forgery of
+// every telemetry kind and both bare native identities in
+// `rk-cli/tests/bbs_capture_export_cli.rs`.
