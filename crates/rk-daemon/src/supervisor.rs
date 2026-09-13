@@ -575,6 +575,19 @@ fn scope_json(spent: f64, cap: f64, warn_at: f64, repo: Option<String>) -> serde
     obj
 }
 
+/// What the name-keyed `AgentRecord` says about one result. Passed as `None`
+/// for a SUPERSEDED launch: everything here is read off the record a successor
+/// now owns, so it is omitted rather than borrowed. The caller supplies it from
+/// its HELD ownership guard ([`Supervisor::own`]) rather than having
+/// `observe_final_usage` read the map again under no lock, where a second read
+/// could disagree with the fence the record write was made under.
+#[derive(Clone, Copy)]
+struct OwnedResult<'a> {
+    record_cost_usd: f64,
+    state: &'a str,
+    declared_done: bool,
+}
+
 /// Immutable per-LAUNCH attribution, plus what that launch has been observed
 /// to do. Measurement only: nothing here gates lifecycle.
 ///
@@ -2840,9 +2853,7 @@ impl Supervisor {
                 // `name`'s `CompletionState`, mutate the successor's record, or
                 // route a completion on its behalf.
                 let Some(_owned) = self.own(name, session) else {
-                    self.observe_final_usage(
-                        session, 0.0, cost_usd, &usage, "unknown", false, false,
-                    );
+                    self.observe_final_usage(session, cost_usd, &usage, None);
                     self.note_result(session, cost_usd.is_some());
                     return;
                 };
@@ -2922,12 +2933,13 @@ impl Supervisor {
                         };
                         self.observe_final_usage(
                             session,
-                            record.cost_usd,
                             cost_usd,
                             &usage,
-                            state,
-                            completed_via_reconcile,
-                            true,
+                            Some(OwnedResult {
+                                record_cost_usd: record.cost_usd,
+                                state,
+                                declared_done: completed_via_reconcile,
+                            }),
                         );
                         self.note_result(session, cost_usd.is_some());
                     }
@@ -2971,17 +2983,18 @@ impl Supervisor {
                     // launch may then be killed without another result.
                     self.observe_final_usage(
                         session,
-                        record.cost_usd,
                         cost_usd,
                         &record.usage,
-                        match record.state {
-                            AgentState::Completed => "completed",
-                            AgentState::Failed => "failed",
-                            AgentState::Paused => "paused",
-                            _ => "unknown",
-                        },
-                        claim.declared_done,
-                        true,
+                        Some(OwnedResult {
+                            record_cost_usd: record.cost_usd,
+                            state: match record.state {
+                                AgentState::Completed => "completed",
+                                AgentState::Failed => "failed",
+                                AgentState::Paused => "paused",
+                                _ => "unknown",
+                            },
+                            declared_done: claim.declared_done,
+                        }),
                     );
                     self.note_result(session, cost_usd.is_some());
                     if claim.publish {
@@ -3685,12 +3698,9 @@ impl Supervisor {
     fn observe_final_usage(
         &self,
         session: rk_core::id::SpawnId,
-        record_cost_usd: f64,
         cost_usd: Option<f64>,
         usage: &TokenUsage,
-        state: &str,
-        declared_done: bool,
-        live: bool,
+        owned: Option<OwnedResult<'_>>,
     ) {
         let Some(watch) = self.attempt_watch(session) else {
             // A result for a launch we have no frozen attribution for. Better
@@ -3701,12 +3711,6 @@ impl Supervisor {
             );
             return;
         };
-        // `live` comes from the caller's HELD ownership guard, not a second
-        // unsynchronised read that could disagree with the fence the record
-        // write was made under. A superseded launch's delayed result must not be
-        // labelled with the successor's record state or priced off its running
-        // total: the event's own provider figure belongs to this launch,
-        // anything read from the name-keyed `AgentRecord` does not.
         // Three genuinely different situations, kept apart on purpose:
         //
         //  * this result carries a provider total -> that total, for THIS
@@ -3729,15 +3733,17 @@ impl Supervisor {
                 None,
                 "a provider total was reported earlier in this launch but not for this result; the running figure mixes bases, so no final launch cost is provable",
             )
-        } else if live && usage.total() > 0 && self.pricing_known(&watch) {
-            // `record_cost_usd` is the generation-cumulative total, which a
+        } else if let Some(owned) =
+            owned.filter(|_| usage.total() > 0 && self.pricing_known(&watch))
+        {
+            // `owned.record_cost_usd` is the generation-cumulative total, which a
             // same-generation relaunch inherits (`begin_launch` mints a new
             // watch and session token, never a new `AgentRecord`). Only the
             // amount accrued since THIS launch's own baseline can honestly be
             // called this launch's daemon-priced cost; a zero or negative
             // delta proves nothing about this launch's own spend and must not
             // be reported as a final total.
-            let increment = record_cost_usd - watch.baseline_cost_usd;
+            let increment = owned.record_cost_usd - watch.baseline_cost_usd;
             if increment > 0.0 {
                 (
                     rk_core::bbs::CostBasis::DaemonPricedIncrements,
@@ -3751,7 +3757,7 @@ impl Supervisor {
                     "no positive per-launch daemon-priced increment is provable against this launch's baseline",
                 )
             }
-        } else if !live {
+        } else if owned.is_none() {
             (
                 rk_core::bbs::CostBasis::Unknown,
                 None,
@@ -3777,9 +3783,9 @@ impl Supervisor {
                 usage: serde_json::to_value(usage).ok(),
                 // Omitted for a superseded launch: the state came from the
                 // record the SUCCESSOR now owns, not from this launch.
-                state: live.then(|| state.to_string()),
-                declared_done: live.then_some(declared_done),
-                stale_session: !live,
+                state: owned.map(|o| o.state.to_string()),
+                declared_done: owned.map(|o| o.declared_done),
+                stale_session: owned.is_none(),
             },
         );
         if capture.is_failed() {
