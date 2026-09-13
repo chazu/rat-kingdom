@@ -2800,7 +2800,11 @@ impl Supervisor {
                             "stopped"
                         };
                         self.observe_final_usage(
-                            &record, session, cost_usd, &usage, state,
+                            &record,
+                            session,
+                            cost_usd,
+                            &usage,
+                            state,
                             completed_via_reconcile,
                         );
                         self.note_result(name, session);
@@ -3013,7 +3017,9 @@ impl Supervisor {
                     let stale = watch.as_ref().is_some_and(|w| w.session != session);
                     let coverage = match &watch {
                         // A result was reported and nothing ran past it.
-                        Some(w) if w.session == session && w.saw_result && !w.usage_since_result => {
+                        Some(w)
+                            if w.session == session && w.saw_result && !w.usage_since_result =>
+                        {
                             CostCoverage::Final
                         }
                         // A result was reported but more model work followed

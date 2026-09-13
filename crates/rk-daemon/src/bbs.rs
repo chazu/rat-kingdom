@@ -2308,7 +2308,8 @@ mod tests {
             // The accepted S3 capture contract's enum, NOT the SQL detail:
             // a consumer keys on this exact value to decide whether it may
             // trust persistence order at all.
-            full["order"], "persistence_sequence",
+            full["order"],
+            "persistence_sequence",
             "the envelope makes its ordering claim explicit"
         );
         assert_eq!(
