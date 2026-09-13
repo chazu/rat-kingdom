@@ -10052,7 +10052,10 @@ mod respawn_tests {
             .filter(|t| t.payload["bbs_kind"] == "agent_final_usage")
             .collect();
         assert_eq!(final_usage.len(), 1);
-        assert_eq!(final_usage[0].payload["session"], recovery_session.to_string());
+        assert_eq!(
+            final_usage[0].payload["session"],
+            recovery_session.to_string()
+        );
         assert_eq!(final_usage[0].payload["spawn"], spawn.to_string());
         assert_eq!(final_usage[0].payload["cost_usd"], 0.5);
         let exits: Vec<_> = events
@@ -12545,7 +12548,13 @@ mod native_observation_tests {
         let priced = sup.lock_registry().get("Nibble").unwrap().cost_usd;
         assert!(priced > 0.0, "priced usage must move the running total");
 
-        sup.handle_event("Nibble", rec.created_at, spawn, session, completed(None, None));
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            completed(None, None),
+        );
 
         let usage = observations(&sup, "agent_final_usage");
         assert_eq!(usage.len(), 1);
@@ -12625,7 +12634,13 @@ mod native_observation_tests {
             "the relaunch's own priced usage must move the cumulative total"
         );
 
-        sup.handle_event("Nibble", rec.created_at, spawn, second, completed(None, None));
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            completed(None, None),
+        );
         sup.handle_event(
             "Nibble",
             rec.created_at,
@@ -12699,7 +12714,13 @@ mod native_observation_tests {
             .update("Nibble", |r| r.model = Some("haiku".into()))
             .unwrap();
 
-        sup.handle_event("Nibble", rec.created_at, spawn, session, completed(None, None));
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            completed(None, None),
+        );
 
         let usage = observations(&sup, "agent_final_usage");
         assert_eq!(usage.len(), 1);
