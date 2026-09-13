@@ -144,8 +144,9 @@ Required results:
 - verified reuse after the source author's terminal lifecycle event;
 - repeated investigations and rework, with reviewed evidence (do not turn an
   agent's estimate of time saved into measured savings);
-- total measured agent cost and active-work duration per accepted delivery,
-  including failed attempts; keep verification/admission queue duration separate;
+- reported agent cost estimates and active-work duration per accepted delivery,
+  including failed attempts; keep verification/admission queue duration separate
+  and identify missing cost or active-work coverage explicitly;
 - incorrect reuse, regressions, operator interventions and observation coverage;
 - mechanism goal: three verified used/adapted effects across at least two batches,
   at least one after its author exited, and no operator-relayed source pointers
@@ -156,6 +157,17 @@ generation joins, repeated self-use, future-source evidence and unsupported
 claims of terminal-author reuse. Legacy records without sufficient identity stay
 unattributed. Stable ordering and explicit schema/evaluator version make replay
 deterministic. All read/export limits must reveal truncation.
+
+Task completion, the final provider cost report, and physical process exit are
+separate observations. Native observations bind both the agent generation and
+the particular process launch; a manual respawn can retain the generation while
+starting a new launch. Cost aggregation also retains the provider session so
+repeated cumulative results within one query are not summed as separate charges.
+Provider cost fields are reported estimates, not billed charges. A process may
+remain paused while awaiting verification or the operator: launch-to-exit is
+process lifetime and must not be labelled measured active work. Preserve unknown
+coverage when the available observations cannot establish either final cost or
+active-work duration.
 
 ## Trial design
 
@@ -252,10 +264,28 @@ The execution ledger and ticket IDs are appended below as work proceeds.
 Initial source: `8e0cccf`; installed daemon: `72911dd1d382`. No live
 workers and no landing queue entries at preflight. Artifact directory: `/Users/chazu/.codex/artifacts/rk-stigmergy-20260913T022353Z`.
 
-- S1 test tracking: `TKT-lakir-sosit-novug` — created by the first worker at its committed checkpoint; the operator resumed S1 to finish these same acceptance tests before delivery. It is not independent delivered work.
+- S1 test tracking: `TKT-lakir-sosit-novug` — closed against S1's completed real-CLI, restart and authority coverage.
 - S3 correction: `TKT-nonub-pugar-pilid` — operator review found incomplete native identity/scope validation and experiment denominators. Required before S4; retains the existing experiment criteria.
+- S2 continuation: `TKT-dorod-sival-fumid` — continues the preserved S2 branch with final-cost/physical-exit observations, export corrections and real-CLI acceptance. `TKT-zutap-zavor-zuloj` tracks the same remaining acceptance and is blocked on this assigned continuation.
+- Claude usage accounting: `TKT-jomig-zimab-pugiv` — deduplicate repeated assistant-message usage within a Claude stream. Required before resuming implementation and before S4; budget and burn-rate policies remain unchanged.
+- Discovered verification failure: `TKT-mukos-pogim-lopis` — daemon-startup timeout during the accounting repair's broad check; isolated retry passed. The root cause is unproven and the ticket remains open.
 
-S1 checkpoint `4f8cfb1` was committed with unit checks but lacked real-CLI
-integration/restart/authority coverage; resumed in its preserved worktree. S3
-checkpoint `43faffe` passed scoped checks and entered the normal landing gate.
-The operator review above is a deployment prerequisite, not a passing trial.
+Execution checkpoint, 2026-09-13 04:31 UTC:
+
+- S1 delivered to `main` as `f75670b`, including the real-CLI acceptance tests
+  and a deterministic persistence-order fixture. Its protected full gate and
+  semantic review passed; the worker was dismissed after delivery.
+- S3 delivered to `main` as `85b4e70` after an offline-command correction and
+  merge-conflict correction. Protected full checks and semantic review passed.
+  The separate evaluator correction above is still required before a live trial.
+- S2 core and initial tests are preserved at `1e35d20`. The original generation
+  remains stopped at its ordinary budget cap. The continuation's `bf3bd63` adds
+  a contract document only: its remaining producers, export corrections and
+  integration tests are unimplemented. It is paused until the usage repair is
+  active, with no task-completion claim. Superseded documentation-check requests
+  were cancelled and are not passing evidence.
+- The accounting repair is committed at `ee087f1` and its broad check is retrying
+  after the recorded startup timeout. It has not landed or been activated.
+- Installed binaries and daemon remain `72911dd1d382`. Rollback binaries and
+  their hashes are retained in the artifact directory. No live stigmergy trial,
+  author-exit trial or matched comparison has run yet.
