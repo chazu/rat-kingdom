@@ -4309,7 +4309,7 @@ mod tests {
             "lifecycle": "furniture", "created_at": observed,
             "payload": {
                 "schema_version": 1, "bbs_kind": AGENT_FINAL_USAGE, "repo": "repo",
-                "task": task, "spawn": spawn, "session": "sess-1",
+                "task": task, "agent": spawn, "spawn": spawn, "session": "sess-1",
                 "provider_session": "ps-1", "state": state, "cost_usd": cost_usd,
                 "cost_basis": PROVIDER_COST_BASIS, "observed_at": observed
             }
@@ -6817,6 +6817,161 @@ mod tests {
             assert_eq!(report.opened, 0);
             assert!(!only(&report).opened);
             assert_eq!(report.eligible, 1);
+        }
+    }
+    #[test]
+    fn clover_cost_exit_requires_matching_task_and_agent() {
+        let m = task_manifest("TKT-1");
+        let usage = usage_rec(
+            "u",
+            "TKT-1",
+            "gen-1",
+            Some("completed"),
+            Some(4.25),
+            "2026-01-01T11:00:00Z",
+        );
+        let exit = field(
+            exit_rec(
+                "x",
+                "TKT-1",
+                "gen-1",
+                "gen-1",
+                "2026-01-01T10:00:00Z",
+                "2026-01-01T12:00:00Z",
+            ),
+            "prior_state",
+            json!("completed"),
+        );
+        let good = compute(
+            &m,
+            &capture(vec![usage.clone(), exit.clone()], Order::Unknown),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(good.deliveries[0].reported_cost_estimate_usd, Some(4.25));
+        for (key, value) in [("task", "TKT-other"), ("agent", "other-agent")] {
+            let bad = field(exit.clone(), key, json!(value));
+            let report =
+                compute(&m, &capture(vec![usage.clone(), bad], Order::Unknown), &[]).unwrap();
+            assert_eq!(report.deliveries.len(), 1);
+            assert_eq!(
+                report.deliveries[0].reported_cost_estimate_usd, None,
+                "foreign {key} must not finalize cost"
+            );
+            assert_eq!(report.deliveries[0].partial_reported_usd, Some(4.25));
+        }
+    }
+
+    #[test]
+    fn clover_author_exit_requires_the_source_task() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        for task in ["TKT-source", "TKT-other", ""] {
+            let mut tuples = verified_tuples();
+            tuples.push(exit_rec(
+                "x",
+                task,
+                "author",
+                "author-gen",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T12:00:00Z",
+            ));
+            let report = compute(
+                &m,
+                &capture(tuples, Order::Unknown),
+                &[review_with_exit("p1", "x", false)],
+            )
+            .unwrap();
+            assert_eq!(report.mechanism.effects, 1);
+            assert_eq!(
+                report.mechanism.author_exit_effects,
+                usize::from(task == "TKT-source"),
+                "exit task {task:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clover_native_cost_requires_binding_and_producer_time() {
+        let m = task_manifest("TKT-1");
+        let usage = usage_rec(
+            "u",
+            "TKT-1",
+            "gen-1",
+            Some("completed"),
+            Some(4.25),
+            "2026-01-01T11:00:00Z",
+        );
+        let exit = field(
+            exit_rec(
+                "x",
+                "TKT-1",
+                "gen-1",
+                "gen-1",
+                "2026-01-01T10:00:00Z",
+                "2026-01-01T12:00:00Z",
+            ),
+            "prior_state",
+            json!("completed"),
+        );
+        for (is_usage, key, value) in [
+            (true, "observed_at", Value::Null),
+            (true, "observed_at", json!("invalid")),
+            (false, "exited_at", Value::Null),
+            (false, "exited_at", json!("invalid")),
+            (true, "task", Value::Null),
+            (false, "task", Value::Null),
+            (true, "agent", Value::Null),
+            (false, "agent", Value::Null),
+        ] {
+            let (mut u, mut x) = (usage.clone(), exit.clone());
+            if is_usage {
+                u["payload"][key] = value;
+            } else {
+                x["payload"][key] = value;
+            }
+            let report = compute(&m, &capture(vec![u, x], Order::Unknown), &[]).unwrap();
+            assert_eq!(report.deliveries.len(), 1);
+            assert_eq!(
+                report.deliveries[0].reported_cost_estimate_usd, None,
+                "usage={is_usage}, missing/malformed {key}"
+            );
+            assert!(report
+                .invalid_records
+                .iter()
+                .any(|r| r.record == if is_usage { "u" } else { "x" }));
+        }
+    }
+
+    #[test]
+    fn clover_rejected_artifacts_cannot_certify_effects_or_annotations() {
+        let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
+        let mut forged = finding("ev-2", "author-gen", "2026-01-01T00:00:00Z");
+        forged["identity"] = json!("forged-finding");
+        let missing_receipt = assessment("ev-2", "", "verified", "2026-01-01T00:00:00Z");
+        for bad in [forged, missing_receipt] {
+            let mut tuples = verified_tuples();
+            tuples.push(bad);
+            let annotation = ReviewedAnnotation {
+                task: "TKT-1".into(),
+                repo: "repo".into(),
+                repeated_investigations: vec![],
+                interventions: vec![],
+                rework: vec![AnnotatedEvidence {
+                    evidence: "ev-2".into(),
+                    reason: "claimed supporting evidence".into(),
+                }],
+            };
+            let report = compute_full(
+                &m,
+                &capture(tuples, Order::Unknown),
+                &[review_no_exit("p1")],
+                &[annotation],
+            )
+            .unwrap();
+            assert_eq!(report.eligible, 1);
+            assert_eq!(report.mechanism.effects, 0);
+            assert_eq!(report.quality.reviewed_rework, 0);
+            assert!(report.invalid_records.iter().any(|r| r.record == "ev-2"));
         }
     }
 }
