@@ -2751,7 +2751,7 @@ mod export_snapshot_tests {
                 .out(Tuple::new(
                     Category::Artifact,
                     "repo",
-                    &format!("noise-{i}"),
+                    format!("noise-{i}"),
                     "peer",
                     json!({}),
                 ))
@@ -2781,11 +2781,10 @@ mod export_snapshot_tests {
         // (the pre-fix `commit_sequences()` call on the resolved reference)
         // can no longer see this id at all.
         assert!(space.delete(evidence.id).unwrap());
-        assert!(space
+        assert!(!space
             .commit_sequences(&[evidence.id])
             .unwrap()
-            .get(&evidence.id)
-            .is_none());
+            .contains_key(&evidence.id));
 
         // Page holding ONLY the finding, so the evidence must be resolved as
         // a reference via `get_as_of`, not read off the (now-gone) live row.
