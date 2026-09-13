@@ -123,6 +123,13 @@ native tuple-list JSON shape; it must not require hand-transcribed synthetic
 events in order to evaluate a live run. Run-specific annotations supply consumer
 outcomes and independently checked eligibility, each with evidence references.
 
+S2 supplies `rk bbs export --repo REPO` / `bbs.export` as the bounded native
+capture surface, using the existing persistence-ordered read. The envelope names
+its order, boundary and truncation/coverage explicitly. Plain legacy `rk scan`
+output remains readable, but its tuple-ID order cannot establish which of two
+assessments was persisted last; retain that ambiguity. Export source/evidence
+artifacts along with BBS records or mark incomplete references explicitly.
+
 Required results:
 
 - discovery coverage = distinct eligible pairs prepared / eligible pairs with
@@ -179,6 +186,15 @@ replays remain disposable. Report per-batch cost, time, accepted work, failures,
 rework and interference. Small samples yield descriptive evidence, not a broad
 statistical productivity claim. A null/negative result is an honest completed
 experiment and must be retained, investigated and reported, not relabeled green.
+
+For this comparison, both arms run the same installed candidate. An isolated,
+operator-owned harness wrapper removes only the distinctly headed `Reusable
+findings` guidance fragment for the baseline arm; treatment preserves it. The
+wrapper must match exactly one fragment, preserve every authority/task/BBS
+instruction outside it, retain argv and stdin/stdout, and record prompt/fragment
+hashes. It is never installed as the production harness. This measures the
+incremental effect of early-publication/reuse guidance with identical product
+capabilities, not the total effect of having any shared memory.
 
 ## Implementation tickets and ordering
 
