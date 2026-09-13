@@ -73,6 +73,45 @@ What remains genuinely unsupported at version 3, under `report.unsupported`:
   `DeliveryCost.reviewed_*`) rather than summed with the span-derived lower
   bound — the two answer different questions.
 
+## Phase-span duration contract and occurrence identity (`task_span`)
+
+Every `task_span` (`rk_daemon::span::PhaseSpan`) carries `queue_wait_ms` and
+`duration_ms`, and — only when built via `PhaseSpan::from_durations` (the
+shape a `VerificationQueued` producer uses, since it has no real wall-clock
+`queued_at`/`started_at` to record directly) — a `duration_semantic` tag.
+`duration_semantic: "additive"` is a CONTRACT, not a description: it asserts
+`queue_wait_ms` (admission wait) and `duration_ms` (execution) are disjoint,
+non-overlapping intervals, so `queue_wait_ms + duration_ms` is a sound total
+elapsed for that span. A row with no `duration_semantic` at all predates the
+tag and must NOT be assumed additive — its `duration_ms` may already include
+the wait `queue_wait_ms` also reports (exactly the bug this tag exists to
+make impossible to repeat: a landing-gate producer once measured
+`duration_ms` from before admission was requested, so summing the two for a
+total double-counted the wait). This report therefore sums `duration_ms +
+queue_wait_ms` into `DeliveryCost.phase_ms.verification_ms` ONLY for a
+`verification`-phase span tagged `additive`; every other `verification` span
+is excluded from that sum and counted instead under
+`phase_ms.verification_ms_legacy_spans` — an explicit coverage gap, never a
+guess in either direction, never zeroed to hide it and never silently summed
+on an assumption that could be wrong.
+
+Idempotency for a `VerificationQueued` span is keyed on `(task, phase,
+attempt)`, additionally fenced by `target`, `candidate`, `lane` and
+`occurrence_key` whenever the producer sets them (`span.rs` module doc) — and
+`crates/rk-cli/src/critical_path.rs::build_critical_path` dedups incoming
+rows on the IDENTICAL key when rendering, so a row the daemon kept as a
+distinct occurrence is never re-collapsed by this report or `rk status`. A
+landing gate's per-check span numbers `attempt` by the check's plan position
+(1, 2, 3, ...) every round, so `target`/`candidate`/`lane`/`occurrence_key`
+are what distinguish a later round's real occurrence, or a check whose
+command/toolchain/environment changed at the same candidate
+(`occurrence_key` — the same digest `verification_proof_key` computes over
+repo/candidate/check-name/command/toolchain/environment), from an earlier
+one recorded at the same small ordinal. Missing historical spans are never
+backfilled as zero time: a task with no recorded span for a phase simply has
+no entry for it, exactly like every other "not invented" field in this
+report.
+
 ## Reviewed annotations: operator judgment, not daemon facts
 
 `ReviewedAnnotation` is a bounded, task-scoped input distinct from `Review`
