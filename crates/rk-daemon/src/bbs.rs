@@ -827,7 +827,12 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
     let boundary = page.boundary;
     let present: HashSet<_> = page.entries.iter().map(|(_, t)| t.id).collect();
     let mut missing: Vec<String> = Vec::new();
-    let mut resolved: HashMap<rk_core::id::RecordId, Tuple> = HashMap::new();
+    // The journal's OWN commit_sequence for the matched historical row, not
+    // the live `tuples` row's — see `Space::get_as_of`. Attaching the live
+    // row's sequence to a reference resolved from an OLDER journal entry
+    // would report a post-boundary or null (deleted) order for a row that is
+    // provably older than the boundary.
+    let mut resolved: HashMap<rk_core::id::RecordId, (u64, Tuple)> = HashMap::new();
     let mut seen: HashSet<rk_core::id::RecordId> = HashSet::new();
     let mut reference_budget_exhausted = false;
 
@@ -857,16 +862,18 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
                             missing.push(id);
                             continue;
                         }
-                        // Fenced to the FROZEN boundary, not read through the
-                        // live row: a tuple persisted after this snapshot did
-                        // not exist in it and must be reported, not exported.
-                        match space.get_as_of(parsed, boundary)? {
-                            Some(found) if found.scope == params.repo => {
+                        // Fenced to the FROZEN boundary AND this repo's own
+                        // scope, both pushed into SQL: a tuple persisted
+                        // after this snapshot, or belonging to a different
+                        // repository, did not exist in it and must be
+                        // reported, not exported.
+                        match space.get_as_of(parsed, boundary, &params.repo)? {
+                            Some((sequence, found)) => {
                                 next.push(found.clone());
-                                resolved.insert(parsed, found);
+                                resolved.insert(parsed, (sequence, found));
                             }
                             // Foreign scope, or absent at this boundary.
-                            Some(_) | None => missing.push(id),
+                            None => missing.push(id),
                         }
                     }
                     // A malformed reference cannot be resolved; report it
@@ -887,8 +894,7 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
         }
     }
 
-    let references: Vec<Tuple> = resolved.into_values().collect();
-    let sequences = space.commit_sequences(&references.iter().map(|t| t.id).collect::<Vec<_>>())?;
+    let references: Vec<(u64, Tuple)> = resolved.into_values().collect();
     let records: Vec<serde_json::Value> = page
         .entries
         .iter()
@@ -900,12 +906,13 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
         .collect();
     let mut reference_records: Vec<serde_json::Value> = references
         .iter()
-        .map(|tuple| {
+        .map(|(sequence, tuple)| {
             let mut value = serde_json::to_value(tuple).unwrap_or(serde_json::Value::Null);
-            // A live row a reference resolved to always has a commit sequence;
-            // `null` means the row exists but its order is unknown, which a
-            // consumer must treat as unordered rather than as sequence zero.
-            value["commit_sequence"] = serde_json::json!(sequences.get(&tuple.id));
+            // The AS-OF row's own sequence (`Space::get_as_of`'s return), never
+            // the live `tuples` row's: the live row can be a NULL (deleted) or
+            // a NEWER (reinforced) sequence than the historical version this
+            // reference actually resolved to.
+            value["commit_sequence"] = serde_json::json!(sequence);
             value
         })
         .collect();
@@ -2726,6 +2733,83 @@ mod export_snapshot_tests {
             .collect();
         assert!(missing.contains(&foreign.id.to_string()));
         assert_eq!(out["coverage"]["complete"], false);
+    }
+
+    /// A reference's exported `commit_sequence` must be the frozen journal
+    /// row's OWN sequence — proven by `Space::get_as_of` — never derived from
+    /// the live `tuples` row. Demonstrated against the concrete case that
+    /// actually diverges: a live-row deletion made AFTER the boundary leaves
+    /// nothing for a live-table lookup to find, while the immutable journal
+    /// still proves this reference's exact historical order.
+    #[test]
+    fn reference_sequence_is_the_as_of_journals_own_and_survives_a_later_deletion() {
+        let space = Space::open_in_memory().unwrap();
+        // A populated journal, so this is a real lookup, not a single-row
+        // table.
+        for i in 0..40 {
+            space
+                .out(Tuple::new(
+                    Category::Artifact,
+                    "repo",
+                    format!("noise-{i}"),
+                    "peer",
+                    json!({}),
+                ))
+                .unwrap();
+        }
+        let evidence = artifact(&space, "repo", "evidence-deleted-later", json!({"v": 1}));
+        let finding = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "bbs-finding-deleted-later",
+            "peer",
+            json!({
+                "bbs_kind":"finding",
+                "text":"t",
+                "areas":["a"],
+                "revision":"abc",
+                "evidence":[evidence.id.to_string()],
+            }),
+        )
+        .with_lifecycle(rk_core::tuple::Lifecycle::Furniture);
+        space.out(finding.clone()).unwrap();
+        let finding_seq = space.commit_sequences(&[finding.id]).unwrap()[&finding.id];
+        let boundary = space.latest_persistence_sequence().unwrap();
+        let historical_sequence = space.commit_sequences(&[evidence.id]).unwrap()[&evidence.id];
+
+        // Delete the live row AFTER the boundary: a live-table lookup
+        // (the pre-fix `commit_sequences()` call on the resolved reference)
+        // can no longer see this id at all.
+        assert!(space.delete(evidence.id).unwrap());
+        assert!(!space
+            .commit_sequences(&[evidence.id])
+            .unwrap()
+            .contains_key(&evidence.id));
+
+        // Page holding ONLY the finding, so the evidence must be resolved as
+        // a reference via `get_as_of`, not read off the (now-gone) live row.
+        let out = export(
+            &space,
+            &ExportParams {
+                repo: "repo".into(),
+                after: Some(finding_seq - 1),
+                limit: 1,
+                boundary: Some(boundary),
+            },
+        )
+        .unwrap();
+        let reference = out["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == evidence.id.to_string())
+            .expect("the deleted row's content still resolves from the immutable journal");
+        assert_eq!(
+            reference["commit_sequence"].as_u64().unwrap(),
+            historical_sequence,
+            "must use the journal's own as-of sequence, not a live-row lookup that is \
+             now empty for this id: {reference:?}"
+        );
     }
 }
 

@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS tuple_persistence_events (
 );
 CREATE INDEX IF NOT EXISTS idx_tuple_persistence_scope
     ON tuple_persistence_events (scope, commit_sequence);
+CREATE INDEX IF NOT EXISTS idx_tuple_persistence_scope_id
+    ON tuple_persistence_events (scope, id, commit_sequence);
 CREATE TABLE IF NOT EXISTS rk_store_migrations (
     version TEXT PRIMARY KEY
 );
@@ -1278,32 +1280,56 @@ impl Store {
             .map_err(sql_err)
     }
 
-    /// Resolve one tuple AS OF a frozen persistence boundary.
+    /// Resolve one tuple AS OF a frozen persistence boundary, fenced to the
+    /// caller's own scope.
     ///
     /// `Space::get` reads the CURRENT row, so a reference resolved through it
     /// can pull a row persisted after the export's boundary into what claims
     /// to be a snapshot of that boundary. This reads the immutable journal
     /// instead and returns the newest version of `id` at or below `boundary`,
-    /// or `None` when the tuple did not yet exist there — in which case the
-    /// caller reports it as missing/unknown rather than exporting a
-    /// post-boundary row.
+    /// or `None` when the tuple did not yet exist there, or existed only
+    /// under a different scope — in which case the caller reports it as
+    /// missing/unknown rather than exporting a post-boundary or foreign-scope
+    /// row.
     ///
-    /// Bounded and indexed: `id` is selected directly and the sequence
-    /// predicate is pushed into SQL, so this is per-id work regardless of
-    /// journal size.
-    pub fn get_as_of(&self, id: RecordId, boundary: u64) -> rk_core::Result<Option<Tuple>> {
+    /// Bounded and indexed: `scope`, `id` and the sequence predicate are all
+    /// pushed into SQL against `idx_tuple_persistence_scope_id (scope, id,
+    /// commit_sequence)`, so this is a bounded index seek regardless of
+    /// journal size, and a foreign-scope row is never even read off disk,
+    /// let alone deserialized.
+    ///
+    /// Returns the MATCHED journal row's own `commit_sequence` alongside the
+    /// tuple. That historical sequence — not the live `tuples` row's, which
+    /// can be `NULL` after a deletion or a NEWER number after a reinforcement
+    /// — is the only value that can honestly be called this reference's
+    /// as-of order; a caller must never substitute the live row's sequence
+    /// for it.
+    pub fn get_as_of(
+        &self,
+        id: RecordId,
+        boundary: u64,
+        scope: &str,
+    ) -> rk_core::Result<Option<(u64, Tuple)>> {
         let boundary = i64::try_from(boundary)
             .map_err(|_| Error::Other("export boundary exceeds SQLite range".into()))?;
         self.conn
             .query_row(
-                "SELECT id, category, scope, identity, instance, lifecycle, payload,
-                        created_at, expires_at, strength
+                "SELECT commit_sequence, id, category, scope, identity, instance, lifecycle,
+                        payload, created_at, expires_at, strength
                  FROM tuple_persistence_events
-                 WHERE id = ?1 AND commit_sequence <= ?2
+                 WHERE scope = ?1 AND id = ?2 AND commit_sequence <= ?3
                  ORDER BY commit_sequence DESC
                  LIMIT 1",
-                params_from_iter::<[&dyn rusqlite::ToSql; 2]>([&id.to_string(), &boundary]),
-                row_to_tuple,
+                params_from_iter::<[&dyn rusqlite::ToSql; 3]>([
+                    &scope.to_string(),
+                    &id.to_string(),
+                    &boundary,
+                ]),
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let tuple = row_to_tuple_offset(row, 1)?;
+                    Ok((sequence as u64, tuple))
+                },
             )
             .optional()
             .map_err(sql_err)
@@ -2153,6 +2179,61 @@ mod tests {
 
         assert!(store.delete(t.id).unwrap());
         assert_eq!(store.count().unwrap(), 0);
+    }
+
+    /// `get_as_of` claims to be a bounded index seek, not a scan of the
+    /// immutable journal. Proves it against a real (if small) query planner
+    /// decision rather than trusting the doc comment: a regression that drops
+    /// `idx_tuple_persistence_scope_id` or stops binding all three predicate
+    /// columns would silently degrade this back to `SCAN
+    /// tuple_persistence_events` over the whole table.
+    #[test]
+    fn get_as_of_lookup_plan_uses_the_scope_id_index_not_a_full_journal_scan() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..50 {
+            store
+                .insert(&tuple(&format!("noise-{i}"), json!({})))
+                .unwrap();
+        }
+        let target = tuple("target", json!({"v": 1}));
+        store.insert(&target).unwrap();
+
+        // Mirrors the exact predicate `Store::get_as_of` runs.
+        let mut stmt = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT commit_sequence, id, category, scope, identity, instance, lifecycle,
+                        payload, created_at, expires_at, strength
+                 FROM tuple_persistence_events
+                 WHERE scope = ?1 AND id = ?2 AND commit_sequence <= ?3
+                 ORDER BY commit_sequence DESC
+                 LIMIT 1",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(
+                params_from_iter::<[&dyn rusqlite::ToSql; 3]>([
+                    &"repo".to_string(),
+                    &target.id.to_string(),
+                    &1_000_000_i64,
+                ]),
+                |row| row.get::<_, String>(row.as_ref().column_count() - 1),
+            )
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let detail = plan.join(" | ");
+        assert!(
+            detail.contains("idx_tuple_persistence_scope_id"),
+            "expected the scope/id/commit_sequence index to drive this lookup: {detail}"
+        );
+        assert!(
+            !detail
+                .to_uppercase()
+                .contains("SCAN TUPLE_PERSISTENCE_EVENTS"),
+            "must not fall back to a full journal scan: {detail}"
+        );
     }
 
     #[test]

@@ -18,7 +18,17 @@ share it. Every join, dedup and aggregation key is the pair `(spawn, session)`.
 substitute for either. All three are emitted on `agent_spawned`/
 `agent_respawned` as well as on the observations, so a launch joins its own
 records; a path that registers no session emits `session: null` rather than
-inventing one.
+inventing one. `provider_session` is learned only at `Started`, which has not
+fired yet at spawn/respawn time — `agent_spawned`/`agent_respawned` therefore
+always emit `provider_session: null` at launch, an explicit "not yet known"
+rather than an omitted field or a value borrowed from a previous launch.
+
+Every launch path publishes `agent_respawned` (or `agent_spawned`) with this
+identity, INCLUDING `continue_recovery`'s managed continuation of a
+post-commit `RecoveryRecord` — previously the one launch path that tracked a
+session (so cost/exit observations attributed correctly) without ever
+publishing it, leaving a managed recovery launch joinless from lifecycle
+evidence alone.
 
 Attribution is frozen at launch, keyed by session token. A delayed event from a
 superseded launch is attributed to the launch it came from, or skipped — never
@@ -54,7 +64,13 @@ Fields: `repo`, `task`, `agent`, `spawn`, `session`, `provider_session`,
   and `cost_usd` is null.
 - `daemon_priced_increments` — the provider never reported USD for this launch
   and the daemon priced `TokenUsage` itself. A weaker estimate; never pooled
-  with a provider total.
+  with a provider total. `AgentRecord.cost_usd` is generation-cumulative (a
+  same-generation respawn inherits it), so this is never the raw cumulative
+  figure: each launch freezes its own `cost_usd` baseline at `begin_launch`,
+  and only the delta accrued since that baseline is reported — otherwise a
+  provider total from an earlier launch of the same generation would leak
+  into a later, unrelated launch's daemon-priced estimate. A non-positive
+  delta is `unknown`, not a manufactured zero-or-negative final cost.
 
 All values are **client-side estimates, not billed charges**. An unprovable
 total stays null; it is never manufactured as zero. The same provider session
@@ -101,6 +117,16 @@ that `order` must treat ordering as unknown.
 - References resolve at the frozen boundary via `Store::get_as_of`, not through
   the live row, so a post-boundary tuple cannot leak into an earlier snapshot;
   absent-at-boundary is reported under `missing_references`.
+- `get_as_of(id, boundary, scope)` fences `scope` into the same SQL predicate
+  as `id` and the sequence bound, driven by `idx_tuple_persistence_scope_id
+  (scope, id, commit_sequence)`: a bounded index seek regardless of journal
+  size, and a foreign-scope row is never read off disk to be checked in Rust
+  afterward, let alone deserialized. It returns the matched journal row's own
+  `commit_sequence` alongside the tuple; the export attaches THAT sequence to
+  the reference, never the live `tuples` row's — which can be absent (a
+  deletion made after the boundary leaves nothing for a live-row lookup to
+  find) even though the immutable journal still proves the reference's exact
+  historical order.
 - Reference closure traverses nested `source`/`evidence` to a finite depth.
   `coverage.complete` is false whenever **any** hop is unresolved, the page
   truncated, or the budget was exhausted.
