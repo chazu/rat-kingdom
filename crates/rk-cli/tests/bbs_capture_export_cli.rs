@@ -378,48 +378,57 @@ async fn brief_and_show_capture_exactly_what_was_served_and_never_leak_into_a_br
     assert!(!telemetry(&mut client, "exposure").await.is_empty());
     assert!(!telemetry(&mut client, "open").await.is_empty());
 
-    // --- Forged telemetry: read authorization is not authority to author the
-    // measurement records about those reads.
-    let furniture = failure(cli(
-        &layout,
-        Some(&bob),
-        &[
-            "out",
-            "event",
-            "myrepo",
-            "bbs-agent-exit",
-            "--payload",
-            r#"{"bbs_kind":"agent_exit","exit_code":0}"#,
-            "--lifecycle",
-            "furniture",
-        ],
-    ));
-    assert!(
-        furniture.to_lowercase().contains("forbidden") || furniture.contains("cannot write"),
-        "{furniture}"
-    );
-    // ...and stripping the lifecycle does not help: the reserved identity and
-    // the `bbs_kind` payload are each refused on their own.
-    let plain = failure(cli(
-        &layout,
-        Some(&bob),
-        &[
-            "out",
-            "event",
-            "myrepo",
-            "bbs-exposure-brief",
-            "--payload",
-            r#"{"bbs_kind":"exposure","prepared":99}"#,
-        ],
-    ));
-    assert!(plain.to_lowercase().contains("forbidden"), "{plain}");
-    assert!(
-        !telemetry(&mut client, "exposure")
-            .await
-            .iter()
-            .any(|e| e["prepared"] == 99),
-        "no forged exposure may have landed"
-    );
+    // --- Forged telemetry over the AUTHENTICATED generic tuple-write path, for
+    // every telemetry kind and both bare fixed native identities. Read
+    // authorization is not authority to author the measurement records about
+    // those reads, and neither a prefixed nor a bare identity is a loophole.
+    for (identity, kind) in [
+        ("bbs-exposure-spawn", "exposure"),
+        ("bbs-exposure-brief", "exposure"),
+        ("bbs-open", "open"),
+        ("bbs-telemetry-gap", "telemetry_gap"),
+        ("bbs-agent-final-usage", "agent_final_usage"),
+        ("bbs-agent-exit", "agent_exit"),
+    ] {
+        let payload = format!(r#"{{"bbs_kind":"{kind}","forged":true}}"#);
+        // With the lifecycle that would make the predicates match...
+        let furniture = failure(cli(
+            &layout,
+            Some(&bob),
+            &[
+                "out",
+                "event",
+                "myrepo",
+                identity,
+                "--payload",
+                &payload,
+                "--lifecycle",
+                "furniture",
+            ],
+        ));
+        assert!(
+            furniture.to_lowercase().contains("forbidden") || furniture.contains("cannot write"),
+            "{identity} as furniture: {furniture}"
+        );
+        // ...and without it, where the reserved identity and the `bbs_kind`
+        // payload each refuse the write on their own.
+        let plain = failure(cli(
+            &layout,
+            Some(&bob),
+            &["out", "event", "myrepo", identity, "--payload", &payload],
+        ));
+        assert!(
+            plain.to_lowercase().contains("forbidden"),
+            "{identity} unqualified: {plain}"
+        );
+        assert!(
+            !telemetry(&mut client, kind)
+                .await
+                .iter()
+                .any(|t| t["forged"] == json!(true)),
+            "a forged {kind} landed"
+        );
+    }
 
     // --- Nonfatal capture. The store now refuses telemetry records outright;
     // the read it describes must still succeed, report its own coverage gap,
@@ -458,6 +467,19 @@ async fn brief_and_show_capture_exactly_what_was_served_and_never_leak_into_a_br
         still_briefed["entries"].as_array().is_some(),
         "the briefing is still computed and returned: {still_briefed:?}"
     );
+    // The same must hold on the real LAUNCH path, not only on a read: a spawn
+    // whose exposure cannot be captured still launches and is still primed.
+    let unlucky_task = ticket(&mut client, "launched while blind").await;
+    let (unlucky, unlucky_spawn) = spawn(&layout, &mut client, &unlucky_task).await;
+    assert!(!unlucky_spawn.is_empty(), "{unlucky} launched anyway");
+    assert!(
+        !telemetry(&mut client, "exposure")
+            .await
+            .iter()
+            .any(|e| e["task"] == unlucky_task.as_str()),
+        "the exposure genuinely failed, so the gap below is not vacuous"
+    );
+
     let gaps = telemetry(&mut client, "telemetry_gap").await;
     assert!(
         gaps.iter().any(|g| g["missing"] == "bbs-open"),
@@ -465,6 +487,11 @@ async fn brief_and_show_capture_exactly_what_was_served_and_never_leak_into_a_br
          than mistaken for a known-negative: {gaps:?}"
     );
     assert!(gaps.iter().any(|g| g["context"]["surface"] == "show"));
+    assert!(
+        gaps.iter().any(|g| g["missing"] == "bbs-exposure-spawn"
+            && g["context"]["task"] == unlucky_task.as_str()),
+        "a launch-path gap must name its own surface and task: {gaps:?}"
+    );
     space.fail_bbs_telemetry_writes_for_tests(false);
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
