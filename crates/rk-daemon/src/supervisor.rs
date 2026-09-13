@@ -2061,14 +2061,11 @@ impl Supervisor {
             }
         };
 
-        let record = self
-            .lock_registry()
-            .update(&name, |record| {
+        let (record, session_token) =
+            self.publish_launch(&name, Some(session.control.clone()), |record| {
                 record.state = AgentState::Running;
                 record.pid = session.pid;
-            })?
-            .ok_or_else(|| rk_core::Error::other("spawn journal row vanished"))?;
-        let session_token = self.track_session(&name, session.control.clone());
+            })?;
 
         self.record_agent_launched_span(&record);
         let (launch_session, launch_time) = self.launch_identity(&name);
@@ -2500,9 +2497,12 @@ impl Supervisor {
         }
         let session = harness.launch(&spec)?;
 
-        let updated = self
-            .lock_registry()
-            .update(name, |r| {
+        // Overwrites whatever token the predecessor session registered, so a
+        // grace timer armed for that session can no longer match this one (see
+        // `session_tokens` on `Supervisor`) — atomically with the reset below,
+        // so the predecessor cannot un-reset it in between.
+        let (updated, session_token) =
+            self.publish_launch(name, Some(session.control.clone()), |r| {
                 r.state = AgentState::Running;
                 r.pid = session.pid;
                 r.result = None;
@@ -2515,12 +2515,7 @@ impl Supervisor {
                 // own, must not publish that stale diagnosis as if it were
                 // current.
                 r.stderr_tail = None;
-            })?
-            .ok_or_else(|| rk_core::Error::other("record vanished"))?;
-        // Overwrites whatever token the predecessor session registered, so a
-        // grace timer armed for that session can no longer match this one
-        // (see `session_tokens` on `Supervisor`).
-        let session_token = self.track_session(name, session.control.clone());
+            })?;
 
         let (launch_session, launch_time) = self.launch_identity(name);
         self.emit_event(
@@ -2565,11 +2560,6 @@ impl Supervisor {
                 "generation": updated.created_at,
             }),
         );
-
-        // The interrupted run's completion bookkeeping does not carry over: its
-        // withheld turn is stale, and (for a manually respawned Completed
-        // record) its `routed` flag would gag the resumed run (TKT-160).
-        self.forget_completion(name);
 
         let supervisor = Arc::clone(self);
         let owned = name.to_string();
@@ -2621,19 +2611,22 @@ impl Supervisor {
                 true,
             )
         };
-        let updated = self
-            .lock_registry()
-            .update(&record.name, |current| {
-                current.state = AgentState::Running;
-                current.pid = None;
-                current.attach_target = Some(target.clone());
-                current.result = None;
-                current.crashed = false;
-                // See the ordinary respawn path above: a stale stderr tail
-                // from the previous generation must not survive a retry.
-                current.stderr_tail = None;
-            })?
-            .ok_or_else(|| rk_core::Error::other("record vanished"))?;
+        // `None`: this launch lives in a herdr pane and registers no session
+        // of its own, so it takes a watch-less token. Retiring the
+        // predecessor's token is not optional — left in place it would stand in
+        // for one, published below as this launch's `session`/`launched_at` off
+        // a watch belonging to the headless process, and still accepted as the
+        // owner of `name` by every late event that process has yet to emit.
+        let (updated, _) = self.publish_launch(&record.name, None, |current| {
+            current.state = AgentState::Running;
+            current.pid = None;
+            current.attach_target = Some(target.clone());
+            current.result = None;
+            current.crashed = false;
+            // See the ordinary respawn path above: a stale stderr tail from the
+            // previous generation must not survive a retry.
+            current.stderr_tail = None;
+        })?;
 
         if created {
             let target = target.clone();
@@ -2663,12 +2656,6 @@ impl Supervisor {
             });
         }
 
-        // This launch registers no session of its own, so the predecessor's
-        // token has to be retired explicitly or it stands in for one: published
-        // below as this launch's `session`/`launched_at` off a watch belonging
-        // to the headless process, and still accepted as the owner of `name` by
-        // every late event that process has yet to emit.
-        self.fence_unobservable_session(&updated.name);
         let (launch_session, launch_time) = self.launch_identity(&updated.name);
         self.emit_event(
             &updated.repo_name,
@@ -2694,7 +2681,6 @@ impl Supervisor {
                 "provider_session": null,
             }),
         );
-        self.forget_completion(&updated.name);
         self.watch_attached_completion(&updated);
         Ok(updated)
     }
@@ -5252,9 +5238,8 @@ impl Supervisor {
         };
         let action_id_owned = action_id.to_string();
         let outcome_for_ack = outcome.clone();
-        let updated = self
-            .lock_registry()
-            .update(name, |r| {
+        let (updated, session_token) =
+            self.publish_launch(name, Some(session.control.clone()), |r| {
                 r.harness = harness_kind.to_string();
                 r.state = AgentState::Running;
                 r.pid = session.pid;
@@ -5268,10 +5253,7 @@ impl Supervisor {
                         acknowledged_at: Utc::now(),
                     });
                 }
-            })?
-            .ok_or_else(|| rk_core::Error::other("record vanished"))?;
-
-        let session_token = self.track_session(name, session.control.clone());
+            })?;
 
         // The managed recovery launch was previously joinless: `track_session`
         // freezes this launch's own `AttemptWatch` (so cost/exit observations
@@ -5306,8 +5288,6 @@ impl Supervisor {
                 "provider_session": null,
             }),
         );
-
-        self.forget_completion(name);
 
         let supervisor = Arc::clone(self);
         let owned = name.to_string();
@@ -8355,6 +8335,51 @@ impl Supervisor {
             .then_some(tokens)
     }
 
+    /// Hand `name` over to a new launch as ONE step under the same guard
+    /// [`own`](Self::own) checks: the record reset, the control handle, the
+    /// fresh session token and the predecessor's stale completion bookkeeping
+    /// all change while that guard is held. Returns the reset record and this
+    /// launch's token.
+    ///
+    /// This is the publishing half of the fence, and it matters as much as the
+    /// handler half. Every launch path used to reset the record to `Running`
+    /// and install its new control handle BEFORE the token changed hands, and
+    /// [`track_session`](Self::track_session) itself inserted the control
+    /// before the token — so a predecessor's late event arriving anywhere in
+    /// those windows still passed its ownership check against the OLD token and
+    /// went on to terminalize the successor's freshly reset record, remove the
+    /// successor's control handle, or flush its completion state. Holding the
+    /// guard across the whole takeover leaves a handler only two observable
+    /// orderings: entirely before it, or entirely after it.
+    ///
+    /// `control` is `None` for a launch that registers no observable session of
+    /// its own (an attach), which gets a watch-less token — see
+    /// [`fence_unobservable_session`](Self::fence_unobservable_session).
+    fn publish_launch(
+        &self,
+        name: &str,
+        control: Option<SessionControl>,
+        reset: impl FnOnce(&mut AgentRecord),
+    ) -> rk_core::Result<(AgentRecord, rk_core::id::SpawnId)> {
+        let mut tokens = self.lock_session_tokens();
+        let record = self
+            .lock_registry()
+            .update(name, reset)?
+            .ok_or_else(|| rk_core::Error::other(format!("record vanished: {name}")))?;
+        // The interrupted run's completion bookkeeping does not carry over: its
+        // withheld turn is stale, and (for a manually respawned `Completed`
+        // record) its `routed` flag would gag the resumed run (TKT-160). Done
+        // here, under the guard, rather than after the events are emitted:
+        // between the takeover and a later clear, a predecessor's `Exited`
+        // could still flush the withheld turn it left behind.
+        self.lock_completions().remove(name);
+        let token = match control {
+            Some(control) => self.track_session(&mut tokens, name, control),
+            None => self.fence_unobservable_session(&mut tokens, name),
+        };
+        Ok((record, token))
+    }
+
     /// Stamp a fresh, watch-less token for a launch that registers no
     /// observable session of its own — an `--attach` respawn, whose process
     /// lives in a herdr pane, produces no [`HarnessEvent`] stream and never
@@ -8369,9 +8394,13 @@ impl Supervisor {
     /// let a grace timer armed for it match here. A token with no watch is what
     /// [`launch_identity`](Self::launch_identity) reports as unobservable,
     /// which is the honest answer for an attach launch.
-    fn fence_unobservable_session(&self, name: &str) -> rk_core::id::SpawnId {
+    fn fence_unobservable_session(
+        &self,
+        tokens: &mut HashMap<String, rk_core::id::SpawnId>,
+        name: &str,
+    ) -> rk_core::id::SpawnId {
         let token = rk_core::id::SpawnId::new();
-        self.lock_session_tokens().insert(name.to_string(), token);
+        tokens.insert(name.to_string(), token);
         token
     }
 
@@ -8380,10 +8409,18 @@ impl Supervisor {
     /// [`kill_lingering_after_done`](Self::kill_lingering_after_done) needs to
     /// tell a respawned session apart from the one a grace timer was armed
     /// for, since both share the same `AgentRecord` generation.
-    fn track_session(&self, name: &str, control: SessionControl) -> rk_core::id::SpawnId {
+    /// Takes the HELD ownership guard rather than reacquiring it, so the
+    /// control handle and the token change hands inside the same guarded
+    /// publication as the record reset — see [`publish_launch`](Self::publish_launch).
+    fn track_session(
+        &self,
+        tokens: &mut HashMap<String, rk_core::id::SpawnId>,
+        name: &str,
+        control: SessionControl,
+    ) -> rk_core::id::SpawnId {
         let token = rk_core::id::SpawnId::new();
         self.lock_controls().insert(name.to_string(), control);
-        self.lock_session_tokens().insert(name.to_string(), token);
+        tokens.insert(name.to_string(), token);
         // Real launch time for this physical process, so an exit can report
         // process lifetime against it. Overwrites any previous launch's watch:
         // a respawn is a NEW launch even though it keeps the same `SpawnId`.
@@ -9265,7 +9302,11 @@ mod respawn_tests {
             session.control.can_steer(),
             "maki's channel is wired for its own initial-prompt delivery"
         );
-        sup.track_session("Nibble", session.control.clone());
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            session.control.clone(),
+        );
 
         let error = sup.steer("Nibble", "please also run the tests").await;
         let error = error.expect_err("caps().steer=false must reject operator steering");
@@ -9319,7 +9360,11 @@ mod respawn_tests {
             ..Default::default()
         };
         let session = make_harness("maki").unwrap().launch(&spec).unwrap();
-        sup.track_session("Nibble", session.control.clone());
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            session.control.clone(),
+        );
 
         sup.interrupt("Nibble")
             .await
@@ -13318,6 +13363,80 @@ mod native_observation_tests {
         );
     }
 
+    /// The other half of the same interleaving, at the ACTUAL transition seam:
+    /// a launch used to reset the record to `Running` and install its control
+    /// handle BEFORE the token changed hands, so a predecessor's late `Exited`
+    /// landing in that window passed its ownership check against the old token
+    /// and then re-terminalized the successor's freshly reset record.
+    ///
+    /// Ordered deterministically, not raced: holding the registry parks the
+    /// publication mid-takeover, and the exiting predecessor is only released
+    /// once the publication is provably holding the ownership guard — so the
+    /// old event cannot reach its check until the takeover has completed.
+    #[test]
+    fn a_predecessors_late_exit_cannot_land_inside_a_launchs_takeover() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, old) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+        sup.lock_registry()
+            .update("Nibble", |r| {
+                r.state = AgentState::Failed;
+                r.crashed = true;
+            })
+            .unwrap();
+
+        let registry = sup.lock_registry();
+        std::thread::scope(|scope| {
+            let takeover = scope.spawn(|| {
+                sup.publish_launch("Nibble", None, |r| {
+                    r.state = AgentState::Running;
+                    r.crashed = false;
+                    r.result = None;
+                })
+                .unwrap()
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while sup.session_tokens.try_lock().is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the takeover never took the ownership guard"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // The takeover holds the guard and is parked on the registry. The
+            // predecessor's exit is released now, so it must queue behind the
+            // WHOLE takeover rather than slipping between the reset and the
+            // token stamp.
+            let exit = scope.spawn(|| {
+                sup.handle_event(
+                    "Nibble",
+                    rec.created_at,
+                    spawn,
+                    old,
+                    HarnessEvent::Exited { code: Some(1) },
+                );
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(registry);
+            let (_, token) = takeover.join().unwrap();
+            exit.join().unwrap();
+            assert_ne!(token, old, "the takeover mints its own token");
+        });
+
+        let after = sup.lock_registry().get("Nibble").unwrap().clone();
+        assert_eq!(
+            after.state,
+            AgentState::Running,
+            "the predecessor's exit must not re-terminalize the record the new \
+             launch has already taken over"
+        );
+        assert!(!after.crashed, "nor re-mark the new launch as crashed");
+    }
+
     /// Headless-to-attach respawn. `respawn_attached` registers no session of
     /// its own, so the predecessor's headless token used to survive it: the
     /// `agent_respawned` event published that launch's native session and
@@ -13339,7 +13458,9 @@ mod native_observation_tests {
             "the headless launch is observable and publishes its own token"
         );
 
-        sup.fence_unobservable_session("Nibble");
+        // Exactly what `respawn_attached` now calls.
+        sup.publish_launch("Nibble", None, |r| r.state = AgentState::Running)
+            .unwrap();
 
         assert_eq!(
             sup.launch_identity("Nibble"),
