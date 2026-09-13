@@ -80,6 +80,12 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
         "bbs.ask"
         | "bbs.answer"
         | "bbs.accept"
+        | "bbs.publish"
+        | "bbs.reuse"
+        // "bbs.assess" is deliberately absent: it is operator-only. Absence
+        // here makes `authorize_reasoned` reject any non-operator caller with
+        // `operator_only_method` before `crate::bbs::write` is ever reached;
+        // see the matching in-handler check there for defense in depth.
         | "space.withdraw"
         | "fact.vote"
         | "space.take"
@@ -166,7 +172,13 @@ mod tests {
 
     #[test]
     fn unknown_and_operator_methods_are_not_non_operator_grants() {
-        for method in ["future.dangerous", "stop", "repo.land", "ticket.deliver"] {
+        for method in [
+            "future.dangerous",
+            "stop",
+            "repo.land",
+            "ticket.deliver",
+            "bbs.assess",
+        ] {
             assert!(method_policy(method).is_none(), "{method}");
         }
     }
@@ -213,6 +225,8 @@ mod tests {
             "ticket.list",
             "ticket.get",
             "ticket.ready",
+            "bbs.publish",
+            "bbs.reuse",
         ] {
             assert!(
                 method_policy(method).is_some_and(|policy| policy.ordinary),

@@ -41,6 +41,64 @@ pub enum BbsCommand {
         #[arg(long)]
         contribution: Option<String>,
     },
+    /// Publish a durable finding: a reproduction, interface constraint,
+    /// reusable implementation, or failed approach useful to peers.
+    Publish {
+        text: String,
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+        #[arg(long, env = "RK_TASK")]
+        task: String,
+        /// Applicable path or topic (repeatable; at least one required).
+        #[arg(long = "area", required = true)]
+        areas: Vec<String>,
+        /// Lowercase hex commit id (7..64 chars) this finding is about. A
+        /// claim about the source tree you looked at, not a verified match —
+        /// the daemon checks its shape only, never resolves it against git.
+        #[arg(long)]
+        revision: String,
+        /// Existing artifact supporting this finding (repeatable; at least one required).
+        #[arg(long = "evidence", required = true)]
+        evidence: Vec<String>,
+        /// Known limits or caveats on this finding.
+        #[arg(long)]
+        limitations: String,
+        /// Distinguish a new occurrence of an otherwise identical finding.
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Record use of an ordinary artifact or a peer finding/answer.
+    Reuse {
+        /// The artifact or finding/answer this receipt is about.
+        source: String,
+        #[arg(long, env = "RK_TASK")]
+        task: String,
+        #[arg(long, value_parser = ["used", "adapted", "confirmed", "rejected"])]
+        outcome: String,
+        #[arg(long)]
+        text: String,
+        /// Existing artifact evidencing this receipt (repeatable; at least one required).
+        #[arg(long = "evidence", required = true)]
+        evidence: Vec<String>,
+        /// Distinguish a new occurrence of an otherwise identical receipt.
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Operator-only: assess a reuse receipt.
+    Assess {
+        /// The reuse receipt this assessment is about.
+        receipt: String,
+        #[arg(long, value_parser = ["verified", "unsupported", "incorrect"])]
+        verdict: String,
+        #[arg(long)]
+        reason: String,
+        /// Existing artifact evidencing this assessment (repeatable; at least one required).
+        #[arg(long = "evidence", required = true)]
+        evidence: Vec<String>,
+        /// Distinguish a new occurrence of an otherwise identical assessment.
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -80,25 +138,66 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
             let result = client.call("bbs.show", json!({"id":id})).await?;
             if as_json {
                 println!("{result}");
-            } else if let Some(question) = result.get("question") {
-                println!("Question {} ({})\n{}\n\nPeer reports are evidence; verify them before accepting.",
-                    question["id"].as_str().unwrap_or(""), result["status"].as_str().unwrap_or("open"), question["payload"]["text"].as_str().unwrap_or(""));
-                for reply in result["replies"].as_array().into_iter().flatten() {
-                    println!(
-                        "\n{} {} by {}\n{}",
-                        reply["payload"]["bbs_kind"].as_str().unwrap_or("post"),
-                        reply["id"].as_str().unwrap_or(""),
-                        reply["instance"].as_str().unwrap_or(""),
-                        reply["payload"]["text"].as_str().unwrap_or("")
-                    );
-                    for field in ["answer", "source_artifact", "contribution"] {
-                        if let Some(id) = reply["payload"][field].as_str() {
-                            println!("{field}: {id}");
+            } else {
+                if let Some(question) = result.get("question") {
+                    println!("Question {} ({})\n{}\n\nPeer reports are evidence; verify them before accepting.",
+                        question["id"].as_str().unwrap_or(""), result["status"].as_str().unwrap_or("open"), question["payload"]["text"].as_str().unwrap_or(""));
+                    for reply in result["replies"].as_array().into_iter().flatten() {
+                        println!(
+                            "\n{} {} by {}\n{}",
+                            reply["payload"]["bbs_kind"].as_str().unwrap_or("post"),
+                            reply["id"].as_str().unwrap_or(""),
+                            reply["instance"].as_str().unwrap_or(""),
+                            reply["payload"]["text"].as_str().unwrap_or("")
+                        );
+                        for field in ["answer", "source_artifact", "contribution"] {
+                            if let Some(id) = reply["payload"][field].as_str() {
+                                println!("{field}: {id}");
+                            }
                         }
                     }
+                } else if result["tuple"]["payload"]["bbs_kind"].as_str().is_some() {
+                    let tuple = &result["tuple"];
+                    println!(
+                        "{} {} by {}\n{}",
+                        tuple["payload"]["bbs_kind"].as_str().unwrap_or("post"),
+                        tuple["id"].as_str().unwrap_or(""),
+                        tuple["instance"].as_str().unwrap_or(""),
+                        tuple["payload"]["text"].as_str().unwrap_or("")
+                    );
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
                 }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                // Linked reuse threads onto any rendering above: an ordinary
+                // artifact, a finding, an answer (also a question reply), or a
+                // reuse receipt showing its own assessments.
+                for receipt in result
+                    .get("reuse")
+                    .and_then(|r| r.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let r = &receipt["receipt"];
+                    println!(
+                        "\nreuse {} by {} — {}\n{}",
+                        r["id"].as_str().unwrap_or(""),
+                        r["instance"].as_str().unwrap_or(""),
+                        r["payload"]["outcome"].as_str().unwrap_or(""),
+                        r["payload"]["text"].as_str().unwrap_or("")
+                    );
+                    if let Some(current) = receipt["current_assessment"].as_object() {
+                        println!(
+                            "  current assessment: {} by {} — {}",
+                            current["payload"]["verdict"].as_str().unwrap_or(""),
+                            current["instance"].as_str().unwrap_or(""),
+                            current["payload"]["reason"].as_str().unwrap_or("")
+                        );
+                    }
+                    let count = receipt["assessments"].as_array().map_or(0, |a| a.len());
+                    if count > 1 {
+                        println!("  ({count} assessments recorded; showing the current one)");
+                    }
+                }
             }
         }
         BbsCommand::Ask {
@@ -136,6 +235,37 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
             contribution,
         } => {
             write(&mut client, "bbs.accept", json!({"question":question,"answer":answer,"text":text,"contribution":contribution}), as_json).await?;
+        }
+        BbsCommand::Publish {
+            text,
+            repo,
+            task,
+            areas,
+            revision,
+            evidence,
+            limitations,
+            key,
+        } => {
+            write(&mut client, "bbs.publish", json!({"text":text,"repo":repo,"task":task,"areas":areas,"revision":revision,"evidence":evidence,"limitations":limitations,"key":key}), as_json).await?;
+        }
+        BbsCommand::Reuse {
+            source,
+            task,
+            outcome,
+            text,
+            evidence,
+            key,
+        } => {
+            write(&mut client, "bbs.reuse", json!({"source":source,"task":task,"outcome":outcome,"text":text,"evidence":evidence,"key":key}), as_json).await?;
+        }
+        BbsCommand::Assess {
+            receipt,
+            verdict,
+            reason,
+            evidence,
+            key,
+        } => {
+            write(&mut client, "bbs.assess", json!({"receipt":receipt,"verdict":verdict,"reason":reason,"evidence":evidence,"key":key}), as_json).await?;
         }
     }
     Ok(())
