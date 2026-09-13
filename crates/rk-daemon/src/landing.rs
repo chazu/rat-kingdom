@@ -6829,30 +6829,54 @@ impl LandingPipeline {
                 continue;
             }
 
-            if let Some(reused) = self
-                .reusable_verification_proof(entry, git_repo, tested_sha, &check)
-                .await?
-            {
-                self.record_verification_proof_reuse(entry, tested_sha, &check, &reused);
-                self.record_check_verification_span(
-                    entry,
-                    CheckVerificationSpan {
-                        check_name: &check.name,
-                        attempt: check_attempt,
-                        candidate: tested_sha,
-                        full_check_required,
-                        queue_wait_ms: None,
-                        duration_ms: None,
-                        proof_reused: true,
-                    },
-                );
-                queue_wait_ms.push((check.name.clone(), None));
-                check_proof_keys.push((
-                    check.name.clone(),
-                    verification_proof_key(&entry.repo_name, tested_sha, &check),
-                ));
-                passed_checks.push(check.name.clone());
-                continue;
+            // The two canonical policy gates are target-dependent: their
+            // command text is the same for every candidate (it reads
+            // `RK_CHECK_TARGET`/`RK_CHECK_PROTECTED_PATHS`/
+            // `RK_CHECK_MAX_DIFF_FILES`/`RK_CHECK_MAX_DIFF_LINES` at runtime
+            // rather than having the target/policy baked into the command
+            // string), but `verification_proof_key` digests only
+            // repo/candidate/check-name/command/toolchain/environment-policy
+            // — none of which capture those env values. A proof recorded
+            // while resolving this exact candidate against one target (or
+            // one policy configuration) is therefore NOT evidence for a
+            // different target or a changed protected-paths/diff-scope
+            // policy, even for the identical candidate sha. Bypass BOTH the
+            // exact-candidate and source-head-ancestor proof lookup for
+            // these two checks unconditionally — they are cheap enough that
+            // always running them fresh costs nothing, and it closes the
+            // hole `reusable_verification_proof`'s own reuse would otherwise
+            // open here (see docs/proposals/prompts/0009 and the
+            // Munch62f425e/Remy/Scurry incident evidence).
+            let is_target_dependent_policy_check = matches!(
+                rk_core::landing_names::canonical(&check.name),
+                PROTECTED_PATHS_CHECK | DIFF_SCOPE_CHECK
+            );
+            if !is_target_dependent_policy_check {
+                if let Some(reused) = self
+                    .reusable_verification_proof(entry, git_repo, tested_sha, &check)
+                    .await?
+                {
+                    self.record_verification_proof_reuse(entry, tested_sha, &check, &reused);
+                    self.record_check_verification_span(
+                        entry,
+                        CheckVerificationSpan {
+                            check_name: &check.name,
+                            attempt: check_attempt,
+                            candidate: tested_sha,
+                            full_check_required,
+                            queue_wait_ms: None,
+                            duration_ms: None,
+                            proof_reused: true,
+                        },
+                    );
+                    queue_wait_ms.push((check.name.clone(), None));
+                    check_proof_keys.push((
+                        check.name.clone(),
+                        verification_proof_key(&entry.repo_name, tested_sha, &check),
+                    ));
+                    passed_checks.push(check.name.clone());
+                    continue;
+                }
             }
 
             let capacity_started = Instant::now();
@@ -7027,6 +7051,17 @@ impl LandingPipeline {
     /// candidate/head sha, check name, command, toolchain, and environment
     /// policy (TKT-01M0QRZ7QT8CQD74GHRN81XFT5) — so an already-proven check
     /// is never re-run inside the gate worktree.
+    ///
+    /// NEVER call this for `landing-protected-paths`/`landing-diff-scope`
+    /// (or their `steward-*` aliases, [`rk_core::landing_names::canonical`]):
+    /// their command text is target/policy-agnostic (it reads
+    /// `RK_CHECK_TARGET`/`RK_CHECK_PROTECTED_PATHS`/`RK_CHECK_MAX_DIFF_FILES`/
+    /// `RK_CHECK_MAX_DIFF_LINES` at runtime), so the "EXACT identity" this
+    /// method matches on says nothing about which target or policy actually
+    /// produced a cached "pass". The call site in
+    /// [`execute_gate_plan_at`](Self::execute_gate_plan_at) bypasses this
+    /// method entirely for those two checks instead of trying to patch the
+    /// digest — see its comment for the incident that motivated this.
     ///
     /// Tries two shas, in order:
     /// 1. `tested_sha` itself (the prepared merge commit) — an exact hit
@@ -17894,6 +17929,247 @@ checks: [
             "verify must never be credited as reused once its environment policy changed: {reuse_events:?}"
         );
     }
+    /// Builds a `checks.cue` registry with REAL protected-paths/diff-scope
+    /// logic (mirroring `.rk/checks.cue`'s own production commands, not the
+    /// `"true"` stub every other fixture in this module uses for those two
+    /// checks) so a caller can vary `GateConfig`'s policy fields — the
+    /// runtime-only `RK_CHECK_*` env values `gate_plan` injects — and see the
+    /// check's actual verdict change. `protected_name`/`diff_scope_name` let
+    /// a caller register either check under its canonical name or a
+    /// `steward-*` alias ([`rk_core::landing_names::canonical`]) — the bypass
+    /// this fixture exists to test must fire either way. A leading
+    /// `echo x >> '<counter>'` in each command is the caller's own
+    /// responsibility (folded into `protected_command`/`diff_scope_command`)
+    /// so the test can prove a check actually EXECUTED a second time, not
+    /// merely that the gate's overall verdict changed.
+    fn checks_cue_with_policy_logic(
+        protected_name: &str,
+        protected_command: &str,
+        diff_scope_name: &str,
+        diff_scope_command: &str,
+    ) -> String {
+        format!(
+            r#"checks: [
+    {{name: "{protected_name}", command: "{protected_command}", timeout: "30s"}},
+    {{name: "{diff_scope_name}", command: "{diff_scope_command}", timeout: "30s"}},
+    {{name: "verify", command: "true", timeout: "30s"}},
+]
+"#
+        )
+    }
+
+    /// THE TICKET'S CORE REGRESSION (TKT-sibij-lilof-bimin): the "direct
+    /// same-candidate/changed-policy-cache" case. `landing-protected-paths`'
+    /// command text never changes — it reads `RK_CHECK_TARGET`/
+    /// `RK_CHECK_PROTECTED_PATHS` at runtime — so `verification_proof_key`
+    /// (repo/candidate/check-name/command/toolchain/environment-policy) is
+    /// IDENTICAL across two `run_gates_at` calls against the exact same
+    /// prepared candidate even when the caller's `GateConfig.protected_paths`
+    /// pattern changes between them. Before the fix in `execute_gate_plan_at`
+    /// (the `is_target_dependent_policy_check` bypass), the second call hits
+    /// `reusable_verification_proof`'s exact-sha cache and reuses the FIRST
+    /// call's lenient-policy pass — the check never re-executes and a real
+    /// protected-path violation is silently waved through. Registers the
+    /// check under its `steward-protected-paths` alias to also prove the
+    /// bypass matches through [`rk_core::landing_names::canonical`], not just
+    /// the literal canonical string.
+    #[tokio::test]
+    async fn landing_gate_never_reuses_a_protected_paths_proof_across_a_changed_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let counter = home.path().join("protected-paths-runs");
+        let protected_command = format!(
+            r#"echo x >> '{counter}'; target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep -qE \"$RK_CHECK_PROTECTED_PATHS\""#,
+            counter = counter.display()
+        );
+        write_checks(
+            repo_dir.path(),
+            &checks_cue_with_policy_logic(
+                "steward-protected-paths",
+                &protected_command,
+                "landing-diff-scope",
+                "true",
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs/notes.txt"), "hello\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: add notes"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        let mut entry = LandingQueueEntry {
+            repo_name: "policy-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: rev_parse(repo_dir.path(), "feature"),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add notes".into(),
+            ..Default::default()
+        };
+
+        // Round 1: a pattern that matches nothing in this diff — passes.
+        let lenient = GateConfig {
+            protected_paths: "zzz_never_matches_zzz".into(),
+            ..GateConfig::default()
+        };
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &lenient, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1,
+            "first run must execute the policy check once"
+        );
+
+        // Round 2: SAME candidate sha, but a policy that DOES match the
+        // changed path. Must hold the branch, not reuse round 1's proof.
+        let strict = GateConfig {
+            protected_paths: "docs/".into(),
+            ..GateConfig::default()
+        };
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &strict, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GateRunOutcome::Fail,
+            "a protected-path violation under the new policy must be held by the check's own \
+             fresh execution, never waved through by a cached pass from the lenient policy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            2,
+            "a cached policy proof from a different policy config must never suppress this \
+             check's fresh execution against the same candidate"
+        );
+
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert!(
+            reuse_events
+                .iter()
+                .all(|t| t.payload["check"] != "steward-protected-paths"),
+            "the protected-paths check must never be credited as reused: {reuse_events:?}"
+        );
+    }
+
+    /// Same defect, the diff-scope check: a larger outer diff under a
+    /// tightened `max_diff_lines` budget must be held by the check's own
+    /// fresh execution against the exact same candidate a looser budget
+    /// already passed, never waved through by a stale exact-sha proof.
+    /// Registered under its literal canonical name (the alias path is
+    /// already covered by the protected-paths regression above).
+    #[tokio::test]
+    async fn landing_gate_never_reuses_a_diff_scope_proof_across_a_changed_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let counter = home.path().join("diff-scope-runs");
+        let diff_scope_command = format!(
+            r#"echo x >> '{counter}'; target=$RK_CHECK_TARGET; files=$(git diff --name-only \"$target\"...HEAD | wc -l | tr -d ' '); lines=$(git diff --numstat \"$target\"...HEAD | awk '{{a=$1;b=$2;if(a==\"-\")a=0;if(b==\"-\")b=0;s+=a+b}} END{{print s+0}}'); {{ [ \"$RK_CHECK_MAX_DIFF_FILES\" -eq 0 ] || [ \"$files\" -le \"$RK_CHECK_MAX_DIFF_FILES\" ]; }} && {{ [ \"$RK_CHECK_MAX_DIFF_LINES\" -eq 0 ] || [ \"$lines\" -le \"$RK_CHECK_MAX_DIFF_LINES\" ]; }}"#,
+            counter = counter.display()
+        );
+        write_checks(
+            repo_dir.path(),
+            &checks_cue_with_policy_logic(
+                "landing-protected-paths",
+                "true",
+                "landing-diff-scope",
+                &diff_scope_command,
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "one\ntwo\nthree\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        let mut entry = LandingQueueEntry {
+            repo_name: "diff-scope-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: rev_parse(repo_dir.path(), "feature"),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        // Round 1: a generous budget this 3-line diff comfortably fits.
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &GateConfig::default(), &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1,
+            "first run must execute the diff-scope check once"
+        );
+
+        // Round 2: SAME candidate sha, an outer (tighter) budget this exact
+        // diff now exceeds. Must hold, not reuse round 1's proof.
+        let tight = GateConfig {
+            max_diff_lines: 1,
+            ..GateConfig::default()
+        };
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &tight, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GateRunOutcome::Fail,
+            "a larger-than-budget diff under the new policy must be held by the check's own \
+             fresh execution, never waved through by a cached pass from the looser budget"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            2,
+            "a cached policy proof from a different budget must never suppress this check's \
+             fresh execution against the same candidate"
+        );
+
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert!(
+            reuse_events
+                .iter()
+                .all(|t| t.payload["check"] != "landing-diff-scope"),
+            "the diff-scope check must never be credited as reused: {reuse_events:?}"
+        );
+    }
+
     fn admission_fixture() -> (
         tempfile::TempDir,
         tempfile::TempDir,
