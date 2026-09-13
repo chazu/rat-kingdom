@@ -39,12 +39,15 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// `schema_version`, when diffing two reports across a rebuild.
 ///
 /// * 1 — initial S3 evaluator (`TKT-tavik-kifos-lozuf`).
-/// * 2 — `TKT-buruk-parut-zisoh` (slice A of `TKT-nonub-pugar-pilid`): native
-///   record identity binding, evidence resolution, repo/window scope, and
-///   opportunity-denominator retention. Author-exit and per-delivery cost are
-///   reported as UNSUPPORTED in this version pending
-///   `TKT-bonik-vuruv-mivuh`.
-pub const EVALUATOR_VERSION: u32 = 2;
+/// * 2 — `TKT-buruk-parut-zisoh` (slice A): native record identity binding,
+///   evidence resolution, repo/window scope, and opportunity-denominator
+///   retention. Author-exit and per-delivery cost were reported as UNSUPPORTED.
+/// * 3 — `TKT-bonik-vuruv-mivuh` (slice B): author-exit derived from a physical
+///   exit observation bound to an exact `(spawn, session)`, and per-delivery
+///   cost derived per proven provider segment with explicit finality. The two
+///   derivations slice A withheld are now real, so a version-2 and a version-3
+///   report of the same inputs are NOT comparable on those fields.
+pub const EVALUATOR_VERSION: u32 = 3;
 
 /// Frozen per the design doc: "three verified used/adapted effects across at
 /// least two batches, at least one after its author exited". Not
@@ -60,6 +63,11 @@ const REUSE: &str = "reuse";
 const ASSESSMENT: &str = "assessment";
 const EXPOSURE: &str = "exposure";
 const OPEN: &str = "open";
+// The two native observation kinds S2's published contract adds
+// (docs/2026-09-13-s2-native-observation-and-export-contract.md, consumed via
+// BBS artifact 01M2CF3RJHX58HH085WKZBJD9A).
+const AGENT_EXIT: &str = "agent_exit";
+const AGENT_FINAL_USAGE: &str = "agent_final_usage";
 
 /// The identity each BBS record kind is actually minted with by
 /// `crates/rk-daemon/src/bbs.rs`. A record whose identity does not carry its
@@ -77,6 +85,8 @@ fn reserved_prefix(bbs_kind: &str) -> Option<&'static str> {
         ASSESSMENT => Some("bbs-assessment-"),
         EXPOSURE => Some("bbs-exposure-"),
         OPEN => Some("bbs-open"),
+        AGENT_EXIT => Some("bbs-agent-exit"),
+        AGENT_FINAL_USAGE => Some("bbs-agent-final-usage"),
         _ => None,
     }
 }
@@ -87,31 +97,33 @@ fn reserved_prefix(bbs_kind: &str) -> Option<&'static str> {
 /// (S2's `48fb2da`); a `harness_result` also proves the generation ran.
 const LAUNCH_EVENT_IDENTITIES: [&str; 2] = ["agent_spawned", "agent_respawned"];
 
-/// Author-exit and per-delivery cost derivation are deliberately absent from
-/// this evaluator version. Both were previously credited from evidence that
-/// cannot establish them — `harness_result` is emitted at `rk done` while the
-/// process is still alive, and a provisional completion cost was summed as a
-/// final total — so rather than ship a known false positive, this version
-/// reports them as unsupported and refuses to pass the mechanism goal. See
-/// `TKT-bonik-vuruv-mivuh`.
-const AUTHOR_EXIT_UNSUPPORTED: &str =
-    "author-exit derivation is not implemented in this evaluator version: crediting it needs a \
-     physical-exit observation bound to the source author's exact generation and launch, with no \
-     intervening resume before the consuming decision. A harness_result cannot establish it (the \
-     supervisor emits it at `rk done`, while the OS process is still alive) and neither can an \
-     agent_lifecycle event (it carries no `spawn` binding and its `change` may be `started`). \
-     Pending TKT-bonik-vuruv-mivuh.";
+/// `AgentState` values that mean this launch produced its *last* provider
+/// result. A `paused` result may be followed by more model usage and then a
+/// budget kill with no further result, which makes the reported total a partial
+/// amount rather than a final cost for the launch.
+const TERMINAL_USAGE_STATES: [&str; 3] = ["completed", "failed", "stopped"];
 
-const DELIVERY_COST_UNSUPPORTED: &str =
-    "per-delivery cost and duration derivation is not implemented in this evaluator version: a \
-     provider total is cumulative within one query segment and a harness_result cost is \
-     provisional, so neither may be summed as measured spend, and launch-to-exit is process \
-     lifetime rather than active model work. Reported as unknown rather than estimated. Pending \
-     TKT-bonik-vuruv-mivuh.";
+/// The only `cost_basis` a *provider-reported* total may carry. The daemon's
+/// own priced-increment fallback is an estimate of an estimate: it is reported
+/// in its own field and never pooled with this one.
+const PROVIDER_COST_BASIS: &str = "provider_reported_segment_total";
+const DAEMON_COST_BASIS: &str = "daemon_priced_increments";
 
-const INTERVENTIONS_UNSUPPORTED: &str =
-    "unknown: an attention_hold span count is a lower bound on operator interventions, not a \
-     total, and span aggregation is not derived in this evaluator version.";
+/// Still reported as unknown, and still not this ticket's to derive: an
+/// `attention_hold` span count is a LOWER BOUND on operator interventions, not
+/// a total. Reviewed task-scoped annotations are the parent's scope.
+const INTERVENTIONS_LOWER_BOUND: &str =
+    "lower bound: attention_hold spans only cover waits the daemon recorded; an operator \
+     intervention that left no span is not counted here. Reviewed annotations are \
+     TKT-nonub-pugar-pilid's scope.";
+
+/// No native observation distinguishes model-active time from a process sitting
+/// paused awaiting verification or the operator, so active work stays an
+/// explicit unknown rather than being aliased to process lifetime or to a
+/// phase-duration sum.
+const ACTIVE_WORK_UNKNOWN: &str =
+    "unknown: launch-to-exit is process lifetime, and no native observation distinguishes \
+     model-active time from a process paused awaiting verification or the operator.";
 
 // ---------------------------------------------------------------------
 // Manifest: the versioned, frozen experiment/scope declaration.
@@ -758,38 +770,143 @@ pub struct MechanismResult {
     pub effect_pairs: Vec<String>,
 }
 
-/// Per-task delivery accounting. This evaluator version reports the SCOPE it
-/// would account for and nothing numeric: the previous version summed a
-/// provisional `harness_result` cost as a measured total, read a `merge` span
-/// as an accepted delivery, and labelled a phase-duration sum as active work.
-/// Rather than keep shipping those, every figure here is an explicit unknown
-/// until `TKT-bonik-vuruv-mivuh` supplies the real derivation.
+/// Phase durations, bucketed. Deliberately NOT one "active" number: a phase
+/// duration is wall-clock time a phase span covered, which is not the same
+/// thing as model-active work.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PhaseDurations {
+    /// Every phase that is neither verification admission nor a human wait.
+    pub work_phases_ms: Option<i64>,
+    /// `verification` span duration plus its own queue wait.
+    pub verification_ms: Option<i64>,
+    /// `attention_hold` — waiting on a human.
+    pub attention_hold_ms: Option<i64>,
+    /// Pre-phase queue wait on every other phase.
+    pub queue_wait_ms: Option<i64>,
+}
+
+/// One observed provider-cost segment: a `(spawn, session, provider_session)`
+/// triple. The provider reports a CUMULATIVE total within one segment, so the
+/// last reported total is the segment's amount and repeated results must
+/// never be summed.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostSegment {
+    pub spawn: String,
+    pub session: String,
+    pub provider_session: Option<String>,
+    pub record: String,
+    pub reported_usd: Option<f64>,
+    pub cost_basis: String,
+    pub state: Option<String>,
+    /// `true` only when the last result for this segment was terminal AND no
+    /// later work is observable after it. A `paused` result followed by more
+    /// work and a kill leaves a partial amount, not a final cost.
+    pub final_cost: bool,
+    pub finality_reason: String,
+}
+
+/// One physical process launch of one generation: the `(spawn, session)` pair
+/// S2's contract names as the only safe aggregation key.
+#[derive(Debug, Clone, Serialize)]
+pub struct LaunchObservation {
+    pub session: String,
+    pub launched_at: Option<String>,
+    pub exited_at: Option<String>,
+    pub exit_record: Option<String>,
+    pub exit_code: Option<i64>,
+    pub crashed: Option<bool>,
+    pub prior_state: Option<String>,
+    /// `exited_at - launched_at`. PROCESS LIFETIME, not measured active model
+    /// work: a Claude process can sit paused awaiting verification or the
+    /// operator for most of it.
+    pub process_lifetime_ms: Option<i64>,
+}
+
+/// One completion (`harness_result`) for a generation. Task-completion
+/// evidence only: it is emitted at `rk done`, before terminal provider usage
+/// and while the OS process is still alive, so its cost is provisional.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionObservation {
+    pub record: String,
+    pub declared_done: bool,
+    pub is_error: bool,
+    pub provisional_cost_usd: Option<f64>,
+    pub failed: bool,
+}
+
+/// Everything observed for one agent generation on one task. Every attempt,
+/// including every failure, is retained.
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerationObservation {
+    pub spawn: String,
+    pub agent: Option<String>,
+    pub completions: Vec<CompletionObservation>,
+    pub launches: Vec<LaunchObservation>,
+    pub cost_segments: Vec<CostSegment>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryCost {
     pub task: String,
     pub repo: String,
     pub batches: Vec<String>,
     /// `frozen_consumer_task` (manifest scope) or `fixture_pair` (a
-    /// predeclared pair's task). Deliberately NOT derived from the pairs that
-    /// survived evaluation: a frozen task with no eligible source and no
+    /// predeclared pair's task). Deliveries are NOT derived from the pairs
+    /// that survived evaluation: a frozen task with no eligible source and no
     /// receipt still owns its costs, failures and acceptance.
     pub enrollment: String,
-    pub derivation_status: String,
-    pub derivation_reason: String,
-    pub cost_usd: Option<f64>,
-    pub active_work_ms: Option<i64>,
+    pub generations: Vec<GenerationObservation>,
+    pub completions: usize,
+    pub failed_completions: usize,
+    pub launches: usize,
+    pub exits: usize,
+    /// Sum of the last provider-reported total per proven segment. `None`
+    /// whenever any observed segment's cost is unknown or only partial —
+    /// never a silent zero and never a partial sum presented as a total.
+    pub reported_cost_estimate_usd: Option<f64>,
+    pub reported_cost_basis: Option<String>,
+    /// `complete` (every segment final), `partial` (some segment reported an
+    /// amount that is not final), `missing` (no final-usage observation at
+    /// all), `none_observed` (no native generation observed for this task).
+    pub cost_coverage: String,
+    /// Amounts that were reported but are NOT final, kept separate so a
+    /// partial figure is never read as spend.
+    pub partial_reported_usd: Option<f64>,
+    /// The supervisor's own priced-increment fallback for harnesses that do
+    /// not self-report USD. An estimate of an estimate: reported separately
+    /// and never pooled with a provider-reported total.
+    pub daemon_priced_estimate_usd: Option<f64>,
+    /// `harness_result.cost_usd`, summed per generation. PROVISIONAL: emitted
+    /// at `rk done`, before terminal provider usage. Never a final spend and
+    /// never merged into `reported_cost_estimate_usd`.
+    pub provisional_completion_cost_usd: Option<f64>,
+    pub unknown_cost: Vec<String>,
+    /// Sum of `exited_at - launched_at` over observed launches. Labelled
+    /// process lifetime deliberately.
     pub process_lifetime_ms: Option<i64>,
-    pub verification_ms: Option<i64>,
-    pub queue_ms: Option<i64>,
+    /// Always `None`. No native observation distinguishes model-active time
+    /// from a process paused awaiting verification or the operator, so this
+    /// stays an explicit unknown rather than being aliased to process
+    /// lifetime or to a phase-duration sum.
+    pub active_work_ms: Option<i64>,
+    pub active_work_coverage: String,
+    pub phase_ms: PhaseDurations,
+    /// `Some(true)` only on an actual `delivery_closure` span in this repo and
+    /// window. A `merge` span alone is not proof (a merge can be reverted);
+    /// absence is unknown, not a negative.
     pub accepted: Option<bool>,
+    pub acceptance_evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QualitySummary {
-    /// `None`, with `interventions_coverage` saying why: an `attention_hold`
-    /// span count is a lower bound on operator interventions, not a total.
-    pub interventions: Option<usize>,
+    /// `attention_hold` phase spans in this repo and window. A LOWER BOUND on
+    /// operator interventions: one that left no span is not counted. Reviewed
+    /// annotations that could close that gap are the parent ticket's scope.
+    pub attention_hold_spans: usize,
+    pub interventions_known: usize,
     pub interventions_coverage: String,
+    pub rework_spans: usize,
     pub incorrect_reuse: usize,
     pub regressions: Vec<String>,
 }
@@ -831,6 +948,7 @@ pub struct Report {
     pub author_exit_reuse: Vec<String>,
     pub mechanism: MechanismResult,
     pub deliveries: Vec<DeliveryCost>,
+    pub tasks_without_native_records: Vec<String>,
     pub quality: QualitySummary,
     pub pairs: Vec<PairResult>,
 }
@@ -961,6 +1079,10 @@ fn telemetry_record_defect(t: &Value, bbs_kind: &str) -> Option<String> {
         ));
     }
     None
+}
+
+fn is_task_span(t: &Value) -> bool {
+    t["category"] == "event" && t["identity"] == "task_span"
 }
 
 fn is_harness_result(t: &Value) -> bool {
@@ -1110,17 +1232,70 @@ fn created_at(t: &Value) -> Option<DateTime<Utc>> {
     t["created_at"].as_str().and_then(parse_rfc3339)
 }
 
+/// A native observation's OWN timestamp field (`exited_at`, `observed_at`),
+/// which is what the window must be applied to — `created_at` is when the
+/// tuple was written, not when the thing happened.
+fn payload_time(t: &Value, field: &str) -> Option<DateTime<Utc>> {
+    t["payload"][field].as_str().and_then(parse_rfc3339)
+}
+
 // ---------------------------------------------------------------------
 // Native observation index: scope-, window- and identity-filtered.
 // ---------------------------------------------------------------------
 
+struct ExitRow {
+    repo: String,
+    task: String,
+    agent: String,
+    spawn: String,
+    session: String,
+    exited_at: Option<DateTime<Utc>>,
+    launched_at: Option<DateTime<Utc>>,
+    exit_code: Option<i64>,
+    crashed: Option<bool>,
+    prior_state: Option<String>,
+    record: String,
+}
+
+struct UsageRow {
+    repo: String,
+    task: String,
+    spawn: String,
+    session: String,
+    provider_session: Option<String>,
+    state: Option<String>,
+    cost_usd: Option<f64>,
+    cost_basis: String,
+    observed_at: Option<DateTime<Utc>>,
+    record: String,
+}
+
+struct CompletionRow {
+    repo: String,
+    task: String,
+    agent: String,
+    spawn: String,
+    declared_done: bool,
+    is_error: bool,
+    cost_usd: Option<f64>,
+    record: String,
+}
+
 /// Native proof that a generation actually started a process, or at least ran
-/// far enough to author a record of its own. Used to decide whether a prepared
-/// exposure was a *launched* consumer opportunity rather than a selection
-/// prepared for a spawn that never ran.
+/// far enough to author a record of its own. Used for two distinct things: to
+/// decide whether a prepared exposure was a *launched* consumer opportunity,
+/// and to refuse an author-exit claim when the generation was relaunched
+/// between the exit and the consuming decision.
 struct LaunchRow {
     repo: String,
     spawn: String,
+    /// Present only for records that identify a physical launch. An
+    /// `agent_spawned`/`agent_respawned` event and an authored record do not,
+    /// so a relaunch is detected by time, not by session identity alone.
+    session: Option<String>,
+    at: Option<DateTime<Utc>>,
+    record: String,
+    kind: &'static str,
 }
 
 struct Index<'a> {
@@ -1130,6 +1305,10 @@ struct Index<'a> {
     /// `(repo, source, consumer_spawn)`.
     opened: BTreeSet<(String, String, String)>,
     launches: Vec<LaunchRow>,
+    exits: Vec<ExitRow>,
+    usage: Vec<UsageRow>,
+    completions: Vec<CompletionRow>,
+    spans: Vec<&'a Value>,
     /// `(source, consumer_task)` -> candidate receipts, in capture order.
     reuse_by_source_task: BTreeMap<(String, String), Vec<&'a Value>>,
     /// `receipt id` -> `(capture position, assessment)`.
@@ -1145,6 +1324,28 @@ impl Index<'_> {
         self.launches
             .iter()
             .any(|l| l.repo == repo && l.spawn == spawn)
+    }
+
+    /// The earliest observed launch of `spawn` strictly after `after` and no
+    /// later than `until` — i.e. a relaunch that invalidates treating an
+    /// earlier exit as permanent. `agent_spawned`/`agent_respawned` and
+    /// authored records do not carry a session, so this is a time test, not a
+    /// session-identity test; a record belonging to the already-exited
+    /// session is excluded by `exclude_session`.
+    fn relaunch_between(
+        &self,
+        repo: &str,
+        spawn: &str,
+        exclude_session: &str,
+        after: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Option<&LaunchRow> {
+        self.launches
+            .iter()
+            .filter(|l| l.repo == repo && l.spawn == spawn)
+            .filter(|l| l.session.as_deref() != Some(exclude_session))
+            .filter(|l| l.at.is_some_and(|at| at > after && at <= until))
+            .min_by_key(|l| (l.at, l.record.clone()))
     }
 }
 
@@ -1162,6 +1363,10 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
         prepared: BTreeMap::new(),
         opened: BTreeSet::new(),
         launches: Vec::new(),
+        exits: Vec::new(),
+        usage: Vec::new(),
+        completions: Vec::new(),
+        spans: Vec::new(),
         reuse_by_source_task: BTreeMap::new(),
         assessment_by_receipt: BTreeMap::new(),
         invalid: Vec::new(),
@@ -1176,12 +1381,12 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     // the frozen window. Both rejections are COUNTED, so a scoping or window
     // mistake shows up as visible coverage loss instead of silently shrinking
     // every metric toward zero.
-    let admit = |idx: &mut Index<'a>, t: &Value| -> bool {
+    let admit = |idx: &mut Index<'a>, t: &Value, at: Option<DateTime<Utc>>| -> bool {
         if !in_scope(str_field(t, &["scope"])) {
             idx.capture.observations_out_of_scope_repo += 1;
             return false;
         }
-        match window.fit(created_at(t)) {
+        match window.fit(at) {
             WindowFit::Inside => {
                 idx.capture.observations_in_window += 1;
                 true
@@ -1215,7 +1420,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
-            if !admit(&mut idx, t) {
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             // Only an exact agent generation counts toward agent exposure.
@@ -1281,7 +1486,7 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 });
                 continue;
             }
-            if !admit(&mut idx, t) {
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             if str_field(t, &["payload", "bound"]) != "agent" {
@@ -1309,29 +1514,197 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             continue;
         }
 
-        // `harness_result` proves the generation RAN. It is used here only as
-        // launch evidence; it is never author-exit evidence (the supervisor
-        // emits it at `rk done`, while the process is still alive).
-        if is_harness_result(t) || is_launch_event(t) {
-            if !admit(&mut idx, t) {
+        // --- agent_exit -----------------------------------------------
+        if claims_kind(t, AGENT_EXIT) {
+            if let Some(reason) = telemetry_record_defect(t, AGENT_EXIT) {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_EXIT.into(),
+                    reason,
+                });
+                continue;
+            }
+            let exited_at = payload_time(t, "exited_at");
+            if !admit(&mut idx, t, exited_at.or_else(|| created_at(t))) {
+                continue;
+            }
+            let spawn = str_field(t, &["payload", "spawn"]).to_string();
+            let session = str_field(t, &["payload", "session"]).to_string();
+            if spawn.is_empty() || session.is_empty() {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_EXIT.into(),
+                    reason: "an exit must identify both its generation (spawn) and its physical \
+                             launch (session)"
+                        .into(),
+                });
+                continue;
+            }
+            let launched_at = payload_time(t, "launched_at");
+            idx.launches.push(LaunchRow {
+                repo: scope.clone(),
+                spawn: spawn.clone(),
+                session: Some(session.clone()),
+                at: launched_at,
+                record: record_id(t),
+                kind: AGENT_EXIT,
+            });
+            idx.exits.push(ExitRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                agent: str_field(t, &["payload", "agent"]).to_string(),
+                spawn,
+                session,
+                exited_at,
+                launched_at,
+                exit_code: t["payload"]["exit_code"].as_i64(),
+                crashed: t["payload"]["crashed"].as_bool(),
+                prior_state: t["payload"]["prior_state"].as_str().map(str::to_string),
+                record: record_id(t),
+            });
+            continue;
+        }
+
+        // --- agent_final_usage ----------------------------------------
+        if claims_kind(t, AGENT_FINAL_USAGE) {
+            if let Some(reason) = telemetry_record_defect(t, AGENT_FINAL_USAGE) {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_FINAL_USAGE.into(),
+                    reason,
+                });
+                continue;
+            }
+            let observed_at = payload_time(t, "observed_at");
+            if !admit(&mut idx, t, observed_at.or_else(|| created_at(t))) {
+                continue;
+            }
+            let spawn = str_field(t, &["payload", "spawn"]).to_string();
+            let session = str_field(t, &["payload", "session"]).to_string();
+            if spawn.is_empty() || session.is_empty() {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_FINAL_USAGE.into(),
+                    reason: "a usage observation must identify both its generation (spawn) and \
+                             its physical launch (session)"
+                        .into(),
+                });
+                continue;
+            }
+            let cost_basis = str_field(t, &["payload", "cost_basis"]).to_string();
+            if cost_basis.is_empty() {
+                idx.invalid.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: AGENT_FINAL_USAGE.into(),
+                    reason: "payload.cost_basis is absent; a cost with no stated basis cannot be \
+                             aggregated"
+                        .into(),
+                });
+                continue;
+            }
+            idx.launches.push(LaunchRow {
+                repo: scope.clone(),
+                spawn: spawn.clone(),
+                session: Some(session.clone()),
+                at: observed_at,
+                record: record_id(t),
+                kind: AGENT_FINAL_USAGE,
+            });
+            idx.usage.push(UsageRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                spawn,
+                session,
+                provider_session: t["payload"]["provider_session"]
+                    .as_str()
+                    .map(str::to_string),
+                state: t["payload"]["state"].as_str().map(str::to_string),
+                cost_usd: t["payload"]["cost_usd"].as_f64(),
+                cost_basis,
+                observed_at,
+                record: record_id(t),
+            });
+            continue;
+        }
+
+        // --- harness_result (completion, NOT exit) --------------------
+        if is_harness_result(t) {
+            if !admit(&mut idx, t, created_at(t)) {
                 continue;
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if spawn.is_empty() {
-                // Pre-C1 completions and pre-`48fb2da` launch events carry no
-                // generation id. Legacy and unattributed, so retained as an
-                // explicit unknown rather than attributed to whoever happens
-                // to share the agent name.
+                // Pre-C1 completions carry no generation id. Legacy and
+                // unattributed, so retained as an explicit unknown rather
+                // than attributed to whoever shares the agent name.
                 idx.unresolved.push(InvalidRecord {
                     record: record_id(t),
-                    kind: str_field(t, &["identity"]).to_string(),
-                    reason: "no payload.spawn: cannot be bound to an exact generation".into(),
+                    kind: "harness_result".into(),
+                    reason: "no payload.spawn: legacy completion cannot be bound to an exact \
+                             generation"
+                        .into(),
                 });
                 continue;
             }
-            idx.launches.push(LaunchRow { repo: scope, spawn });
+            idx.launches.push(LaunchRow {
+                repo: scope.clone(),
+                spawn: spawn.clone(),
+                session: None,
+                at: created_at(t),
+                record: record_id(t),
+                kind: "harness_result",
+            });
+            idx.completions.push(CompletionRow {
+                repo: scope.clone(),
+                task: str_field(t, &["payload", "task"]).to_string(),
+                agent: str_field(t, &["payload", "agent"]).to_string(),
+                spawn,
+                declared_done: t["payload"]["declared_done"].as_bool().unwrap_or(false),
+                is_error: t["payload"]["is_error"].as_bool().unwrap_or(false),
+                cost_usd: t["payload"]["cost_usd"].as_f64(),
+                record: record_id(t),
+            });
             continue;
         }
+
+        // --- agent_spawned / agent_respawned --------------------------
+        if is_launch_event(t) {
+            if !admit(&mut idx, t, created_at(t)) {
+                continue;
+            }
+            // `spawn` is additive on these events (S2 `48fb2da`); older rows
+            // omit it and cannot prove which generation launched.
+            let spawn = str_field(t, &["payload", "spawn"]).to_string();
+            if spawn.is_empty() {
+                idx.unresolved.push(InvalidRecord {
+                    record: record_id(t),
+                    kind: str_field(t, &["identity"]).to_string(),
+                    reason: "no payload.spawn: this launch event predates the additive generation \
+                             field and cannot be bound to a generation"
+                        .into(),
+                });
+                continue;
+            }
+            idx.launches.push(LaunchRow {
+                repo: scope.clone(),
+                spawn,
+                session: None,
+                at: created_at(t),
+                record: record_id(t),
+                kind: "launch_event",
+            });
+            continue;
+        }
+
+        // --- task_span ------------------------------------------------
+        if is_task_span(t) {
+            if !admit(&mut idx, t, created_at(t)) {
+                continue;
+            }
+            idx.spans.push(t);
+            continue;
+        }
+
 
         if claims_kind(t, REUSE) {
             if let Some(reason) = artifact_record_defect(t, REUSE) {
@@ -1349,6 +1722,10 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
                 idx.launches.push(LaunchRow {
                     repo: scope.clone(),
                     spawn,
+                    session: None,
+                    at: created_at(t),
+                    record: record_id(t),
+                    kind: "authored_record",
                 });
             }
             let source = str_field(t, &["payload", "source"]).to_string();
@@ -1398,7 +1775,14 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             }
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if !spawn.is_empty() {
-                idx.launches.push(LaunchRow { repo: scope, spawn });
+                idx.launches.push(LaunchRow {
+                repo: scope,
+                spawn,
+                session: None,
+                at: created_at(t),
+                record: record_id(t),
+                kind: "launch_event",
+            });
             }
         }
     }
@@ -1408,42 +1792,213 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
     idx
 }
 
-/// The scope deliveries are accounted over: frozen consumer tasks plus the
-/// consumer tasks of predeclared fixture pairs. Deliberately NOT the pairs that
-/// survived evaluation — a frozen task with no eligible source and no receipt
-/// still owns its delivery accounting.
-fn frozen_task_scope(manifest: &Manifest) -> Vec<DeliveryCost> {
-    let mut scopes: BTreeMap<(String, String), (BTreeSet<String>, &'static str)> = BTreeMap::new();
+/// Validates a review's `author_terminal_evidence` id against the capture.
+///
+/// Only an `agent_exit` observation can establish this, and only for the
+/// source author's exact `(spawn, session)` in the pair's repo, no later than
+/// the reuse, with no relaunch of that generation in between. The two
+/// tempting alternatives are both refused with an explicit reason:
+///
+/// * `harness_result` is task-completion evidence. `Supervisor::route_completion`
+///   emits it when the agent routes `rk done`; the OS process is still alive
+///   until `HarnessEvent::Exited`, and the provider may still report a later,
+///   different total for the same query.
+/// * `agent_lifecycle` carries no `spawn` field at all (its identity fields
+///   are `agent` and `generation`), is not repo-bound, and its `change` may be
+///   `started` — so it cannot identify a terminal generation even in
+///   principle.
+fn resolve_author_exit(
+    evidence_id: &str,
+    idx: &Index<'_>,
+    repo: &str,
+    source_agent: &str,
+    source_spawn: &str,
+    claim_created: Option<DateTime<Utc>>,
+) -> std::result::Result<String, String> {
+    let Some(ev) = idx.by_id.get(evidence_id) else {
+        return Err(format!(
+            "author_terminal_evidence {evidence_id} is not present in the tuple capture"
+        ));
+    };
+    if is_harness_result(ev) {
+        return Err(format!(
+            "{evidence_id} is a harness_result: task-completion evidence emitted at `rk done` \
+             while the process is still alive. Author-exit requires an agent_exit observation"
+        ));
+    }
+    if ev["identity"] == "agent_lifecycle" {
+        return Err(format!(
+            "{evidence_id} is an agent_lifecycle event: it carries no `spawn` binding, is not \
+             repo-bound, and its `change` may be `started`, so it cannot establish a terminal \
+             generation"
+        ));
+    }
+    if !claims_kind(ev, AGENT_EXIT) {
+        return Err(format!("{evidence_id} is not an agent_exit observation"));
+    }
+    if let Some(reason) = telemetry_record_defect(ev, AGENT_EXIT) {
+        return Err(format!(
+            "{evidence_id} is not a valid agent_exit record: {reason}"
+        ));
+    }
+    if source_spawn.is_empty() {
+        return Err(format!(
+            "the source carries no authoring generation, so {evidence_id} cannot be bound to it \
+             (legacy/unattributed source)"
+        ));
+    }
+    let Some(exit) = idx.exits.iter().find(|e| e.record == evidence_id) else {
+        return Err(format!(
+            "{evidence_id} is an agent_exit record but was excluded from the frozen repo scope or \
+             measurement window"
+        ));
+    };
+    if exit.repo != repo {
+        return Err(format!(
+            "{evidence_id} is scoped to repo {}, not the pair's {repo}",
+            exit.repo
+        ));
+    }
+    if exit.spawn != source_spawn {
+        return Err(format!(
+            "{evidence_id} records the exit of generation {}, not the source's {source_spawn}",
+            exit.spawn
+        ));
+    }
+    if !source_agent.is_empty() && !exit.agent.is_empty() && exit.agent != source_agent {
+        return Err(format!(
+            "{evidence_id} names agent {}, not the source's author {source_agent}",
+            exit.agent
+        ));
+    }
+    let Some(exited_at) = exit.exited_at else {
+        return Err(format!("{evidence_id} carries no parsable exited_at"));
+    };
+    let Some(claim_at) = claim_created else {
+        return Err(format!(
+            "{evidence_id} cannot be ordered against the reuse: the reuse has no captured, \
+             parsable timestamp"
+        ));
+    };
+    if exited_at > claim_at {
+        return Err(format!(
+            "{evidence_id} records an exit at {exited_at} which is AFTER the reuse at {claim_at}"
+        ));
+    }
+    // A manual respawn continues the same SpawnId, so an earlier exit is not
+    // proof the author was gone when the consumer decided.
+    if let Some(relaunch) =
+        idx.relaunch_between(repo, source_spawn, &exit.session, exited_at, claim_at)
+    {
+        return Err(format!(
+            "generation {source_spawn} was observed running again at {} ({} {}) after the exit at \
+             {exited_at} and before the reuse at {claim_at}",
+            relaunch
+                .at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "unknown time".into()),
+            relaunch.kind,
+            relaunch.record
+        ));
+    }
+    Ok(evidence_id.to_string())
+}
+
+// ---------------------------------------------------------------------
+// Delivery derivation: frozen task scope, NOT surviving pairs.
+// ---------------------------------------------------------------------
+
+struct TaskScope {
+    task: String,
+    repo: String,
+    batches: BTreeSet<String>,
+    enrollment: &'static str,
+}
+
+fn frozen_task_scope(manifest: &Manifest) -> Vec<TaskScope> {
+    let mut scopes: BTreeMap<(String, String), TaskScope> = BTreeMap::new();
     for c in &manifest.consumer_tasks {
         let e = scopes
             .entry((c.task.clone(), c.repo.clone()))
-            .or_insert_with(|| (BTreeSet::new(), "frozen_consumer_task"));
-        e.0.insert(c.batch.clone());
-        e.1 = "frozen_consumer_task";
+            .or_insert_with(|| TaskScope {
+                task: c.task.clone(),
+                repo: c.repo.clone(),
+                batches: BTreeSet::new(),
+                enrollment: "frozen_consumer_task",
+            });
+        e.batches.insert(c.batch.clone());
+        e.enrollment = "frozen_consumer_task";
     }
+    // Supported fixture enrollment: a predeclared pair's consumer task is in
+    // scope for delivery accounting even when the manifest lists no
+    // `consumer_tasks` (the deterministic fixture/replay shape).
     for p in &manifest.eligible_pairs {
         let e = scopes
             .entry((p.consumer_task.clone(), p.repo.clone()))
-            .or_insert_with(|| (BTreeSet::new(), "fixture_pair"));
-        e.0.insert(p.batch.clone());
+            .or_insert_with(|| TaskScope {
+                task: p.consumer_task.clone(),
+                repo: p.repo.clone(),
+                batches: BTreeSet::new(),
+                enrollment: "fixture_pair",
+            });
+        e.batches.insert(p.batch.clone());
     }
-    scopes
-        .into_iter()
-        .map(|((task, repo), (batches, enrollment))| DeliveryCost {
-            task,
-            repo,
-            batches: batches.into_iter().collect(),
-            enrollment: enrollment.to_string(),
-            derivation_status: "unsupported".into(),
-            derivation_reason: DELIVERY_COST_UNSUPPORTED.into(),
-            cost_usd: None,
-            active_work_ms: None,
-            process_lifetime_ms: None,
-            verification_ms: None,
-            queue_ms: None,
-            accepted: None,
-        })
-        .collect()
+    scopes.into_values().collect()
+}
+
+/// Per-segment cost finality. A `paused` provider result can be followed by
+/// more model usage and then a budget kill with no further result; the earlier
+/// cumulative total is then a partial amount, not this launch's final cost.
+/// Finality therefore needs an observed exit for the same launch AND a
+/// terminal last result AND an exit whose `prior_state` agrees with it.
+fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
+    let state = last.state.as_deref().unwrap_or("");
+    if !TERMINAL_USAGE_STATES.contains(&state) {
+        return (
+            false,
+            format!(
+                "last result for this segment is state={state:?}, which is not terminal: more \
+                 usage may follow"
+            ),
+        );
+    }
+    let Some(exit) = exit else {
+        return (
+            false,
+            "no agent_exit observed for this launch, so the process may still be running and \
+             report more usage"
+                .into(),
+        );
+    };
+    match exit.prior_state.as_deref() {
+        None => (
+            true,
+            format!(
+                "terminal result (state={state}) followed by observed exit {}",
+                exit.record
+            ),
+        ),
+        Some(prior) if prior == state => (
+            true,
+            format!(
+                "terminal result (state={state}) followed by observed exit {}",
+                exit.record
+            ),
+        ),
+        Some(prior) => (
+            false,
+            format!(
+                "last result said state={state:?} but the exit records prior_state={prior:?}: the \
+                 launch did more work after that result, so the reported amount is partial"
+            ),
+        ),
+    }
+}
+
+fn opt_sum(acc: &mut Option<i64>, v: Option<i64>) {
+    if let Some(v) = v {
+        *acc.get_or_insert(0) += v;
+    }
 }
 
 /// Computes the deterministic report. Same inputs always produce the same
@@ -1508,6 +2063,7 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             .unwrap_or("artifact")
             .to_string();
         let source_spawn = str_field(source, &["payload", "spawn"]).to_string();
+        let source_agent = str_field(source, &["payload", "agent"]).to_string();
         let source_attributed = !source_spawn.is_empty();
         if source_attributed && source_spawn == pair.consumer_generation {
             excluded.push(Excluded {
@@ -1747,15 +2303,32 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             pair.consumer_generation.clone(),
         ));
 
-        // Author exit is NOT derived in this evaluator version. Any supplied
-        // evidence is reported as unsupported with the reason, rather than
-        // credited from a record that cannot establish a physical exit.
+        // Author exit, derived. Only an `agent_exit` observation for the source
+        // author's exact `(spawn, session)` can establish it, and only with no
+        // relaunch of that generation before the consuming decision — a manual
+        // respawn keeps the SpawnId, so an earlier exit is not proof the author
+        // was gone when the consumer decided.
+        let mut author_terminal = false;
+        let mut author_terminal_evidence = None;
         if let Some(evidence_id) = review.and_then(|r| r.author_terminal_evidence.as_deref()) {
-            author_exit_unsupported.push(AuthorExitUnsupported {
-                pair: pair.id.clone(),
-                evidence: evidence_id.to_string(),
-                reason: AUTHOR_EXIT_UNSUPPORTED.to_string(),
-            });
+            match resolve_author_exit(
+                evidence_id,
+                &idx,
+                &pair.repo,
+                &source_agent,
+                &source_spawn,
+                claim_created,
+            ) {
+                Ok(id) => {
+                    author_terminal = true;
+                    author_terminal_evidence = Some(id);
+                }
+                Err(reason) => author_exit_unsupported.push(AuthorExitUnsupported {
+                    pair: pair.id.clone(),
+                    evidence: evidence_id.to_string(),
+                    reason,
+                }),
+            }
         }
         let relayed_by_operator = review.is_some_and(|r| r.relayed_by_operator);
         let regression = review.is_some_and(|r| r.regression);
@@ -1797,10 +2370,8 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             claim_evidence,
             assessed_verdict,
             assessment_evidence,
-            // Author exit cannot be established in this version; see
-            // `AUTHOR_EXIT_UNSUPPORTED`.
-            author_terminal: false,
-            author_terminal_evidence: None,
+            author_terminal,
+            author_terminal_evidence,
             relayed_by_operator,
             regression,
             verified_effect,
@@ -1929,31 +2500,343 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         .filter(|p| p.counts_as_effect)
         .map(|p| p.batch.as_str())
         .collect();
-    // The author-exit sub-goal cannot be satisfied at all in this version, so
-    // the mechanism goal is forced `false` with the reason attached. This is
-    // the whole point of the intermediate: a goal that cannot be evaluated
-    // must not report as met, and the previous version would have passed it on
-    // author-exit evidence that establishes nothing.
-    let goal_blocked_reason = if capture.truncated {
-        Some(
-            "the tuple capture is truncated: a reuse or assessment outside the truncation window \
-             could change any of these counts"
-                .to_string(),
-        )
-    } else {
-        Some(AUTHOR_EXIT_UNSUPPORTED.to_string())
-    };
+    let mut author_exit_reuse: Vec<String> = pairs_out
+        .iter()
+        .filter(|p| p.counts_as_effect && p.author_terminal)
+        .map(|p| p.pair.clone())
+        .collect();
+    author_exit_reuse.sort();
+    let author_exit_effects = author_exit_reuse.len();
+    // A truncated capture still cannot certify the goal: a reuse or assessment
+    // outside the truncation window could change any of these counts.
+    let goal_blocked_reason = capture.truncated.then(|| {
+        "the tuple capture is truncated: a reuse or assessment outside the truncation window \
+         could change any of these counts"
+            .to_string()
+    });
     let mechanism = MechanismResult {
         effects: effect_pairs.len(),
         batches: effect_batches.len(),
-        author_exit_effects: 0,
+        author_exit_effects,
         effects_required: MECHANISM_EFFECTS_REQUIRED,
         batches_required: MECHANISM_BATCHES_REQUIRED,
         author_exit_required: MECHANISM_AUTHOR_EXIT_REQUIRED,
-        goal_met: false,
+        goal_met: goal_blocked_reason.is_none()
+            && effect_pairs.len() >= MECHANISM_EFFECTS_REQUIRED
+            && effect_batches.len() >= MECHANISM_BATCHES_REQUIRED
+            && author_exit_effects >= MECHANISM_AUTHOR_EXIT_REQUIRED,
         goal_blocked_reason,
         effect_pairs,
     };
+
+    // --- deliveries, from frozen scope -------------------------------
+    let mut deliveries = Vec::new();
+    let mut tasks_without_native_records = Vec::new();
+    let mut attention_hold_spans = 0usize;
+    let mut rework_spans = 0usize;
+    for scope in frozen_task_scope(manifest) {
+        // Spans are pre-filtered by repo and window here because
+        // `build_critical_path` dedups on `(phase, attempt)` across whatever
+        // it is handed and does not filter by scope: two repos' same-named
+        // task ids would silently merge.
+        let task_spans: Vec<Value> = idx
+            .spans
+            .iter()
+            .filter(|t| {
+                str_field(t, &["scope"]) == scope.repo
+                    && t["payload"]["task"] == scope.task.as_str()
+            })
+            .map(|t| (*t).clone())
+            .collect();
+        let cp = crate::critical_path::build_critical_path(&scope.task, &task_spans);
+        let mut phase_ms = PhaseDurations::default();
+        if let Some(phases) = cp["phases"].as_array() {
+            for phase in phases {
+                let dur = phase["duration_ms"].as_i64();
+                let wait = phase["queue_wait_ms"].as_i64();
+                match phase["phase"].as_str().unwrap_or("") {
+                    "verification" => {
+                        // Admission/check queue AND its own run time both count
+                        // as verification time, never as work.
+                        opt_sum(&mut phase_ms.verification_ms, dur);
+                        opt_sum(&mut phase_ms.verification_ms, wait);
+                    }
+                    "attention_hold" => {
+                        attention_hold_spans += 1;
+                        opt_sum(&mut phase_ms.attention_hold_ms, dur);
+                        opt_sum(&mut phase_ms.attention_hold_ms, wait);
+                    }
+                    other => {
+                        if other == "rework" {
+                            rework_spans += 1;
+                        }
+                        opt_sum(&mut phase_ms.work_phases_ms, dur);
+                        // Generic pre-phase queueing is a wait, not work, even
+                        // for an otherwise-active phase.
+                        opt_sum(&mut phase_ms.queue_wait_ms, wait);
+                    }
+                }
+            }
+        }
+        let acceptance_evidence = idx
+            .spans
+            .iter()
+            .filter(|t| {
+                str_field(t, &["scope"]) == scope.repo
+                    && t["payload"]["task"] == scope.task.as_str()
+                    && t["payload"]["phase"] == "delivery_closure"
+            })
+            .map(|t| record_id(t))
+            .min();
+        let accepted = acceptance_evidence.as_ref().map(|_| true);
+
+        // Every native generation observed for this task, whether or not it
+        // ever produced an eligible pair or a receipt.
+        let mut spawns: BTreeSet<&str> = BTreeSet::new();
+        for c in &idx.completions {
+            if c.repo == scope.repo && c.task == scope.task {
+                spawns.insert(c.spawn.as_str());
+            }
+        }
+        for e in &idx.exits {
+            if e.repo == scope.repo && e.task == scope.task {
+                spawns.insert(e.spawn.as_str());
+            }
+        }
+        for u in &idx.usage {
+            if u.repo == scope.repo && u.task == scope.task {
+                spawns.insert(u.spawn.as_str());
+            }
+        }
+
+        let mut generations = Vec::new();
+        let mut completions_total = 0usize;
+        let mut failed_completions = 0usize;
+        let mut launches_total = 0usize;
+        let mut exits_total = 0usize;
+        let mut provisional: Option<f64> = None;
+        let mut provisional_known = true;
+        let mut provider_total: Option<f64> = None;
+        let mut daemon_total: Option<f64> = None;
+        let mut partial_total: Option<f64> = None;
+        let mut all_final = true;
+        let mut any_segment = false;
+        let mut non_provider_basis = false;
+        let mut unknown_cost: Vec<String> = Vec::new();
+        let mut lifetime: Option<i64> = None;
+
+        for spawn in spawns {
+            let mut completions = Vec::new();
+            for c in idx
+                .completions
+                .iter()
+                .filter(|c| c.repo == scope.repo && c.task == scope.task && c.spawn == spawn)
+            {
+                completions_total += 1;
+                // TKT-175: an undeclared generation is also an error, but the
+                // two are recorded separately so "the rat said it was done"
+                // stays distinguishable from "nothing went wrong".
+                let failed = c.is_error || !c.declared_done;
+                if failed {
+                    failed_completions += 1;
+                }
+                match c.cost_usd {
+                    Some(v) => *provisional.get_or_insert(0.0) += v,
+                    None => provisional_known = false,
+                }
+                completions.push(CompletionObservation {
+                    record: c.record.clone(),
+                    declared_done: c.declared_done,
+                    is_error: c.is_error,
+                    provisional_cost_usd: c.cost_usd,
+                    failed,
+                });
+            }
+            completions.sort_by(|a, b| a.record.cmp(&b.record));
+
+            let mut agent = idx
+                .completions
+                .iter()
+                .find(|c| c.repo == scope.repo && c.spawn == spawn && !c.agent.is_empty())
+                .map(|c| c.agent.clone());
+            if agent.is_none() {
+                agent = idx
+                    .exits
+                    .iter()
+                    .find(|e| e.repo == scope.repo && e.spawn == spawn && !e.agent.is_empty())
+                    .map(|e| e.agent.clone());
+            }
+
+            let mut launches = Vec::new();
+            for e in idx
+                .exits
+                .iter()
+                .filter(|e| e.repo == scope.repo && e.task == scope.task && e.spawn == spawn)
+            {
+                exits_total += 1;
+                launches_total += 1;
+                let ms = match (e.launched_at, e.exited_at) {
+                    (Some(l), Some(x)) => Some((x - l).num_milliseconds()),
+                    _ => None,
+                };
+                opt_sum(&mut lifetime, ms);
+                launches.push(LaunchObservation {
+                    session: e.session.clone(),
+                    launched_at: e.launched_at.map(|t| t.to_rfc3339()),
+                    exited_at: e.exited_at.map(|t| t.to_rfc3339()),
+                    exit_record: Some(e.record.clone()),
+                    exit_code: e.exit_code,
+                    crashed: e.crashed,
+                    prior_state: e.prior_state.clone(),
+                    process_lifetime_ms: ms,
+                });
+            }
+            launches.sort_by(|a, b| a.session.cmp(&b.session));
+
+            // Group usage by (session, provider_session): the provider reports
+            // a CUMULATIVE total within one segment, so only the last result
+            // per segment is that segment's amount.
+            let mut by_segment: BTreeMap<(String, Option<String>), Vec<&UsageRow>> =
+                BTreeMap::new();
+            for u in idx
+                .usage
+                .iter()
+                .filter(|u| u.repo == scope.repo && u.task == scope.task && u.spawn == spawn)
+            {
+                by_segment
+                    .entry((u.session.clone(), u.provider_session.clone()))
+                    .or_default()
+                    .push(u);
+            }
+            let mut cost_segments = Vec::new();
+            for ((session, provider_session), mut rows) in by_segment {
+                any_segment = true;
+                rows.sort_by(|a, b| (a.observed_at, &a.record).cmp(&(b.observed_at, &b.record)));
+                let last = rows.last().copied().expect("segment has at least one row");
+                let exit = idx
+                    .exits
+                    .iter()
+                    .find(|e| e.repo == scope.repo && e.spawn == spawn && e.session == session);
+                let (final_cost, finality_reason) = segment_finality(last, exit);
+                if !final_cost {
+                    all_final = false;
+                    unknown_cost.push(format!(
+                        "{spawn}/{session}/{}: {finality_reason}",
+                        provider_session.as_deref().unwrap_or("no-provider-session")
+                    ));
+                }
+                if last.cost_basis != PROVIDER_COST_BASIS {
+                    non_provider_basis = true;
+                }
+                match (final_cost, last.cost_usd, last.cost_basis.as_str()) {
+                    (true, Some(v), PROVIDER_COST_BASIS) => {
+                        *provider_total.get_or_insert(0.0) += v;
+                    }
+                    (true, Some(v), DAEMON_COST_BASIS) => {
+                        *daemon_total.get_or_insert(0.0) += v;
+                    }
+                    (false, Some(v), _) => {
+                        *partial_total.get_or_insert(0.0) += v;
+                    }
+                    (_, None, _) => {
+                        all_final = false;
+                        unknown_cost.push(format!(
+                            "{spawn}/{session}/{}: reported cost is null (cost_basis={})",
+                            provider_session.as_deref().unwrap_or("no-provider-session"),
+                            last.cost_basis
+                        ));
+                    }
+                    (true, Some(_), _) => {}
+                }
+                cost_segments.push(CostSegment {
+                    spawn: spawn.to_string(),
+                    session,
+                    provider_session,
+                    record: last.record.clone(),
+                    reported_usd: last.cost_usd,
+                    cost_basis: last.cost_basis.clone(),
+                    state: last.state.clone(),
+                    final_cost,
+                    finality_reason,
+                });
+            }
+            cost_segments.sort_by(|a, b| {
+                (&a.spawn, &a.session, &a.provider_session).cmp(&(
+                    &b.spawn,
+                    &b.session,
+                    &b.provider_session,
+                ))
+            });
+            if cost_segments.is_empty() {
+                unknown_cost.push(format!(
+                    "{spawn}: no agent_final_usage observation, so this generation's provider cost \
+                     is unknown"
+                ));
+            }
+            generations.push(GenerationObservation {
+                spawn: spawn.to_string(),
+                agent,
+                completions,
+                launches,
+                cost_segments,
+            });
+        }
+        generations.sort_by(|a, b| a.spawn.cmp(&b.spawn));
+
+        if generations.is_empty() && task_spans.is_empty() {
+            tasks_without_native_records.push(format!("{}/{}", scope.repo, scope.task));
+        }
+
+        let cost_coverage = if generations.is_empty() {
+            "none_observed"
+        } else if !any_segment {
+            "missing"
+        } else if all_final && !non_provider_basis {
+            "complete"
+        } else {
+            "partial"
+        };
+        // A provider total is only reported when EVERY observed segment is a
+        // final, provider-reported total. A partial segment, a null cost, or a
+        // daemon-priced segment all leave the task total unknown rather than
+        // pooling bases or presenting a partial sum as a total.
+        let reported_cost_estimate_usd = (cost_coverage == "complete")
+            .then_some(provider_total)
+            .flatten();
+        unknown_cost.sort();
+
+        deliveries.push(DeliveryCost {
+            task: scope.task.clone(),
+            repo: scope.repo.clone(),
+            batches: scope.batches.iter().cloned().collect(),
+            enrollment: scope.enrollment.to_string(),
+            generations,
+            completions: completions_total,
+            failed_completions,
+            launches: launches_total,
+            exits: exits_total,
+            reported_cost_estimate_usd,
+            reported_cost_basis: reported_cost_estimate_usd
+                .map(|_| PROVIDER_COST_BASIS.to_string()),
+            cost_coverage: cost_coverage.to_string(),
+            partial_reported_usd: partial_total,
+            daemon_priced_estimate_usd: daemon_total,
+            provisional_completion_cost_usd: provisional_known.then_some(provisional).flatten(),
+            unknown_cost,
+            process_lifetime_ms: lifetime,
+            active_work_ms: None,
+            active_work_coverage:
+                "unknown: launch-to-exit is process lifetime, and no native observation \
+                 distinguishes model-active time from a process paused awaiting verification or \
+                 the operator"
+                    .into(),
+            phase_ms,
+            accepted,
+            acceptance_evidence,
+        });
+    }
+    deliveries.sort_by(|a, b| (&a.repo, &a.task).cmp(&(&b.repo, &b.task)));
+    tasks_without_native_records.sort();
 
     let incorrect_reuse = pairs_out
         .iter()
@@ -1966,8 +2849,10 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         .collect();
     regressions.sort();
     let quality = QualitySummary {
-        interventions: None,
-        interventions_coverage: INTERVENTIONS_UNSUPPORTED.into(),
+        attention_hold_spans,
+        interventions_known: attention_hold_spans,
+        interventions_coverage: INTERVENTIONS_LOWER_BOUND.into(),
+        rework_spans,
         incorrect_reuse,
         regressions,
     };
@@ -1995,18 +2880,21 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         capture: idx.capture.clone(),
         invalid_records: idx.invalid.clone(),
         unresolved_records: unresolved,
+        // Author-exit and per-delivery cost are DERIVED as of evaluator version
+        // 3. What remains genuinely underived is named here, so its absence
+        // still cannot be read as a measured zero.
         unsupported: vec![
             UnsupportedDerivation {
-                derivation: "author_exit".into(),
-                status: "unsupported".into(),
-                reason: AUTHOR_EXIT_UNSUPPORTED.into(),
-                tracked_by: "TKT-bonik-vuruv-mivuh".into(),
+                derivation: "active_work_ms".into(),
+                status: "unknown".into(),
+                reason: ACTIVE_WORK_UNKNOWN.into(),
+                tracked_by: "no native observation exists; not scheduled".into(),
             },
             UnsupportedDerivation {
-                derivation: "delivery_cost_and_duration".into(),
-                status: "unsupported".into(),
-                reason: DELIVERY_COST_UNSUPPORTED.into(),
-                tracked_by: "TKT-bonik-vuruv-mivuh".into(),
+                derivation: "total_operator_interventions".into(),
+                status: "lower_bound".into(),
+                reason: INTERVENTIONS_LOWER_BOUND.into(),
+                tracked_by: "TKT-nonub-pugar-pilid".into(),
             },
         ],
         eligible,
@@ -2023,10 +2911,10 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         ambiguous_assessments,
         author_exit_unsupported,
         verified_reuse,
-        // Cannot be established in this version; see `AUTHOR_EXIT_UNSUPPORTED`.
-        author_exit_reuse: vec![],
+        author_exit_reuse,
         mechanism,
-        deliveries: frozen_task_scope(manifest),
+        deliveries,
+        tasks_without_native_records,
         quality,
         pairs: pairs_out,
     })
@@ -2035,6 +2923,13 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
 /// Renders a `Report` as human-readable text. JSON output should use
 /// `serde_json::to_string_pretty` directly on the `Report` for a byte-stable
 /// machine shape.
+fn opt_usd(v: Option<f64>) -> String {
+    match v {
+        Some(v) => format!("${v:.4}"),
+        None => "unknown".into(),
+    }
+}
+
 fn opt_rate(rate: Option<f64>) -> String {
     match rate {
         Some(r) => format!("{:.1}%", r * 100.0),
@@ -2179,18 +3074,59 @@ pub fn render(report: &Report) -> String {
         }
     }
     if !report.deliveries.is_empty() {
-        out.push_str("deliveries (scope only; cost/duration are UNSUPPORTED here):\n");
+        out.push_str("deliveries (reported cost ESTIMATES, not billed charges):\n");
         for d in &report.deliveries {
             let _ = writeln!(
                 out,
-                "  {}/{} [{}] cost_usd=unknown active_work_ms=unknown accepted=unknown ({})",
-                d.repo, d.task, d.enrollment, d.derivation_status
+                "  {}/{} [{}] completions={} failed={} launches={} exits={}",
+                d.repo,
+                d.task,
+                d.enrollment,
+                d.completions,
+                d.failed_completions,
+                d.launches,
+                d.exits
             );
+            let _ = writeln!(
+                out,
+                "    cost: reported={} coverage={} partial={} daemon_priced={} \
+                 provisional_completion={}",
+                opt_usd(d.reported_cost_estimate_usd),
+                d.cost_coverage,
+                opt_usd(d.partial_reported_usd),
+                opt_usd(d.daemon_priced_estimate_usd),
+                opt_usd(d.provisional_completion_cost_usd)
+            );
+            let _ = writeln!(
+                out,
+                "    time: process_lifetime_ms={:?} active_work_ms=unknown work_phases_ms={:?} \
+                 verification_ms={:?} attention_hold_ms={:?} queue_wait_ms={:?}",
+                d.process_lifetime_ms,
+                d.phase_ms.work_phases_ms,
+                d.phase_ms.verification_ms,
+                d.phase_ms.attention_hold_ms,
+                d.phase_ms.queue_wait_ms
+            );
+            let _ = writeln!(out, "    accepted={:?}", d.accepted);
+            for u in &d.unknown_cost {
+                let _ = writeln!(out, "    unknown cost: {u}");
+            }
         }
+    }
+    if !report.tasks_without_native_records.is_empty() {
+        let _ = writeln!(
+            out,
+            "frozen tasks with no native record at all: {}",
+            report.tasks_without_native_records.join(", ")
+        );
     }
     let _ = writeln!(
         out,
-        "quality: interventions=unknown incorrect_reuse={} regressions={}",
+        "quality: attention_hold_spans={} interventions_known={} rework_spans={} \
+         incorrect_reuse={} regressions={}",
+        report.quality.attention_hold_spans,
+        report.quality.interventions_known,
+        report.quality.rework_spans,
         report.quality.incorrect_reuse,
         report.quality.regressions.join(", ")
     );
