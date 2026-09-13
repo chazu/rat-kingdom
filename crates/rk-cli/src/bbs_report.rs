@@ -5242,14 +5242,7 @@ mod tests {
     /// completions/exits/usage alone dropped it entirely.
     #[test]
     fn a_generation_with_only_a_launch_event_is_still_an_enrolled_attempt() {
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-live".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-live");
         let spawned = json!({
             "id": "e1", "category": "event", "scope": "repo", "identity": "agent_spawned",
             "instance": CASTLE, "created_at": "2026-01-01T00:00:00Z",
@@ -5274,14 +5267,7 @@ mod tests {
     /// already accounted for and is counted as the attempt it is.
     #[test]
     fn a_relaunch_with_no_exit_yet_is_counted_as_a_further_attempt() {
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-relaunch".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-relaunch");
         let event = |id: &str, identity: &str, at: &str| {
             json!({
                 "id": id, "category": "event", "scope": "repo", "identity": identity,
@@ -5319,14 +5305,7 @@ mod tests {
     /// a validated capture the position decides.
     #[test]
     fn cumulative_segment_total_comes_from_persistence_position_not_observed_at() {
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-cost".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-cost");
         let usage = |id: &str, cost: f64, observed: &str| {
             usage_rec(
                 id,
@@ -5387,14 +5366,7 @@ mod tests {
     /// unordered capture must not manufacture a finality gap for it.
     #[test]
     fn a_single_row_segment_stays_final_under_unknown_order() {
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-one".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-one");
         let tuples = vec![
             usage_rec(
                 "u1",
@@ -5512,14 +5484,7 @@ mod tests {
         // OMITTED DENOMINATOR the previous version had: deliveries were derived
         // from the pairs that survived evaluation, so a frozen task with no
         // eligible source and no receipt vanished along with its accounting.
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-lonely".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-lonely");
         let report = compute(&m, &capture(vec![], Order::Unknown), &[]).unwrap();
         assert_eq!(report.eligible, 0, "no pairs at all");
         assert_eq!(report.deliveries.len(), 1, "the frozen task still appears");
@@ -5555,14 +5520,7 @@ mod tests {
     /// guessed into the sum.
     #[test]
     fn verification_ms_sums_only_additive_tagged_spans_and_counts_the_rest_as_legacy() {
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-verify".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-verify");
         // `from_durations` anchors `ended_at` at now and derives the two
         // earlier stamps, so a real additive span carries all three.
         let additive_span = span_full(
@@ -5606,10 +5564,8 @@ mod tests {
         );
     }
 
-    /// A task scope whose native records are all rejected. Used by the
-    /// malformed-record regressions to prove rejection is honest rather than
-    /// lossy.
-    fn cost_manifest(task: &str) -> Manifest {
+    /// A manifest whose frozen scope is exactly one task in `repo`/`batch-1`.
+    fn task_manifest(task: &str) -> Manifest {
         Manifest {
             consumer_tasks: vec![ConsumerTaskScope {
                 task: task.into(),
@@ -5787,7 +5743,7 @@ mod tests {
     /// tuple SCOPE and must stay supported.
     #[test]
     fn real_producer_shaped_spans_are_admitted_including_a_null_repo() {
-        let m = cost_manifest("TKT-dorod-sival-fumid");
+        let m = task_manifest("TKT-dorod-sival-fumid");
         let ready = span_full(
             "s-ready",
             json!({
@@ -5912,7 +5868,7 @@ mod tests {
             ),
         ];
 
-        let m = cost_manifest("TKT-span");
+        let m = task_manifest("TKT-span");
         for (span, expected) in cases {
             let id = span["id"].as_str().unwrap().to_string();
             let r = compute(&m, &capture(vec![span], Order::Unknown), &[]).unwrap();
@@ -5947,7 +5903,7 @@ mod tests {
     /// PARTIAL rather than being pooled into a provider total or discarded.
     #[test]
     fn a_matching_exit_state_is_not_a_final_cost_unless_coverage_says_final() {
-        let m = cost_manifest("TKT-cost");
+        let m = task_manifest("TKT-cost");
         let delivery_for = |coverage: &Value| -> DeliveryCost {
             // Exactly the state-only condition the old check accepted:
             // terminal result, observed exit, prior_state agreeing.
@@ -6086,14 +6042,7 @@ mod tests {
 
     #[test]
     fn cost_is_credited_when_a_segment_is_final_and_provider_reported() {
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-1");
         let tuples = vec![
             field(
                 usage_rec(
@@ -6135,14 +6084,7 @@ mod tests {
         // The last usage result said `paused`, but the exit's prior_state was
         // `running`: work happened after that result, so the reported amount
         // is partial, not final.
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-1");
         let tuples = vec![
             field(
                 usage_rec(
@@ -6180,14 +6122,7 @@ mod tests {
 
     #[test]
     fn cost_is_missing_when_no_final_usage_observation_exists() {
-        let m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let m = task_manifest("TKT-1");
         let tuples = vec![harness_result(
             "h1",
             "gen-1",
@@ -6205,14 +6140,7 @@ mod tests {
 
     #[test]
     fn reviewed_annotation_counts_resolved_evidence_and_reports_bad_evidence() {
-        let mut m = Manifest {
-            consumer_tasks: vec![ConsumerTaskScope {
-                task: "TKT-1".into(),
-                repo: "repo".into(),
-                batch: "batch-1".into(),
-            }],
-            ..manifest(vec![])
-        };
+        let mut m = task_manifest("TKT-1");
         m.eligible_pairs = vec![];
         let c = capture(vec![], Order::Unknown);
         let annotations = vec![ReviewedAnnotation {
