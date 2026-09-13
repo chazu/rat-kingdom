@@ -2663,6 +2663,12 @@ impl Supervisor {
             });
         }
 
+        // This launch registers no session of its own, so the predecessor's
+        // token has to be retired explicitly or it stands in for one: published
+        // below as this launch's `session`/`launched_at` off a watch belonging
+        // to the headless process, and still accepted as the owner of `name` by
+        // every late event that process has yet to emit.
+        self.fence_unobservable_session(&updated.name);
         let (launch_session, launch_time) = self.launch_identity(&updated.name);
         self.emit_event(
             &updated.repo_name,
@@ -2710,37 +2716,26 @@ impl Supervisor {
         session: rk_core::id::SpawnId,
         event: HarnessEvent,
     ) {
-        // Whether this event's own launch still owns `name`. A respawn mints
-        // a fresh session token the moment it registers (`track_session`),
-        // so a late event from a superseded launch reads `live == false`
-        // here for the rest of its life. Only this launch's own frozen
-        // per-session watch (`self.lock_attempts()`/`observe_final_usage`)
-        // may still be updated from a stale event below — nothing keyed on
-        // `name` may be resumed, mutated, claimed, or routed for it.
+        // Every name-keyed mutation below is made under a HELD [`own`] guard,
+        // so the ownership check and the mutation it authorises are one step. A
+        // respawn publishes its replacement token under the same lock, so it is
+        // ordered strictly before the check (and the stale launch mutates
+        // nothing) or strictly after the mutation — never between them, which
+        // is where a bare `live` boolean let a predecessor's event resume,
+        // fail, overwrite, claim or route its successor's record. Only this
+        // launch's own frozen per-session watch (`lock_attempts`,
+        // `observe_final_usage`) stays writable from a stale event.
         //
-        // No entry at all counts as live, not stale: `track_session` stamps
-        // `name`'s token before its harness can produce a single event, so a
-        // real predecessor/successor race always has SOME current token to
-        // compare against — an empty map means nothing has ever claimed
-        // ownership of `name` to be superseded from (an attach-mode launch
-        // that never calls `track_session`, or a caller driving this event
-        // directly without going through a launch path), not a stale event
-        // from a launch this map no longer remembers.
-        let live = self
-            .lock_session_tokens()
-            .get(name)
-            .is_none_or(|current| *current == session);
         // A harness that speaks again has resumed the turn it paused on.
         // `Completed`/`Exited` are excluded because they decide their own
-        // state below (a fresh pause, a completion, or a death). A stale
-        // launch's chatter must never resume a successor it no longer owns.
-        if live
-            && !matches!(
-                event,
-                HarnessEvent::Completed { .. } | HarnessEvent::Exited { .. }
-            )
-        {
-            self.resume_if_paused(name);
+        // state below (a fresh pause, a completion, or a death).
+        if !matches!(
+            event,
+            HarnessEvent::Completed { .. } | HarnessEvent::Exited { .. }
+        ) {
+            if let Some(_owned) = self.own(name, session) {
+                self.resume_if_paused(name);
+            }
         }
         match event {
             HarnessEvent::Started { session_id } => {
@@ -2749,14 +2744,13 @@ impl Supervisor {
                 if let Some(watch) = self.lock_attempts().get_mut(&session) {
                     watch.provider_session = session_id.clone();
                 }
-                if !live {
-                    // Stale predecessor Started: its provider session id is
-                    // already frozen on its own watch above. A late
-                    // handshake from a superseded launch must never
-                    // resume/overwrite the successor's `session_id`,
-                    // transport-outage, or recovery state.
+                // A superseded launch's late handshake reaches nothing past
+                // here: its provider session id is frozen on its own watch
+                // above, and it must never resume/overwrite the successor's
+                // `session_id`, transport-outage, or recovery state.
+                let Some(_owned) = self.own(name, session) else {
                     return;
-                }
+                };
                 let had_outage = self
                     .lock_registry()
                     .get(name)
@@ -2823,12 +2817,12 @@ impl Supervisor {
                         }
                     }
                 }
-                if !live {
-                    // Stale predecessor Usage: this launch's own watch is
-                    // updated above; it must never add to the successor's
-                    // running usage/cost total or consume its budget floor.
+                // A superseded launch's usage lands on its own watch above and
+                // nowhere else: it must never add to the successor's running
+                // usage/cost total or consume its budget floor.
+                let Some(_owned) = self.own(name, session) else {
                     return;
-                }
+                };
                 let updated = self.lock_registry().update(name, |r| {
                     r.usage.add(&usage);
                     // Incremental cost for harnesses that don't self-report
@@ -2856,17 +2850,19 @@ impl Supervisor {
                 cost_usd,
                 session_id,
             } => {
-                if !live {
-                    // Stale predecessor Completed: observed under its own
-                    // frozen watch (cost/usage only, via the same `!live`
-                    // path `observe_final_usage` already takes for a
-                    // superseded launch) — it must never claim completion
-                    // for `name`'s `CompletionState`, mutate the successor's
-                    // record, or route a completion/delivery on its behalf.
-                    self.observe_final_usage(session, 0.0, cost_usd, &usage, "unknown", false);
+                // Held for the whole disposition: the claim, the record write
+                // it authorises, and the routing that follows are one step. A
+                // superseded launch is observed under its own frozen watch
+                // (cost/usage only) and must never claim completion for
+                // `name`'s `CompletionState`, mutate the successor's record, or
+                // route a completion/delivery on its behalf.
+                let Some(_owned) = self.own(name, session) else {
+                    self.observe_final_usage(
+                        session, 0.0, cost_usd, &usage, "unknown", false, false,
+                    );
                     self.note_result(session, cost_usd.is_some());
                     return;
-                }
+                };
                 let diff = self.diff_summary_for(name);
                 // The claim is decided BEFORE the state write, because it is
                 // what the state write depends on: a clean turn that nothing
@@ -2948,6 +2944,7 @@ impl Supervisor {
                             &usage,
                             state,
                             completed_via_reconcile,
+                            true,
                         );
                         self.note_result(session, cost_usd.is_some());
                     }
@@ -3001,6 +2998,7 @@ impl Supervisor {
                             _ => "unknown",
                         },
                         claim.declared_done,
+                        true,
                     );
                     self.note_result(session, cost_usd.is_some());
                     if claim.publish {
@@ -3035,6 +3033,14 @@ impl Supervisor {
                     .map(|r| r.state)
                     .unwrap_or(AgentState::Failed);
 
+                // Held across this whole arm, so every change it makes under
+                // `name` — dropping the control handle, cancelling the managed
+                // verification, terminalizing the record, the recovery probe,
+                // and the withheld-turn flush/route at the bottom — is made
+                // under the same proof of ownership it was decided on. `live`
+                // is a readback of that proof, never a second lookup.
+                let owned = self.own(name, session);
+                let live = owned.is_some();
                 if live {
                     self.lock_controls().remove(name);
                     // The harness process behind this generation is provably
@@ -3116,14 +3122,13 @@ impl Supervisor {
                         self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
                     })
                 };
-                // Fenced to the session that actually died: a late `Exited`
-                // from a SUPERSEDED session (e.g. a continuation already
-                // resumed this name under a fresh session token before this
+                // A late `Exited` from a SUPERSEDED session (a continuation
+                // already resumed this name under a fresh token before this
                 // event was processed) must never write recovery state over
-                // whatever the active session already established
+                // whatever the active session established
                 // (TKT-01M0HNDJ7AS9F1A3W22FRCC63N — "a stale or late
                 // generation cannot overwrite the active generation").
-                if self.lock_session_tokens().get(name) == Some(&session) {
+                if live {
                     if let Ok(Some(record)) = &updated {
                         self.detect_post_commit_outage(name, record);
                     }
@@ -3183,7 +3188,6 @@ impl Supervisor {
                     // borrowing the successor's, and an exit with no watch at
                     // all reports unknown coverage rather than guessing.
                     let watch = self.attempt_watch(session);
-                    let live = self.lock_session_tokens().get(name) == Some(&session);
                     let coverage = match &watch {
                         Some(w) if w.saw_result && !w.usage_since_result => CostCoverage::Final,
                         // A result was reported but more model work followed
@@ -3228,14 +3232,14 @@ impl Supervisor {
                     // Retire only this launch's own watch.
                     self.lock_attempts().remove(&session);
                 }
-                // Fenced on `live`: `generation` alone cannot tell a stale
+                // Still under `owned`: `generation` alone cannot tell a stale
                 // predecessor's exit apart from the successor's, because a
                 // respawn keeps the same generation and only mints a fresh
-                // session token. Without this fence, a predecessor's late
-                // `Exited` could match a currently-PAUSED successor's own
-                // withheld `CompletionState` (same generation, `withheld:
-                // true`) and falsely flush/route its held-back turn as a
-                // failure — a completion the successor never earned.
+                // session token. Unfenced, a predecessor's late `Exited` could
+                // match a currently-PAUSED successor's own withheld
+                // `CompletionState` (same generation, `withheld: true`) and
+                // falsely flush/route its held-back turn as a failure — a
+                // completion the successor never earned.
                 if live {
                     if let Ok(Some(record)) = updated {
                         if self.flush_withheld_completion(name, generation) {
@@ -3250,6 +3254,7 @@ impl Supervisor {
                         }
                     }
                 }
+                drop(owned);
             }
             // Formerly dropped on the floor; now persisted as the agent's
             // transcript so the operator can `rk log` a run without --attach.
@@ -3260,17 +3265,17 @@ impl Supervisor {
             // `record_output_progress`/`record_reconnect_event` derive from
             // this text, is fenced on `live` below.
             HarnessEvent::AssistantText { text } => {
-                self.record_output_progress(name, "text", &text, true, live);
+                self.record_output_progress(name, session, "text", &text, true);
                 self.log
                     .append(name, spawn, crate::agent_log::LogEvent::Text { text });
             }
             HarnessEvent::ToolUse { name: tool } => {
-                self.record_output_progress(name, "tool", &tool, true, live);
+                self.record_output_progress(name, session, "tool", &tool, true);
                 self.log
                     .append(name, spawn, crate::agent_log::LogEvent::Tool { name: tool });
             }
             HarnessEvent::Retry { attempt, error } => {
-                self.record_reconnect_event(name, live);
+                self.record_reconnect_event(name, session);
                 self.log.append(
                     name,
                     spawn,
@@ -3299,9 +3304,9 @@ impl Supervisor {
                 // be appended onto the successor's `stderr_tail` (read back
                 // into crash diagnostics for the CURRENT generation) or
                 // extend the successor's liveness fingerprint.
-                if live {
+                if let Some(_owned) = self.own(name, session) {
                     let fingerprint = output_fingerprint("stderr", &text);
-                    let session = self.lock_session_tokens().get(name).copied();
+                    let session = Some(session);
                     let _ = self.lock_registry().update(name, |r| {
                         crate::agents::append_stderr_tail(&mut r.stderr_tail, &text);
                         if r.liveness.session != session {
@@ -3322,7 +3327,8 @@ impl Supervisor {
                 // whichever record currently holds `name`, so a stale
                 // launch's belated delivery report must not durably
                 // acknowledge under the successor's identity.
-                if live && envelope.durable {
+                let owned = envelope.durable.then(|| self.own(name, session)).flatten();
+                if owned.is_some() {
                     if let Some(record) = self.lock_registry().get(name) {
                         if let Err(error) = crate::steer::acknowledge(
                             &self.space,
@@ -3341,7 +3347,7 @@ impl Supervisor {
                 }
             }
             HarnessEvent::TransportFailure { outcome } => {
-                self.record_transport_outage(name, &outcome, live);
+                self.record_transport_outage(name, session, &outcome);
             }
         }
     }
@@ -3356,24 +3362,23 @@ impl Supervisor {
     /// the moment a fresh one is observed — see
     /// [`LivenessObservation::session`](crate::agents::LivenessObservation::session).
     ///
-    /// `live` must be `false` for an event whose own launch no longer owns
-    /// `name` (a superseded generation's late chatter) — such an event is
-    /// skipped entirely rather than feeding the successor's liveness
-    /// fingerprint, which would let a dead predecessor manufacture proof
-    /// that the CURRENT launch is still producing output.
+    /// Fenced on `session` still owning `name`: a superseded generation's late
+    /// chatter is skipped entirely rather than feeding the successor's liveness
+    /// fingerprint, which would let a dead predecessor manufacture proof that
+    /// the CURRENT launch is still producing output.
     fn record_output_progress(
         &self,
         name: &str,
+        session: rk_core::id::SpawnId,
         kind: &str,
         text: &str,
         resets_reconnect: bool,
-        live: bool,
     ) {
-        if !live {
+        let Some(_owned) = self.own(name, session) else {
             return;
-        }
+        };
         let now = Utc::now();
-        let session = self.lock_session_tokens().get(name).copied();
+        let session = Some(session);
         let fingerprint = output_fingerprint(kind, text);
         let _ = self.lock_registry().update_quiet(name, |r| {
             let mut changed = false;
@@ -3408,16 +3413,16 @@ impl Supervisor {
     /// needs an accurate count of, and retries are inherently rate-limited by
     /// the harness's own backoff, never per-token chatty.
     ///
-    /// `live` gates this the same way as [`record_output_progress`](Self::record_output_progress):
+    /// Fenced like [`record_output_progress`](Self::record_output_progress):
     /// a stale predecessor's own transport retries must not inflate the
     /// successor's reconnect count, which
     /// [`LivenessEvidence::reconnect_loop`](LivenessEvidence::reconnect_loop) reads as evidence
     /// about the CURRENT launch.
-    fn record_reconnect_event(&self, name: &str, live: bool) {
-        if !live {
+    fn record_reconnect_event(&self, name: &str, session: rk_core::id::SpawnId) {
+        let Some(_owned) = self.own(name, session) else {
             return;
-        }
-        let session = self.lock_session_tokens().get(name).copied();
+        };
+        let session = Some(session);
         let _ = self.lock_registry().update_quiet(name, |r| {
             if r.liveness.session != session {
                 r.liveness = crate::agents::LivenessObservation {
@@ -3644,17 +3649,30 @@ impl Supervisor {
     /// Emitted on launch/resume events so a launch can be joined to the
     /// `agent_final_usage`/`agent_exit` observations for the SAME launch —
     /// `spawn` alone cannot do that, because a respawn keeps it. Both are
-    /// `None` on a path that registers no session (an attach), which is
+    /// `None` on a path that registers no observable session (an attach),
     /// recorded as unobservable rather than filled with a fresh `now()` that
     /// would silently disagree with the watch.
+    ///
+    /// The WATCH decides that, not the token. An attach launch is fenced with a
+    /// token of its own ([`fence_unobservable_session`](Self::fence_unobservable_session))
+    /// so the predecessor's events stop reaching it, and that token has no
+    /// watch precisely because nothing will ever observe the launch. A token
+    /// whose watch belongs to some OTHER launch must never be published here —
+    /// that is how a headless predecessor's session and launch time used to be
+    /// reported as an attach launch's own.
     fn launch_identity(&self, name: &str) -> (Option<String>, Option<String>) {
-        let Some(session) = self.lock_session_tokens().get(name).copied() else {
-            return (None, None);
-        };
-        let launched_at = self
-            .attempt_watch(session)
-            .map(|w| w.launched_at.to_rfc3339());
-        (Some(session.to_string()), launched_at)
+        let watched = self
+            .lock_session_tokens()
+            .get(name)
+            .copied()
+            .and_then(|s| self.attempt_watch(s).map(|w| (s, w)));
+        match watched {
+            Some((session, watch)) => (
+                Some(session.to_string()),
+                Some(watch.launched_at.to_rfc3339()),
+            ),
+            None => (None, None),
+        }
     }
 
     /// The frozen attribution for one launch, or `None` when no watch
@@ -3691,6 +3709,7 @@ impl Supervisor {
         usage: &TokenUsage,
         state: &str,
         declared_done: bool,
+        live: bool,
     ) {
         let Some(watch) = self.attempt_watch(session) else {
             // A result for a launch we have no frozen attribution for. Better
@@ -3701,12 +3720,12 @@ impl Supervisor {
             );
             return;
         };
-        // Whether this result still belongs to the launch that holds the name.
-        // A superseded launch's delayed result must not be labelled with the
-        // successor's record state or priced off the successor's running total:
-        // the event's own provider figure is this launch's, everything read
-        // from the name-keyed `AgentRecord` is not.
-        let live = self.lock_session_tokens().get(&watch.name) == Some(&session);
+        // `live` comes from the caller's held ownership guard, not a second
+        // unsynchronised read that could disagree with the fence the record
+        // write was made under. A superseded launch's delayed result must not
+        // be labelled with the successor's record state or priced off the
+        // successor's running total: the event's own provider figure is this
+        // launch's, everything read from the name-keyed `AgentRecord` is not.
         // Three genuinely different situations, kept apart on purpose:
         //
         //  * this result carries a provider total -> that total, for THIS
@@ -5404,11 +5423,12 @@ impl Supervisor {
     fn record_transport_outage(
         &self,
         name: &str,
+        session: rk_core::id::SpawnId,
         outcome: &rk_harness::TransportOutcome,
-        live: bool,
     ) {
         let now = Utc::now();
-        if live {
+        let owned = self.own(name, session);
+        if owned.is_some() {
             let _ = self.lock_registry().update(name, |r| {
                 let attempts = r
                     .transport_outage
@@ -5427,6 +5447,7 @@ impl Supervisor {
                 });
             });
         }
+        drop(owned);
         // Cheap, safe default: a breaker that never received the threshold
         // config yet (bare/test supervisor) still counts failures — it just
         // never trips, since `record_failure`'s own zero-threshold guard
@@ -8292,6 +8313,66 @@ impl Supervisor {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
+    }
+
+    /// The `session_tokens` guard, HELD, as proof that `session` still owns
+    /// `name` — or `None`, holding nothing, when it has been superseded.
+    ///
+    /// Holding it is the point: it makes an ownership check and the name-keyed
+    /// mutation it authorises one step. A respawn publishes its replacement
+    /// token under this same lock ([`track_session`](Self::track_session), or
+    /// [`fence_unobservable_session`](Self::fence_unobservable_session) for a
+    /// launch that registers no session of its own), so every launch or
+    /// replacement transition is ordered strictly before the check or strictly
+    /// after the mutation — never between them, which is exactly where a bare
+    /// `live` boolean let a predecessor's event land on its successor's record.
+    /// Bind the guard (`let Some(_owned) = ...`); a bare `.is_some()` in an
+    /// `if` condition drops it before the block and proves nothing.
+    ///
+    /// An absent entry counts as OWNED: a launch stamps `name` before its
+    /// harness can speak, so an empty map means nothing ever claimed `name`
+    /// (a test driving events directly), not a launch this map forgot.
+    ///
+    /// LOCK ORDER: `session_tokens` first, then `registry`/`controls`/
+    /// `completions`; never the reverse, and no path takes `session_tokens`
+    /// while holding one of those. Nothing may re-enter `session_tokens` while
+    /// a guard is held — `std::sync::Mutex` is not reentrant — so
+    /// [`launch_identity`](Self::launch_identity),
+    /// [`gather_liveness_evidence`](Self::gather_liveness_evidence),
+    /// [`update_stuck_ceiling`](Self::update_stuck_ceiling) and
+    /// [`session_generation`](Self::session_generation) stay outside, and
+    /// [`observe_final_usage`](Self::observe_final_usage) takes the answer as
+    /// an argument instead of reading the map a second time.
+    fn own(
+        &self,
+        name: &str,
+        session: rk_core::id::SpawnId,
+    ) -> Option<std::sync::MutexGuard<'_, HashMap<String, rk_core::id::SpawnId>>> {
+        let tokens = self.lock_session_tokens();
+        tokens
+            .get(name)
+            .is_none_or(|current| *current == session)
+            .then_some(tokens)
+    }
+
+    /// Stamp a fresh, watch-less token for a launch that registers no
+    /// observable session of its own — an `--attach` respawn, whose process
+    /// lives in a herdr pane, produces no [`HarnessEvent`] stream and never
+    /// calls [`track_session`](Self::track_session).
+    ///
+    /// Replaces rather than removes, and both halves matter. Removing the entry
+    /// would read as OWNED in [`own`](Self::own), so every late event the dead
+    /// headless process still emits would go on mutating the record this attach
+    /// launch now holds. Keeping the predecessor's token would publish that
+    /// headless launch's native session — and borrow its [`AttemptWatch`] for a
+    /// launch time this launch never had — as THIS launch's identity, and would
+    /// let a grace timer armed for it match here. A token with no watch is what
+    /// [`launch_identity`](Self::launch_identity) reports as unobservable,
+    /// which is the honest answer for an attach launch.
+    fn fence_unobservable_session(&self, name: &str) -> rk_core::id::SpawnId {
+        let token = rk_core::id::SpawnId::new();
+        self.lock_session_tokens().insert(name.to_string(), token);
+        token
     }
 
     /// Register a freshly launched session's control handle under `name`,
