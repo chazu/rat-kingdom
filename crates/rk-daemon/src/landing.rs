@@ -17543,17 +17543,20 @@ checks: [
             "replaying the same prepared candidate must not re-execute the check"
         );
 
-        // Every check in the plan (the two cheap policy checks plus
-        // "verify") was credited by the first run's own `landing_gate_pass`
-        // for this exact candidate, so replay reuses all three.
+        // "verify" was credited by the first run's own `landing_gate_pass`
+        // for this exact candidate, so replay reuses it. The two cheap
+        // policy checks (landing-protected-paths/landing-diff-scope) are
+        // target-dependent — their command text never changes, so a cached
+        // proof says nothing about the target/policy that actually produced
+        // it (TKT-sibij-lilof-bimin) — so they always execute fresh, never
+        // reused, even on an exact-candidate replay like this one.
         let reuse_events = space
             .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
             .unwrap();
-        assert_eq!(reuse_events.len(), 3, "reuse events: {reuse_events:?}");
-        assert!(
-            reuse_events
-                .iter()
-                .all(|t| t.payload["reused_from"] == "landing_gate_pass"),
+        assert_eq!(reuse_events.len(), 1, "reuse events: {reuse_events:?}");
+        assert_eq!(reuse_events[0].payload["check"], "verify");
+        assert_eq!(
+            reuse_events[0].payload["reused_from"], "landing_gate_pass",
             "replay must credit the gate's own prior pass, not a managed verify proof: {reuse_events:?}"
         );
 
@@ -17758,15 +17761,16 @@ checks: [
             reuse_events.iter().all(|t| t.payload["check"] != "verify"),
             "verify must never be credited as reused once its command changed: {reuse_events:?}"
         );
-        // The two unchanged cheap checks still reuse — the fix must not cost
-        // the exact-match fast path anything.
+        // The two cheap policy checks (landing-protected-paths/
+        // landing-diff-scope) are target-dependent and always execute fresh
+        // (TKT-sibij-lilof-bimin), so neither is ever credited as reused —
+        // ordinary/unrelated "verify" reuse is what the fix must not cost
+        // anything, and there is none of it to reuse here since "verify"'s
+        // own command changed between the two calls.
         assert_eq!(
-            reuse_events
-                .iter()
-                .filter(|t| t.payload["reused_from"] == "landing_gate_pass")
-                .count(),
-            2,
-            "the two unrelated, unchanged checks must still reuse via landing_gate_pass: {reuse_events:?}"
+            reuse_events.len(),
+            0,
+            "the two target-dependent policy checks must never be credited as reused: {reuse_events:?}"
         );
     }
 
