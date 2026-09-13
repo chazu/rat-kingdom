@@ -2703,13 +2703,24 @@ impl Supervisor {
         session: rk_core::id::SpawnId,
         event: HarnessEvent,
     ) {
+        // Whether this event's own launch still owns `name`. A respawn mints
+        // a fresh session token the moment it registers (`track_session`),
+        // so a late event from a superseded launch reads `live == false`
+        // here for the rest of its life. Only this launch's own frozen
+        // per-session watch (`self.lock_attempts()`/`observe_final_usage`)
+        // may still be updated from a stale event below — nothing keyed on
+        // `name` may be resumed, mutated, claimed, or routed for it.
+        let live = self.lock_session_tokens().get(name) == Some(&session);
         // A harness that speaks again has resumed the turn it paused on.
         // `Completed`/`Exited` are excluded because they decide their own
-        // state below (a fresh pause, a completion, or a death).
-        if !matches!(
-            event,
-            HarnessEvent::Completed { .. } | HarnessEvent::Exited { .. }
-        ) {
+        // state below (a fresh pause, a completion, or a death). A stale
+        // launch's chatter must never resume a successor it no longer owns.
+        if live
+            && !matches!(
+                event,
+                HarnessEvent::Completed { .. } | HarnessEvent::Exited { .. }
+            )
+        {
             self.resume_if_paused(name);
         }
         match event {
@@ -2718,6 +2729,14 @@ impl Supervisor {
                 // keeps its own provider session instead of the successor's.
                 if let Some(watch) = self.lock_attempts().get_mut(&session) {
                     watch.provider_session = session_id.clone();
+                }
+                if !live {
+                    // Stale predecessor Started: its provider session id is
+                    // already frozen on its own watch above. A late
+                    // handshake from a superseded launch must never
+                    // resume/overwrite the successor's `session_id`,
+                    // transport-outage, or recovery state.
+                    return;
                 }
                 let had_outage = self
                     .lock_registry()
@@ -2785,6 +2804,12 @@ impl Supervisor {
                         }
                     }
                 }
+                if !live {
+                    // Stale predecessor Usage: this launch's own watch is
+                    // updated above; it must never add to the successor's
+                    // running usage/cost total or consume its budget floor.
+                    return;
+                }
                 let updated = self.lock_registry().update(name, |r| {
                     r.usage.add(&usage);
                     // Incremental cost for harnesses that don't self-report
@@ -2812,6 +2837,17 @@ impl Supervisor {
                 cost_usd,
                 session_id,
             } => {
+                if !live {
+                    // Stale predecessor Completed: observed under its own
+                    // frozen watch (cost/usage only, via the same `!live`
+                    // path `observe_final_usage` already takes for a
+                    // superseded launch) — it must never claim completion
+                    // for `name`'s `CompletionState`, mutate the successor's
+                    // record, or route a completion/delivery on its behalf.
+                    self.observe_final_usage(session, 0.0, cost_usd, &usage, "unknown", false);
+                    self.note_result(session, cost_usd.is_some());
+                    return;
+                }
                 let diff = self.diff_summary_for(name);
                 // The claim is decided BEFORE the state write, because it is
                 // what the state write depends on: a clean turn that nothing
@@ -2980,19 +3016,37 @@ impl Supervisor {
                     .map(|r| r.state)
                     .unwrap_or(AgentState::Failed);
 
-                self.lock_controls().remove(name);
-                // The harness process behind this generation is provably
-                // gone — clean exit, crash, or kill alike. Any `verify.run`
-                // execution it still has in flight will never be read by a
-                // caller that no longer exists, so its managed child must not
-                // keep running under the daemon alone
-                // (TKT-01M0PA6C5WYRWS757R1SS2F2GR).
-                self.cancel_managed_verification_for_agent(
-                    name,
-                    Some(spawn),
-                    "agent_terminal_death",
-                );
-                let updated = self.lock_registry().update(name, |r| {
+                if live {
+                    self.lock_controls().remove(name);
+                    // The harness process behind this generation is provably
+                    // gone — clean exit, crash, or kill alike. Any `verify.run`
+                    // execution it still has in flight will never be read by a
+                    // caller that no longer exists, so its managed child must not
+                    // keep running under the daemon alone
+                    // (TKT-01M0PA6C5WYRWS757R1SS2F2GR).
+                    //
+                    // Fenced on `live`, not just `spawn`: `spawn` is the
+                    // generation's stable id and does NOT change across a
+                    // respawn (see the `handle_event` doc comment), so a
+                    // stale predecessor's exit sharing the successor's
+                    // `spawn` would otherwise cancel the successor's own
+                    // in-flight managed verification.
+                    self.cancel_managed_verification_for_agent(
+                        name,
+                        Some(spawn),
+                        "agent_terminal_death",
+                    );
+                }
+                let updated = if !live {
+                    // A stale predecessor's exit is a true fact about that
+                    // launch, but `name` is already owned by a successor
+                    // launch: read-only, so its pid/state/crashed/result and
+                    // budget floor are left untouched and no `updated_at`
+                    // bump is recorded against a record this event didn't
+                    // change.
+                    Ok(self.lock_registry().get(name).cloned())
+                } else {
+                    self.lock_registry().update(name, |r| {
                     r.pid = None;
                     // A paused agent is live, but it is not mid-turn: its
                     // harness DID report, the result was merely withheld for
@@ -3040,7 +3094,8 @@ impl Supervisor {
                     // that never reports a `Completed` at all still lands its
                     // true cost/usage on the terminal record.
                     self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
-                });
+                    })
+                };
                 // Fenced to the session that actually died: a late `Exited`
                 // from a SUPERSEDED session (e.g. a continuation already
                 // resumed this name under a fresh session token before this
@@ -3153,33 +3208,49 @@ impl Supervisor {
                     // Retire only this launch's own watch.
                     self.lock_attempts().remove(&session);
                 }
-                if let Ok(Some(record)) = updated {
-                    if self.flush_withheld_completion(name, generation) {
-                        info!(
-                            agent = name,
-                            killed = code != Some(0),
-                            exit_code = ?code,
-                            "agent ended without ever running `rk done`; publishing its last \
-                             turn result as a failure"
-                        );
-                        self.route_completion(&record, true, false, diff);
+                // Fenced on `live`: `generation` alone cannot tell a stale
+                // predecessor's exit apart from the successor's, because a
+                // respawn keeps the same generation and only mints a fresh
+                // session token. Without this fence, a predecessor's late
+                // `Exited` could match a currently-PAUSED successor's own
+                // withheld `CompletionState` (same generation, `withheld:
+                // true`) and falsely flush/route its held-back turn as a
+                // failure — a completion the successor never earned.
+                if live {
+                    if let Ok(Some(record)) = updated {
+                        if self.flush_withheld_completion(name, generation) {
+                            info!(
+                                agent = name,
+                                killed = code != Some(0),
+                                exit_code = ?code,
+                                "agent ended without ever running `rk done`; publishing its last \
+                                 turn result as a failure"
+                            );
+                            self.route_completion(&record, true, false, diff);
+                        }
                     }
                 }
             }
             // Formerly dropped on the floor; now persisted as the agent's
             // transcript so the operator can `rk log` a run without --attach.
+            // The transcript append is generation-bound (keyed on `spawn`,
+            // which a respawn keeps), so a stale launch's own words remain a
+            // true, permanent part of that generation's log either way —
+            // only the CURRENT record's liveness/registry state, which
+            // `record_output_progress`/`record_reconnect_event` derive from
+            // this text, is fenced on `live` below.
             HarnessEvent::AssistantText { text } => {
-                self.record_output_progress(name, "text", &text, true);
+                self.record_output_progress(name, "text", &text, true, live);
                 self.log
                     .append(name, spawn, crate::agent_log::LogEvent::Text { text });
             }
             HarnessEvent::ToolUse { name: tool } => {
-                self.record_output_progress(name, "tool", &tool, true);
+                self.record_output_progress(name, "tool", &tool, true, live);
                 self.log
                     .append(name, spawn, crate::agent_log::LogEvent::Tool { name: tool });
             }
             HarnessEvent::Retry { attempt, error } => {
-                self.record_reconnect_event(name);
+                self.record_reconnect_event(name, live);
                 self.log.append(
                     name,
                     spawn,
@@ -3203,24 +3274,35 @@ impl Supervisor {
                 // chatter must not mask the loop it is reporting
                 // (`LivenessEvidence::reconnect_loop` vetoes stale-but-
                 // changing output for exactly this reason).
-                let fingerprint = output_fingerprint("stderr", &text);
-                let session = self.lock_session_tokens().get(name).copied();
-                let _ = self.lock_registry().update(name, |r| {
-                    crate::agents::append_stderr_tail(&mut r.stderr_tail, &text);
-                    if r.liveness.session != session {
-                        r.liveness = crate::agents::LivenessObservation {
-                            session,
-                            ..Default::default()
-                        };
-                    }
-                    if r.liveness.output_fingerprint != fingerprint {
-                        r.liveness.output_fingerprint = fingerprint;
-                        r.liveness.output_changed_at = Some(Utc::now());
-                    }
-                });
+                //
+                // Fenced on `live`: a stale launch's stderr text must never
+                // be appended onto the successor's `stderr_tail` (read back
+                // into crash diagnostics for the CURRENT generation) or
+                // extend the successor's liveness fingerprint.
+                if live {
+                    let fingerprint = output_fingerprint("stderr", &text);
+                    let session = self.lock_session_tokens().get(name).copied();
+                    let _ = self.lock_registry().update(name, |r| {
+                        crate::agents::append_stderr_tail(&mut r.stderr_tail, &text);
+                        if r.liveness.session != session {
+                            r.liveness = crate::agents::LivenessObservation {
+                                session,
+                                ..Default::default()
+                            };
+                        }
+                        if r.liveness.output_fingerprint != fingerprint {
+                            r.liveness.output_fingerprint = fingerprint;
+                            r.liveness.output_changed_at = Some(Utc::now());
+                        }
+                    });
+                }
             }
             HarnessEvent::ControlDelivered { envelope } => {
-                if envelope.durable {
+                // Fenced on `live`: the repo scope read here comes off
+                // whichever record currently holds `name`, so a stale
+                // launch's belated delivery report must not durably
+                // acknowledge under the successor's identity.
+                if live && envelope.durable {
                     if let Some(record) = self.lock_registry().get(name) {
                         if let Err(error) = crate::steer::acknowledge(
                             &self.space,
@@ -3239,7 +3321,7 @@ impl Supervisor {
                 }
             }
             HarnessEvent::TransportFailure { outcome } => {
-                self.record_transport_outage(name, &outcome);
+                self.record_transport_outage(name, &outcome, live);
             }
         }
     }
@@ -3253,7 +3335,23 @@ impl Supervisor {
     /// stale (respawned-over) session's evidence is discarded, not merged,
     /// the moment a fresh one is observed — see
     /// [`LivenessObservation::session`](crate::agents::LivenessObservation::session).
-    fn record_output_progress(&self, name: &str, kind: &str, text: &str, resets_reconnect: bool) {
+    ///
+    /// `live` must be `false` for an event whose own launch no longer owns
+    /// `name` (a superseded generation's late chatter) — such an event is
+    /// skipped entirely rather than feeding the successor's liveness
+    /// fingerprint, which would let a dead predecessor manufacture proof
+    /// that the CURRENT launch is still producing output.
+    fn record_output_progress(
+        &self,
+        name: &str,
+        kind: &str,
+        text: &str,
+        resets_reconnect: bool,
+        live: bool,
+    ) {
+        if !live {
+            return;
+        }
         let now = Utc::now();
         let session = self.lock_session_tokens().get(name).copied();
         let fingerprint = output_fingerprint(kind, text);
@@ -3289,7 +3387,16 @@ impl Supervisor {
     /// [`LivenessEvidence::reconnect_loop`](LivenessEvidence::reconnect_loop)
     /// needs an accurate count of, and retries are inherently rate-limited by
     /// the harness's own backoff, never per-token chatty.
-    fn record_reconnect_event(&self, name: &str) {
+    ///
+    /// `live` gates this the same way as [`record_output_progress`](Self::record_output_progress):
+    /// a stale predecessor's own transport retries must not inflate the
+    /// successor's reconnect count, which
+    /// [`LivenessEvidence::reconnect_loop`](LivenessEvidence::reconnect_loop) reads as evidence
+    /// about the CURRENT launch.
+    fn record_reconnect_event(&self, name: &str, live: bool) {
+        if !live {
+            return;
+        }
         let session = self.lock_session_tokens().get(name).copied();
         let _ = self.lock_registry().update_quiet(name, |r| {
             if r.liveness.session != session {
@@ -5267,25 +5374,34 @@ impl Supervisor {
     /// live->Failed state transition (and so the ordinary WIP release)
     /// exactly as any other crashed launch does; this only adds the typed,
     /// durable retry bookkeeping on top.
-    fn record_transport_outage(&self, name: &str, outcome: &rk_harness::TransportOutcome) {
+    ///
+    /// `live` gates only the per-record retry episode: a stale predecessor's
+    /// transport failure must never seed the successor's `transport_outage`
+    /// (a `detect_post_commit_outage`/respawn-sweep recovery INPUT keyed on
+    /// whichever record currently holds `name`), even though the failure
+    /// itself is a true, provider-wide fact — the breaker feed below stays
+    /// unconditional.
+    fn record_transport_outage(&self, name: &str, outcome: &rk_harness::TransportOutcome, live: bool) {
         let now = Utc::now();
-        let _ = self.lock_registry().update(name, |r| {
-            let attempts = r
-                .transport_outage
-                .as_ref()
-                .map(|o| o.attempts + 1)
-                .unwrap_or(1);
-            r.transport_outage = Some(crate::agents::TransportOutageState {
-                provider: outcome.provider.clone(),
-                class: outcome.class,
-                retryable: outcome.retryable,
-                attempts,
-                last_failure_at: now,
-                evidence: outcome.evidence.clone(),
-                ceiling_hit: false,
-                circuit_refused: false,
+        if live {
+            let _ = self.lock_registry().update(name, |r| {
+                let attempts = r
+                    .transport_outage
+                    .as_ref()
+                    .map(|o| o.attempts + 1)
+                    .unwrap_or(1);
+                r.transport_outage = Some(crate::agents::TransportOutageState {
+                    provider: outcome.provider.clone(),
+                    class: outcome.class,
+                    retryable: outcome.retryable,
+                    attempts,
+                    last_failure_at: now,
+                    evidence: outcome.evidence.clone(),
+                    ceiling_hit: false,
+                    circuit_refused: false,
+                });
             });
-        });
+        }
         // Cheap, safe default: a breaker that never received the threshold
         // config yet (bare/test supervisor) still counts failures — it just
         // never trips, since `record_failure`'s own zero-threshold guard
@@ -12505,6 +12621,28 @@ mod native_observation_tests {
         );
         // The successor's watch survives: a stale exit must not retire it.
         assert!(sup.attempt_watch(new).is_some());
+
+        // The defect Tunnel's review found: everything above only checked
+        // the OBSERVATION this stale exit produced, never whether it left
+        // the successor's own live record alone. Pre-fix, `r.state.is_live()`
+        // was read off the CURRENT (successor) record and unconditionally
+        // flipped to `Failed` — with `crashed`/`result` overwritten too,
+        // since the successor was `Running`, not `Paused`.
+        let record = sup.lock_registry().get("Nibble").unwrap().clone();
+        assert_eq!(
+            record.state,
+            AgentState::Running,
+            "a stale predecessor's exit must not fail the successor's still-live record"
+        );
+        assert!(
+            !record.crashed,
+            "a stale predecessor's exit must not mark the live successor crashed"
+        );
+        assert!(
+            record.result.is_none(),
+            "a stale predecessor's exit text must not overwrite the successor's result: {:?}",
+            record.result
+        );
     }
 
     /// The result half of the same defect. A stale RESULT had no observation
@@ -12553,6 +12691,320 @@ mod native_observation_tests {
             usage[0]["cost_usd"].is_null(),
             "9.75 is the successor's spend: {:?}",
             usage[0]["cost_usd"]
+        );
+
+        // The defect Tunnel's review found: the observation above was
+        // already fixed to omit the successor's total, but nothing asserted
+        // the successor's OWN record was left alone. Pre-fix, this stale
+        // result still ran `claim_completion` and the registry write against
+        // `name`, downgrading the successor's live `Running` state to
+        // `Paused` (no `task_done` for either launch) and overwriting its
+        // `result` with the predecessor's stale turn text.
+        let record = sup.lock_registry().get("Nibble").unwrap().clone();
+        assert_eq!(
+            record.state,
+            AgentState::Running,
+            "a stale predecessor's own turn boundary must not downgrade the \
+             successor's live state"
+        );
+        assert_eq!(
+            record.cost_usd, 9.75,
+            "the successor's running total must survive a stale predecessor's result"
+        );
+        assert!(
+            record.result.is_none(),
+            "a stale predecessor's turn text must not overwrite the successor's \
+             own result: {:?}",
+            record.result
+        );
+        assert!(
+            observations(&sup, "harness_result").is_empty(),
+            "a stale predecessor's result must never claim or route a completion \
+             for the successor"
+        );
+    }
+
+    /// The completion-ROUTING half of the same defect (severer than the
+    /// telemetry/state cases above): `generation` alone cannot tell a stale
+    /// predecessor's `Exited` apart from the live successor's, because a
+    /// respawn keeps the same generation and mints only a fresh session
+    /// token. Before the `live` fence, a late predecessor exit could flip a
+    /// still-`Paused` successor straight to `Failed` (previous test) and
+    /// then `flush_withheld_completion` would match it — same generation,
+    /// `withheld: true` — and publish the successor's held-back turn as a
+    /// completed failure it never earned.
+    #[test]
+    fn a_stale_predecessor_exit_must_not_fail_or_flush_the_successors_paused_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, old) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        // A successor takes over the SAME generation (an ordinary respawn).
+        let new = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), new);
+        sup.begin_launch("Nibble", new);
+
+        // The successor pauses mid-task: a turn boundary with no `rk done`.
+        sup.handle_event("Nibble", rec.created_at, spawn, new, completed(None, None));
+        assert_eq!(
+            sup.status("Nibble").unwrap().state,
+            AgentState::Paused,
+            "setup: the successor's own turn must withhold, not complete"
+        );
+
+        // Only now does the predecessor's exit arrive.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+
+        let record = sup.status("Nibble").unwrap();
+        assert_eq!(
+            record.state,
+            AgentState::Paused,
+            "a stale predecessor's exit must not fail the successor's still-live \
+             paused record"
+        );
+        assert!(
+            !record.crashed,
+            "the stale exit must not mark the live successor crashed"
+        );
+        assert!(
+            observations(&sup, "harness_result").is_empty(),
+            "a stale predecessor's exit must never flush/route the successor's \
+             withheld turn"
+        );
+    }
+
+    /// A respawn keeps the SAME generation (`spawn`/`SpawnId`), which is
+    /// exactly what `cancel_agent`'s own generation filter cannot tell apart
+    /// from a predecessor sharing it — only the session token changes. Before
+    /// the `live` fence, a stale predecessor's exit would cancel the
+    /// successor's own in-flight managed verification run out from under it.
+    #[test]
+    fn a_stale_predecessor_exit_must_not_cancel_the_successors_managed_verification() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, old) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        let new = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), new);
+        sup.begin_launch("Nibble", new);
+        sup.lock_registry()
+            .update("Nibble", |r| r.pid = Some(4242))
+            .unwrap();
+
+        let (_id, mut rx) = sup.verification.runs.register("Nibble", Some(spawn), "req-1");
+
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+
+        assert!(
+            rx.borrow_and_update().is_none(),
+            "a stale predecessor's exit must not cancel the successor's own \
+             managed verification"
+        );
+        let record = sup.lock_registry().get("Nibble").unwrap().clone();
+        assert_eq!(
+            record.pid,
+            Some(4242),
+            "the successor's pid must survive a stale predecessor exit"
+        );
+    }
+
+    /// `resume_if_paused` is called for every event but `Completed`/`Exited`
+    /// (which decide their own state), keyed only on `name` — the exact
+    /// "resumes the current name before checking [the launch token]" defect:
+    /// a superseded launch's late chatter must not resume a successor it no
+    /// longer owns.
+    #[test]
+    fn a_stale_predecessor_event_must_not_resume_a_paused_successor() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, old) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        let new = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), new);
+        sup.begin_launch("Nibble", new);
+        sup.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Paused)
+            .unwrap();
+
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::Started {
+                session_id: Some("provider-OLD-2".into()),
+            },
+        );
+
+        assert_eq!(
+            sup.status("Nibble").unwrap().state,
+            AgentState::Paused,
+            "a stale predecessor's chatter must not resume a successor it no \
+             longer owns"
+        );
+    }
+
+    /// The stale-launch fence also has to cover the chattier events
+    /// (`AssistantText`/`ToolUse`/`Retry`/`Stderr`) and the two side-channel
+    /// ones (`TransportFailure`/`ControlDelivered`) — all of them read or
+    /// write the CURRENT name-keyed record/liveness rather than anything
+    /// keyed on the event's own launch token, so each is just as exposed to
+    /// a superseded predecessor's late arrival as Started/Usage/Completed/
+    /// Exited are.
+    #[test]
+    fn stale_predecessor_liveness_transport_and_control_events_never_touch_the_successor() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, old) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        let new = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), new);
+        sup.begin_launch("Nibble", new);
+
+        // The successor establishes its own liveness baseline first.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            new,
+            HarnessEvent::AssistantText {
+                text: "successor working".into(),
+            },
+        );
+        let baseline = sup.status("Nibble").unwrap();
+        assert_eq!(baseline.liveness.session, Some(new));
+
+        // The predecessor's own chatter, retry, stderr, transport failure,
+        // and control delivery all arrive late.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::AssistantText {
+                text: "predecessor STALE text".into(),
+            },
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::ToolUse {
+                name: "stale-tool".into(),
+            },
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::Retry {
+                attempt: 9,
+                error: "stale retry".into(),
+            },
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::Stderr {
+                text: "stale stderr".into(),
+            },
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::TransportFailure {
+                outcome: rk_harness::TransportOutcome {
+                    provider: "claude".into(),
+                    class: rk_harness::TransportClass::Unavailable,
+                    retryable: true,
+                    generation: None,
+                    evidence: "stale outage".into(),
+                },
+            },
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::ControlDelivered {
+                envelope: ControlEnvelope::new(
+                    "stale-msg",
+                    "operator",
+                    "Nibble",
+                    "g-old",
+                    "g-old",
+                    "stale steer",
+                ),
+            },
+        );
+
+        let after = sup.status("Nibble").unwrap();
+        assert_eq!(
+            after.liveness.output_fingerprint, baseline.liveness.output_fingerprint,
+            "stale predecessor chatter must not overwrite the successor's liveness fingerprint"
+        );
+        assert_eq!(
+            after.liveness.output_changed_at, baseline.liveness.output_changed_at,
+            "stale predecessor chatter must not extend the successor's liveness timestamp"
+        );
+        assert_eq!(
+            after.liveness.reconnect_events, 0,
+            "a stale predecessor's Retry must not inflate the successor's reconnect count"
+        );
+        assert!(
+            after.stderr_tail.is_none(),
+            "a stale predecessor's stderr must not be appended to the successor's \
+             stderr_tail: {:?}",
+            after.stderr_tail
+        );
+        assert!(
+            after.transport_outage.is_none(),
+            "a stale predecessor's transport failure must not seed the successor's \
+             recovery input"
+        );
+        let acks = sup
+            .space
+            .scan(&rk_core::tuple::Pattern {
+                category: Some(rk_core::tuple::Category::Event),
+                identity: Some(crate::steer::CONTROL_ACK_IDENTITY.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            acks.is_empty(),
+            "a stale predecessor's control delivery must not durably acknowledge \
+             under the successor's identity: {acks:?}"
         );
     }
 
@@ -12650,6 +13102,61 @@ mod native_observation_tests {
             usage[0]["cost_usd"].as_f64().unwrap(),
             priced,
             "with a zero baseline the full priced total is honestly this launch's own"
+        );
+    }
+
+    /// The `Usage` half of the stale-launch fence: a delayed predecessor
+    /// token report must neither add to the successor's running
+    /// `usage`/`cost_usd` total nor drive an `enforce_budget` check off it —
+    /// both would let a dead launch spend the live successor's budget floor.
+    #[test]
+    fn a_stale_predecessor_usage_event_must_not_add_to_the_successors_total() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), Some("b"));
+        rec.name = "Nibble".into();
+        rec.model = Some("haiku".into());
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec.clone()).unwrap();
+        let spawn = rec.spawn_id();
+        let old = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), old);
+        sup.begin_launch("Nibble", old);
+
+        // A successor takes over and runs up a total of its own.
+        let new = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), new);
+        sup.begin_launch("Nibble", new);
+        sup.lock_registry()
+            .update("Nibble", |r| r.cost_usd = 1.25)
+            .unwrap();
+
+        // The predecessor's own usage arrives late.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            old,
+            HarnessEvent::Usage {
+                usage: TokenUsage {
+                    input: 100_000,
+                    output: 100_000,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let record = sup.lock_registry().get("Nibble").unwrap().clone();
+        assert_eq!(
+            record.cost_usd, 1.25,
+            "a stale predecessor's usage must not add to the successor's running cost"
+        );
+        assert_eq!(
+            record.usage.total(),
+            0,
+            "a stale predecessor's usage must not accumulate onto the successor's total"
         );
     }
 
