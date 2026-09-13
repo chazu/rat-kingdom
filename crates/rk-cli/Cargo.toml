@@ -33,6 +33,11 @@ libc.workspace = true
 ratatui.workspace = true
 
 [dev-dependencies]
+# The BBS capture tests build the daemon's `Space` themselves so a test-only
+# telemetry write fault can be injected into a REAL daemon (see
+# `bbs_capture_export_cli.rs`).
+rk-ledger.workspace = true
+rk-space.workspace = true
 tempfile = "3"
 
 [lints]

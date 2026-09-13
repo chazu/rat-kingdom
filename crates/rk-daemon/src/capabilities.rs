@@ -68,7 +68,10 @@ const GROOMER_CLOSE: MethodPolicy = MethodPolicy {
 /// non-operator, even if a dispatch arm is added elsewhere.
 pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
     Some(match method {
-        "bbs.brief" | "bbs.show" | "ping" | "status" | "space.scan" | "space.rd" | "repo.list"
+        // `bbs.export` is a bounded READ of the caller's own repository; the
+        // handler refuses a foreign scope. It authors nothing.
+        "bbs.brief" | "bbs.show" | "bbs.export" | "ping" | "status" | "space.scan" | "space.rd"
+        | "repo.list"
         | "repo.get" | "agent.status" | "agent.log" | "agent.progress" => ORDINARY_READ_ONLY,
         "space.out" => ORDINARY_SELF_DONE,
         "repo.onboard.inspect" => ORDINARY_ONBOARDER,

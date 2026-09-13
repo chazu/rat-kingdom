@@ -47,10 +47,160 @@ pub fn is_assessment(tuple: &Tuple) -> bool {
         && tuple.payload["bbs_kind"] == "assessment"
 }
 
+/// A daemon-authored record that a bounded selection of sources was PREPARED
+/// for one context (`spawn`, `resume`, `recovery` or `brief`).
+///
+/// An exposure is an opportunity, never evidence of delivery to a model,
+/// reading, comprehension or benefit. A spawn that later fails to launch still
+/// leaves a prepared exposure behind: join native lifecycle evidence before
+/// counting it as an active consumer.
+pub fn is_exposure(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "exposure"
+}
+
+/// A daemon-authored record that an authenticated caller's explicit `bbs show`
+/// request for one source was served. Requested, not comprehended.
+pub fn is_open(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "open"
+}
+
+/// A daemon-authored record that a telemetry capture FAILED, so the absence of
+/// an exposure/open record for that moment is known-missing rather than known-
+/// negative. The read or launch it describes still succeeded.
+pub fn is_telemetry_gap(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "telemetry_gap"
+}
+
+/// A daemon-authored observation of the FINAL provider-reported usage/cost for
+/// one `(spawn, session)` attempt.
+///
+/// Distinct from the `harness_result` a generation's `rk done` routes: that is
+/// task-completion evidence and may carry a provisional cost, because a
+/// provider can report a different total for the same query afterwards. Never
+/// sum these across results of one query — see `cost_basis`.
+pub fn is_agent_final_usage(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "agent_final_usage"
+}
+
+/// A daemon-authored observation that the harness PROCESS for one
+/// `(spawn, session)` attempt actually exited.
+///
+/// Completion is not exit: the `Completed` handler returns while the OS
+/// process is still alive. Author-terminal claims must join this, never a
+/// `harness_result`.
+pub fn is_agent_exit(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && tuple.lifecycle == Lifecycle::Furniture
+        && tuple.payload["bbs_kind"] == "agent_exit"
+}
+
+/// How a `cost_usd` on an [`is_agent_final_usage`] record was arrived at.
+///
+/// These are REPORTED ESTIMATES, not billed charges, and the variants must
+/// never be pooled into one total: a provider segment total and a daemon-side
+/// price multiplication are different measurements of different things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostBasis {
+    /// The provider's own last reported total for one proven session segment.
+    /// Cumulative WITHIN a query: take the last, never the sum.
+    ProviderReportedSegmentTotal,
+    /// The daemon priced `TokenUsage` increments itself because the harness
+    /// does not self-report USD. An estimate of an estimate.
+    DaemonPricedIncrements,
+    /// No final usage was supplied. `cost_usd` is null and stays null — an
+    /// unknown total is reported as unknown, never manufactured as zero.
+    Unknown,
+}
+
+impl CostBasis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderReportedSegmentTotal => "provider_reported_segment_total",
+            Self::DaemonPricedIncrements => "daemon_priced_increments",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Every `bbs_kind` the daemon authors as measurement metadata rather than as
+/// peer-visible content. These are observations ABOUT collaboration, never
+/// collaboration: they must not reach a briefing, a `bbs show` thread, or any
+/// surface a peer or the King reads as a useful finding.
+pub fn is_telemetry(tuple: &Tuple) -> bool {
+    is_exposure(tuple)
+        || is_open(tuple)
+        || is_telemetry_gap(tuple)
+        || is_agent_final_usage(tuple)
+        || is_agent_exit(tuple)
+}
+
+/// Identity prefixes reserved for daemon-authored records. An agent caller
+/// must never be able to mint one through the generic tuple-write path — BBS
+/// read authorization is not authority to author arbitrary telemetry.
+pub const RESERVED_IDENTITY_PREFIXES: &[&str] = &[
+    "bbs-question-",
+    "bbs-answer-",
+    "bbs-accept-",
+    "bbs-finding-",
+    "bbs-reuse-",
+    "bbs-assessment-",
+    "bbs-exposure-",
+    "bbs-open-",
+    "bbs-telemetry-gap-",
+    // No trailing dash: these identities are written bare, and `starts_with`
+    // must refuse the bare form as well as any future suffixed variant.
+    "bbs-agent-final-usage",
+    "bbs-agent-exit",
+];
+
+/// The four contexts in which a bounded selection of sources is prepared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposureSurface {
+    /// A first launch of an agent generation.
+    Spawn,
+    /// A resume of an existing generation (same `SpawnId`).
+    Resume,
+    /// A continuation after a transport outage took down a prior harness.
+    Recovery,
+    /// An explicit `rk bbs brief` read by an authenticated caller.
+    Brief,
+}
+
+impl ExposureSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Resume => "resume",
+            Self::Recovery => "recovery",
+            Self::Brief => "brief",
+        }
+    }
+}
+
+/// Whether a telemetry capture succeeded for the work that produced this
+/// result. Attached to a briefing response so a caller can see that its read
+/// succeeded while its coverage did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TelemetryStatus {
+    Recorded,
+    Failed,
+}
+
 /// Receipt/assessment/telemetry records must never crowd findings out of
 /// discovery views such as `bbs brief`.
 pub fn is_excluded_from_discovery(tuple: &Tuple) -> bool {
-    is_reuse(tuple) || is_assessment(tuple)
+    is_reuse(tuple) || is_assessment(tuple) || is_telemetry(tuple)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +225,17 @@ pub struct Briefing {
     pub since: Option<u64>,
     pub entries: Vec<BriefingEntry>,
     pub omitted: usize,
+    /// Whether the daemon durably recorded that this exact selection was
+    /// prepared. A failed capture never fails the read: the briefing is still
+    /// returned and still correct, but its coverage is reported as missing so
+    /// a later report counts it as unknown rather than as no-exposure.
+    /// `None` on a briefing computed outside a capture context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetryStatus>,
+    /// The exposure record this selection was captured as, when one was
+    /// written. Lets a caller or test join a rendered briefing to its record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<String>,
 }
 
 impl Briefing {
@@ -114,6 +275,9 @@ impl Briefing {
         }
         if self.omitted > 0 {
             let _ = writeln!(out, "{} more relevant posts omitted; narrow with --area or increase --limit (per category).", self.omitted);
+        }
+        if self.telemetry == Some(TelemetryStatus::Failed) {
+            out.push_str("Telemetry coverage for this briefing was NOT recorded; the briefing itself is unaffected.\n");
         }
         let _ = writeln!(out, "Read a source: `rk bbs show <id>`. Refresh at a work checkpoint: `rk bbs brief --since {}`. Updated marks writes/reinforcements; this bounded view is not a complete change log.", self.cursor);
         out

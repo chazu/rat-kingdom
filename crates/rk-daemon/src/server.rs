@@ -3257,7 +3257,22 @@ impl Daemon {
                             .map_err(|e| e.to_string())
                     });
                 reply(match result {
-                    Ok(briefing) => Response::ok(id, json!(briefing)),
+                    Ok(mut briefing) => {
+                        // The selection is captured only AFTER it was computed
+                        // successfully, and a capture failure is reported on
+                        // the briefing rather than raised: an explicit read
+                        // must not start failing because telemetry did.
+                        let capture = crate::bbs::record_exposure(
+                            &self.space,
+                            &self.castle,
+                            rk_core::bbs::ExposureSurface::Brief,
+                            &self.consumer_binding(&req.caller),
+                            &briefing,
+                        );
+                        briefing.telemetry = Some(capture.status);
+                        briefing.exposure = capture.record;
+                        Response::ok(id, json!(briefing))
+                    }
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
                 })
             }
@@ -3267,7 +3282,46 @@ impl Daemon {
                     .ok_or_else(|| "tuple id required".to_string())
                     .and_then(|id| crate::bbs::show(&self.space, id).map_err(|e| e.to_string()));
                 reply(match result {
-                    Ok(tuple) => Response::ok(id, tuple),
+                    Ok(mut post) => {
+                        // Only a request that was actually SERVED is recorded:
+                        // a lookup that errored above never reaches here, so a
+                        // failed read never manufactures an open.
+                        let capture =
+                            serde_json::from_value::<rk_core::tuple::Tuple>(post["tuple"].clone())
+                                .map(|source| {
+                                    crate::bbs::record_open(
+                                        &self.space,
+                                        &self.castle,
+                                        &self.consumer_binding(&req.caller),
+                                        &source,
+                                    )
+                                })
+                                .unwrap_or_else(|_| crate::bbs::Capture::failed());
+                        post["telemetry"] = json!(capture.status);
+                        post["open"] = json!(capture.record);
+                        Response::ok(id, post)
+                    }
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.export" => {
+                let result =
+                    parse_params::<crate::bbs::ExportParams>(&req.params).and_then(|params| {
+                        // A worker may capture only its own repository; the
+                        // operator may name any. Export is a read of a whole
+                        // scope, so this is enforced here rather than left to
+                        // the per-record checks the write path uses.
+                        if let Some(record) = self.supervisor.status(&req.caller) {
+                            if record.repo_name != params.repo {
+                                return Err(
+                                    "export is limited to the agent's assigned repository".into()
+                                );
+                            }
+                        }
+                        crate::bbs::export(&self.space, &params).map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(export) => Response::ok(id, export),
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
                 })
             }
@@ -10652,6 +10706,26 @@ impl Daemon {
         }
     }
 
+    /// The daemon's own authenticated view of who a read was served to.
+    ///
+    /// Derived from the supervisor registry, never from anything the caller
+    /// sends: an agent cannot claim to be another generation, and an operator
+    /// or unregistered caller is recorded as explicitly unbound rather than
+    /// attributed to whoever happens to share its name.
+    fn consumer_binding(&self, caller: &str) -> crate::bbs::ConsumerBinding {
+        if caller.is_empty() || caller == "operator" {
+            return crate::bbs::ConsumerBinding::operator();
+        }
+        match self.supervisor.status(caller) {
+            Some(record) => crate::bbs::ConsumerBinding::agent(
+                &record.name,
+                &record.spawn_id().to_string(),
+                record.task.as_deref(),
+            ),
+            None => crate::bbs::ConsumerBinding::operator(),
+        }
+    }
+
     fn handle_out(&self, req: Request) -> Response {
         let mut params: OutParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -10670,23 +10744,21 @@ impl Daemon {
                 payload.insert("spawn".into(), json!(record.spawn_id()));
             }
         }
+        // Telemetry prefixes are in this list too: `bbs.brief`/`bbs.show` are
+        // granted to every agent, and read authorization must not become
+        // authority to author the measurement records about those reads.
         if is_agent
             && (params.payload.get("bbs_kind").is_some()
-                || [
-                    "bbs-question-",
-                    "bbs-answer-",
-                    "bbs-accept-",
-                    "bbs-finding-",
-                    "bbs-reuse-",
-                    "bbs-assessment-",
-                ]
-                .iter()
-                .any(|prefix| params.identity.starts_with(prefix)))
+                || rk_core::bbs::RESERVED_IDENTITY_PREFIXES
+                    .iter()
+                    .any(|prefix| params.identity.starts_with(prefix))
+                || params.identity == "bbs-open"
+                || params.identity == "bbs-telemetry-gap")
         {
             return Response::err(
                 req.id,
                 codes::FORBIDDEN,
-                "BBS lifecycle records must use rk bbs ask/answer/accept",
+                "BBS lifecycle and telemetry records are daemon-authored; use rk bbs ask/answer/accept",
             );
         }
         if is_agent && params.category == Category::Artifact && params.identity == "review" {
