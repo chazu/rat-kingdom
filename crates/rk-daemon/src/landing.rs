@@ -15568,21 +15568,42 @@ checks: [
     /// the durable marker, not on the pure helper's arithmetic.
     #[tokio::test]
     async fn shipped_default_policy_paces_the_replacement_within_its_jitter_band() {
-        let home = tempfile::tempdir().unwrap();
-        let layout = Layout::at(home.path());
-        write_broken_review_workflow(&layout);
-        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
-        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
-
         // Jitter at both ends of the band, on two independent runs of the
         // real dispatch path: the floor is the un-jittered backoff and the
         // ceiling is exactly `jitter_pct` above it. Nothing outside that
         // band is reachable, which is what "jitter within configured bounds"
         // means for an operator reading the policy.
+        //
+        // Each pass gets its own repo, home/layout, and Space — a fully
+        // independent candidate, not just an independent clock — because
+        // both the reviewer's agent-registry record and its `rat/<agent>/…`
+        // branch outlive the pass: the retry reviewer this loop dispatches
+        // finalizes its registry record (Running -> terminal) on a
+        // background task independent of `route_verdict`'s own future, so
+        // aborting that future below is no guarantee the record has settled
+        // before the next pass starts, and a dead-before-verdict reviewer's
+        // branch is never cleaned up (it never lands). Sharing either the
+        // repo or the home across passes let a leftover branch or a
+        // still-"Running" registry record from the first pass collide with
+        // the second pass's own dispatch — both passes spawn against the
+        // identical literal task title `"review"` from
+        // `write_broken_review_workflow` and the same small fixed rat-name
+        // pool, so a shared repo reliably collides on the reused agent's
+        // `rat/<name>/review` branch, and a shared home could additionally
+        // race the duplicate-task-in-flight guard (`Supervisor::spawn`'s
+        // `(repo, task)` check). Either one could silently swallow the
+        // second pass's replacement reviewer and hang `wait_for_spawn_count`
+        // until its timeout. Fully independent passes make both collisions
+        // structurally impossible rather than timing-dependent.
         for (jitter_unit, expected) in [
             (0.0, Duration::from_secs(30)),
             (1.0, Duration::from_secs(36)),
         ] {
+            let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+            let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+            let home = tempfile::tempdir().unwrap();
+            let layout = Layout::at(home.path());
+            write_broken_review_workflow(&layout);
             let space = Space::open_in_memory().unwrap();
             let clock = FakeSchedule::new(jitter_unit);
             let pipeline = Arc::new(
