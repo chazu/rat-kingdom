@@ -716,11 +716,11 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
     let mut assessment_by_receipt: BTreeMap<String, Vec<(usize, &Value)>> = BTreeMap::new();
     for (idx, t) in capture.tuples.iter().enumerate() {
         if is_authoritative_assessment(t) {
-            let receipt = t["payload"]["receipt"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            assessment_by_receipt.entry(receipt).or_default().push((idx, t));
+            let receipt = t["payload"]["receipt"].as_str().unwrap_or("").to_string();
+            assessment_by_receipt
+                .entry(receipt)
+                .or_default()
+                .push((idx, t));
         }
     }
     let mut prepared: BTreeSet<(String, String)> = BTreeSet::new();
@@ -765,8 +765,7 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             excluded.push(Excluded {
                 pair: pair.id.clone(),
                 reason: "duplicate".into(),
-                detail: "identical source/consumer_task/consumer_generation already counted"
-                    .into(),
+                detail: "identical source/consumer_task/consumer_generation already counted".into(),
             });
             continue;
         }
@@ -816,7 +815,9 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         // claim for this pair — never silently accepted.
         let mut claim: Option<&Value> = None;
         let mut claim_reject: Option<(&'static str, String)> = None;
-        if let Some(candidates) = reuse_by_source_task.get(&(pair.source.clone(), pair.consumer_task.clone())) {
+        if let Some(candidates) =
+            reuse_by_source_task.get(&(pair.source.clone(), pair.consumer_task.clone()))
+        {
             for c in candidates {
                 if c["scope"] != pair.repo {
                     claim_reject.get_or_insert((
@@ -880,7 +881,9 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
         }
 
         let review = review_by_pair.get(pair.id.as_str());
-        let claimed_outcome = claim.and_then(|c| c["payload"]["outcome"].as_str()).map(str::to_string);
+        let claimed_outcome = claim
+            .and_then(|c| c["payload"]["outcome"].as_str())
+            .map(str::to_string);
         let claim_evidence = claim.and_then(|c| c["id"].as_str()).map(str::to_string);
         let claim_created = claim.and_then(|c| c["created_at"].as_str().and_then(parse_rfc3339));
 
@@ -896,7 +899,11 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
                     .iter()
                     .filter(|(_, a)| {
                         a["scope"] == pair.repo
-                            && evidence_resolves_in_repo(&a["payload"]["evidence"], &by_id, &pair.repo)
+                            && evidence_resolves_in_repo(
+                                &a["payload"]["evidence"],
+                                &by_id,
+                                &pair.repo,
+                            )
                     })
                     .copied()
                     .collect();
@@ -928,18 +935,19 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
             }
         }
 
-        let coverage_status = if prepared.contains(&(pair.source.clone(), pair.consumer_generation.clone())) {
-            "prepared".to_string()
-        } else {
-            match review.map(|r| &r.coverage) {
-                Some(Coverage::Prepared { .. }) => "prepared".to_string(),
-                Some(Coverage::NotPrepared { .. }) => "not_prepared".to_string(),
-                _ => {
-                    unknown_coverage.push(pair.id.clone());
-                    "unknown".to_string()
+        let coverage_status =
+            if prepared.contains(&(pair.source.clone(), pair.consumer_generation.clone())) {
+                "prepared".to_string()
+            } else {
+                match review.map(|r| &r.coverage) {
+                    Some(Coverage::Prepared { .. }) => "prepared".to_string(),
+                    Some(Coverage::NotPrepared { .. }) => "not_prepared".to_string(),
+                    _ => {
+                        unknown_coverage.push(pair.id.clone());
+                        "unknown".to_string()
+                    }
                 }
-            }
-        };
+            };
         let opened = opened_set.contains(&(pair.source.clone(), pair.consumer_generation.clone()));
 
         let mut author_terminal = false;
@@ -995,10 +1003,19 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
     }
 
     let eligible = sorted_pairs.len();
-    let presented = pairs_out.iter().filter(|p| p.coverage_status == "prepared").count();
+    let presented = pairs_out
+        .iter()
+        .filter(|p| p.coverage_status == "prepared")
+        .count();
     let opened = pairs_out.iter().filter(|p| p.opened).count();
-    let claimed = pairs_out.iter().filter(|p| p.claimed_outcome.is_some()).count();
-    let assessed = pairs_out.iter().filter(|p| p.assessed_verdict.is_some()).count();
+    let claimed = pairs_out
+        .iter()
+        .filter(|p| p.claimed_outcome.is_some())
+        .count();
+    let assessed = pairs_out
+        .iter()
+        .filter(|p| p.assessed_verdict.is_some())
+        .count();
 
     let mut outcome_classes = OutcomeClasses::default();
     for p in &pairs_out {
@@ -1033,9 +1050,15 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
                 && p.assessed_verdict.as_deref() == Some("verified")
         }) {
             verified_used_or_adapted += 1;
-        } else if ps.iter().any(|p| p.claimed_outcome.as_deref() == Some("confirmed")) {
+        } else if ps
+            .iter()
+            .any(|p| p.claimed_outcome.as_deref() == Some("confirmed"))
+        {
             confirmed_tasks += 1;
-        } else if ps.iter().any(|p| p.claimed_outcome.as_deref() == Some("rejected")) {
+        } else if ps
+            .iter()
+            .any(|p| p.claimed_outcome.as_deref() == Some("rejected"))
+        {
             rejected_tasks += 1;
         }
     }
@@ -1090,7 +1113,10 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
     };
 
     // Cost/duration per accepted delivery, keyed by distinct consumer task.
-    let mut distinct_tasks: BTreeSet<&str> = sorted_pairs.iter().map(|p| p.consumer_task.as_str()).collect();
+    let mut distinct_tasks: BTreeSet<&str> = sorted_pairs
+        .iter()
+        .map(|p| p.consumer_task.as_str())
+        .collect();
     distinct_tasks.retain(|t| !t.is_empty());
     let mut deliveries = Vec::new();
     for task in distinct_tasks {
@@ -1250,10 +1276,7 @@ pub fn compute(manifest: &Manifest, capture: &TupleCapture, reviews: &[Review]) 
 /// `serde_json::to_string_pretty` directly on the `Report` for a byte-stable
 /// machine shape.
 pub fn render(report: &Report) -> String {
-    let mut out = format!(
-        "## Stigmergy evidence report: {}\n\n",
-        report.experiment_id
-    );
+    let mut out = format!("## Stigmergy evidence report: {}\n\n", report.experiment_id);
     let _ = writeln!(
         out,
         "eligible={} excluded={} presented={} opened={} claimed={} assessed={}",
@@ -1412,7 +1435,14 @@ mod tests {
         })
     }
 
-    fn reuse(id: &str, source: &str, task: &str, spawn: &str, outcome: &str, created: &str) -> Value {
+    fn reuse(
+        id: &str,
+        source: &str,
+        task: &str,
+        spawn: &str,
+        outcome: &str,
+        created: &str,
+    ) -> Value {
         json!({
             "id": id,
             "category": "artifact",
@@ -1535,7 +1565,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
             lifecycle_terminal("hr1", "author-gen", "TKT-source", "2026-01-01T12:00:00Z"),
         ];
@@ -1564,7 +1601,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -1583,7 +1627,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
             // Terminal event for a DIFFERENT generation than the source's author.
             lifecycle_terminal("hr1", "someone-else", "TKT-other", "2026-01-01T12:00:00Z"),
@@ -1600,7 +1651,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
             // Exit happens AFTER the reuse it's supposed to precede.
             lifecycle_terminal("hr1", "author-gen", "TKT-source", "2026-01-05T00:00:00Z"),
@@ -1617,7 +1675,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "confirmed", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "confirmed",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -1677,7 +1742,14 @@ mod tests {
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
             // Written by a different generation than the frozen pair names.
-            reuse("r1", "src-1", "TKT-1", "gen-OTHER", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-OTHER",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
         ];
         let c = capture(tuples, Order::Unknown);
         let r = compute(&m, &c, &[]).unwrap();
@@ -1691,7 +1763,14 @@ mod tests {
         let tuples = vec![
             // Source postdates the reuse it supposedly informed.
             finding("src-1", "author-gen", "2026-02-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
         ];
         let c = capture(tuples, Order::Unknown);
         let r = compute(&m, &c, &[]).unwrap();
@@ -1703,7 +1782,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "unsupported", "2026-01-03T00:00:00Z"),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -1720,7 +1806,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -1765,12 +1858,33 @@ mod tests {
             },
         ];
         let mut tuples = vec![];
-        for (src, task, gen) in [("src-1", "TKT-1", "gen-1"), ("src-2", "TKT-2", "gen-2"), ("src-3", "TKT-3", "gen-3")] {
+        for (src, task, gen) in [
+            ("src-1", "TKT-1", "gen-1"),
+            ("src-2", "TKT-2", "gen-2"),
+            ("src-3", "TKT-3", "gen-3"),
+        ] {
             tuples.push(finding(src, "author-gen", "2026-01-01T00:00:00Z"));
-            tuples.push(reuse(&format!("r-{src}"), src, task, gen, "adapted", "2026-01-02T00:00:00Z"));
-            tuples.push(assessment(&format!("a-{src}"), &format!("r-{src}"), "verified", "2026-01-03T00:00:00Z"));
+            tuples.push(reuse(
+                &format!("r-{src}"),
+                src,
+                task,
+                gen,
+                "adapted",
+                "2026-01-02T00:00:00Z",
+            ));
+            tuples.push(assessment(
+                &format!("a-{src}"),
+                &format!("r-{src}"),
+                "verified",
+                "2026-01-03T00:00:00Z",
+            ));
         }
-        tuples.push(lifecycle_terminal("hr1", "author-gen", "TKT-source", "2026-01-01T12:00:00Z"));
+        tuples.push(lifecycle_terminal(
+            "hr1",
+            "author-gen",
+            "TKT-source",
+            "2026-01-01T12:00:00Z",
+        ));
         let c = capture(tuples, Order::Unknown);
         let reviews = vec![
             review_no_exit("p1"),
@@ -1789,7 +1903,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             // Two revisions of the same assessment, order unknown: a naive
             // implementation might pick "last in array" or "highest ULID"
             // and silently manufacture a verdict. Neither is legitimate
@@ -1810,7 +1931,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "incorrect", "2026-01-03T00:00:00Z"),
             assessment("a2", "r1", "verified", "2026-01-04T00:00:00Z"),
         ];
@@ -1897,7 +2025,14 @@ mod tests {
         });
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -2044,7 +2179,14 @@ mod tests {
         a["payload"]["agent"] = json!("some-rat");
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             a,
         ];
         let c = capture(tuples, Order::Unknown);
@@ -2085,7 +2227,14 @@ mod tests {
         f.as_object_mut().unwrap().remove("created_at");
         let tuples = vec![
             f,
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -2102,7 +2251,14 @@ mod tests {
         let m = manifest(vec![pair("p1", "src-1", "TKT-1", "gen-1")]);
         let tuples = vec![
             finding("src-1", "author-gen", "2026-01-01T00:00:00Z"),
-            reuse("r1", "src-1", "TKT-1", "gen-1", "used", "2026-01-02T00:00:00Z"),
+            reuse(
+                "r1",
+                "src-1",
+                "TKT-1",
+                "gen-1",
+                "used",
+                "2026-01-02T00:00:00Z",
+            ),
             assessment("a1", "r1", "verified", "2026-01-03T00:00:00Z"),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -2133,12 +2289,33 @@ mod tests {
             },
         ];
         let mut tuples = vec![];
-        for (src, task, gen) in [("src-1", "TKT-1", "gen-1"), ("src-2", "TKT-2", "gen-2"), ("src-3", "TKT-3", "gen-3")] {
+        for (src, task, gen) in [
+            ("src-1", "TKT-1", "gen-1"),
+            ("src-2", "TKT-2", "gen-2"),
+            ("src-3", "TKT-3", "gen-3"),
+        ] {
             tuples.push(finding(src, "author-gen", "2026-01-01T00:00:00Z"));
-            tuples.push(reuse(&format!("r-{src}"), src, task, gen, "adapted", "2026-01-02T00:00:00Z"));
-            tuples.push(assessment(&format!("a-{src}"), &format!("r-{src}"), "verified", "2026-01-03T00:00:00Z"));
+            tuples.push(reuse(
+                &format!("r-{src}"),
+                src,
+                task,
+                gen,
+                "adapted",
+                "2026-01-02T00:00:00Z",
+            ));
+            tuples.push(assessment(
+                &format!("a-{src}"),
+                &format!("r-{src}"),
+                "verified",
+                "2026-01-03T00:00:00Z",
+            ));
         }
-        tuples.push(lifecycle_terminal("hr1", "author-gen", "TKT-source", "2026-01-01T12:00:00Z"));
+        tuples.push(lifecycle_terminal(
+            "hr1",
+            "author-gen",
+            "TKT-source",
+            "2026-01-01T12:00:00Z",
+        ));
         let reviews = vec![
             review_no_exit("p1"),
             review_no_exit("p2"),

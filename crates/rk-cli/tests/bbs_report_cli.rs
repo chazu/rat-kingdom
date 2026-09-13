@@ -188,7 +188,8 @@ fn writes_output_file_in_addition_to_stdout() {
         output_path.to_str().unwrap(),
     ]);
     assert!(out.status.success());
-    let written: Value = serde_json::from_str(&std::fs::read_to_string(&output_path).unwrap()).unwrap();
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(&output_path).unwrap()).unwrap();
     let stdout: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(written, stdout);
 }

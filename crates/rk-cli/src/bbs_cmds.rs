@@ -172,7 +172,8 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
 fn read_json(path: &std::path::Path, what: &str) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading {what} file {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing {what} file {} as JSON", path.display()))
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {what} file {} as JSON", path.display()))
 }
 
 fn run_report(args: ReportArgs, as_json: bool) -> Result<()> {
