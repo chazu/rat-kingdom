@@ -1246,10 +1246,38 @@ impl Registry {
         Ok(orphaned)
     }
 
+    /// A persistence failure rolls the live row back out of `self.agents`
+    /// (TKT-kovik-libiv-dotiz): without this, a failed `insert` still left a
+    /// live `Spawning` record in memory, which `live_or_reserved_wip`/
+    /// `live_task_owner`/lane occupancy all count — so the caller's own
+    /// `release_wip`/`release_lane_wip`/`release_task_for_lane` (which only
+    /// ever touch the separate reservation counters, never the live map)
+    /// could not actually free the slot/task ownership this attempt leaked.
+    /// The name itself is left released to `reserve_name`'s pool exactly as
+    /// it was before this call, matching a spawn that failed before insert.
     pub fn insert(&mut self, record: AgentRecord) -> rk_core::Result<()> {
-        self.reserved.remove(&record.name);
-        self.agents.insert(record.name.clone(), record);
-        self.persist()
+        let name = record.name.clone();
+        self.reserved.remove(&name);
+        // `insert` is generic enough to replace an existing row (not just
+        // `Supervisor::spawn`'s always-freshly-reserved-name case), so the
+        // rollback below must restore exactly what stood here before, not
+        // merely absence: `HashMap::insert`'s own return is that prior row,
+        // and `write_atomic` has no fallible step after its final `rename`,
+        // so this is a bounded, purely in-memory undo of the mutation this
+        // call itself just made — never a wider durability mechanism.
+        let previous = self.agents.insert(name.clone(), record);
+        if let Err(e) = self.persist() {
+            match previous {
+                Some(previous) => {
+                    self.agents.insert(name, previous);
+                }
+                None => {
+                    self.agents.remove(&name);
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&AgentRecord> {
@@ -2023,6 +2051,48 @@ mod tests {
         reg.release_name(&third);
         let reused = reg.reserve_name();
         assert_eq!(reused, second, "released name should be picked first again");
+    }
+
+    /// TKT-kovik-libiv-dotiz: `insert` is generic enough to replace an
+    /// existing row (a respawn-shaped call, not just `Supervisor::spawn`'s
+    /// always-fresh-name case). A failed persist must restore that prior
+    /// row exactly, not merely remove whatever `insert` had just written —
+    /// an unconditional `self.agents.remove` would silently drop a real,
+    /// previously-durable record because ITS OWN replacement failed to
+    /// persist.
+    #[test]
+    fn insert_failure_restores_the_previous_record_it_would_have_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let mut reg = Registry::load(&path).unwrap();
+
+        reg.insert(record("Whisker", AgentState::Running)).unwrap();
+
+        // Sabotage only the NEXT persist: the directory refuses to accept
+        // the write_atomic temp file, so `path` itself (already written by
+        // the successful insert above) is never touched.
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o555),
+        )
+        .unwrap();
+        let result = reg.insert(record("Whisker", AgentState::Completed));
+        // Restore before any assertion, so a failure here still leaves the
+        // tempdir removable on drop.
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        assert!(result.is_err(), "the sabotaged persist must fail");
+        let restored = reg.get("Whisker").expect("the prior row must survive");
+        assert_eq!(
+            restored.state,
+            AgentState::Running,
+            "a failed replace must restore the ORIGINAL row, not just avoid \
+             leaving the new one behind"
+        );
     }
 
     #[test]
