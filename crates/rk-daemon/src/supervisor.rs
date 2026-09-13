@@ -11405,40 +11405,45 @@ mod respawn_tests {
         assert!(record.state.is_live());
     }
 
-    /// TKT-kovik-libiv-dotiz, two compounding defects on the same error path.
-    ///
-    /// (1) `if let Err(e) = self.lock_registry().insert(spawning)` kept the
-    /// guard temporary from its OWN scrutinee alive for the whole block
-    /// (`if let`'s temporary lifetime extension), so the error branch's
-    /// `let mut reg = self.lock_registry();` used to self-deadlock on this
-    /// same, non-reentrant mutex on every real persistence failure at
-    /// `insert` — confirmed live in
-    /// `rk-daemon::factory_analytics_rpc::factory_rpcs_are_deterministic_and_read_only_across_repeated_calls`
-    /// under `mise run verify-full` (SIGKILLed after ~690s stuck in
-    /// `Supervisor::spawn` waiting on `lock_registry`, per a captured stack
-    /// sample and disassembly filed against this ticket, and the daemon's
-    /// own failed-run record). A live hang is deliberately NOT reproduced
-    /// in-process here: `spawn_async` runs on the blocking pool, and an
-    /// `#[tokio::test]` runtime's `Drop` waits for outstanding blocking
-    /// tasks to finish, so a `tokio::time::timeout` around the call cannot
-    /// bound a genuine deadlock — it would return, but the runtime teardown
-    /// at the end of the test would still hang exactly like the captured
-    /// factory stack. The certainty here comes from Rust's documented `if
-    /// let` temporary-scope rule (deterministic, not timing-dependent) plus
-    /// that already-captured real hang, not from a synthetic repro.
-    ///
-    /// (2) Independently, `Registry::insert` removed the name reservation
-    /// and inserted the live `Spawning` row BEFORE `persist()`, so even
-    /// with (1) fixed, a persist failure left that row in `self.agents` —
-    /// counted by `live_or_reserved_wip`/`live_task_owner`/lane occupancy —
-    /// while `Supervisor::spawn`'s error branch only ever released the
-    /// separate RESERVATION counters, never touching the live map. A
-    /// positive, finite cap and a retry of the exact same task are required
-    /// to see this: WIP disabled (cap 0) or a different retry task both
-    /// hide it, because neither path ever consults the leaked live row.
+    /// A failed registry persist must return its IO error and release the name,
+    /// WIP, lane and task reservations. Run the real path in a child because a
+    /// regression can deadlock Tokio's blocking pool, whose runtime teardown
+    /// is not bounded by an in-process `tokio::time::timeout`.
     #[tokio::test]
     async fn a_registry_persistence_failure_at_insert_returns_promptly_and_releases_every_reservation(
     ) {
+        const CHILD: &str = "RK_REGISTRY_PERSIST_FAILURE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let completion = tempfile::NamedTempFile::new().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::respawn_tests::a_registry_persistence_failure_at_insert_returns_promptly_and_releases_every_reservation",
+                    "--nocapture",
+                ])
+                .env(CHILD, completion.path())
+                .spawn()
+                .expect("start the registry regression child");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll registry regression child") {
+                    assert!(
+                        status.success(),
+                        "registry regression child failed: {status}"
+                    );
+                    assert_eq!(std::fs::read(completion.path()).unwrap(), b"passed\n");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // This exact child is owned by this test. Reap it before
+                    // failing so a blocking-pool deadlock cannot hang the suite.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("registry regression child exceeded its 40s process deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -11493,6 +11498,8 @@ mod respawn_tests {
             1,
             "exactly the recovered spawn should have a registry row"
         );
+        // A zero-test child or an early return is not a successful regression.
+        std::fs::write(std::env::var_os(CHILD).unwrap(), b"passed\n").unwrap();
     }
 
     /// TKT-pumod-hubir-robik: two `agent.spawn` calls for the identical
