@@ -2657,8 +2657,7 @@ fn segment_finality(last: &UsageRow, exit: Option<&ExitRow>) -> (bool, String) {
             )
         }
     }
-    // The contract requires prior_state to AGREE with the terminal state; an
-    // absent one states nothing to agree with, so it fails closed like any unknown.
+    // Agreement is required, so an absent prior_state fails closed like any unknown.
     match exit.prior_state.as_deref() {
         None => (
             false,
@@ -5814,8 +5813,7 @@ mod tests {
 
     #[test]
     fn an_exit_without_a_prior_state_cannot_confirm_a_final_cost() {
-        // Otherwise the healthy shape: terminal result, cost_coverage=final.
-        // Only prior_state is absent, so agreement is unmet, not vacuous.
+        // Healthy otherwise: only prior_state is absent, so agreement is unmet.
         let m = task_manifest("TKT-1");
         let tuples = vec![
             usage_rec(
@@ -5851,7 +5849,7 @@ mod tests {
         assert_eq!(d.unknown_cost.len(), 1, "the uncertainty is named");
         assert!(
             d.unknown_cost[0].contains("no prior_state"),
-            "got {:?}",
+            "{:?}",
             d.unknown_cost[0]
         );
         // Bounding the cost does not retract the physical exit evidence.
