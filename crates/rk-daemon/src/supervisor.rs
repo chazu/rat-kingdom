@@ -3597,20 +3597,10 @@ impl Supervisor {
         );
     }
 
-    /// This agent's live launch identity: the native session token and the ONE
-    /// launch timestamp the watch froze.
-    ///
-    /// Emitted on launch/resume events so a launch can be joined to the
-    /// `agent_final_usage`/`agent_exit` observations for the SAME launch —
-    /// `spawn` alone cannot, because a respawn keeps it.
-    ///
-    /// Both are `None` on a path that registers no observable session, and the
-    /// WATCH decides that, not the token: an attach launch is fenced with a
-    /// token of its own so the predecessor's events stop reaching it, and that
-    /// token has no watch precisely because nothing will ever observe the
-    /// launch. A token whose watch belongs to some OTHER launch must never be
-    /// published here — that is how a headless predecessor's session and launch
-    /// time used to be reported as an attach launch's own.
+    /// Native token and frozen launch time for joining this launch's cost/exit
+    /// records; `spawn` alone is insufficient because respawn retains it.
+    /// An attach token has no watch and returns `(None, None)`, never a
+    /// predecessor's identity or launch time.
     fn launch_identity(&self, name: &str) -> (Option<String>, Option<String>) {
         let watched = self
             .lock_session_tokens()
@@ -3626,29 +3616,16 @@ impl Supervisor {
         }
     }
 
-    /// The frozen attribution for one launch, or `None` when no watch
-    /// survives for it.
-    ///
-    /// Deliberately never falls back to the current `AgentRecord`: that is the
-    /// exact bug this replaces, where a delayed event from an older launch
-    /// resolved against whichever record holds the name now and borrowed its
-    /// provider session and launch time.
+    /// Frozen attribution for this launch, or none. Never fall back to the
+    /// current name-keyed record, which may belong to a successor.
     fn attempt_watch(&self, session: rk_core::id::SpawnId) -> Option<AttemptWatch> {
         self.lock_attempts().get(&session).cloned()
     }
 
-    /// Record the reported usage/cost observed at one result event.
-    ///
-    /// Never raises and never changes lifecycle: a capture failure is logged and
-    /// reported as a telemetry gap, exactly like exposure/open capture. Emitted
-    /// at EVERY result path — including the ones that return early because the
-    /// disposition was already decided — so a `rk done` that precedes the
-    /// provider's final total leaves both observations behind, not just the
-    /// provisional one.
-    ///
-    /// Attribution comes from the launch's own frozen watch; with none, the
-    /// observation is skipped rather than bound to the current record. See
-    /// [`OwnedResult`] for what a SUPERSEDED launch omits.
+    /// Observe every result, including one arriving after `rk done`, without
+    /// changing lifecycle or propagating capture failure. Failed capture leaves
+    /// a telemetry gap. Attribution requires this launch's frozen watch;
+    /// [`OwnedResult`] omits successor-derived fields for stale events.
     fn observe_final_usage(
         &self,
         session: rk_core::id::SpawnId,
@@ -3665,12 +3642,9 @@ impl Supervisor {
             );
             return;
         };
-        // Three genuinely different situations, kept apart on purpose: a
-        // provider total on THIS result (cumulative within its query, never
-        // summed with others); none here but one earlier in the launch (the
-        // running figure MIXES bases, so no honest final value exists:
-        // unknown); or no provider total ever, leaving the daemon's own priced
-        // increments, labelled as the weaker estimate they are.
+        // A provider total is cumulative within its query. Missing USD after
+        // an earlier provider result leaves mixed bases unknown; a launch with
+        // no provider result may use the weaker daemon-priced estimate.
         let (basis, cost, provenance) = if let Some(total) = cost_usd {
             (
                 rk_core::bbs::CostBasis::ProviderReportedSegmentTotal,
@@ -3686,13 +3660,9 @@ impl Supervisor {
         } else if let Some(owned) =
             owned.filter(|_| usage.total() > 0 && self.pricing_known(&watch))
         {
-            // `owned.record_cost_usd` is the generation-cumulative total, which a
-            // same-generation relaunch inherits (`begin_launch` mints a new
-            // watch and session token, never a new `AgentRecord`). Only the
-            // amount accrued since THIS launch's own baseline can honestly be
-            // called this launch's daemon-priced cost; a zero or negative
-            // delta proves nothing about this launch's own spend and must not
-            // be reported as a final total.
+            // A respawn inherits the generation total. Only a positive delta
+            // from this launch's baseline proves its own priced spend; zero
+            // or negative deltas remain unknown.
             let increment = owned.record_cost_usd - watch.baseline_cost_usd;
             if increment > 0.0 {
                 (
@@ -12919,13 +12889,8 @@ mod native_observation_tests {
         );
     }
 
-    /// The completion-ROUTING half of the same defect, severer than the
-    /// telemetry/state cases above. `generation` alone cannot tell a stale
-    /// predecessor's `Exited` from the live successor's — a respawn keeps the
-    /// generation and mints only a fresh session token — so unfenced, a late
-    /// predecessor exit flips a still-`Paused` successor to `Failed` and then
-    /// `flush_withheld_completion` matches it (same generation, `withheld:
-    /// true`), publishing a completed failure the successor never earned.
+    /// A same-generation predecessor exit must not fail a paused successor or
+    /// flush its withheld completion: only the launch token distinguishes them.
     #[test]
     fn a_stale_predecessor_exit_must_not_fail_or_flush_the_successors_paused_turn() {
         let home = tempfile::tempdir().unwrap();
@@ -12975,11 +12940,8 @@ mod native_observation_tests {
         );
     }
 
-    /// A respawn keeps the SAME generation (`spawn`/`SpawnId`), which is
-    /// exactly what `cancel_agent`'s own generation filter cannot tell apart
-    /// from a predecessor sharing it — only the session token changes. Before
-    /// the `live` fence, a stale predecessor's exit would cancel the
-    /// successor's own in-flight managed verification run out from under it.
+    /// `cancel_agent` sees the same generation across respawns. Only the launch
+    /// token prevents a stale exit from cancelling the successor's verification.
     #[test]
     fn a_stale_predecessor_exit_must_not_cancel_the_successors_managed_verification() {
         let home = tempfile::tempdir().unwrap();
@@ -13022,11 +12984,8 @@ mod native_observation_tests {
         );
     }
 
-    /// `resume_if_paused` is called for every event but `Completed`/`Exited`
-    /// (which decide their own state), keyed only on `name` — the exact
-    /// "resumes the current name before checking [the launch token]" defect:
-    /// a superseded launch's late chatter must not resume a successor it no
-    /// longer owns.
+    /// Late chatter must not resume a paused successor through the name-keyed
+    /// `resume_if_paused` call that precedes event dispatch.
     #[test]
     fn a_stale_predecessor_event_must_not_resume_a_paused_successor() {
         let home = tempfile::tempdir().unwrap();
@@ -13061,13 +13020,9 @@ mod native_observation_tests {
         );
     }
 
-    /// The stale-launch fence also has to cover the chattier events
-    /// (`AssistantText`/`ToolUse`/`Retry`/`Stderr`) and the two side-channel
-    /// ones (`TransportFailure`/`ControlDelivered`) — all of them read or
-    /// write the CURRENT name-keyed record/liveness rather than anything
-    /// keyed on the event's own launch token, so each is just as exposed to
-    /// a superseded predecessor's late arrival as Started/Usage/Completed/
-    /// Exited are.
+    /// Chatter and side-channel events also mutate name-keyed state. Exercise
+    /// text, tools, retries, stderr, transport failure and control acknowledgement
+    /// so none can update a successor through a late predecessor event.
     #[test]
     fn stale_predecessor_liveness_transport_and_control_events_never_touch_the_successor() {
         let home = tempfile::tempdir().unwrap();
@@ -13594,12 +13549,8 @@ mod native_observation_tests {
         );
     }
 
-    /// The exact defect: a provider total on the FIRST launch of a generation,
-    /// then a same-generation relaunch (new session token, same `spawn`) whose
-    /// own result never self-reports USD. `AgentRecord.cost_usd` is
-    /// generation-cumulative and still carries the first launch's provider
-    /// total, so pricing the relaunch off the raw running total would mix an
-    /// already-final provider figure with a second, unrelated estimate.
+    /// A no-USD relaunch must not inherit the earlier launch's provider total
+    /// from the generation-cumulative record and mix it with its own estimate.
     #[test]
     fn same_generation_relaunch_prices_only_its_own_baseline_delta() {
         let home = tempfile::tempdir().unwrap();
