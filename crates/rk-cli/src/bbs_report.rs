@@ -563,7 +563,10 @@ pub struct ReviewedAnnotation {
 /// pair must satisfy — and at most once per (task, repo): a retrospective
 /// annotation cannot introduce new scope or be silently duplicated to
 /// inflate a count.
-fn validate_reviewed_annotations(manifest: &Manifest, annotations: &[ReviewedAnnotation]) -> Result<()> {
+fn validate_reviewed_annotations(
+    manifest: &Manifest,
+    annotations: &[ReviewedAnnotation],
+) -> Result<()> {
     let frozen: BTreeSet<(String, String)> = frozen_task_scope(manifest)
         .into_iter()
         .map(|s| (s.task, s.repo))
@@ -1856,7 +1859,6 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             continue;
         }
 
-
         if claims_kind(t, REUSE) {
             if let Some(reason) = artifact_record_defect(t, REUSE) {
                 idx.invalid.push(InvalidRecord {
@@ -1940,13 +1942,13 @@ fn build_index<'a>(capture: &'a TupleCapture, manifest: &Manifest) -> Index<'a> 
             let spawn = str_field(t, &["payload", "spawn"]).to_string();
             if !spawn.is_empty() {
                 idx.launches.push(LaunchRow {
-                repo: scope,
-                spawn,
-                session: None,
-                at: created_at(t),
-                record: record_id(t),
-                kind: "launch_event",
-            });
+                    repo: scope,
+                    spawn,
+                    session: None,
+                    at: created_at(t),
+                    record: record_id(t),
+                    kind: "launch_event",
+                });
             }
         }
     }
@@ -2237,8 +2239,10 @@ pub fn compute_full(
     // up per task in the delivery loop below.
     let mut invalid_records: Vec<InvalidRecord> = idx.invalid.clone();
     #[allow(clippy::type_complexity)]
-    let mut reviewed_by_task: BTreeMap<(String, String), (Vec<String>, Vec<String>, Vec<String>)> =
-        BTreeMap::new();
+    let mut reviewed_by_task: BTreeMap<
+        (String, String),
+        (Vec<String>, Vec<String>, Vec<String>),
+    > = BTreeMap::new();
     for a in reviewed_annotations {
         let repeated = resolve_annotated_evidence(
             &a.repeated_investigations,
@@ -2264,7 +2268,10 @@ pub fn compute_full(
             &mut invalid_records,
             &mut unresolved,
         );
-        reviewed_by_task.insert((a.task.clone(), a.repo.clone()), (repeated, rework, interventions));
+        reviewed_by_task.insert(
+            (a.task.clone(), a.repo.clone()),
+            (repeated, rework, interventions),
+        );
     }
 
     for pair in &sorted_pairs {
@@ -4389,10 +4396,7 @@ mod tests {
         assert_eq!(r.author_exit_reuse, vec!["p1".to_string()]);
         assert_eq!(r.mechanism.author_exit_effects, 1);
         assert!(only(&r).author_terminal);
-        assert_eq!(
-            only(&r).author_terminal_evidence,
-            Some("ax1".to_string())
-        );
+        assert_eq!(only(&r).author_terminal_evidence, Some("ax1".to_string()));
     }
 
     #[test]
@@ -4449,13 +4453,31 @@ mod tests {
         };
         let tuples = vec![
             agent_final_usage(
-                "u1", "repo", "TKT-1", "gen-1", "sess-1", Some("prov-1"), Some("completed"),
-                Some(1.5), PROVIDER_COST_BASIS, "2026-01-01T11:00:00Z", "2026-01-01T11:00:00Z",
+                "u1",
+                "repo",
+                "TKT-1",
+                "gen-1",
+                "sess-1",
+                Some("prov-1"),
+                Some("completed"),
+                Some(1.5),
+                PROVIDER_COST_BASIS,
+                "2026-01-01T11:00:00Z",
+                "2026-01-01T11:00:00Z",
             ),
             agent_exit(
-                "ax1", "repo", "TKT-1", "gen-1", "gen-1", "sess-1",
-                Some("2026-01-01T10:00:00Z"), Some("2026-01-01T12:00:00Z"),
-                Some("completed"), false, None, "2026-01-01T12:00:00Z",
+                "ax1",
+                "repo",
+                "TKT-1",
+                "gen-1",
+                "gen-1",
+                "sess-1",
+                Some("2026-01-01T10:00:00Z"),
+                Some("2026-01-01T12:00:00Z"),
+                Some("completed"),
+                false,
+                None,
+                "2026-01-01T12:00:00Z",
             ),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -4483,13 +4505,31 @@ mod tests {
         };
         let tuples = vec![
             agent_final_usage(
-                "u1", "repo", "TKT-1", "gen-1", "sess-1", Some("prov-1"), Some("paused"),
-                Some(3.0), PROVIDER_COST_BASIS, "2026-01-01T11:00:00Z", "2026-01-01T11:00:00Z",
+                "u1",
+                "repo",
+                "TKT-1",
+                "gen-1",
+                "sess-1",
+                Some("prov-1"),
+                Some("paused"),
+                Some(3.0),
+                PROVIDER_COST_BASIS,
+                "2026-01-01T11:00:00Z",
+                "2026-01-01T11:00:00Z",
             ),
             agent_exit(
-                "ax1", "repo", "TKT-1", "gen-1", "gen-1", "sess-1",
-                Some("2026-01-01T10:00:00Z"), Some("2026-01-01T12:00:00Z"),
-                Some("running"), false, None, "2026-01-01T12:00:00Z",
+                "ax1",
+                "repo",
+                "TKT-1",
+                "gen-1",
+                "gen-1",
+                "sess-1",
+                Some("2026-01-01T10:00:00Z"),
+                Some("2026-01-01T12:00:00Z"),
+                Some("running"),
+                false,
+                None,
+                "2026-01-01T12:00:00Z",
             ),
         ];
         let c = capture(tuples, Order::Unknown);
@@ -4554,7 +4594,11 @@ mod tests {
         let r = compute_full(&m, &c, &[], &annotations).unwrap();
         let d = &r.deliveries[0];
         assert_eq!(d.reviewed_repeated_investigations, vec!["ev-1".to_string()]);
-        assert_eq!(d.reviewed_interventions.len(), 0, "unresolved evidence is not counted");
+        assert_eq!(
+            d.reviewed_interventions.len(),
+            0,
+            "unresolved evidence is not counted"
+        );
         assert_eq!(r.quality.reviewed_repeated_investigations, 1);
         assert_eq!(r.quality.reviewed_interventions, 0);
         assert!(r
@@ -4602,7 +4646,10 @@ mod tests {
             .iter()
             .map(|u| u.derivation.as_str())
             .collect();
-        assert_eq!(named, vec!["active_work_ms", "total_operator_interventions"]);
+        assert_eq!(
+            named,
+            vec!["active_work_ms", "total_operator_interventions"]
+        );
         for u in &report.unsupported {
             assert!(!u.reason.is_empty());
             assert!(!u.tracked_by.is_empty());

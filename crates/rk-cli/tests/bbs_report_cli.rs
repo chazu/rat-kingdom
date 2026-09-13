@@ -523,7 +523,10 @@ fn native_record_shapes_replay_author_exit_and_cost_end_to_end() {
     );
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["evaluator_version"], 3);
-    assert_eq!(report["author_exit_unsupported"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        report["author_exit_unsupported"].as_array().unwrap().len(),
+        0
+    );
     assert_eq!(report["mechanism"]["author_exit_effects"], 1);
     assert_eq!(report["deliveries"][0]["cost_coverage"], "complete");
     assert_eq!(report["deliveries"][0]["reported_cost_estimate_usd"], 1.5);
