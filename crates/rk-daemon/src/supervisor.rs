@@ -602,6 +602,14 @@ struct AttemptWatch {
     /// A provider-reported USD total has been seen for this launch, so a later
     /// result without one leaves a MIXED total that cannot be called final.
     saw_provider_cost: bool,
+    /// `AgentRecord.cost_usd` at the moment this launch began. `cost_usd` is
+    /// generation-cumulative — a same-generation respawn keeps it — so a
+    /// relaunch whose OWN result never reports provider USD must not price
+    /// itself off the raw running total, which can still carry an earlier
+    /// launch's provider-reported spend. Subtracting this baseline isolates
+    /// only what accrued from THIS launch's own `HarnessEvent::Usage`
+    /// increments.
+    baseline_cost_usd: f64,
 }
 
 impl AttemptWatch {
@@ -2081,6 +2089,12 @@ impl Supervisor {
                 // path that registers no session rather than inventing one.
                 "session": launch_session,
                 "launched_at": launch_time,
+                // The harness's own session id is learned only at `Started`,
+                // which has not fired yet for this launch. Explicit `null`,
+                // not an omitted field: the contract never promises a
+                // provider id before one exists, and this must never be
+                // filled in from a previous launch's value.
+                "provider_session": null,
             }),
         );
         self.emit_coordinator_event(
@@ -2195,6 +2209,12 @@ impl Supervisor {
                 // path that registers no session rather than inventing one.
                 "session": launch_session,
                 "launched_at": launch_time,
+                // The harness's own session id is learned only at `Started`,
+                // which has not fired yet for this launch. Explicit `null`,
+                // not an omitted field: the contract never promises a
+                // provider id before one exists, and this must never be
+                // filled in from a previous launch's value.
+                "provider_session": null,
             }),
         );
         self.emit_coordinator_event(
@@ -2514,6 +2534,12 @@ impl Supervisor {
                 // path that registers no session rather than inventing one.
                 "session": launch_session,
                 "launched_at": launch_time,
+                // The harness's own session id is learned only at `Started`,
+                // which has not fired yet for this launch. Explicit `null`,
+                // not an omitted field: the contract never promises a
+                // provider id before one exists, and this must never be
+                // filled in from a previous launch's value.
+                "provider_session": null,
             }),
         );
         self.emit_coordinator_event(
@@ -2647,6 +2673,12 @@ impl Supervisor {
                 // path that registers no session rather than inventing one.
                 "session": launch_session,
                 "launched_at": launch_time,
+                // The harness's own session id is learned only at `Started`,
+                // which has not fired yet for this launch. Explicit `null`,
+                // not an omitted field: the contract never promises a
+                // provider id before one exists, and this must never be
+                // filled in from a previous launch's value.
+                "provider_session": null,
             }),
         );
         self.forget_completion(&updated.name);
@@ -3474,6 +3506,7 @@ impl Supervisor {
                 saw_result: false,
                 usage_since_result: false,
                 saw_provider_cost: false,
+                baseline_cost_usd: record.cost_usd,
             },
         );
     }
@@ -3570,11 +3603,27 @@ impl Supervisor {
                 "a provider total was reported earlier in this launch but not for this result; the running figure mixes bases, so no final launch cost is provable",
             )
         } else if live && usage.total() > 0 && self.pricing_known(&watch) {
-            (
-                rk_core::bbs::CostBasis::DaemonPricedIncrements,
-                Some(record_cost_usd),
-                "daemon-priced TokenUsage increments; this harness never self-reported USD for this launch",
-            )
+            // `record_cost_usd` is the generation-cumulative total, which a
+            // same-generation relaunch inherits (`begin_launch` mints a new
+            // watch and session token, never a new `AgentRecord`). Only the
+            // amount accrued since THIS launch's own baseline can honestly be
+            // called this launch's daemon-priced cost; a zero or negative
+            // delta proves nothing about this launch's own spend and must not
+            // be reported as a final total.
+            let increment = record_cost_usd - watch.baseline_cost_usd;
+            if increment > 0.0 {
+                (
+                    rk_core::bbs::CostBasis::DaemonPricedIncrements,
+                    Some(increment),
+                    "daemon-priced TokenUsage increments accrued since this launch's own baseline (record total minus cost_usd at launch start); this harness never self-reported USD for this launch",
+                )
+            } else {
+                (
+                    rk_core::bbs::CostBasis::Unknown,
+                    None,
+                    "no positive per-launch daemon-priced increment is provable against this launch's baseline",
+                )
+            }
         } else if !live {
             (
                 rk_core::bbs::CostBasis::Unknown,
@@ -5077,6 +5126,41 @@ impl Supervisor {
             .ok_or_else(|| rk_core::Error::other("record vanished"))?;
 
         let session_token = self.track_session(name, session.control.clone());
+
+        // The managed recovery launch was previously joinless: `track_session`
+        // freezes this launch's own `AttemptWatch` (so cost/exit observations
+        // attribute correctly), but nothing published its identity, so no
+        // lifecycle evidence could join a recovery launch to its own
+        // `agent_final_usage`/`agent_exit` records. Same shape as an ordinary
+        // respawn's `agent_respawned`, for the same reason.
+        let (launch_session, launch_time) = self.launch_identity(name);
+        self.emit_event(
+            &updated.repo_name,
+            "agent_respawned",
+            json!({
+                "agent": name,
+                // A recovery continuation reuses this generation's identity,
+                // same as an ordinary respawn.
+                "spawn": updated.spawn_id().to_string(),
+                "task": updated.task,
+                "role": updated.role,
+                "workflow_instance": updated.workflow_instance,
+                "recovery": true,
+                "harness": harness_kind,
+                // Exact native launch token for THIS process, so the launch
+                // joins its own final_usage/exit records; `spawn` cannot,
+                // because a respawn deliberately keeps it. `null` marks a
+                // path that registers no session rather than inventing one.
+                "session": launch_session,
+                "launched_at": launch_time,
+                // Not yet known: the harness's own session id is learned only
+                // at `Started`, which has not fired yet for this launch, and
+                // it must never be borrowed from the recovery record's
+                // preserved (now-superseded) provider session.
+                "provider_session": null,
+            }),
+        );
+
         self.forget_completion(name);
 
         let supervisor = Arc::clone(self);
@@ -9882,6 +9966,102 @@ mod respawn_tests {
             "fake",
             "the record's harness must reflect the alternate it actually continued under"
         );
+
+        // The managed recovery launch must publish its own lifecycle
+        // identity: without an `agent_respawned` tuple, nothing joins this
+        // launch to its own `agent_final_usage`/`agent_exit` evidence.
+        let recovery_session = sup
+            .lock_session_tokens()
+            .get(&name)
+            .copied()
+            .expect("continue_recovery must register a live session token");
+        assert_ne!(
+            recovery_session, session,
+            "the recovery continuation must mint its OWN session token, never reuse the dead launch's"
+        );
+        let respawned = sup
+            .space
+            .scan(&rk_core::tuple::Pattern {
+                category: Some(rk_core::tuple::Category::Event),
+                scope: Some("repo".into()),
+                identity: Some("agent_respawned".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            respawned.len(),
+            1,
+            "the recovery launch must publish exactly one agent_respawned tuple"
+        );
+        let payload = &respawned[0].payload;
+        assert_eq!(payload["agent"], name);
+        assert_eq!(
+            payload["spawn"],
+            spawn.to_string(),
+            "a recovery continuation reuses the generation's spawn identity"
+        );
+        assert_eq!(
+            payload["session"],
+            recovery_session.to_string(),
+            "must carry THIS launch's own native session token"
+        );
+        assert!(payload["launched_at"].is_string());
+        assert!(
+            payload["provider_session"].is_null(),
+            "not knowable before this launch's own Started event, and must never be \
+             borrowed from the dead launch's preserved provider session: {:?}",
+            payload["provider_session"]
+        );
+
+        // The recovery launch's own final-usage/exit evidence must join on
+        // the SAME (spawn, session) pair the agent_respawned tuple carried.
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            recovery_session,
+            HarnessEvent::Completed {
+                result: "recovered".into(),
+                is_error: false,
+                usage: TokenUsage {
+                    input: 3,
+                    output: 2,
+                    ..Default::default()
+                },
+                cost_usd: Some(0.5),
+                session_id: None,
+            },
+        );
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            recovery_session,
+            HarnessEvent::Exited { code: Some(0) },
+        );
+        let events = sup
+            .space
+            .scan(&rk_core::tuple::Pattern {
+                category: Some(rk_core::tuple::Category::Event),
+                scope: Some("repo".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let final_usage: Vec<_> = events
+            .iter()
+            .filter(|t| t.payload["bbs_kind"] == "agent_final_usage")
+            .collect();
+        assert_eq!(final_usage.len(), 1);
+        assert_eq!(final_usage[0].payload["session"], recovery_session.to_string());
+        assert_eq!(final_usage[0].payload["spawn"], spawn.to_string());
+        assert_eq!(final_usage[0].payload["cost_usd"], 0.5);
+        let exits: Vec<_> = events
+            .iter()
+            .filter(|t| t.payload["bbs_kind"] == "agent_exit")
+            .collect();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].payload["session"], recovery_session.to_string());
+        assert_eq!(exits[0].payload["spawn"], spawn.to_string());
     }
 
     /// Terminal-failure path: an operator/policy decision to NOT continue a
@@ -12328,6 +12508,206 @@ mod native_observation_tests {
             usage[1]["cost_usd"].is_null(),
             "an unprovable total stays null rather than being manufactured"
         );
+    }
+
+    /// With no prior launch, this launch's baseline is 0.0, so the full
+    /// priced total IS this launch's own. Guards the baseline-subtraction fix
+    /// against regressing the ordinary, non-relaunch case.
+    #[test]
+    fn a_pure_no_provider_priced_launch_reports_its_full_priced_total() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), Some("b"));
+        rec.name = "Nibble".into();
+        rec.model = Some("haiku".into());
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec.clone()).unwrap();
+        let spawn = rec.spawn_id();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), session);
+        sup.begin_launch("Nibble", session);
+
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            HarnessEvent::Usage {
+                usage: TokenUsage {
+                    input: 1000,
+                    output: 400,
+                    ..Default::default()
+                },
+            },
+        );
+        let priced = sup.lock_registry().get("Nibble").unwrap().cost_usd;
+        assert!(priced > 0.0, "priced usage must move the running total");
+
+        sup.handle_event("Nibble", rec.created_at, spawn, session, completed(None, None));
+
+        let usage = observations(&sup, "agent_final_usage");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0]["cost_basis"], "daemon_priced_increments");
+        assert_eq!(
+            usage[0]["cost_usd"].as_f64().unwrap(),
+            priced,
+            "with a zero baseline the full priced total is honestly this launch's own"
+        );
+    }
+
+    /// The exact defect: a provider total on the FIRST launch of a generation,
+    /// then a same-generation relaunch (new session token, same `spawn`) whose
+    /// own result never self-reports USD. `AgentRecord.cost_usd` is
+    /// generation-cumulative and still carries the first launch's provider
+    /// total, so pricing the relaunch off the raw running total would mix an
+    /// already-final provider figure with a second, unrelated estimate.
+    #[test]
+    fn same_generation_relaunch_prices_only_its_own_baseline_delta() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), Some("b"));
+        rec.name = "Nibble".into();
+        rec.model = Some("haiku".into());
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec.clone()).unwrap();
+        let spawn = rec.spawn_id();
+        let first = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), first);
+        sup.begin_launch("Nibble", first);
+
+        // First launch: the provider self-reports its own USD total.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            completed(Some(4.5), Some("p1")),
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            HarnessEvent::Exited { code: Some(0) },
+        );
+
+        // A same-generation relaunch: same record/`spawn`, a fresh session
+        // token and a fresh baseline frozen from the CURRENT cumulative total.
+        sup.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Running)
+            .unwrap();
+        let second = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), second);
+        sup.begin_launch("Nibble", second);
+
+        // This launch never self-reports USD; only the daemon prices it.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            HarnessEvent::Usage {
+                usage: TokenUsage {
+                    input: 1000,
+                    output: 200,
+                    ..Default::default()
+                },
+            },
+        );
+        let cumulative_after_usage = sup.lock_registry().get("Nibble").unwrap().cost_usd;
+        let expected_increment = cumulative_after_usage - 4.5;
+        assert!(
+            expected_increment > 0.0,
+            "the relaunch's own priced usage must move the cumulative total"
+        );
+
+        sup.handle_event("Nibble", rec.created_at, spawn, second, completed(None, None));
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            HarnessEvent::Exited { code: Some(0) },
+        );
+
+        let usage = observations(&sup, "agent_final_usage");
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0]["cost_basis"], "provider_reported_segment_total");
+        assert_eq!(usage[0]["cost_usd"], 4.5);
+        assert_eq!(
+            usage[1]["cost_basis"], "daemon_priced_increments",
+            "the relaunch's own usage was priced and pricing is known for it"
+        );
+        assert_eq!(
+            usage[1]["cost_usd"].as_f64().unwrap(),
+            expected_increment,
+            "must be THIS launch's own increment since its baseline, never the \
+             generation-cumulative total that still carries the first launch's \
+             $4.50 provider total"
+        );
+        assert_ne!(
+            usage[1]["cost_usd"].as_f64().unwrap(),
+            cumulative_after_usage,
+            "the raw cumulative record total must never be reported as this launch's cost"
+        );
+    }
+
+    /// A relaunch whose own usage was never priced (e.g. the model looked
+    /// unpriced while the tokens actually ran) must not have a later,
+    /// coincidental pricing-known state manufacture a final cost from a
+    /// baseline delta of exactly zero.
+    #[test]
+    fn a_zero_baseline_delta_does_not_manufacture_a_final_daemon_priced_cost() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), Some("b"));
+        rec.name = "Nibble".into();
+        rec.model = None;
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec.clone()).unwrap();
+        let spawn = rec.spawn_id();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), session);
+        sup.begin_launch("Nibble", session);
+
+        // Usage arrives while the model is unpriced: cost_usd never moves.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            session,
+            HarnessEvent::Usage {
+                usage: TokenUsage {
+                    input: 900,
+                    output: 300,
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(sup.lock_registry().get("Nibble").unwrap().cost_usd, 0.0);
+
+        // `pricing_known` reads the CURRENT registry, not a frozen snapshot,
+        // so becoming priced only now still satisfies the branch condition
+        // even though nothing was ever actually priced during this launch.
+        sup.lock_registry()
+            .update("Nibble", |r| r.model = Some("haiku".into()))
+            .unwrap();
+
+        sup.handle_event("Nibble", rec.created_at, spawn, session, completed(None, None));
+
+        let usage = observations(&sup, "agent_final_usage");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(
+            usage[0]["cost_basis"], "unknown",
+            "a zero baseline delta proves nothing about this launch's own spend"
+        );
+        assert!(usage[0]["cost_usd"].is_null());
     }
 
     /// `rk done` routes a completion while the provider may still report a
