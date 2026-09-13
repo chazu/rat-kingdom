@@ -33,6 +33,12 @@ libc.workspace = true
 ratatui.workspace = true
 
 [dev-dependencies]
+# Native-producer replay: the report's own tests drive
+# `rk_daemon::span::record_phase_span` against a real in-memory Space and feed
+# the resulting wire tuples straight into `bbs_report::compute`, so field
+# compatibility with the committed producer is exercised rather than
+# transcribed (TKT-nonub-pugar-pilid, review finding 6).
+rk-space.workspace = true
 tempfile = "3"
 
 [lints]
