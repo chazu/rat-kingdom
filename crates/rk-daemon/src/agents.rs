@@ -1246,10 +1246,24 @@ impl Registry {
         Ok(orphaned)
     }
 
+    /// A persistence failure rolls the live row back out of `self.agents`
+    /// (TKT-kovik-libiv-dotiz): without this, a failed `insert` still left a
+    /// live `Spawning` record in memory, which `live_or_reserved_wip`/
+    /// `live_task_owner`/lane occupancy all count — so the caller's own
+    /// `release_wip`/`release_lane_wip`/`release_task_for_lane` (which only
+    /// ever touch the separate reservation counters, never the live map)
+    /// could not actually free the slot/task ownership this attempt leaked.
+    /// The name itself is left released to `reserve_name`'s pool exactly as
+    /// it was before this call, matching a spawn that failed before insert.
     pub fn insert(&mut self, record: AgentRecord) -> rk_core::Result<()> {
-        self.reserved.remove(&record.name);
-        self.agents.insert(record.name.clone(), record);
-        self.persist()
+        let name = record.name.clone();
+        self.reserved.remove(&name);
+        self.agents.insert(name.clone(), record);
+        if let Err(e) = self.persist() {
+            self.agents.remove(&name);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&AgentRecord> {

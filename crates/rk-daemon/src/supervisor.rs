@@ -1935,7 +1935,14 @@ impl Supervisor {
             permission_mode: effective.permission_mode.clone(),
         });
         let spawn = spawning.spawn_id();
-        if let Err(e) = self.lock_registry().insert(spawning) {
+        // Bound the guard to this statement rather than matching on it
+        // directly in the `if let` scrutinee: a guard temporary there is
+        // lifetime-extended through the whole block (TKT-kovik-libiv-dotiz),
+        // so the error branch's own `self.lock_registry()` below would
+        // self-deadlock on this same, non-reentrant mutex on every
+        // persistence failure at `insert`.
+        let inserted = self.lock_registry().insert(spawning);
+        if let Err(e) = inserted {
             let mut reg = self.lock_registry();
             reg.release_name(&name);
             reg.release_wip(fleet_wip_cap);
@@ -11275,6 +11282,96 @@ mod respawn_tests {
             .await
             .expect("the failed attempt's reservation must have been released");
         assert!(record.state.is_live());
+    }
+
+    /// TKT-kovik-libiv-dotiz, two compounding defects on the same error path.
+    ///
+    /// (1) `if let Err(e) = self.lock_registry().insert(spawning)` kept the
+    /// guard temporary from its OWN scrutinee alive for the whole block
+    /// (`if let`'s temporary lifetime extension), so the error branch's
+    /// `let mut reg = self.lock_registry();` used to self-deadlock on this
+    /// same, non-reentrant mutex on every real persistence failure at
+    /// `insert` — confirmed live in
+    /// `rk-daemon::factory_analytics_rpc::factory_rpcs_are_deterministic_and_read_only_across_repeated_calls`
+    /// under `mise run verify-full` (SIGKILLed after ~690s stuck in
+    /// `Supervisor::spawn` waiting on `lock_registry`, per a captured stack
+    /// sample and disassembly filed against this ticket, and the daemon's
+    /// own failed-run record). A live hang is deliberately NOT reproduced
+    /// in-process here: `spawn_async` runs on the blocking pool, and an
+    /// `#[tokio::test]` runtime's `Drop` waits for outstanding blocking
+    /// tasks to finish, so a `tokio::time::timeout` around the call cannot
+    /// bound a genuine deadlock — it would return, but the runtime teardown
+    /// at the end of the test would still hang exactly like the captured
+    /// factory stack. The certainty here comes from Rust's documented `if
+    /// let` temporary-scope rule (deterministic, not timing-dependent) plus
+    /// that already-captured real hang, not from a synthetic repro.
+    ///
+    /// (2) Independently, `Registry::insert` removed the name reservation
+    /// and inserted the live `Spawning` row BEFORE `persist()`, so even
+    /// with (1) fixed, a persist failure left that row in `self.agents` —
+    /// counted by `live_or_reserved_wip`/`live_task_owner`/lane occupancy —
+    /// while `Supervisor::spawn`'s error branch only ever released the
+    /// separate RESERVATION counters, never touching the live map. A
+    /// positive, finite cap and a retry of the exact same task are required
+    /// to see this: WIP disabled (cap 0) or a different retry task both
+    /// hide it, because neither path ever consults the leaked live row.
+    #[tokio::test]
+    async fn a_registry_persistence_failure_at_insert_returns_promptly_and_releases_every_reservation(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let task = "persistence-failure-task";
+        let cap = 1;
+
+        // Sabotage the NEXT persist only: `write_atomic` renames its temp
+        // file onto `agents.json`, which fails once that path is a
+        // directory — the least invasive way to force a REAL
+        // `Registry::insert` error without touching permissions the
+        // worktree/branch creation steps ahead of it also depend on.
+        std::fs::create_dir_all(home.path().join("agents.json")).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sup.spawn_async(spawn_params(repo.path(), task), cap),
+        )
+        .await
+        .expect(
+            "on the CORRECTED path a persistence failure at insert must return \
+             promptly, not deadlock the blocking pool",
+        );
+        let error = result.expect_err("a sabotaged persist must surface as a spawn error");
+        assert!(
+            error.to_string().starts_with("io:"),
+            "the original io error must survive unreplaced: {error}"
+        );
+        assert_eq!(
+            sup.list().len(),
+            0,
+            "a failed insert must leave no phantom live row behind: {:?}",
+            sup.list()
+        );
+
+        // Un-sabotage and retry the EXACT SAME task under the SAME positive
+        // cap: a leaked live row (defect 2) or a stuck task-ownership/lane
+        // reservation would refuse this, since nothing about a different
+        // task or a disabled cap would have exercised either.
+        std::fs::remove_dir_all(home.path().join("agents.json")).unwrap();
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sup.spawn_async(spawn_params(repo.path(), task), cap),
+        )
+        .await
+        .expect("the registry must still be responsive after a sabotaged insert");
+        let record = recovered
+            .expect("the failed attempt's WIP/lane/task reservations must be fully released");
+        assert!(record.state.is_live());
+        assert_eq!(
+            sup.list().len(),
+            1,
+            "exactly the recovered spawn should have a registry row"
+        );
     }
 
     /// TKT-pumod-hubir-robik: two `agent.spawn` calls for the identical
