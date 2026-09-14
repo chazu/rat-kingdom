@@ -120,11 +120,15 @@ async fn show(layout: &Layout, id: String, as_json: bool) -> Result<()> {
         }
         bail!("no such release: {id}");
     }
-    let release = &result["release"];
     if as_json {
-        println!("{release}");
+        // `content_verified` is a sibling of `release` in the RPC response,
+        // not a field of it (see `handle_release_show`) — print the whole
+        // result so a JSON consumer sees the integrity verdict too, not just
+        // the (possibly stale/tampered) `release` record.
+        println!("{result}");
         return Ok(());
     }
+    let release = &result["release"];
     println!(
         "{}: {} (repo {}, recipe {})",
         release["id"].as_str().unwrap_or("?"),
@@ -140,7 +144,8 @@ async fn show(layout: &Layout, id: String, as_json: bool) -> Result<()> {
     if let Some(detail) = release["detail"].as_str() {
         println!("  detail     {detail}");
     }
-    match release.get("content_verified").and_then(Value::as_bool) {
+    // Read from the top-level result, not `release` — see the comment above.
+    match result.get("content_verified").and_then(Value::as_bool) {
         Some(true) => println!("  content    verified"),
         Some(false) => println!("  content    TAMPERED OR CORRUPTED — does not match its manifest"),
         None => {}

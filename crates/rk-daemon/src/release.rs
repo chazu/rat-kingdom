@@ -160,6 +160,23 @@ pub struct RecipeBounds {
     pub enforcement_note: String,
 }
 
+/// Whether a declared build-config file at an exact commit was found,
+/// confirmed absent, or could not be observed at all. Collapsing the last two
+/// into one `None` (as an earlier draft did) is unsafe: a transient `git`
+/// failure is not evidence the file doesn't exist, and for `used_mise` in
+/// particular — which SELECTS the recipe's cargo invocation style — silently
+/// treating "could not check" as "absent" risks running the wrong toolchain
+/// without any record that the check never actually happened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum FileObservation {
+    Present { sha256: String },
+    Absent,
+    /// `git` itself failed to answer — never treated as `Absent` by any
+    /// caller.
+    Unavailable { reason: String },
+}
+
 /// Effective build-environment facts this module actually observed, kept
 /// distinct from what it does not verify (see `compatibility_checked`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,31 +184,37 @@ pub struct ConfigProvenance {
     pub cargo_build_jobs_env: String,
     pub cargo_incremental_env: String,
     /// Observed: whether the resolved source commit's tree carried a
-    /// `mise.toml`/`.mise.toml` (read via `git show <sha>:<path>`, a pure
-    /// function of the exact source, not of whatever the persistent staging
-    /// worktree happened to have checked out before this call), which
-    /// decided whether the recipe ran `cargo`/`rustc` directly or through
-    /// `mise exec --`.
+    /// `mise.toml`/`.mise.toml` (read via `git cat-file -e`/`git show
+    /// <sha>:<path>`, a pure function of the exact source, not of whatever
+    /// the persistent staging worktree happened to have checked out before
+    /// this call), which decided whether the recipe ran `cargo`/`rustc`
+    /// directly or through `mise exec --`. Unlike `repo_policy`/
+    /// `checks_registry` below, this is a plain `bool`: an unresolvable
+    /// observation here aborts `prepare` outright (see `mise_present`)
+    /// rather than being recorded as a value, because it selects the actual
+    /// build recipe — there is no safe default to silently fall back to.
     pub used_mise: bool,
-    /// sha256 of `.rk/repo.cue` at the resolved commit, when present — a
-    /// non-secret fingerprint of the effective repository delivery policy
-    /// this exact source tree carries. `None` means the tree has no such
-    /// file at that commit, not that this wasn't checked.
-    pub repo_policy_digest: Option<String>,
-    /// sha256 of `.rk/checks.cue` at the resolved commit, when present.
-    pub checks_registry_digest: Option<String>,
+    /// `.rk/repo.cue` at the resolved commit — a non-secret fingerprint of
+    /// the effective repository delivery policy this exact source tree
+    /// carries.
+    pub repo_policy: FileObservation,
+    /// `.rk/checks.cue` at the resolved commit.
+    pub checks_registry: FileObservation,
     /// A reference to an existing exact-key managed-verification proof for
     /// this resolved commit (`crate::managed_verification::
-    /// lookup_verification_proof`/`verification_proof_key`), when this
-    /// module is wired to look one up. Always `None` in this slice:
-    /// `release::prepare` deliberately does not take the `Space`/
-    /// `VerificationResources` plumbing that lookup needs, because the
-    /// alternative path available today (`WorkflowEngine::verify_repo_check`)
-    /// does not merely read a cache — on a miss it EXECUTES the named check,
-    /// which could silently run a full `verify` suite as a hidden side
-    /// effect of preparing a release. `None` here means "not looked up",
-    /// never "checked and none exists"; wiring in the read-only cache lookup
-    /// without that execution risk is a tracked, bounded follow-up.
+    /// lookup_verification_proof`/`verification_proof_key`'s durable
+    /// `Event`/`landing_gate_pass` records — a pure read, never an
+    /// execution), forwarded from `PrepareParams::known_verification`. The
+    /// daemon looks this up itself (it alone holds the `Space`/
+    /// `VerificationResources` that read needs) before calling `prepare`;
+    /// this module deliberately never calls the alternative path that WOULD
+    /// be reachable from in here (`WorkflowEngine::verify_repo_check`),
+    /// because on a cache miss that path EXECUTES the named check — silently
+    /// running a full `verify` suite as a side effect of preparing a release
+    /// is exactly the unbounded behavior this ticket excludes. `None` means
+    /// no cached proof exists for this exact repo/commit/check identity, not
+    /// "not looked up" — this is a reference for operator/consumer
+    /// awareness, never itself proof this release's own binaries pass it.
     pub known_verification: Option<serde_json::Value>,
     /// Always `false` in this slice. Explicit rather than absent: the bounded
     /// smoke checks below prove the frozen binaries launch and speak their
@@ -225,11 +248,60 @@ pub struct ReleaseManifest {
 }
 
 /// A caller-supplied request to prepare (or idempotently return) one release.
+///
+/// `resolved_commit`/`tree_sha` must already be frozen by the CALLER before
+/// this is constructed — `prepare` never re-resolves `requested` itself. This
+/// matters because `requested` can be a mutable ref (a branch or tag): if the
+/// caller resolved it once for a read (e.g. `known_verification`'s proof
+/// lookup) and `prepare` resolved it AGAIN independently after queueing
+/// behind `Server::release_prepare_lock`, a push to that branch in between
+/// could attach the first resolution's proof reference to a manifest that
+/// actually describes the second, different commit. The caller MUST resolve
+/// exactly once and pass the same frozen values into both the lookup and
+/// this struct.
 pub struct PrepareParams {
     pub repo_name: String,
     pub repo_path: PathBuf,
-    pub candidate: String,
+    /// Exactly what the caller passed as `--candidate` — kept for
+    /// operator-readable provenance (`SourceProvenance::requested`), never
+    /// used for identity or re-resolved.
+    pub requested: String,
+    pub resolved_commit: String,
+    pub tree_sha: String,
     pub recipe: String,
+    /// A read-only reference to an existing exact-key managed-verification
+    /// proof for `resolved_commit` (see `crate::managed_verification::
+    /// lookup_verification_proof`), when the caller — which alone holds the
+    /// `Space`/`VerificationResources` that lookup needs — found one under
+    /// the SAME lock/resolution as this struct's `resolved_commit`. `None`
+    /// means no such proof is currently cached for this exact
+    /// repo/sha/check identity, never "not looked up".
+    pub known_verification: Option<serde_json::Value>,
+}
+
+/// Resolve `candidate` (a branch, tag, or sha) to its exact commit and tree
+/// sha in `repo_path`. Blocking (shells out to `git`); callers on an async
+/// executor should wrap this in `spawn_blocking`.
+pub fn resolve_candidate(repo_path: &Path, candidate: &str) -> rk_core::Result<(String, String)> {
+    let repo = rk_git::Repo::discover(repo_path)?;
+    let resolved = repo
+        .rev_parse(&format!("{candidate}^{{commit}}"))
+        .map_err(|e| rk_core::Error::other(format!("cannot resolve candidate '{candidate}': {e}")))?;
+    let tree = repo.rev_parse(&format!("{resolved}^{{tree}}"))?;
+    Ok((resolved, tree))
+}
+
+/// Load one named check from `.rk/checks.cue` as it existed at `sha`, read
+/// via `git show` (no worktree touched). `None` covers "no checks.cue at that
+/// commit", "checks.cue doesn't parse", and "no check with that name" alike —
+/// callers only need "a usable check definition was found" vs. not.
+pub fn load_named_check(repo_path: &Path, sha: &str, name: &str) -> Option<rk_workflow::Check> {
+    let BlobObservation::Present(bytes) = read_blob_at(repo_path, sha, ".rk/checks.cue") else {
+        return None;
+    };
+    let text = String::from_utf8(bytes).ok()?;
+    let checks = rk_workflow::load_checks_str(&text).ok()?;
+    checks.into_iter().find(|c| c.name == name)
 }
 
 pub struct PrepareOutcome {
@@ -455,25 +527,6 @@ fn verify_content(entry: &ReleaseIndexEntry, release_dir: &Path, manifest: &Rele
     binaries_match_disk(release_dir, manifest)
 }
 
-/// Structural self-consistency check for a manifest found on disk with no
-/// prior trusted registry digest to compare against (the crash-recovery
-/// window between publishing `manifest.json` and updating the registry to
-/// `Prepared` — see the doc comment in `prepare`). Requires the manifest to
-/// claim to BE exactly this bound request before it is trusted enough to
-/// adopt.
-fn manifest_matches_requested_identity(
-    manifest: &ReleaseManifest,
-    id: &str,
-    repo: &str,
-    recipe: &str,
-    resolved_commit: &str,
-) -> bool {
-    manifest.id == id
-        && manifest.repo == repo
-        && manifest.recipe == recipe
-        && manifest.source.resolved_commit == resolved_commit
-}
-
 /// Char-boundary-safe tail of the last `FAILURE_EVIDENCE_CHARS` characters —
 /// used only for human-readable failure messages, never for identity or
 /// comparison. Operates on `char`s throughout (never re-slices the lossily-
@@ -513,7 +566,7 @@ fn upsert_entry(
             recipe: params.recipe.clone(),
             recipe_revision: RECIPE_REVISION,
             input_key: input_key.to_string(),
-            requested_source: params.candidate.clone(),
+            requested_source: params.requested.clone(),
             status,
             created_at: now,
             updated_at: now,
@@ -539,47 +592,21 @@ pub async fn prepare(layout: &Layout, params: PrepareParams) -> rk_core::Result<
         )));
     }
 
+    // `resolved_commit`/`tree_sha` were frozen by the CALLER — see
+    // `PrepareParams`'s doc comment for why `prepare` must never re-resolve
+    // `requested` itself. Config provenance IS safe to gather here: it's a
+    // pure function of the already-frozen commit, not of the mutable ref.
     let repo_path = params.repo_path.clone();
-    let candidate = params.candidate.clone();
-    let (resolved_commit, tree_sha, config_provenance) = {
+    let resolved_commit = params.resolved_commit.clone();
+    let tree_sha = params.tree_sha.clone();
+    let mut config_provenance = {
         let repo_path = repo_path.clone();
-        let candidate = candidate.clone();
-        tokio::task::spawn_blocking(move || -> rk_core::Result<(String, String, ConfigProvenance)> {
-            let repo = rk_git::Repo::discover(&repo_path)?;
-            let resolved = repo
-                .rev_parse(&format!("{candidate}^{{commit}}"))
-                .map_err(|e| {
-                    rk_core::Error::other(format!("cannot resolve candidate '{candidate}': {e}"))
-                })?;
-            let tree = repo.rev_parse(&format!("{resolved}^{{tree}}"))?;
-            // Pure functions of the resolved commit, read via `git show`
-            // rather than the (possibly not-yet-reset) persistent staging
-            // worktree — this binds config provenance to the exact source
-            // tree, not to whatever a prior prepare happened to leave
-            // checked out.
-            let used_mise = read_blob_at(&repo_path, &resolved, "mise.toml").is_some()
-                || read_blob_at(&repo_path, &resolved, ".mise.toml").is_some();
-            let repo_policy_digest =
-                read_blob_at(&repo_path, &resolved, ".rk/repo.cue").map(|b| hex::encode(Sha256::digest(&b)));
-            let checks_registry_digest =
-                read_blob_at(&repo_path, &resolved, ".rk/checks.cue").map(|b| hex::encode(Sha256::digest(&b)));
-            Ok((
-                resolved,
-                tree,
-                ConfigProvenance {
-                    cargo_build_jobs_env: CARGO_BUILD_JOBS.to_string(),
-                    cargo_incremental_env: "0".to_string(),
-                    used_mise,
-                    repo_policy_digest,
-                    checks_registry_digest,
-                    known_verification: None,
-                    compatibility_checked: false,
-                },
-            ))
-        })
-        .await
-        .map_err(|e| rk_core::Error::other(format!("source resolution task failed: {e}")))??
+        let resolved_commit = resolved_commit.clone();
+        tokio::task::spawn_blocking(move || gather_config_provenance(&repo_path, &resolved_commit))
+            .await
+            .map_err(|e| rk_core::Error::other(format!("config provenance task failed: {e}")))??
     };
+    config_provenance.known_verification = params.known_verification.clone();
 
     let input_key = compute_input_key(
         &params.repo_name,
@@ -595,56 +622,72 @@ pub async fn prepare(layout: &Layout, params: PrepareParams) -> rk_core::Result<
     let existing_entry = ReleaseRegistry::load(&registry_path)?.get(&id).cloned();
 
     // `manifest.json` can exist here even when the registry doesn't (yet)
-    // say `Prepared` for this id: `run_recipe` publishes it durably BEFORE
-    // this function updates the registry (see the `Ok(manifest)` arm below),
-    // so a crash in that exact window leaves a fully valid, complete manifest
-    // sitting next to a stale `Preparing`/absent registry entry. Adopting it
-    // (once it verifies) is strictly better than quarantining perfectly good,
-    // already-built content and paying for a rebuild — but ONLY once it
-    // verifies: a manifest sitting at this path that does NOT verify is
-    // exactly the "tampered/incomplete" case the ticket requires rejecting,
-    // never silently rebuilt over.
+    // say `Prepared` for this id: `run_recipe`'s caller (below) durably
+    // commits the digest of the content it is ABOUT to publish before
+    // publishing it (see the `Ok(manifest)` arm below), so a crash between
+    // those two writes leaves a fully valid, complete manifest sitting next
+    // to a `Preparing` registry entry that ALREADY carries that exact digest.
+    // Recovery trusts ONLY that pre-committed, daemon-authored digest — never
+    // the manifest file's own self-reported identity fields. The release id
+    // is a deterministic hash of public inputs (repo name, candidate, recipe
+    // — nothing secret), so its path is guessable; a manifest.json that
+    // merely *claims* to be this release, with no prior registry commitment
+    // to back it, is not evidence of anything and must never be adopted on
+    // its own say-so (this was a real hole in an earlier draft: "the
+    // manifest's own identity fields match" is trivially satisfiable by
+    // whoever wrote the file).
     if manifest_path.is_file() {
         let manifest = load_manifest(&manifest_path)?;
-        let trusted = match &existing_entry {
-            Some(entry) if entry.manifest_digest.is_some() => {
-                verify_content(entry, &release_dir, &manifest)
+        let previously_prepared = existing_entry
+            .as_ref()
+            .is_some_and(|e| e.status == ReleaseStatus::Prepared);
+        match &existing_entry {
+            Some(entry) if verify_content(entry, &release_dir, &manifest) => {
+                // The registry already held this exact digest before this
+                // call — either from a completed prior `Prepared` (ordinary
+                // idempotent reuse) or from the pre-publish commit of an
+                // attempt interrupted before its final `Prepared` write
+                // (crash-before-index-update recovery). Both are equally
+                // trustworthy: the digest was recorded by this daemon,
+                // strictly before `manifest.json` could exist at this path.
+                let entry = upsert_entry(
+                    &registry_path,
+                    &id,
+                    &params,
+                    &input_key,
+                    ReleaseStatus::Prepared,
+                    None,
+                    entry.manifest_digest.clone(),
+                )?;
+                return Ok(PrepareOutcome {
+                    entry,
+                    manifest,
+                    already_prepared: previously_prepared,
+                });
+            }
+            Some(entry) if entry.status == ReleaseStatus::Prepared => {
+                // Previously trusted and promoted, but no longer verifies
+                // against its OWN recorded digest — tampered or corrupted.
+                return Err(rk_core::Error::other(format!(
+                    "release {id} content no longer matches its recorded manifest digest \
+                     (tampered or corrupted); refusing to treat it as valid or rebuild over it"
+                )));
             }
             _ => {
-                manifest_matches_requested_identity(
-                    &manifest,
-                    &id,
-                    &params.repo_name,
-                    &params.recipe,
-                    &resolved_commit,
-                ) && binaries_match_disk(&release_dir, &manifest)
+                // No registry-committed digest this file can be checked
+                // against (or it doesn't match): an unattested file at this
+                // fully guessable, content-derived path proves nothing, no
+                // matter how internally self-consistent it looks. Quarantine
+                // it — preserving it as inspectable evidence rather than
+                // deleting — and fall through to a fresh build below, the
+                // same as any other stale/unverifiable partial content.
+                let quarantine = quarantine_dir(layout, &id);
+                if let Some(parent) = quarantine.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(&release_dir, &quarantine)?;
             }
-        };
-        if trusted {
-            let already_prepared = existing_entry
-                .as_ref()
-                .is_some_and(|e| e.status == ReleaseStatus::Prepared);
-            let digest = manifest_digest(&manifest);
-            let entry = upsert_entry(
-                &registry_path,
-                &id,
-                &params,
-                &input_key,
-                ReleaseStatus::Prepared,
-                None,
-                Some(digest),
-            )?;
-            return Ok(PrepareOutcome {
-                entry,
-                manifest,
-                already_prepared,
-            });
         }
-        return Err(rk_core::Error::other(format!(
-            "release {id} has a manifest.json that does not verify against its recorded \
-             identity/digest and on-disk binaries (tampered, corrupted, or an incomplete \
-             write); refusing to treat it as valid or rebuild over it"
-        )));
     }
 
     // No manifest at all. A registry entry claiming `Prepared` with no
@@ -680,7 +723,7 @@ pub async fn prepare(layout: &Layout, params: PrepareParams) -> rk_core::Result<
         &params.repo_name,
         &resolved_commit,
         &tree_sha,
-        &candidate,
+        &params.requested,
         &id,
         &release_dir,
         config_provenance,
@@ -688,7 +731,28 @@ pub async fn prepare(layout: &Layout, params: PrepareParams) -> rk_core::Result<
     .await
     {
         Ok(manifest) => {
+            // Commit the digest of what is ABOUT to be published, durably,
+            // BEFORE publishing it — the trust anchor a later crash-recovery
+            // read relies on (see the `manifest_path.is_file()` branch
+            // above). Still `Preparing`: the file doesn't exist at its
+            // trusted path yet. If the daemon dies between this write and
+            // the next one, a later `prepare` call finds `manifest.json`
+            // already written (by `write_manifest_new`, below) with a digest
+            // that matches what THIS write already committed, and adopts it;
+            // if it finds `manifest.json` missing entirely, it just re-runs
+            // the recipe, because a `Preparing` status commits to nothing
+            // being published yet either way.
             let digest = manifest_digest(&manifest);
+            upsert_entry(
+                &registry_path,
+                &id,
+                &params,
+                &input_key,
+                ReleaseStatus::Preparing,
+                None,
+                Some(digest.clone()),
+            )?;
+            write_manifest_new(&release_dir.join("manifest.json"), &manifest)?;
             let entry = upsert_entry(
                 &registry_path,
                 &id,
@@ -723,29 +787,128 @@ pub async fn prepare(layout: &Layout, params: PrepareParams) -> rk_core::Result<
 /// without touching any worktree. `None` covers both "absent at that commit"
 /// and any other git failure equally — callers only need "present with this
 /// content" vs. "not usably present", never the distinction between them.
-fn read_blob_at(repo_path: &Path, sha: &str, rel_path: &str) -> Option<Vec<u8>> {
-    let output = std::process::Command::new("git")
+enum BlobObservation {
+    Present(Vec<u8>),
+    Absent,
+    Unavailable(String),
+}
+
+/// Read a file's content at an exact commit, distinguishing "confirmed
+/// absent" from "could not observe" (see `FileObservation`'s doc comment for
+/// why collapsing the two is unsafe). `git cat-file -e` first: its exit code
+/// is a well-defined /0 exists, 1 absent/, so anything else (a different
+/// exit code, or `git` failing to run at all) is treated as `Unavailable`,
+/// never silently coerced to `Absent`.
+fn read_blob_at(repo_path: &Path, sha: &str, rel_path: &str) -> BlobObservation {
+    let spec = format!("{sha}:{rel_path}");
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("cat-file")
+        .arg("-e")
+        .arg(&spec)
+        .output()
+    {
+        Ok(out) if out.status.code() == Some(0) => {}
+        Ok(out) if out.status.code() == Some(1) => return BlobObservation::Absent,
+        Ok(out) => {
+            return BlobObservation::Unavailable(format!(
+                "git cat-file -e {spec} exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+        Err(e) => return BlobObservation::Unavailable(format!("git cat-file -e {spec} failed to run: {e}")),
+    }
+    match std::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
         .arg("show")
-        .arg(format!("{sha}:{rel_path}"))
+        .arg(&spec)
         .output()
-        .ok()?;
-    output.status.success().then_some(output.stdout)
+    {
+        Ok(out) if out.status.success() => BlobObservation::Present(out.stdout),
+        Ok(out) => BlobObservation::Unavailable(format!(
+            "git show {spec} exited {:?} even though cat-file confirmed it exists: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Err(e) => BlobObservation::Unavailable(format!("git show {spec} failed to run: {e}")),
+    }
 }
 
-fn build_script(use_mise: bool) -> String {
+/// Whether the resolved commit's tree carries `mise.toml`/`.mise.toml`.
+/// Unlike `file_observation` below, this is behavior-selecting (it decides
+/// whether the recipe runs through `mise exec --`), so an `Unavailable`
+/// observation for either candidate path is a hard error, not a default —
+/// see `ConfigProvenance::used_mise`'s doc comment.
+fn mise_present(repo_path: &Path, sha: &str) -> rk_core::Result<bool> {
+    for name in ["mise.toml", ".mise.toml"] {
+        match read_blob_at(repo_path, sha, name) {
+            BlobObservation::Present(_) => return Ok(true),
+            BlobObservation::Absent => continue,
+            BlobObservation::Unavailable(reason) => {
+                return Err(rk_core::Error::other(format!(
+                    "could not determine whether {sha} carries {name}, so the build recipe \
+                     (mise vs. plain cargo) cannot be safely selected: {reason}"
+                )));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn file_observation(repo_path: &Path, sha: &str, rel_path: &str) -> FileObservation {
+    match read_blob_at(repo_path, sha, rel_path) {
+        BlobObservation::Present(bytes) => FileObservation::Present {
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        },
+        BlobObservation::Absent => FileObservation::Absent,
+        BlobObservation::Unavailable(reason) => FileObservation::Unavailable { reason },
+    }
+}
+
+/// Gather `ConfigProvenance` for an already-resolved commit. Pure function of
+/// `resolved_commit` (never of `requested` or of the persistent staging
+/// worktree's current state), so — unlike candidate resolution — it is safe
+/// to call after queueing behind `Server::release_prepare_lock`: the commit
+/// is already frozen by the time this runs.
+fn gather_config_provenance(repo_path: &Path, resolved_commit: &str) -> rk_core::Result<ConfigProvenance> {
+    Ok(ConfigProvenance {
+        cargo_build_jobs_env: CARGO_BUILD_JOBS.to_string(),
+        cargo_incremental_env: "0".to_string(),
+        used_mise: mise_present(repo_path, resolved_commit)?,
+        repo_policy: file_observation(repo_path, resolved_commit, ".rk/repo.cue"),
+        checks_registry: file_observation(repo_path, resolved_commit, ".rk/checks.cue"),
+        known_verification: None,
+        compatibility_checked: false,
+    })
+}
+
+/// `target_dir` is passed BOTH as the `CARGO_TARGET_DIR` env var (set on the
+/// child process, see `run_recipe`) AND as an explicit `--target-dir` CLI
+/// flag here — CLI flags win over env vars and config-file settings in
+/// Cargo's own precedence order, but binding it twice means this recipe's
+/// output location does not depend on getting the env var through some
+/// wrapper (`mise exec --`, `sh -c`) uninterfered with. Likewise `--jobs`
+/// is explicit on the invocation, not left to the `CARGO_BUILD_JOBS` env var
+/// alone. Quoted with `'...'` (shell single-quotes): the path is daemon-
+/// controlled, never user input, but staying quote-safe costs nothing.
+fn build_script(use_mise: bool, target_dir: &Path) -> String {
+    let target_dir = target_dir.display();
     if use_mise {
         format!(
             "set -e\n\
              export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\"\n\
-             nice -n {NICE_LEVEL} mise exec -- cargo build --release -p rk-cli -p rk-mcp\n\
+             nice -n {NICE_LEVEL} mise exec -- cargo build --release --target-dir '{target_dir}' \
+             --jobs {CARGO_BUILD_JOBS} -p rk-cli -p rk-mcp\n\
              mise exec -- rustc --version > .rk-release-toolchain.txt\n"
         )
     } else {
         format!(
             "set -e\n\
-             nice -n {NICE_LEVEL} cargo build --release -p rk-cli -p rk-mcp\n\
+             nice -n {NICE_LEVEL} cargo build --release --target-dir '{target_dir}' \
+             --jobs {CARGO_BUILD_JOBS} -p rk-cli -p rk-mcp\n\
              rustc --version > .rk-release-toolchain.txt\n"
         )
     }
@@ -782,11 +945,22 @@ async fn run_recipe(
         .map_err(|e| rk_core::Error::other(format!("staging worktree task failed: {e}")))??;
     }
 
+    // Explicit, owned build output directory — overriding whatever
+    // `CARGO_TARGET_DIR` the daemon process's own ambient environment might
+    // carry (mise sets a shared one for some agent roles; see
+    // `supervisor.rs`'s `shared_cargo_target` handling). Without this, an
+    // inherited shared target dir could point this build's output at a
+    // location shared with unrelated builds — this function reads
+    // `<staging>/target/release/*` unconditionally below, so it must also be
+    // where THIS build actually writes, not wherever ambient config says.
+    // Bound BOTH as an env var and as an explicit `--target-dir` CLI flag in
+    // the script itself (see `build_script`'s doc comment).
+    let target_dir = staging.join("target");
     // `used_mise` was already decided from the resolved commit's tree (via
     // `git show`, in `prepare`) rather than re-derived from the staging
     // worktree here — a pure function of the exact source, not of whatever a
     // prior prepare happened to leave checked out.
-    let script = build_script(config_provenance.used_mise);
+    let script = build_script(config_provenance.used_mise, &target_dir);
 
     let mut command = tokio::process::Command::new("sh");
     command
@@ -796,6 +970,7 @@ async fn run_recipe(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .env("CARGO_TARGET_DIR", &target_dir)
         .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS.to_string())
         .env("CARGO_INCREMENTAL", "0")
         .process_group(0);
@@ -835,7 +1010,7 @@ async fn run_recipe(
         .trim()
         .to_string();
 
-    let target_release = staging.join("target").join("release");
+    let target_release = target_dir.join("release");
     if release_dir.exists() {
         // Only reachable when a prior attempt at this exact id failed after
         // partially writing binaries but before ever completing a manifest
@@ -917,7 +1092,10 @@ async fn run_recipe(
         checks,
         created_at: Utc::now(),
     };
-    write_manifest_new(&release_dir.join("manifest.json"), &manifest)?;
+    // Publishing `manifest.json` is the caller's (`prepare`'s) job: it must
+    // durably commit this manifest's digest to the registry FIRST (the
+    // crash-recovery trust anchor — see `prepare`'s doc comments), which
+    // requires the fully-constructed manifest this function returns.
     Ok(manifest)
 }
 
@@ -1148,8 +1326,11 @@ mod tests {
         let params = PrepareParams {
             repo_name: "r".into(),
             repo_path: "/tmp/r".into(),
-            candidate: "main".into(),
+            requested: "main".into(),
+            resolved_commit: "abc123".into(),
+            tree_sha: "def456".into(),
             recipe: RECIPE_PAIRED_RK_MCP.into(),
+            known_verification: None,
         };
         let entry = upsert_entry(
             &path,
@@ -1171,8 +1352,11 @@ mod tests {
         let params = PrepareParams {
             repo_name: "r".into(),
             repo_path: "/tmp/r".into(),
-            candidate: "main".into(),
+            requested: "main".into(),
+            resolved_commit: "abc123".into(),
+            tree_sha: "def456".into(),
             recipe: RECIPE_PAIRED_RK_MCP.into(),
+            known_verification: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("releases.json");
@@ -1229,8 +1413,8 @@ mod tests {
                 cargo_build_jobs_env: "2".into(),
                 cargo_incremental_env: "0".into(),
                 used_mise: false,
-                repo_policy_digest: None,
-                checks_registry_digest: None,
+                repo_policy: FileObservation::Absent,
+                checks_registry: FileObservation::Absent,
                 known_verification: None,
                 compatibility_checked: false,
             },

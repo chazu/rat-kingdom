@@ -7925,13 +7925,84 @@ impl Daemon {
         // signal a `release.list`/`release.show` read uses to tell a build
         // actually in flight from a `Preparing` record a crash left behind.
         let _guard = self.release_prepare_lock.lock().await;
+        // Resolve the candidate EXACTLY ONCE, here, under the lock: `candidate`
+        // can be a mutable ref (a branch/tag), and this is the single frozen
+        // value used for BOTH the verification-proof lookup below and the
+        // actual build inside `release::prepare`. Resolving it a second time
+        // after queueing (an earlier draft resolved once here before the
+        // lock, for the lookup, then again inside `prepare` after acquiring
+        // it) would let a push to the branch in between attach one commit's
+        // proof reference to a manifest that actually describes a different
+        // commit.
+        let (resolved_commit, tree_sha) = {
+            let repo_path = repo_path.clone();
+            let candidate = params.candidate.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::release::resolve_candidate(&repo_path, &candidate)
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+                Err(e) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("candidate resolution task failed: {e}"),
+                    )
+                }
+            }
+        };
+        // Read-only reference evidence: does this daemon already hold an
+        // exact-key managed-verification proof (or reusable landing-gate
+        // pass) for the "verify" check at this exact resolved commit? A pure
+        // tuple-scan read (`lookup_verification_proof`), never an execution —
+        // unlike `WorkflowEngine::verify_repo_check`, which `release.prepare`
+        // deliberately never calls, because on a cache miss THAT path
+        // executes the check. Best-effort: a repo with no "verify" check
+        // just yields `None` here.
+        let check = {
+            let repo_path = repo_path.clone();
+            let resolved_commit = resolved_commit.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::release::load_named_check(&repo_path, &resolved_commit, "verify")
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let known_verification = check.and_then(|check| {
+            let proof = crate::managed_verification::ManagedVerification::new(
+                &self.layout,
+                &self.space,
+                self.supervisor.verification_resources(),
+                check.shared_cargo_target,
+            )
+            .lookup_verification_proof(&params.repo, &resolved_commit, &check)?;
+            // Carry the check identity/context alongside the proof itself so
+            // a manifest reader can trace exactly what this reference
+            // describes, rather than an opaque blob.
+            Some(json!({
+                "check": {
+                    "name": check.name,
+                    "command": check.command,
+                    "toolchain": check.toolchain,
+                    "environment_policy": check.environment_policy.to_string(),
+                },
+                "resolved_commit": resolved_commit,
+                "proof": proof,
+            }))
+        });
         match crate::release::prepare(
             &self.layout,
             crate::release::PrepareParams {
                 repo_name: params.repo,
                 repo_path,
-                candidate: params.candidate,
+                requested: params.candidate,
+                resolved_commit,
+                tree_sha,
                 recipe: params.recipe,
+                known_verification,
             },
         )
         .await
