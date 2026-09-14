@@ -8,29 +8,39 @@ set -euo pipefail
 # crates/rk-core/tests/verify_full_recipe_regression.rs all execute it
 # identically instead of hand-kept copies that can drift.
 #
-# NOT yet wired into .github/workflows/ci.yml: `.github` is a protected path,
-# so adopting this recipe in CI needs the explicit protected-change
+# NOT yet wired into .github/workflows/ci.yml, and .rk/checks.cue's `verify`
+# toolchain declaration is not yet updated to mention cargo-nextest either:
+# both `.github` and `.rk` are protected paths, so adopting this recipe in CI
+# and updating the check's toolchain label need the explicit protected-change
 # authorization route rather than landing alongside this local recipe.
 # Tracked separately as TKT-sojuz-bogij-bapip, which retains the prepared CI
 # hunk. Until that lands, CI and protected-final landing run different
-# recipes.
+# recipes, and the named check's toolchain label undercounts its actual
+# tools.
 #
 # The test phase runs cargo-nextest (pinned in mise.toml's [tools], already
-# used by verify-changed.sh) instead of `cargo test --workspace`, because
-# nextest runs test binaries concurrently while `cargo test` runs them one at
-# a time — that serialization is why the old single-command test phase
-# dominated protected-final's wall time (native evidence on candidate
-# 34be02b2cfed52ed087b4c9ae80bda6b953f6928: verify-changed's nextest phase
-# 145.053s vs the full gate's 1331.540s on the same tracked tree a2865b3 —
-# different scopes, no speedup ratio asserted). Nextest does not run
-# doctests (https://nexte.st/docs/running/), so the explicit
+# used by verify-changed.sh) instead of `cargo test --workspace`. This is a
+# scheduling opportunity, not a measured causal proof: verify-changed's
+# nextest phase ran 145.053s versus the full gate's 1331.540s on the same
+# tracked tree a2865b3 (native evidence, candidate
+# 34be02b2cfed52ed087b4c9ae80bda6b953f6928), but those numbers cover unequal
+# scopes (a package-scoped nextest run versus fmt+build+test+clippy over the
+# whole workspace) with no disjoint per-phase timing of the OLD recipe to
+# compare against — nextest running test binaries concurrently while
+# `cargo test` runs them one at a time is the hypothesis motivating this
+# change, not something these two numbers alone establish as the cause; no
+# speedup ratio is asserted. Nextest does not run doctests
+# (https://nexte.st/docs/running/), so the explicit
 # `cargo test --workspace --doc` step below preserves that category. It is a
 # no-op on this workspace today (verified via `cargo metadata
-# --format-version 1 --no-deps`: no target has `doctest: false`, and the only
+# --format-version 1 --no-deps`: none of the workspace's 10 library targets
+# has `doctest: false` — non-library targets such as bins and integration
+# tests always report `doctest: false` regardless, since only libraries
+# support doctests, so that is not evidence of anything here — and the only
 # ``` fence outside a doctest is rk-git/src/lib.rs's ```text, which rustdoc
 # never executes) but load-bearing the moment a runnable doctest is added.
 # The same metadata query confirms no target has kind "example" or "bench"
-# and no target carries `doctest: false`. It does NOT confirm the absence of
+# and no library target carries `doctest: false`. It does NOT confirm the absence of
 # `harness = false` test targets — metadata's `test` field only says whether
 # a target participates in `cargo test` at all, not which harness it uses, so
 # a harness=false target still reports `test: true` and metadata alone cannot

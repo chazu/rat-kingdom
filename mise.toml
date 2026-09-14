@@ -62,12 +62,14 @@ description = "Full workspace build, test, and lint — reserved for CI and prot
 # drift — mirroring how [tasks.verify] already delegates to verify-changed.sh.
 # See that script's header for the nextest/doctest/job-bound rationale.
 #
-# .github/workflows/ci.yml is NOT yet wired onto this script: .github is a
-# protected path, so that edit needs the explicit protected-change
-# authorization route rather than landing alongside this local recipe.
-# Tracked as TKT-sojuz-bogij-bapip (blocked on this ticket); the prepared CI
-# hunk is retained there. Until it lands, CI and protected-final landing run
-# different recipes — this is a real, tracked gap, not full CI/local parity.
+# .github/workflows/ci.yml is NOT yet wired onto this script, and
+# .rk/checks.cue's `verify` toolchain declaration still omits cargo-nextest:
+# both .github and .rk are protected paths, so those edits need the explicit
+# protected-change authorization route rather than landing alongside this
+# local recipe. Tracked as TKT-sojuz-bogij-bapip (blocked on this ticket);
+# the prepared CI hunk is retained there. Until it lands, CI and
+# protected-final landing run different recipes — this is a real, tracked
+# gap, not full CI/local parity.
 run = "./scripts/verify-full.sh"
 
 [tasks.clean]
