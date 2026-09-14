@@ -10751,11 +10751,23 @@ impl Daemon {
             session_generation.clone(),
             params.message,
         );
-        if let Err(e) =
-            crate::steer::enqueue(&self.space, &record.repo_name, &envelope, &self.castle)
-        {
-            return Response::err(req.id, codes::INTERNAL, e.to_string());
-        }
+        // `Supervisor::steer_envelope` now owns the durable journal write
+        // itself (`admit_steer(..., durable: true)`, wired to
+        // `crate::steer::enqueue`), reserving-and-journaling-and-sending as
+        // one admission decision. This RPC must NOT also call `enqueue`:
+        // doing so here, before this call, as an earlier version did, durably
+        // journaled every request unconditionally — including one about to
+        // be refused for a terminal/stale-generation/wrong-harness/saturated
+        // reason. That left a permanently un-acknowledged pending message in
+        // storage indistinguishable from one genuinely in flight when the
+        // daemon crashed, and `publish_launch`/`track_session`'s
+        // restart-replay would then silently replay it onto whatever session
+        // a later `rk respawn` of the SAME agent name launched — reopening
+        // exactly what the rejection was for. Journaling only ever inside a
+        // successful admission means a rejected request leaves no durable
+        // trace to be replayed by anything, ever, and an accepted one is
+        // journaled before it is sent, never after — see `admit_steer`'s doc
+        // comment for why that direction matters too.
         match self
             .supervisor
             .steer_envelope(&params.name, &envelope)
