@@ -91,7 +91,34 @@ capability/failure-path requirements.
 - Independent-delivery metrics retain root lineage and deferred scope; more
   tickets or integrated disabled code alone do not prove delivered benefit.
 
-This amendment has an author consistency check, not a new independent adversarial
-approval. The earlier approval applies only to its recorded revision. Subsequent
-review should examine the changed contracts and dependency removals; unrelated
-accepted deliveries need not repeat their program-level review.
+The amendment initially had an author consistency check only. The earlier
+approval applies only to its recorded revision. The independent amendment review
+below covers the changed contracts and dependency removals; unrelated accepted
+deliveries do not repeat their program-level review.
+
+### Independent amendment review
+
+Reviewed source: `6e486af643482c56eaa8dfa749437be027d7b776`, compared with
+`108692631b6da730f81c7f8b91424049523ece01`. Both reviewers checked existing
+capabilities against deployed baseline `3b12e720d21b0cf3cdb6aa9a5c5512644e2a9b2b`.
+
+- Requirements reviewer (`promotion_plan_requirements`): **approve**, no blocking
+  findings. R1-R9 and the full capability/failure-path requirements remain intact.
+  Existing execution, installation, configuration and analytics paths can support
+  independently useful deliveries without unfinished check sharing.
+- Standards reviewer (`promotion_plan_standards`): **approve**, no blocking
+  findings. Capability-specific correctness, authority, resource and recovery
+  prerequisites remain mandatory. Existing full checks, native review and exact
+  source/policy binding still govern each delivery.
+
+Implementation constraints retained from review: tickets must name actual
+required capabilities; flags must control real behavior; inventory and reporting
+must provide their stated operator journeys. Initial inventory recipes must
+explicitly enforce build parallelism limits because the existing installer does
+not provide them itself. Overlap must account for duplicate check cost until
+coalescing is accepted. Manual recovery does not establish automatic supervision.
+
+This approval covers the design amendment only. It does not accept the earlier
+P0 source, reset spent authority, or establish implementation, delivery or
+deployment evidence. The subsequent review-record edit is administrative;
+reviewed design and requirements are unchanged.
