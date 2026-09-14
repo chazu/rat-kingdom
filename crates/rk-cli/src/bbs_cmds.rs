@@ -108,6 +108,14 @@ pub enum BbsCommand {
         #[arg(long)]
         key: Option<String>,
     },
+    /// Inspect or change the opt-in `bbs-discovery-ranking` setting for one
+    /// repo (P8/P11 first slice). Default is `off`, which reproduces the
+    /// original ranking exactly; that default is also the permanent
+    /// fallback if no later program slice ships.
+    Discovery {
+        #[command(subcommand)]
+        command: DiscoveryCommand,
+    },
     /// Operator-only: assess a reuse receipt.
     Assess {
         /// The reuse receipt this assessment is about.
@@ -158,6 +166,27 @@ pub struct BriefArgs {
     /// Maximum posts per category (1..20).
     #[arg(long, default_value_t = 5)]
     limit: usize,
+}
+
+#[derive(Subcommand)]
+pub enum DiscoveryCommand {
+    /// Show the effective `bbs-discovery-ranking` setting for a repo.
+    Show {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Turn on the observed-generic-word-filter ranking variant for a repo.
+    /// Operator-only; the repo must already be registered.
+    Enable {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Return a repo to the baseline ranking (the default and fallback).
+    /// Operator-only.
+    Disable {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
 }
 
 pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<()> {
@@ -330,6 +359,33 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
         } => {
             write(&mut client, "bbs.reuse", json!({"source":source,"task":task,"outcome":outcome,"text":text,"evidence":evidence,"key":key}), as_json).await?;
         }
+        BbsCommand::Discovery { command } => match command {
+            DiscoveryCommand::Show { repo } => {
+                let result = client
+                    .call("bbs.discovery.show", json!({"repo": repo}))
+                    .await?;
+                if as_json {
+                    println!("{result}");
+                } else {
+                    println!(
+                        "bbs-discovery-ranking for {}: {} (revision {}{})",
+                        repo,
+                        result["mode"].as_str().unwrap_or("off"),
+                        result["revision"].as_u64().unwrap_or(0),
+                        result["updated_by"]
+                            .as_str()
+                            .map(|by| format!(", set by {by}"))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            DiscoveryCommand::Enable { repo } => {
+                discovery_set(&mut client, &repo, "on", as_json).await?;
+            }
+            DiscoveryCommand::Disable { repo } => {
+                discovery_set(&mut client, &repo, "off", as_json).await?;
+            }
+        },
         BbsCommand::Assess {
             receipt,
             verdict,
@@ -374,6 +430,24 @@ fn run_report(args: ReportArgs, as_json: bool) -> Result<()> {
         if let Some(output) = &args.output {
             println!("(also written to {})", output.display());
         }
+    }
+    Ok(())
+}
+
+async fn discovery_set(client: &mut Client, repo: &str, mode: &str, as_json: bool) -> Result<()> {
+    let result = client
+        .call("bbs.discovery.set", json!({"repo": repo, "mode": mode}))
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "bbs-discovery-ranking for {}: now {} (revision {}); {}",
+            repo,
+            result["mode"].as_str().unwrap_or(mode),
+            result["revision"].as_u64().unwrap_or(0),
+            result["rollover_note"].as_str().unwrap_or(""),
+        );
     }
     Ok(())
 }

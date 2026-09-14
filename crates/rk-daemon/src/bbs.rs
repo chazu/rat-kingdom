@@ -35,7 +35,34 @@ impl BriefParams {
     }
 }
 
-pub fn brief(space: &Space, tickets: &Tickets, params: &BriefParams) -> rk_core::Result<Briefing> {
+/// Additional words excluded from the "task topic" tier's title-word set,
+/// applied only when a repo's `bbs-discovery-ranking` feature is `on`
+/// (`crate::bbs_discovery`). Derived from the pre-outcome observation
+/// retained at BBS artifact `01M2ERKFJ8KCQ78TTBK42VVASP`: words whose
+/// incidental title overlap produced unrelated landing/review noise in two
+/// real briefs. This is a display-noise observation, not a general claim
+/// that any of these words is always generic everywhere.
+///
+/// Deliberately NARROWER than the full set the observation flagged:
+/// `observer`, `budget` and `verification` were dropped from this list after
+/// review, because they are load-bearing domain terms IN THIS REPOSITORY
+/// (checks/verification, ledger budgets, the observer component) — excluding
+/// them would drop genuinely relevant findings, not just noise, exactly the
+/// failure mode this feature exists to avoid. The counterexample is fixed by
+/// narrowing the list itself, not by telling an operator not to enable the
+/// feature. What remains is pure report-narration vocabulary with no
+/// identified domain meaning in this repo's title/finding text. Nothing
+/// broader than this reviewed list is excluded, and nothing is invented
+/// beyond it. The baseline (`off`, the default and fallback) never applies
+/// this list.
+const OBSERVED_GENERIC_TITLE_WORDS: &[&str] = &["source", "report", "after", "during", "current"];
+
+pub fn brief(
+    space: &Space,
+    tickets: &Tickets,
+    params: &BriefParams,
+    discovery: crate::bbs_discovery::DiscoveryConfig,
+) -> rk_core::Result<Briefing> {
     if params.repo.trim().is_empty()
         || params.task.trim().is_empty()
         || !(1..=20).contains(&params.limit)
@@ -97,6 +124,10 @@ pub fn brief(space: &Space, tickets: &Tickets, params: &BriefParams) -> rk_core:
         }
     }
     related.insert(canonical.to_lowercase());
+    let generic_extra: &[&str] = match discovery.variant {
+        rk_core::bbs::RankingVariant::ObservedGenericWordFilter => OBSERVED_GENERIC_TITLE_WORDS,
+        rk_core::bbs::RankingVariant::Baseline => &[],
+    };
     let words: HashSet<_> = task
         .as_ref()
         .and_then(|t| t.payload["title"].as_str())
@@ -115,6 +146,7 @@ pub fn brief(space: &Space, tickets: &Tickets, params: &BriefParams) -> rk_core:
                 "remaining",
             ]
             .contains(&w.as_str())
+                && !generic_extra.contains(&w.as_str())
         })
         .take(24)
         .collect();
@@ -222,6 +254,9 @@ pub fn brief(space: &Space, tickets: &Tickets, params: &BriefParams) -> rk_core:
         // this selection was prepared for.
         telemetry: None,
         exposure: None,
+        ranking_variant: discovery.variant,
+        ranking_config_revision: discovery.revision,
+        ranking_config_status: discovery.status,
     })
 }
 
@@ -346,6 +381,15 @@ pub fn record_exposure(
         // Stated in the record itself so no consumer has to rediscover it:
         // preparing a selection is not delivering it to a model.
         "semantics": "prepared",
+        // The actually applied ranking variant/config identity (P8/P11
+        // first slice): the daemon build that computed this selection, and
+        // whether the config revision below is a confirmed repo setting or
+        // an unreadable-registry fallback (`ranking_config_status`) — never
+        // collapsed into a bare "0 means unconfigured" revision number.
+        "build": rk_core::version::BUILD_VERSION,
+        "ranking_variant": briefing.ranking_variant.as_str(),
+        "ranking_config_revision": briefing.ranking_config_revision,
+        "ranking_config_status": briefing.ranking_config_status.as_str(),
     });
     write_telemetry(
         space,
@@ -1526,7 +1570,13 @@ mod tests {
         space.out(late.clone()).unwrap();
         let mut params = BriefParams::for_task("repo", &task.identity);
         params.since = Some(checkpoint);
-        let briefing = brief(&space, &tickets, &params).unwrap();
+        let briefing = brief(
+            &space,
+            &tickets,
+            &params,
+            crate::bbs_discovery::DiscoveryConfig::default(),
+        )
+        .unwrap();
         assert!(briefing
             .entries
             .iter()
@@ -1554,7 +1604,13 @@ mod tests {
             }
         }
         params.limit = 2;
-        let briefing = brief(&space, &tickets, &params).unwrap();
+        let briefing = brief(
+            &space,
+            &tickets,
+            &params,
+            crate::bbs_discovery::DiscoveryConfig::default(),
+        )
+        .unwrap();
         assert_eq!(briefing.entries.len(), 6);
         assert_eq!(briefing.omitted, 19);
         assert!(briefing
@@ -1562,7 +1618,173 @@ mod tests {
             .iter()
             .all(|e| e.summary.chars().count() <= 501));
         params.repo = "foreign".into();
-        assert!(brief(&space, &tickets, &params).is_err());
+        assert!(brief(
+            &space,
+            &tickets,
+            &params,
+            crate::bbs_discovery::DiscoveryConfig::default()
+        )
+        .is_err());
+    }
+
+    /// Shape of the retained pre-outcome observation (BBS artifact
+    /// `01M2ERKFJ8KCQ78TTBK42VVASP`), narrowed to the reviewed word list and
+    /// mirrored against the finite public CLI probe (candidate evidence
+    /// `01M2GZDA9YRS8E9AFYRSG99QQS`): the discovery ranking variant filters
+    /// generic-word-only noise while preserving stronger explicit-link
+    /// relevance AND a legitimate single-topic match on a real domain word
+    /// (`verification`) that this repo's own titles use constantly —
+    /// noise reduction must not erase that. Disabling it reproduces the
+    /// baseline selection exactly.
+    #[test]
+    fn discovery_ranking_on_filters_generic_word_noise_but_preserves_domain_topic_and_explicit_links(
+    ) {
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Tickets::new(space.clone(), "castle".into());
+        let task = Tuple::new(
+            Category::Task,
+            "repo",
+            format!("TKT-{}", rk_core::id::RecordId::new()),
+            "operator",
+            json!({"title":"Reconcile verification budget after report","status":"open"}),
+        );
+        space.out(task.clone()).unwrap();
+
+        // Generic-word-only noise: shares only "after"/"report", the pure
+        // report-narration words that remain on the reviewed exclusion list.
+        let noise = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "landing-notice",
+            "peer",
+            json!({"summary":"after report from another unrelated task"}),
+        );
+        space.out(noise.clone()).unwrap();
+
+        // A legitimate single-topic source sharing only "verification" — a
+        // load-bearing domain word (checks/verification), deliberately NOT
+        // excluded, so noise reduction must not erase it either.
+        let specific = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "verification-finding",
+            "peer",
+            json!({"summary":"verification concurrency must remain bounded to avoid resource starvation"}),
+        );
+        space.out(specific.clone()).unwrap();
+
+        // An explicit task link: unaffected by ranking mode either way.
+        let linked = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "linked-note",
+            "peer",
+            json!({"task":task.identity,"summary":"A directly linked useful constraint"}),
+        );
+        space.out(linked.clone()).unwrap();
+
+        let params = BriefParams::for_task("repo", &task.identity);
+
+        let baseline = brief(
+            &space,
+            &tickets,
+            &params,
+            crate::bbs_discovery::DiscoveryConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.ranking_variant,
+            rk_core::bbs::RankingVariant::Baseline
+        );
+        assert_eq!(baseline.ranking_config_revision, 0);
+        for id in [&noise.id, &specific.id, &linked.id] {
+            assert!(
+                baseline.entries.iter().any(|e| e.id == id.to_string()),
+                "baseline selects {id}"
+            );
+        }
+
+        let on = crate::bbs_discovery::DiscoveryConfig {
+            variant: rk_core::bbs::RankingVariant::ObservedGenericWordFilter,
+            revision: 1,
+            status: rk_core::bbs::ConfigStatus::Explicit,
+        };
+        let filtered = brief(&space, &tickets, &params, on).unwrap();
+        assert_eq!(
+            filtered.ranking_variant,
+            rk_core::bbs::RankingVariant::ObservedGenericWordFilter
+        );
+        assert_eq!(filtered.ranking_config_revision, 1);
+        assert_eq!(
+            filtered.ranking_config_status,
+            rk_core::bbs::ConfigStatus::Explicit
+        );
+        assert!(
+            !filtered
+                .entries
+                .iter()
+                .any(|e| e.id == noise.id.to_string()),
+            "generic-word-only noise is dropped when the feature is on"
+        );
+        let specific_entry = filtered
+            .entries
+            .iter()
+            .find(|e| e.id == specific.id.to_string())
+            .expect("a legitimate single-topic source survives noise reduction");
+        assert_eq!(specific_entry.reason, "task topic");
+        let linked_entry = filtered
+            .entries
+            .iter()
+            .find(|e| e.id == linked.id.to_string())
+            .expect("an explicit task link is unaffected by ranking mode");
+        assert_eq!(linked_entry.reason, "task or dependency");
+
+        // Disable returns exactly to the baseline selection/order.
+        let disabled = crate::bbs_discovery::DiscoveryConfig {
+            variant: rk_core::bbs::RankingVariant::Baseline,
+            revision: 2,
+            status: rk_core::bbs::ConfigStatus::Explicit,
+        };
+        let back = brief(&space, &tickets, &params, disabled).unwrap();
+        let baseline_ids: Vec<_> = baseline.entries.iter().map(|e| &e.id).collect();
+        let back_ids: Vec<_> = back.entries.iter().map(|e| &e.id).collect();
+        assert_eq!(
+            baseline_ids, back_ids,
+            "disable reproduces the baseline selection/order exactly"
+        );
+        assert_eq!(
+            back.ranking_config_revision, 2,
+            "revision is honestly reported even when behavior matches baseline"
+        );
+        assert_eq!(
+            back.ranking_config_status,
+            rk_core::bbs::ConfigStatus::Explicit,
+            "an explicit disable record is not the same evidence as never-configured"
+        );
+    }
+
+    #[test]
+    fn discovery_config_status_distinguishes_absent_from_unreadable_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+
+        // Nothing written yet: a confirmed, not assumed, absence.
+        let absent = crate::bbs_discovery::resolve_for_brief(&layout, "repo");
+        assert_eq!(absent.variant, rk_core::bbs::RankingVariant::Baseline);
+        assert_eq!(absent.revision, 0);
+        assert_eq!(absent.status, rk_core::bbs::ConfigStatus::DefaultAbsent);
+
+        // A malformed registry file degrades to baseline, but as an honest
+        // UNKNOWN — never reported as though the repo were confirmed unset.
+        std::fs::write(dir.path().join("bbs-discovery.json"), "not valid json").unwrap();
+        let unreadable = crate::bbs_discovery::resolve_for_brief(&layout, "repo");
+        assert_eq!(unreadable.variant, rk_core::bbs::RankingVariant::Baseline);
+        assert_eq!(unreadable.revision, 0);
+        assert_eq!(
+            unreadable.status,
+            rk_core::bbs::ConfigStatus::UnreadableFallback
+        );
+        assert_ne!(absent.status, unreadable.status);
     }
 
     #[test]
@@ -2185,7 +2407,13 @@ mod tests {
 
         // Before anything relevant exists, the selection is genuinely EMPTY.
         let params = BriefParams::for_task("repo", &task.identity);
-        let empty = brief(&space, &tickets, &params).unwrap();
+        let empty = brief(
+            &space,
+            &tickets,
+            &params,
+            crate::bbs_discovery::DiscoveryConfig::default(),
+        )
+        .unwrap();
         assert!(empty.entries.is_empty());
         let binding = ConsumerBinding::agent("Scurry-15", "spawn-1", Some(&task.identity));
         let capture = record_exposure(&space, "castle", ExposureSurface::Spawn, &binding, &empty);
@@ -2216,7 +2444,13 @@ mod tests {
             json!({"task":task.identity,"summary":"a reproduction"}),
         );
         space.out(post.clone()).unwrap();
-        let filled = brief(&space, &tickets, &params).unwrap();
+        let filled = brief(
+            &space,
+            &tickets,
+            &params,
+            crate::bbs_discovery::DiscoveryConfig::default(),
+        )
+        .unwrap();
         record_exposure(&space, "castle", ExposureSurface::Brief, &binding, &filled);
         let brief_record = exposures(&space)
             .into_iter()
@@ -2229,7 +2463,13 @@ mod tests {
 
         // An exposure is measurement metadata: it must never come back as a
         // peer finding, however well it matches the task.
-        let after = brief(&space, &tickets, &params).unwrap();
+        let after = brief(
+            &space,
+            &tickets,
+            &params,
+            crate::bbs_discovery::DiscoveryConfig::default(),
+        )
+        .unwrap();
         assert!(
             after
                 .entries

@@ -203,6 +203,74 @@ pub fn is_excluded_from_discovery(tuple: &Tuple) -> bool {
     is_reuse(tuple) || is_assessment(tuple) || is_telemetry(tuple)
 }
 
+/// Which BBS discovery ranking a briefing selection actually applied. See
+/// `crates/rk-daemon/src/bbs_discovery.rs` (P8/P11 first slice: design doc
+/// `docs/2026-09-13-continuous-validation-promotion.md` section 7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RankingVariant {
+    /// Every title word (length >= 5, minus a fixed stoplist) scores a
+    /// "task topic" match equally. Always the default and the fallback: a
+    /// repo with no explicit setting, a disabled setting, or a config read
+    /// failure all resolve here.
+    Baseline,
+    /// Baseline plus a small set of additional excluded words, shown by a
+    /// retained pre-outcome observation (BBS artifact
+    /// `01M2ERKFJ8KCQ78TTBK42VVASP`) to produce unrelated landing/review
+    /// noise on generic title-word overlap. Opt-in per repository.
+    ObservedGenericWordFilter,
+}
+
+impl Default for RankingVariant {
+    fn default() -> Self {
+        Self::Baseline
+    }
+}
+
+impl RankingVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::ObservedGenericWordFilter => "observed-generic-word-filter",
+        }
+    }
+}
+
+/// How a briefing's [`RankingVariant`]/config revision was actually arrived
+/// at. Both non-explicit states apply the baseline, but for different, not
+/// interchangeable, reasons — collapsing them would let an unreadable
+/// registry silently masquerade as "operator confirmed this repo is
+/// unconfigured".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigStatus {
+    /// An explicit per-repo record exists and was read successfully.
+    Explicit,
+    /// The registry itself was read successfully and genuinely has no record
+    /// for this repo — a confirmed, not assumed, absence.
+    DefaultAbsent,
+    /// The registry could not be read (I/O or parse error). The baseline was
+    /// applied as a safe fallback, but whether this repo has an explicit
+    /// setting is UNKNOWN, not confirmed absent.
+    UnreadableFallback,
+}
+
+impl Default for ConfigStatus {
+    fn default() -> Self {
+        Self::DefaultAbsent
+    }
+}
+
+impl ConfigStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::DefaultAbsent => "default_absent",
+            Self::UnreadableFallback => "unreadable_fallback",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BriefingEntry {
     pub id: String,
@@ -236,6 +304,22 @@ pub struct Briefing {
     /// written. Lets a caller or test join a rendered briefing to its record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure: Option<String>,
+    /// The ranking variant actually applied to this selection. Always
+    /// concretely known — never absent — so a consumer never has to guess
+    /// which algorithm produced the entries above.
+    #[serde(default)]
+    pub ranking_variant: RankingVariant,
+    /// The per-repo discovery config revision this selection observed. `0`
+    /// means no explicit per-repo record exists yet: an honest "unset",
+    /// never fabricated as revision 1.
+    #[serde(default)]
+    pub ranking_config_revision: u64,
+    /// Whether `ranking_variant`/`ranking_config_revision` reflect a
+    /// confirmed repo setting (`explicit`/`default_absent`) or an
+    /// unreadable-registry fallback (`unreadable_fallback`) — see
+    /// [`ConfigStatus`]. Never collapsed into a bare revision number.
+    #[serde(default)]
+    pub ranking_config_status: ConfigStatus,
 }
 
 impl Briefing {
@@ -278,6 +362,14 @@ impl Briefing {
         }
         if self.telemetry == Some(TelemetryStatus::Failed) {
             out.push_str("Telemetry coverage for this briefing was NOT recorded; the briefing itself is unaffected.\n");
+        }
+        if self.ranking_variant != RankingVariant::Baseline {
+            let _ = writeln!(
+                out,
+                "Discovery ranking: {} (repo config revision {}).",
+                self.ranking_variant.as_str(),
+                self.ranking_config_revision
+            );
         }
         let _ = writeln!(out, "Read a source: `rk bbs show <id>`. Refresh at a work checkpoint: `rk bbs brief --since {}`. Updated marks writes/reinforcements; this bounded view is not a complete change log.", self.cursor);
         out
