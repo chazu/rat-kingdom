@@ -170,11 +170,15 @@ pub struct RecipeBounds {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum FileObservation {
-    Present { sha256: String },
+    Present {
+        sha256: String,
+    },
     Absent,
     /// `git` itself failed to answer — never treated as `Absent` by any
     /// caller.
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
 }
 
 /// Effective build-environment facts this module actually observed, kept
@@ -286,7 +290,9 @@ pub fn resolve_candidate(repo_path: &Path, candidate: &str) -> rk_core::Result<(
     let repo = rk_git::Repo::discover(repo_path)?;
     let resolved = repo
         .rev_parse(&format!("{candidate}^{{commit}}"))
-        .map_err(|e| rk_core::Error::other(format!("cannot resolve candidate '{candidate}': {e}")))?;
+        .map_err(|e| {
+            rk_core::Error::other(format!("cannot resolve candidate '{candidate}': {e}"))
+        })?;
     let tree = repo.rev_parse(&format!("{resolved}^{{tree}}"))?;
     Ok((resolved, tree))
 }
@@ -408,7 +414,9 @@ impl ReleaseRegistry {
     fn persist(&self) -> rk_core::Result<()> {
         use std::io::Write;
         let Some(parent) = self.path.parent() else {
-            return Err(rk_core::Error::other("release registry path has no parent directory"));
+            return Err(rk_core::Error::other(
+                "release registry path has no parent directory",
+            ));
         };
         std::fs::create_dir_all(parent)?;
         let tmp = self.path.with_extension("json.tmp");
@@ -437,7 +445,12 @@ pub fn effective_status(entry: &ReleaseIndexEntry, lock_is_free: bool) -> Releas
     }
 }
 
-fn compute_input_key(repo: &str, resolved_commit: &str, recipe: &str, recipe_revision: u32) -> String {
+fn compute_input_key(
+    repo: &str,
+    resolved_commit: &str,
+    recipe: &str,
+    recipe_revision: u32,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"rat-kingdom-release-input-v1\0");
     hasher.update(repo.as_bytes());
@@ -532,7 +545,11 @@ fn binaries_match_disk(release_dir: &Path, manifest: &ReleaseManifest) -> bool {
 /// recorded digest for: the digest covers every manifest field (so an edited
 /// id/repo/hash/schema is caught), the manifest's identity fields must match
 /// the registry entry's, and the binaries on disk must match.
-fn verify_content(entry: &ReleaseIndexEntry, release_dir: &Path, manifest: &ReleaseManifest) -> bool {
+fn verify_content(
+    entry: &ReleaseIndexEntry,
+    release_dir: &Path,
+    manifest: &ReleaseManifest,
+) -> bool {
     let Some(recorded_digest) = &entry.manifest_digest else {
         return false;
     };
@@ -877,7 +894,11 @@ fn read_blob_at(repo_path: &Path, sha: &str, rel_path: &str) -> BlobObservation 
                 String::from_utf8_lossy(&out.stderr)
             ))
         }
-        Err(e) => return BlobObservation::Unavailable(format!("git cat-file -e {spec} failed to run: {e}")),
+        Err(e) => {
+            return BlobObservation::Unavailable(format!(
+                "git cat-file -e {spec} failed to run: {e}"
+            ))
+        }
     }
     match std::process::Command::new("git")
         .arg("-C")
@@ -932,7 +953,10 @@ fn file_observation(repo_path: &Path, sha: &str, rel_path: &str) -> FileObservat
 /// worktree's current state), so — unlike candidate resolution — it is safe
 /// to call after queueing behind `Server::release_prepare_lock`: the commit
 /// is already frozen by the time this runs.
-fn gather_config_provenance(repo_path: &Path, resolved_commit: &str) -> rk_core::Result<ConfigProvenance> {
+fn gather_config_provenance(
+    repo_path: &Path,
+    resolved_commit: &str,
+) -> rk_core::Result<ConfigProvenance> {
     Ok(ConfigProvenance {
         cargo_build_jobs_env: CARGO_BUILD_JOBS.to_string(),
         cargo_incremental_env: "0".to_string(),
@@ -1033,9 +1057,9 @@ async fn run_recipe(
         .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS.to_string())
         .env("CARGO_INCREMENTAL", "0")
         .process_group(0);
-    let child = command
-        .spawn()
-        .map_err(|e| rk_core::Error::other(format!("release build: failed to spawn recipe: {e}")))?;
+    let child = command.spawn().map_err(|e| {
+        rk_core::Error::other(format!("release build: failed to spawn recipe: {e}"))
+    })?;
     let _marker = child
         .id()
         .map(|pid| ManagedChildMarker::create(layout, pid));
@@ -1165,7 +1189,8 @@ async fn run_recipe(
 /// `rk-mcp`'s real minimal handshake, matching the operator recipe's own
 /// smoke proof: one JSON-RPC `initialize` request, `id: 1`, empty object
 /// params (`rk_mcp::handle_request` refuses a non-object `params`).
-const MCP_INITIALIZE_REQUEST: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+const MCP_INITIALIZE_REQUEST: &[u8] =
+    br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
 
 async fn run_smoke_check(
     layout: &Layout,
@@ -1177,7 +1202,9 @@ async fn run_smoke_check(
     if name == "rk-mcp" {
         command.stdin(std::process::Stdio::piped());
     } else {
-        command.args(RK_SMOKE_ARGV).stdin(std::process::Stdio::null());
+        command
+            .args(RK_SMOKE_ARGV)
+            .stdin(std::process::Stdio::null());
     }
     // The candidate binary is arbitrary (that's the point of smoke-testing
     // it) and must never touch the daemon's own production home even
@@ -1193,13 +1220,17 @@ async fn run_smoke_check(
         command.env("PATH", path);
     }
     let mut child = command.spawn().map_err(|e| {
-        rk_core::Error::other(format!("release smoke check for {name}: failed to spawn: {e}"))
+        rk_core::Error::other(format!(
+            "release smoke check for {name}: failed to spawn: {e}"
+        ))
     })?;
     if name == "rk-mcp" {
         use tokio::io::AsyncWriteExt;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(MCP_INITIALIZE_REQUEST).await.map_err(|e| {
-                rk_core::Error::other(format!("release smoke check for {name}: stdin write failed: {e}"))
+                rk_core::Error::other(format!(
+                    "release smoke check for {name}: stdin write failed: {e}"
+                ))
             })?;
             stdin.write_all(b"\n").await.ok();
             // Dropping the handle here closes the write half, giving the
@@ -1270,7 +1301,11 @@ fn verify_mcp_initialize_response(stdout: &[u8]) -> rk_core::Result<()> {
     let result = value
         .get("result")
         .ok_or_else(|| rk_core::Error::other("mcp smoke: response has neither result nor error"))?;
-    if result.get("protocolVersion").and_then(serde_json::Value::as_str).is_none() {
+    if result
+        .get("protocolVersion")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
         return Err(rk_core::Error::other(format!(
             "mcp smoke: result missing protocolVersion: {result}"
         )));
@@ -1333,7 +1368,10 @@ fn write_manifest_new(path: &Path, manifest: &ReleaseManifest) -> rk_core::Resul
     let result = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     result.map_err(|e| {
-        rk_core::Error::other(format!("failed to publish manifest at {}: {e}", path.display()))
+        rk_core::Error::other(format!(
+            "failed to publish manifest at {}: {e}",
+            path.display()
+        ))
     })?;
     // Sync the directory entry so the hard link's visibility itself survives
     // a crash promptly, matching `ReleaseRegistry::persist`'s same
@@ -1389,7 +1427,12 @@ mod tests {
         let base = compute_input_key("repo", "abc123", RECIPE_PAIRED_RK_MCP, RECIPE_REVISION);
         assert_ne!(
             base,
-            compute_input_key("other-repo", "abc123", RECIPE_PAIRED_RK_MCP, RECIPE_REVISION)
+            compute_input_key(
+                "other-repo",
+                "abc123",
+                RECIPE_PAIRED_RK_MCP,
+                RECIPE_REVISION
+            )
         );
         assert_ne!(
             base,
@@ -1539,7 +1582,11 @@ mod tests {
         // this only exercises the digest/identity gate, not the hash re-read.
         let mut tampered = manifest.clone();
         tampered.repo = "someone-elses-repo".into();
-        assert!(!verify_content(&entry, Path::new("/nonexistent"), &tampered));
+        assert!(!verify_content(
+            &entry,
+            Path::new("/nonexistent"),
+            &tampered
+        ));
     }
 
     #[test]
@@ -1570,7 +1617,11 @@ mod tests {
         // exact-name-set gate independently by using the ORIGINAL digest
         // (as if only the key set had somehow been added without touching
         // the recorded digest) to prove that gate alone would still refuse.
-        assert!(!verify_content(&entry, Path::new("/nonexistent"), &manifest));
+        assert!(!verify_content(
+            &entry,
+            Path::new("/nonexistent"),
+            &manifest
+        ));
     }
 
     #[test]

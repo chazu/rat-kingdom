@@ -244,7 +244,10 @@ fn start_daemon(home: &Path) -> u32 {
     until("a daemon to come up over the home", || {
         let mut cmd = rk(home);
         cmd.args(["--json", "release", "list"]);
-        bounded_output(cmd, RPC_BOUND).status.success().then_some(())
+        bounded_output(cmd, RPC_BOUND)
+            .status
+            .success()
+            .then_some(())
     });
     until("the freshly started daemon to report its pid", || {
         daemon_pid(home)
@@ -522,7 +525,10 @@ fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() 
         },
         RPC_BOUND,
     ));
-    assert_eq!(earlier_shown["release"]["status"], "prepared", "{earlier_shown}");
+    assert_eq!(
+        earlier_shown["release"]["status"], "prepared",
+        "{earlier_shown}"
+    );
     assert_eq!(earlier_shown["content_verified"], true, "{earlier_shown}");
 
     // No manual `rk daemon stop`/pid-file cleanup here: `_daemon_guard`'s

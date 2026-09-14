@@ -134,7 +134,12 @@ async fn prepare_lists_and_shows_a_verified_release() {
     let manifest = &release["manifest"];
     assert_eq!(manifest["source"]["resolved_commit"], source);
     assert_eq!(
-        manifest["binaries"].as_object().unwrap().keys().collect::<Vec<_>>().len(),
+        manifest["binaries"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>()
+            .len(),
         2
     );
     assert!(manifest["binaries"]["rk"]["sha256"].as_str().unwrap().len() == 64);
@@ -296,7 +301,10 @@ async fn tampered_binary_is_detected_and_rejected() {
     assert_eq!(shown["content_verified"], false, "{shown}");
 
     let retry = prepare(&mut client, &repo_name, "main").await;
-    assert!(retry.is_err(), "a tampered release must refuse to be reused: {retry:?}");
+    assert!(
+        retry.is_err(),
+        "a tampered release must refuse to be reused: {retry:?}"
+    );
     // Refusing to reuse it must not silently repair it either.
     assert_eq!(std::fs::read(&bin_path).unwrap(), tampered);
 }
@@ -316,7 +324,11 @@ async fn tampered_manifest_field_is_detected_even_without_touching_binaries() {
     let prepared = prepare(&mut client, &repo_name, "main").await.unwrap();
     let id = prepared["release"]["id"].as_str().unwrap().to_string();
 
-    let manifest_path = layout.home().join("releases").join(&id).join("manifest.json");
+    let manifest_path = layout
+        .home()
+        .join("releases")
+        .join(&id)
+        .join("manifest.json");
     let original = std::fs::read(&manifest_path).unwrap();
     let mut edited: Value = serde_json::from_slice(&original).unwrap();
     // Edit a field that isn't a binary hash — proves the whole-manifest
@@ -345,13 +357,20 @@ async fn prepared_entry_with_missing_manifest_is_rejected_not_rebuilt() {
     let prepared = prepare(&mut client, &repo_name, "main").await.unwrap();
     let id = prepared["release"]["id"].as_str().unwrap().to_string();
 
-    let manifest_path = layout.home().join("releases").join(&id).join("manifest.json");
+    let manifest_path = layout
+        .home()
+        .join("releases")
+        .join(&id)
+        .join("manifest.json");
     std::fs::remove_file(&manifest_path).unwrap();
 
     let retry = prepare(&mut client, &repo_name, "main").await;
     assert!(retry.is_err(), "{retry:?}");
     assert!(
-        retry.unwrap_err().to_string().contains("manifest is missing"),
+        retry
+            .unwrap_err()
+            .to_string()
+            .contains("manifest is missing"),
         "must name the actual failure"
     );
     assert!(
@@ -375,7 +394,11 @@ async fn unsupported_manifest_schema_is_refused() {
     let prepared = prepare(&mut client, &repo_name, "main").await.unwrap();
     let id = prepared["release"]["id"].as_str().unwrap().to_string();
 
-    let manifest_path = layout.home().join("releases").join(&id).join("manifest.json");
+    let manifest_path = layout
+        .home()
+        .join("releases")
+        .join(&id)
+        .join("manifest.json");
     let mut edited: Value =
         serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
     edited["schema_version"] = json!(999_999);

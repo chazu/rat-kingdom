@@ -68,7 +68,11 @@ async fn prepare(layout: &Layout, args: PrepareArgs, as_json: bool) -> Result<()
     let already = result["already_prepared"].as_bool().unwrap_or(false);
     println!(
         "{} {} — {} (repo {}, recipe {})",
-        if already { "already prepared" } else { "prepared" },
+        if already {
+            "already prepared"
+        } else {
+            "prepared"
+        },
         release["id"].as_str().unwrap_or("?"),
         release["status"].as_str().unwrap_or("?"),
         release["repo"].as_str().unwrap_or("?"),
@@ -96,7 +100,10 @@ async fn list(layout: &Layout, args: ListArgs, as_json: bool) -> Result<()> {
         println!("(no releases)");
         return Ok(());
     }
-    println!("{:<24} {:<12} {:<14} {:<12} SOURCE", "ID", "STATUS", "REPO", "RECIPE");
+    println!(
+        "{:<24} {:<12} {:<14} {:<12} SOURCE",
+        "ID", "STATUS", "REPO", "RECIPE"
+    );
     for r in &releases {
         println!(
             "{:<24} {:<12} {:<14} {:<12} {}",
@@ -140,7 +147,10 @@ async fn show(layout: &Layout, id: String, as_json: bool) -> Result<()> {
         "  source     {}",
         release["requested_source"].as_str().unwrap_or("?")
     );
-    println!("  created    {}", release["created_at"].as_str().unwrap_or("?"));
+    println!(
+        "  created    {}",
+        release["created_at"].as_str().unwrap_or("?")
+    );
     if let Some(detail) = release["detail"].as_str() {
         println!("  detail     {detail}");
     }
@@ -159,10 +169,15 @@ async fn show(layout: &Layout, id: String, as_json: bool) -> Result<()> {
 fn print_manifest_summary(manifest: &Value) {
     println!(
         "  source     resolved {} (tree {})",
-        manifest["source"]["resolved_commit"].as_str().unwrap_or("?"),
+        manifest["source"]["resolved_commit"]
+            .as_str()
+            .unwrap_or("?"),
         manifest["source"]["tree_sha"].as_str().unwrap_or("?"),
     );
-    println!("  toolchain  {}", manifest["toolchain"].as_str().unwrap_or("(unavailable)"));
+    println!(
+        "  toolchain  {}",
+        manifest["toolchain"].as_str().unwrap_or("(unavailable)")
+    );
     if let Some(binaries) = manifest["binaries"].as_object() {
         for (name, artifact) in binaries {
             println!(
