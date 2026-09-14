@@ -2925,6 +2925,52 @@ impl Daemon {
                 Vec::new()
             }
         };
+        // Bounded, storage-side-capped read of native landing outcomes
+        // (`landing::LandingPipeline::mark_processed`'s `landing_processed`
+        // markers) for the additive `native_delivery` scorecard section.
+        // `scan_newest_limited` pushes scope+limit into SQL before any
+        // payload is materialized (module doc), so this cost is the page,
+        // not the journal; request one extra row to detect truncation
+        // without guessing, matching `inbox_value`'s idiom above. Despite the
+        // method's name, its order is descending tuple id (ULID mint order),
+        // not persistence sequence or wall clock — `factory_analytics`'s
+        // reduction over these rows is order-independent and reports this
+        // page's bound honestly rather than as "newest".
+        let native_delivery_pattern = Pattern::category(Category::Event)
+            .identity(crate::landing::LANDING_PROCESSED_IDENTITY)
+            .scope(repo.clone());
+        let native_delivery = match self
+            .space
+            .scan_newest_limited(&native_delivery_pattern, MAX_SCAN_TUPLES.saturating_add(1))
+        {
+            Ok(mut rows) => {
+                let scanned = rows.len().min(MAX_SCAN_TUPLES);
+                let truncated = rows.len() > MAX_SCAN_TUPLES;
+                rows.truncate(MAX_SCAN_TUPLES);
+                let events = rows
+                    .into_iter()
+                    .filter(|event| in_window(event.created_at.timestamp_millis()))
+                    .collect();
+                crate::factory_analytics::NativeDeliveryInputs {
+                    events,
+                    scanned,
+                    limit: MAX_SCAN_TUPLES,
+                    truncated,
+                    available: true,
+                    read_warning: None,
+                }
+            }
+            Err(error) => crate::factory_analytics::NativeDeliveryInputs {
+                events: Vec::new(),
+                scanned: 0,
+                limit: MAX_SCAN_TUPLES,
+                truncated: false,
+                available: false,
+                read_warning: Some(format!(
+                    "source_family_read_failed: NativeLandingDelivery unavailable: {error}"
+                )),
+            },
+        };
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
@@ -2936,6 +2982,7 @@ impl Daemon {
             reviewer_verdicts,
             runtime_unavailable,
             read_warnings,
+            native_delivery,
         }
     }
 
