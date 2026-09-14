@@ -2315,17 +2315,18 @@ impl Supervisor {
                 spec.prompt.clone()
             };
             tokio::task::spawn_blocking(move || {
-                let _ = std::process::Command::new("herdr")
-                    .args([
-                        "agent",
-                        "wait",
-                        &target,
-                        "--status",
-                        "idle",
-                        "--timeout",
-                        "30000",
-                    ])
-                    .output();
+                let mut cmd = std::process::Command::new("herdr");
+                cmd.args([
+                    "agent",
+                    "wait",
+                    &target,
+                    "--status",
+                    "idle",
+                    "--timeout",
+                    "30000",
+                ]);
+                rk_core::exec::close_extra_fds(&mut cmd);
+                let _ = cmd.output();
                 if let Err(e) = rk_mux::HerdrMux::send(&target, &prompt) {
                     warn!(error = %e, "failed to deliver prompt to herdr pane");
                 }
@@ -2705,17 +2706,18 @@ impl Supervisor {
                 spec.prompt
             };
             tokio::task::spawn_blocking(move || {
-                let _ = std::process::Command::new("herdr")
-                    .args([
-                        "agent",
-                        "wait",
-                        &target,
-                        "--status",
-                        "idle",
-                        "--timeout",
-                        "30000",
-                    ])
-                    .output();
+                let mut cmd = std::process::Command::new("herdr");
+                cmd.args([
+                    "agent",
+                    "wait",
+                    &target,
+                    "--status",
+                    "idle",
+                    "--timeout",
+                    "30000",
+                ]);
+                rk_core::exec::close_extra_fds(&mut cmd);
+                let _ = cmd.output();
                 if let Err(e) = rk_mux::HerdrMux::send(&target, &prompt) {
                     warn!(error = %e, "failed to deliver resume prompt to herdr pane");
                 }
