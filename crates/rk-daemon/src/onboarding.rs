@@ -1795,14 +1795,15 @@ fn find_named_files(root: &Path, name: &str, depth: usize, found: &mut Vec<PathB
 }
 
 fn git_output(root: &Path, args: &[&str]) -> std::io::Result<Output> {
-    Command::new("git")
-        .arg("--no-optional-locks")
+    let mut cmd = Command::new("git");
+    cmd.arg("--no-optional-locks")
         .arg("-C")
         .arg(root)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C")
-        .output()
+        .env("LC_ALL", "C");
+    rk_core::exec::close_extra_fds(&mut cmd);
+    cmd.output()
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String, String> {
