@@ -70,6 +70,13 @@ async fn main() {
                     // Exact generation join key. Missing RK_SPAWN is a broken
                     // fixture environment, never a name/time fallback.
                     "spawn": env("RK_SPAWN"),
+                    // Exact LAUNCH join key (TKT-vifob-gadil-vufuj), same as
+                    // `rk done` itself: optional, so a fixture invocation that
+                    // deliberately omits it still models the legacy/no-attempt
+                    // case, but a normal fixture run must carry it or it
+                    // models a completion the daemon's `current_attempt` gate
+                    // can never actually recognize.
+                    "attempt": std::env::var("RK_ATTEMPT").ok(),
                     "branch": std::env::var("RK_BRANCH").ok(),
                     "summary": std::env::args().nth(1).unwrap_or_else(|| "done".into()),
                 },

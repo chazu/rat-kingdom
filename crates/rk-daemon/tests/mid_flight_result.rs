@@ -191,12 +191,17 @@ async fn a_mid_flight_turn_is_not_published_as_the_completion() {
     // harness never runs it on this path), so it must carry `spawn` itself —
     // `declared_done` keys on it whenever the live record has one (every
     // record does, C1/S3a, docs/2026-08-17-tkt-c1-generation-identity.md), and
-    // a payload missing the field would never match.
+    // a payload missing the field would never match. Same for `attempt`
+    // (TKT-vifob-gadil-vufuj): the live record's `current_attempt` was minted
+    // before this spawn's process ever ran, so a hand-written `task_done`
+    // that omits it models a completion the daemon's exact-attempt gate can
+    // never recognize.
     let status = client
         .call("agent.status", json!({"name": agent}))
         .await
         .unwrap();
     let spawn = status["agent"]["spawn"].clone();
+    let attempt = status["agent"]["current_attempt"].clone();
     client
         .call(
             "space.out",
@@ -204,7 +209,13 @@ async fn a_mid_flight_turn_is_not_published_as_the_completion() {
                 "category": "event",
                 "scope": repo,
                 "identity": "task_done",
-                "payload": {"agent": agent, "task": "multi-turn", "summary": "done", "spawn": spawn},
+                "payload": {
+                    "agent": agent,
+                    "task": "multi-turn",
+                    "summary": "done",
+                    "spawn": spawn,
+                    "attempt": attempt,
+                },
             }),
         )
         .await
