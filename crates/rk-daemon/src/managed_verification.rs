@@ -701,6 +701,16 @@ impl<'a> ManagedVerification<'a> {
             "daemon",
             json!({
                 "schema_version": VERIFICATION_FAILURE_RECEIPT_SCHEMA_VERSION,
+                // Mirrors the tuple's own `id` (set to `occurrence_id`
+                // below) inside the payload too — `rk scan`'s `--search` is
+                // `payload_search`, a substring test over the SERIALIZED
+                // PAYLOAD only (`Pattern::payload_search`); it never matches
+                // against `tuple.id`. Without this field, the documented
+                // retrieval command (`rk scan artifact <repo>
+                // verification-failure-receipt --search <receipt_id>`)
+                // always returns empty — a real operator probe caught
+                // exactly this gap (TKT-lurin-bulif-gabik).
+                "receipt_id": input.occurrence_id.to_string(),
                 "repo": input.repo_name,
                 "check": input.check_name,
                 "command": input.check.command,
