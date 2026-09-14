@@ -6412,12 +6412,34 @@ impl Supervisor {
     /// that channel. The adapter's own internal initial-prompt delivery calls
     /// `SessionControl::steer` directly on its session handle and never goes
     /// through here, so it is unaffected by this gate.
+    ///
+    /// Nor is a retained `steer_tx`/registry row proof the record is still
+    /// *admitted* as live work: `kill_lingering_after_done` deliberately
+    /// keeps the control handle in place for a grace window after a clean
+    /// `rk done` so a lingering process can still be reached and killed, and
+    /// a `Completed`/`Failed`/`Stopped`/`Dismissed`/`Orphaned` record never
+    /// re-occupies an implementation slot on its own. An ordinary steer
+    /// delivered into that window would silently resume source editing and
+    /// provider cost on a generation the daemon, ticket routing, and
+    /// capacity accounting all already consider finished — TKT-jobib-zahaj-
+    /// tilaj. `AgentState::is_live` is checked first, before the harness
+    /// capability check, so a terminal record is rejected the same way
+    /// regardless of harness.
     fn assert_steerable(&self, name: &str) -> rk_core::Result<()> {
-        let harness_kind = self
+        let record = self
             .lock_registry()
             .get(name)
-            .map(|r| r.harness.clone())
+            .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if !record.state.is_live() {
+            return Err(rk_core::Error::other(format!(
+                "{name} is {:?}, not a live session — steering a terminal generation would \
+                 silently reopen finished work outside implementation admission. Use \
+                 `rk respawn {name}` to resume the same generation/cost ledger instead.",
+                record.state
+            )));
+        }
+        let harness_kind = record.harness.clone();
         if make_harness(&harness_kind)?.caps().steer {
             Ok(())
         } else {
@@ -6425,6 +6447,33 @@ impl Supervisor {
                 "{harness_kind} does not support trusted mid-session steering"
             )))
         }
+    }
+
+    /// Fence delivery against a replacement session: `envelope.delivery_generation`
+    /// names the session token the caller observed when it built the
+    /// envelope (see `handle_steer` in server.rs). If a respawn has since
+    /// registered a new session token under this name, the live control
+    /// handle now belongs to the successor, not the process the operator's
+    /// guidance was meant for — deliver there only, never silently reroute a
+    /// stale envelope onto whichever process happens to hold the name now.
+    fn assert_same_generation(
+        &self,
+        name: &str,
+        envelope: &ControlEnvelope,
+    ) -> rk_core::Result<()> {
+        let current = self
+            .session_generation(name)
+            .ok_or_else(|| rk_core::Error::other(format!("{name} has no live session")))?
+            .to_string();
+        if current != envelope.delivery_generation {
+            return Err(rk_core::Error::other(format!(
+                "{name}'s live session has moved on to generation {current}; this envelope was \
+                 addressed to {}, which is no longer the current session — refusing to deliver \
+                 an operator's guidance to a replacement session",
+                envelope.delivery_generation
+            )));
+        }
+        Ok(())
     }
 
     pub async fn steer(&self, name: &str, message: &str) -> rk_core::Result<()> {
@@ -6467,6 +6516,7 @@ impl Supervisor {
         let control = self.lock_controls().get(name).cloned();
         if let Some(control) = control {
             self.assert_steerable(name)?;
+            self.assert_same_generation(name, envelope)?;
             return control.steer_envelope(envelope).await;
         }
         if self
@@ -9439,6 +9489,170 @@ mod respawn_tests {
         assert!(error
             .to_string()
             .contains("does not support trusted mid-session steering"));
+    }
+
+    /// TKT-jobib-zahaj-tilaj: `kill_lingering_after_done` deliberately keeps
+    /// the control handle in place for a grace window after a clean
+    /// `rk done` so a lingering process can still be reached and killed — a
+    /// retained `steer_tx` is therefore never proof the generation is still
+    /// admitted as live implementation work. A steer against a `Completed`
+    /// record must be rejected before it ever reaches the harness's control
+    /// channel (no provider continuation), and the rejection itself must not
+    /// mutate the record's state.
+    #[tokio::test]
+    async fn steer_is_rejected_for_a_completed_record_despite_a_retained_control_handle() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Completed;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let session = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            session.control.can_steer(),
+            "fake's channel is wired for trusted steering"
+        );
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            session.control.clone(),
+        );
+
+        let error = sup
+            .steer("Nibble", "keep going")
+            .await
+            .expect_err("a retained control handle on a Completed record must not accept a steer");
+        let text = error.to_string();
+        assert!(text.contains("Completed"), "got: {text}");
+        assert!(text.contains("rk respawn"), "got: {text}");
+
+        let envelope = ControlEnvelope::new("m1", "operator", "Nibble", "g1", "g1", "keep going");
+        let error = sup
+            .steer_envelope("Nibble", &envelope)
+            .await
+            .expect_err("the typed path must reject the same terminal record");
+        assert!(error.to_string().contains("Completed"), "got: {error}");
+
+        assert_eq!(
+            sup.status("Nibble").unwrap().state,
+            AgentState::Completed,
+            "a rejected steer must never mutate agent state or occupy a live slot"
+        );
+    }
+
+    /// `handle_steer` in server.rs captures `session_generation` immediately
+    /// before constructing the envelope, naming the process the operator's
+    /// message was meant for. If a respawn races in between and registers a
+    /// new session token under the same name, the live control handle now
+    /// belongs to the successor — an envelope still addressed to the
+    /// predecessor's generation must be refused rather than silently
+    /// rerouted onto whichever process happens to hold the name now
+    /// (TKT-jobib-zahaj-tilaj).
+    #[tokio::test]
+    async fn steer_envelope_is_rejected_after_a_respawn_supersedes_its_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let first = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        let stale_generation = sup
+            .track_session(
+                &mut sup.lock_session_tokens(),
+                "Nibble",
+                first.control.clone(),
+            )
+            .to_string();
+
+        // A respawn takes over the name with a fresh session, exactly as
+        // `publish_launch`/`track_session` do for a real `rk respawn`.
+        let second = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            second.control.clone(),
+        );
+
+        let envelope = ControlEnvelope::new(
+            "m1",
+            "operator",
+            "Nibble",
+            stale_generation.clone(),
+            stale_generation,
+            "guidance meant for the predecessor",
+        );
+        let error = sup
+            .steer_envelope("Nibble", &envelope)
+            .await
+            .expect_err("an envelope addressed to a superseded generation must be refused");
+        assert!(
+            error.to_string().contains("replacement session"),
+            "got: {error}"
+        );
+    }
+
+    /// Positive control for the two rejection tests above: ordinary live
+    /// steering against the current generation of a `Running` record must
+    /// keep working unchanged.
+    #[tokio::test]
+    async fn steer_envelope_succeeds_for_a_live_matching_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let session = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        let generation = sup
+            .track_session(
+                &mut sup.lock_session_tokens(),
+                "Nibble",
+                session.control.clone(),
+            )
+            .to_string();
+
+        let envelope = ControlEnvelope::new(
+            "m1",
+            "operator",
+            "Nibble",
+            generation.clone(),
+            generation,
+            "keep going",
+        );
+        sup.steer_envelope("Nibble", &envelope)
+            .await
+            .expect("ordinary live steering against the current generation must still work");
     }
 
     /// `interrupt` is harness-agnostic (every `runner::launch`-based adapter
