@@ -32,6 +32,39 @@
 //! timings and repo/source sizes (history length, branch count, load shape)
 //! and asserts every sampled RPC still completes inside its 5s budget with
 //! the fix in place.
+//!
+//! TKT-matom-livag-zohut diagnosed a later protected-landing gate failure of
+//! this same test (candidate 5de6060, 2026-09-14T13:53:37Z, gate-failure
+//! artifact 01M2G33QCXBQRNKYDBZY033VY0) whose tail-truncated capture omitted
+//! the actual panic — the real cause of that specific 13:53 failure could
+//! not be recovered byte-for-byte, and this note does not claim otherwise.
+//! What was established directly:
+//!
+//! - An isolated replay of the exact failing binary (hash bb3ed21…) passed
+//!   cleanly (22.10s, max RPC 322ms), and the daemon-side fix this test
+//!   guards (open-once-per-scope in `cleared_branches_for_paths`, concurrent
+//!   `cleared_branches`/`merge_commit_ancestry` reads in `reconcile_report`)
+//!   was confirmed still present by reading `server.rs`. No evidence of a
+//!   regression in the RPC-latency path itself was found.
+//! - The pre-fix fixture's own synthetic load generator (see
+//!   `load_check_body`'s prior doc comment / git history) bounded each
+//!   check's CPU burn by a fixed iteration count, checked against its 60s
+//!   `timeout` only implicitly (by finishing or not) rather than against
+//!   wall-clock time. Measured directly: the identical loop body took 19.1s
+//!   on a lightly-loaded host and 106.7s under a representative 65-way CPU-
+//!   contention scenario (8 cores) — over the 60s cap. Reproduced through
+//!   the REAL `verify.run` path with the unmodified pre-fix binary under
+//!   96-way contention: `verify.run` itself failed for 3 of 6 checks with
+//!   "... timed out after 60s and was killed", panicking this test at its
+//!   `run_verify` call site — a demonstrated, real failure mode of the old
+//!   fixture, distinct from (and easily mistaken for, given a truncated
+//!   tail) the RPC-deadline assertions this test exists to guard.
+//!
+//! Fixed by making the load generator's own budget wall-clock-bounded and
+//! checked at a fine (small-batch) granularity rather than only at the end
+//! of a fixed-size run — see `load_check_body` for why granularity matters
+//! as much as the wall-clock basis, and why this does not reduce load
+//! coverage or weaken the observer's 5s/20s budgets.
 
 mod support;
 
@@ -101,22 +134,61 @@ fn cue_command(body: &str) -> String {
 /// spawns for the linker/build scripts) — against the same repository
 /// `reconcile.report` reads, without needing an actual Cargo project. Pure
 /// POSIX shell arithmetic for the CPU burn (portable, no `seq`/brace
-/// expansion/external CPU-spin binary), with a real `git` subprocess spawned
-/// every 100k iterations so fork/exec contention is present too, not just
-/// CPU pressure.
-fn load_check_body(repo: &Path, iterations: usize) -> String {
+/// expansion/external CPU-spin binary) run in small fixed-size batches, with
+/// a real `git` subprocess spawned roughly every 100k arithmetic iterations
+/// so fork/exec contention is present too, not just CPU pressure. The check
+/// runner execs this via `sh` (`managed_verification.rs`'s
+/// `Command::new("sh")`), so it deliberately avoids `$SECONDS` and other
+/// bash/ksh-only builtins in favor of the POSIX `date +%s` utility this file
+/// already relies on elsewhere for portability.
+///
+/// Bounded by wall-clock, not by a fixed iteration count, and checked every
+/// `BATCH` (small) arithmetic iterations rather than only once at the very
+/// end — the granularity matters as much as the wall-clock basis. TKT-
+/// matom-livag-zohut measured why: the same CPU burn written as a single
+/// `while [ $i -lt N ]` loop up to a fixed count of 2,000,000 took 19.1s on a
+/// lightly-loaded host but 106.7s under a representative 65-way CPU-
+/// contention scenario (8 cores) — a 5.6x slowdown that blows straight
+/// through this check's own 60s `timeout`, and was independently reproduced
+/// through the real `verify.run` path with the unmodified pre-fix binary
+/// (96-way contention, `verify.run` itself failed: "... timed out after 60s
+/// and was killed" for 3 of 6 checks). A host-speed-dependent, checked-once
+/// budget can therefore fail this test on its OWN load generator instead of
+/// the actual subject under test (the observer's RPC deadline) — an
+/// ambiguity this diagnosis could not rule out for the original gate
+/// failure, whose panic text did not survive tail truncation. Checking the
+/// deadline every small batch (not every 2,000,000-iteration run) bounds the
+/// worst-case overrun to roughly one batch's duration regardless of how slow
+/// the host is — not eliminating scheduling delay, but keeping any overrun
+/// small and non-multiplicative, unlike the original design where the ENTIRE
+/// workload's slowdown compounded before the deadline was ever consulted.
+/// Wall-clock bounding also does not reduce load coverage: on a slower host
+/// it does fewer arithmetic iterations in the same `duration_secs`, but it
+/// still spends the full `duration_secs` generating CPU and git-subprocess
+/// contention overlapping the observer's sampling window — which is the
+/// dimension this test actually asserts on, not a specific op count.
+fn load_check_body(repo: &Path, duration_secs: u64) -> String {
     let repo = repo.display();
+    const BATCH: u64 = 5_000;
+    // Roughly one `git` spawn per 100k arithmetic iterations, preserved from
+    // the original design: one every `CHECKS_PER_GIT_SPAWN` batches.
+    const CHECKS_PER_GIT_SPAWN: u64 = 100_000 / BATCH;
     format!(
-        "i=0; while [ $i -lt {iterations} ]; do i=$((i+1)); \
-         if [ $((i % 100000)) -eq 0 ]; then git -C {repo} rev-parse HEAD >/dev/null 2>&1; fi; \
+        "i=0; c=0; start=$(date +%s); end=$((start + {duration_secs})); \
+         while true; do \
+         b=0; while [ $b -lt {BATCH} ]; do i=$((i+1)); b=$((b+1)); done; \
+         c=$((c+1)); \
+         now=$(date +%s); \
+         if [ \"$now\" -ge \"$end\" ]; then break; fi; \
+         if [ $((c % {CHECKS_PER_GIT_SPAWN})) -eq 0 ]; then git -C {repo} rev-parse HEAD >/dev/null 2>&1; fi; \
          done"
     )
 }
 
-fn write_load_checks(repo: &Path, n: usize, iterations: usize) {
+fn write_load_checks(repo: &Path, n: usize, duration_secs: u64) {
     let mut checks = String::from("checks: [\n");
     for i in 0..n {
-        let body = load_check_body(repo, iterations);
+        let body = load_check_body(repo, duration_secs);
         checks.push_str(&format!(
             "    {{name: \"load-{i}\", command: \"{}\", timeout: \"60s\", environmentPolicy: \"strip_rk_spawn\"}},\n",
             cue_command(&body)
@@ -141,7 +213,11 @@ async fn run_verify(layout: &Layout, repo: &str, check: &str) -> Value {
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const SAMPLE_DEADLINE: Duration = Duration::from_secs(20);
 const N_CHECKS: usize = 6;
-const ITERATIONS_PER_CHECK: usize = 2_000_000;
+// Wall-clock, not an iteration count — see `load_check_body`'s doc comment
+// for why a work-based budget is unsafe on a contended host. 25s overlaps
+// most of the 45s sampling window while leaving ample margin under each
+// check's own 60s timeout even under heavy contention.
+const LOAD_CHECK_DURATION_SECS: u64 = 25;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn work_current_and_reconcile_report_stay_inside_the_observer_rpc_budget_under_concurrent_verification(
@@ -216,7 +292,7 @@ async fn work_current_and_reconcile_report_stay_inside_the_observer_rpc_budget_u
     // Concurrent managed verification, real subprocess contention against
     // the SAME repo — written before `repo.add`, matching
     // `verification_saturation_regression.rs`'s own ordering.
-    write_load_checks(repo_path, N_CHECKS, ITERATIONS_PER_CHECK);
+    write_load_checks(repo_path, N_CHECKS, LOAD_CHECK_DURATION_SECS);
     client
         .call(
             "repo.add",
@@ -278,7 +354,7 @@ async fn work_current_and_reconcile_report_stay_inside_the_observer_rpc_budget_u
     eprintln!(
         "observer_rpc_deadline_under_verification_load: {} samples, max elapsed {max_elapsed:?}, \
          repo history: {commit_count} commits / {branch_count} branches, {N_CHECKS} concurrent \
-         checks x {ITERATIONS_PER_CHECK} CPU-bound iterations each",
+         checks x {LOAD_CHECK_DURATION_SECS}s CPU-bound each",
         samples.len(),
     );
     for (method, elapsed) in &samples {
