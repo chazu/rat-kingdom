@@ -61,5 +61,37 @@ policy authority distinction are concrete enough to execute.
 
 All seven round-1 blockers are closed at the plan level. This approval does not
 claim source implementation, installed behavior, or operational proof. Ticket
-acceptance retains the failure sequences. The subsequent status edit and this
-review disposition are administrative; reviewed design content is unchanged.
+acceptance retains the failure sequences. The status edit and review disposition
+at that revision were administrative; reviewed design content was unchanged at
+that point.
+
+## 2026-09-14 amendment: independently shippable vertical slices
+
+The operator made thin vertical slices, shipped independently and promptly, a
+design pillar. The previous dependency graph made coalescing a prerequisite for
+unrelated capabilities and bundled too much acceptance into whole workstreams.
+The amendment changes that sequencing while preserving R1-R9 and their final
+capability/failure-path requirements.
+
+- Section 1 now defines a usable slice and its ticket contract: current-system
+  compatibility, explicit hard dependencies, bounded evidence/cost, operational
+  delivery and recovery, and a published BBS contract.
+- Section 11 retains P0-P14 as coverage tracks and identifies first usable
+  deliveries. It replaces blanket track dependencies with specific capability
+  prerequisites. Existing ticket dependencies must be reconciled before dispatch;
+  editing this plan does not itself change live RK state.
+- The earlier standards finding about duplicate checks remains valid. Its
+  resolution is now separate acceptance for exact coalescing and explicit
+  duplicate-cost accounting for overlap, rather than mandatory P0 completion
+  before unrelated shipping. Workspace, cancellation and proof correctness
+  remain mandatory for every slice that exposes those paths.
+- Initial inventory, flags, scorecards and manual operations can use existing
+  bounded mechanisms. Later automation retains its stronger acceptance; manual
+  capability does not count as automatic promotion or recovery.
+- Independent-delivery metrics retain root lineage and deferred scope; more
+  tickets or integrated disabled code alone do not prove delivered benefit.
+
+This amendment has an author consistency check, not a new independent adversarial
+approval. The earlier approval applies only to its recorded revision. Subsequent
+review should examine the changed contracts and dependency removals; unrelated
+accepted deliveries need not repeat their program-level review.

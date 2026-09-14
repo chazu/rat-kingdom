@@ -25,6 +25,18 @@ It records the operator's requested outcomes, independently of plan choices.
 10. Preserve completed work, failed evidence, live state and user-owned changes.
     Report implementation, delivery, installed behavior, and demonstrated benefit
     separately and honestly.
+11. Added 2026-09-14: independently shippable vertical slices are a design pillar.
+    Each slice delivers immediately useful behavior on the deployed system and
+    remains usable if later work never ships. Include its operational journey,
+    bounded validation, deployment/default behavior, and disable or recovery path.
+    Ship accepted slices promptly; neither whole-program completion nor long-term
+    benefit qualification should hold an otherwise accepted independent delivery.
+12. Distinguish capabilities required for correctness from coordination needs and
+    later optimizations. Split oversized work without losing unresolved findings
+    or weakening gates. Publish available contracts and evidence through BBS so
+    consumers can use delivered behavior before an entire workstream finishes.
+    Track time to useful deployment and dependency-blocked time, retaining root
+    lineage so ticket splitting does not inflate feature throughput.
 
 These requirements authorize routine scope decomposition, tracker choices,
 implementation, validation and previously established delivery/deployment work.
