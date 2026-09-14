@@ -270,6 +270,42 @@ impl SessionControl {
             .map_err(|_| rk_core::Error::other("session is no longer running"))
     }
 
+    /// Reserve a channel slot and hand the envelope over in one synchronous
+    /// step — no `.await`, so a caller can do this while still holding a
+    /// `std::sync::Mutex` admission guard instead of releasing it and
+    /// racing an unbounded await against whatever that guard was protecting.
+    ///
+    /// [`steer_envelope`](Self::steer_envelope) awaits capacity: if the
+    /// channel is momentarily full, it suspends until a slot frees up,
+    /// and everything an admission check validated before that suspend can
+    /// go stale during it (the record can terminalize, or a respawn can
+    /// supersede the session) with no way for the now-stale send to notice.
+    /// This instead reserves a slot with `try_reserve` — instant, never
+    /// blocks — and only proceeds to send once one is actually held, so
+    /// there is no window between "admitted" and "in the channel" for
+    /// anything to change underneath it. A momentarily saturated channel is
+    /// reported as refused outright, on the same footing as any other
+    /// admission failure, rather than queued behind unknown backpressure.
+    pub fn try_steer_envelope(&self, envelope: ControlEnvelope) -> rk_core::Result<()> {
+        let Some(tx) = &self.steer_tx else {
+            return Err(rk_core::Error::other(
+                "this harness does not support steering",
+            ));
+        };
+        match tx.try_reserve() {
+            Ok(permit) => {
+                permit.send(envelope);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(rk_core::Error::other(
+                "the harness's control channel is saturated right now; steer not admitted",
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(rk_core::Error::other("session is no longer running"))
+            }
+        }
+    }
+
     pub fn can_steer(&self) -> bool {
         self.steer_tx.is_some()
     }
