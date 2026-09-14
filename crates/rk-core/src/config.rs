@@ -1212,6 +1212,19 @@ pub struct PolicyConfig {
     /// `rk_daemon::Reap::artifact_paths_by_repo`). A repo absent here uses the
     /// fleet-wide default above.
     pub verification_admission_limit_by_repo: BTreeMap<String, u32>,
+    /// Optional aggregate ceiling on daemon-managed verification runs ACROSS
+    /// EVERY REPOSITORY this daemon serves (P3.1), layered ABOVE — never
+    /// instead of — each repository's own
+    /// [`verification_admission_limit`](Self::verification_admission_limit)/
+    /// `_by_repo`. `0` (the default) disables it entirely: zero behaviour
+    /// change from before this existed. Enforcement boundary: this bounds
+    /// only checks routed through THIS daemon's managed runner (landing
+    /// gates, workflow `run` steps, `verify.run`); another daemon on the same
+    /// host, or unmanaged shell work an operator runs directly, is outside
+    /// it. Read once at daemon startup like every other admission limit in
+    /// this file — changing this value requires a daemon restart to take
+    /// effect, it is not live-reloaded.
+    pub verification_admission_aggregate_limit: u32,
     /// Fleet-wide default max concurrent LIVE implementing agents (every role
     /// except `"reviewer"`) for one repository at a time — the
     /// "implementation lane" (TKT-01M0P2KM83Y4MD5QYETR3JCKF2). Checked
@@ -1254,6 +1267,7 @@ impl Default for PolicyConfig {
             orchestrator_lease_ttl_secs: 300,
             verification_admission_limit: 0,
             verification_admission_limit_by_repo: BTreeMap::new(),
+            verification_admission_aggregate_limit: 0,
             implementation_admission_limit: 0,
             implementation_admission_limit_by_repo: BTreeMap::from([(
                 "rat-kingdom".to_string(),

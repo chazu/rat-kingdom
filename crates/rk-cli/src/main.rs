@@ -1108,6 +1108,24 @@ async fn main() -> Result<()> {
                                 );
                             }
                         }
+                        // Aggregate cross-repository verification ceiling
+                        // (P3.1, TKT-vilug-hujok-bolis) — silent when
+                        // disabled (limit 0, the default), same convention
+                        // as the per-repo lanes above.
+                        let host = &status["verification_host"];
+                        let host_limit = host["limit"].as_u64().unwrap_or(0);
+                        if host_limit > 0 {
+                            let executing = host["executing"].as_u64().unwrap_or(0);
+                            let waiting = host["waiting"].as_u64().unwrap_or(0);
+                            let queue = if waiting > 0 {
+                                format!(", {waiting} waiting")
+                            } else {
+                                String::new()
+                            };
+                            println!(
+                                "  capacity host verification: {executing}/{host_limit}{queue}"
+                            );
+                        }
                     }
                 }
                 Err(_) => {

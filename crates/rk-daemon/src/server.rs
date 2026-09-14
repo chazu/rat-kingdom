@@ -1138,6 +1138,11 @@ impl Daemon {
                 .into_iter()
                 .collect(),
         );
+        daemon
+            .supervisor
+            .set_verification_admission_aggregate_limit(
+                config.policy.verification_admission_aggregate_limit,
+            );
         daemon.supervisor.set_implementation_admission_limits(
             config.policy.implementation_admission_limit,
             config
@@ -1350,6 +1355,17 @@ impl Daemon {
     ) {
         self.supervisor
             .set_verification_admission_limits(default_limit, overrides);
+    }
+
+    /// Test-only hook, same rationale as
+    /// [`set_verification_admission_limits`](Self::set_verification_admission_limits):
+    /// `Daemon::with_space_for_tests`/`new_in_memory` bypass `Daemon::new`'s
+    /// `config.policy.verification_admission_aggregate_limit` wiring, so an
+    /// integration test driving the P3.1 host-wide cap sets it directly.
+    #[doc(hidden)]
+    pub fn set_verification_admission_aggregate_limit(&self, limit: u32) {
+        self.supervisor
+            .set_verification_admission_aggregate_limit(limit);
     }
 
     #[doc(hidden)]
@@ -11369,6 +11385,12 @@ impl Daemon {
             // implementation, review, and verification lanes
             // (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — see `Supervisor::capacity_summary`.
             "capacity": self.supervisor.capacity_summary(),
+            // Aggregate cross-repository ceiling for daemon-managed
+            // verification runs (P3.1, TKT-vilug-hujok-bolis) — a host-wide
+            // sibling of each repo's own `"verification"` lane above, not a
+            // replacement for it. `limit: 0` means the aggregate cap is
+            // disabled (the default) — see `Supervisor::host_verification_capacity_summary`.
+            "verification_host": self.supervisor.host_verification_capacity_summary(),
         })
     }
 }

@@ -1315,6 +1315,14 @@ impl Supervisor {
             .set_limits(default_limit, overrides);
     }
 
+    /// Set `[policy] verification_admission_aggregate_limit` (P3.1,
+    /// TKT-vilug-hujok-bolis). Applied by `Daemon::new` from config, same
+    /// pattern as [`set_verification_admission_limits`](Self::set_verification_admission_limits)
+    /// — restart-required to change, `0` disables.
+    pub fn set_verification_admission_aggregate_limit(&self, limit: u32) {
+        self.verification.host_admission.set_limit(limit);
+    }
+
     /// Acquire one bounded per-repo verification admission permit for `repo`.
     /// See [`crate::managed_verification::VerificationAdmission`] for what this bounds, the FIFO fairness
     /// guarantee, and why a daemon restart can never leak one.
@@ -1470,6 +1478,26 @@ impl Supervisor {
             );
         }
         serde_json::Value::Object(out)
+    }
+
+    /// Configured aggregate ceiling, current executing count and waiting
+    /// count for daemon-managed verification runs across every repository
+    /// (P3.1, TKT-vilug-hujok-bolis) — the host-wide sibling of
+    /// [`capacity_summary`](Self::capacity_summary)'s per-repo
+    /// `"verification"` lane, which this leaves untouched. `limit: 0` means
+    /// the aggregate cap is disabled; `executing`/`waiting` are always `0`
+    /// in that case, matching [`crate::managed_verification::HostVerificationAdmission`]'s own
+    /// reporting. `waiting` counts ONLY requests blocked on this host-wide
+    /// semaphore specifically — a request still queued behind its OWN
+    /// repo's `"verification"` lane (reported separately, per-repo, above)
+    /// has not reached this semaphore yet and is not double-counted here.
+    pub fn host_verification_capacity_summary(&self) -> serde_json::Value {
+        let limit = self.verification.host_admission.limit();
+        json!({
+            "limit": limit,
+            "executing": self.verification.host_admission.executing(),
+            "waiting": self.verification.host_admission.waiting(),
+        })
     }
 
     /// Normalize `repo` — whatever shape reached
