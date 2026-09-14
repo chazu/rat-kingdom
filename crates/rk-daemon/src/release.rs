@@ -394,13 +394,36 @@ impl ReleaseRegistry {
         self.persist()
     }
 
+    /// `prepare`'s crash-recovery correctness relies on this registry write
+    /// (specifically, committing `manifest_digest`) landing durably BEFORE
+    /// `manifest.json` is ever published (see `write_manifest_new` and the
+    /// doc comments in `prepare`'s `Ok(manifest)` arm). A `write` +
+    /// `rename` with no `sync_all` gives atomicity (no reader ever observes
+    /// a torn file) but not durability against power loss — the OS can hold
+    /// either write in its page cache indefinitely. `sync_all` on the temp
+    /// file before the rename, plus a best-effort sync of the containing
+    /// directory after it (some filesystems refuse to fsync a directory;
+    /// that failure is not fatal — the rename itself is still atomic either
+    /// way, this only affects how quickly its visibility survives a crash),
+    /// makes the write actually durable before this function returns,
+    /// matching what the crash-recovery design claims rather than only
+    /// approximating it.
     fn persist(&self) -> rk_core::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        use std::io::Write;
+        let Some(parent) = self.path.parent() else {
+            return Err(rk_core::Error::other("release registry path has no parent directory"));
+        };
+        std::fs::create_dir_all(parent)?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.entries)?)?;
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&serde_json::to_vec_pretty(&self.entries)?)?;
+            file.sync_all()?;
+        }
         std::fs::rename(&tmp, &self.path)?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 }
@@ -1255,7 +1278,16 @@ fn write_manifest_new(path: &Path, manifest: &ReleaseManifest) -> rk_core::Resul
     let _ = std::fs::remove_file(&tmp);
     result.map_err(|e| {
         rk_core::Error::other(format!("failed to publish manifest at {}: {e}", path.display()))
-    })
+    })?;
+    // Best-effort: sync the directory entry so the hard link's visibility
+    // itself survives a crash promptly, matching `ReleaseRegistry::persist`'s
+    // same treatment. Not fatal if the filesystem refuses to fsync a
+    // directory — the link is already atomic either way, this only affects
+    // how quickly it durably persists.
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+    Ok(())
 }
 
 pub fn list(layout: &Layout, repo: Option<&str>) -> rk_core::Result<Vec<ReleaseIndexEntry>> {

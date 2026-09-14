@@ -7979,6 +7979,18 @@ impl Daemon {
                 check.shared_cargo_target,
             )
             .lookup_verification_proof(&params.repo, &resolved_commit, &check)?;
+            // `lookup_verification_proof` itself returns only the matched
+            // tuple's `result` payload, not the tuple's own identity or the
+            // exact key it matched on — recompute the same digest
+            // independently (a pure function of repo/candidate/check, the
+            // same inputs `lookup_verification_proof` used internally) so a
+            // manifest reader can find and independently re-verify the exact
+            // durable proof this reference names, not just trust the copy.
+            let key = crate::managed_verification::verification_proof_key(
+                &params.repo,
+                &resolved_commit,
+                &check,
+            );
             // Carry the check identity/context alongside the proof itself so
             // a manifest reader can trace exactly what this reference
             // describes, rather than an opaque blob.
@@ -7990,6 +8002,7 @@ impl Daemon {
                     "environment_policy": check.environment_policy.to_string(),
                 },
                 "resolved_commit": resolved_commit,
+                "key": key,
                 "proof": proof,
             }))
         });
