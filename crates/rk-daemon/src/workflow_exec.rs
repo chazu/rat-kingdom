@@ -5348,6 +5348,7 @@ test a::flaky ... FAILED
             transport_outage: None,
             recovery: None,
             recovery_receipt: None,
+            current_attempt: None,
         }
     }
 
@@ -5833,6 +5834,7 @@ test a::flaky ... FAILED
             transport_outage: None,
             recovery: None,
             recovery_receipt: None,
+            current_attempt: None,
         };
         // The workflow's own `spawn` step ran and its `wait` completed against
         // this generation.

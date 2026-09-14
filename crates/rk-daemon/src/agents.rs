@@ -233,6 +233,34 @@ pub struct AgentRecord {
     /// this tombstone when `recovery` is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_receipt: Option<RecoveryReceipt>,
+    /// Identity of the launch CURRENTLY authorized to declare this
+    /// generation's completion — distinct from `spawn`, which never changes
+    /// across a respawn. Minted fresh by `Supervisor::begin_attempt` and
+    /// persisted BEFORE the new process is launched (before `harness.launch`
+    /// runs at all, not merely before it returns), then handed to that
+    /// process as `RK_ATTEMPT` so its own `rk done` stamps the SAME id into
+    /// its `task_done` payload.
+    ///
+    /// TKT-vifob-gadil-vufuj: a generation resumed after its first `rk done`
+    /// (same `SpawnId`, by construction — see `AgentRecord::spawn_id`) kept
+    /// completing on that first launch's `task_done`, because the durable
+    /// scan behind it keyed on `spawn` alone. An earlier version of this fix
+    /// used a wall-clock floor instead of an identity; that was rejected on
+    /// review (artifact 01M2F1VK5QVK1KGMDQ0TB7V7QH) because a clock rollback
+    /// can let an old `task_done` satisfy a later floor, a late predecessor
+    /// write can land after the floor and pass anyway, and stamping the floor
+    /// only after `harness.launch` returns can reject a genuinely fresh done
+    /// from a fast child. An exact identity, established before the child is
+    /// exposed and compared by equality rather than ordering, is immune to
+    /// all three: a predecessor's `task_done` carries the predecessor's id
+    /// forever, regardless of when it lands or what the clock does.
+    ///
+    /// `None` on a record that predates this field, or whose launch path has
+    /// not (yet) minted one, matches unconditionally in
+    /// `Supervisor::find_task_done` — the exact pre-migration behavior, never
+    /// a stricter one a legacy in-flight record cannot satisfy.
+    #[serde(default)]
+    pub current_attempt: Option<rk_core::id::SpawnId>,
 }
 
 /// See the field doc on [`AgentRecord::recovery_receipt`].
@@ -1755,6 +1783,7 @@ mod tests {
             transport_outage: None,
             recovery: None,
             recovery_receipt: None,
+            current_attempt: None,
         }
     }
 

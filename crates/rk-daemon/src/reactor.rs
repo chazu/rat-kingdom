@@ -3341,6 +3341,7 @@ mod tests {
             transport_outage: None,
             recovery: None,
             recovery_receipt: None,
+            current_attempt: None,
         }
     }
 

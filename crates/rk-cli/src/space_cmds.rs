@@ -544,6 +544,15 @@ pub async fn done(layout: &Layout, args: DoneArgs, as_json: bool) -> Result<()> 
         // Exact generation join key. A primed worker without RK_SPAWN is an
         // invalid runtime environment, not a name/time compatibility case.
         "spawn": spawn,
+        // Exact LAUNCH join key (TKT-vifob-gadil-vufuj): unlike RK_SPAWN,
+        // this changes across a respawn, so the daemon can tell "this launch
+        // declared done" from "an earlier launch of the same generation did,
+        // and I have said nothing yet". Optional, not `env_required`: a
+        // launch path that predates this field (or a legacy in-flight
+        // record) simply omits it, and the daemon's match falls back to
+        // spawn-only — never a stricter requirement such a launch could not
+        // satisfy.
+        "attempt": std::env::var("RK_ATTEMPT").ok(),
         "branch": std::env::var("RK_BRANCH").ok(),
         "parent": std::env::var("RK_PARENT").ok(),
         "workflow_instance": std::env::var("RK_WORKFLOW_INSTANCE").ok(),

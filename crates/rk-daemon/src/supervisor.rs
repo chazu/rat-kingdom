@@ -371,6 +371,17 @@ fn uses_harness_terminal_completion(role: &str, harness: &str) -> bool {
     })
 }
 
+/// Whether `tuple`'s top-level `attempt` field is EXACTLY `attempt` —
+/// deliberately a parsed-field comparison, not a `payload_search` substring
+/// test: a substring search over the whole serialized payload can be
+/// satisfied by an unrelated free-text field (a rat's own `result`/summary
+/// text) that happens to contain the literal `"attempt":"<id>"`, which
+/// reading the named field cannot. Shared by [`Supervisor::find_task_done`]
+/// and [`Supervisor::harness_result_exists`].
+fn tuple_attempt_matches(tuple: &Tuple, attempt: rk_core::id::SpawnId) -> bool {
+    tuple.payload.get("attempt").and_then(Value::as_str) == Some(attempt.to_string().as_str())
+}
+
 fn is_reporting_boundary(record: &AgentRecord) -> bool {
     record
         .coordination
@@ -434,6 +445,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         transport_outage: None,
         recovery: None,
         recovery_receipt: None,
+        current_attempt: None,
     }
 }
 
@@ -2033,9 +2045,11 @@ impl Supervisor {
             .clone()
             .unwrap_or_else(|| format!("Work on task {}. Begin now.", params.task));
 
+        let attempt = self.begin_attempt(&name)?;
         let mut env = self.agent_env(
             &name,
             spawn,
+            attempt,
             &params.role,
             &repo_name,
             &params.task,
@@ -2432,9 +2446,11 @@ impl Supervisor {
         let repo = Repo::discover(&record.repo_root)?;
         let instruction_base = self.instruction_base(&record.role, &record.target_branch, &repo);
 
+        let attempt = self.begin_attempt(&record.name)?;
         let env = self.agent_env(
             &record.name,
             record.spawn_id(),
+            attempt,
             &record.role,
             &record.repo_name,
             &task,
@@ -2636,6 +2652,18 @@ impl Supervisor {
             // See the ordinary respawn path above: a stale stderr tail from the
             // previous generation must not survive a retry.
             current.stderr_tail = None;
+            if !created {
+                // Reattaching to a pane that survived the daemon (`existing`
+                // above) starts no new process at all — `respawn_mode`'s
+                // `begin_attempt` already minted a fresh id and baked it into
+                // `spec.env`'s `RK_ATTEMPT`, but that env was only ever
+                // consumed by the `created` branch's `HerdrMux::start_agent`
+                // call, which this branch skips entirely. The live pane's own
+                // process still carries whatever `RK_ATTEMPT` it actually
+                // started with, so the record must keep matching that, not
+                // the id minted for a launch that never happened.
+                current.current_attempt = record.current_attempt;
+            }
         })?;
 
         if created {
@@ -2952,6 +2980,7 @@ impl Supervisor {
                     name,
                     generation,
                     pre.spawn,
+                    pre.current_attempt,
                     is_error,
                     uses_harness_terminal_completion(&pre.role, &pre.harness),
                 );
@@ -3486,7 +3515,10 @@ impl Supervisor {
                 // `reconcile_task_done` supplies the bounded fallback when it
                 // does not. Storage errors fail closed here: an unreadable
                 // completion signal must not disable a hard budget cap.
-                if matches!(self.find_task_done(record.spawn), Ok(Some(_))) {
+                if matches!(
+                    self.find_task_done(record.spawn, record.current_attempt),
+                    Ok(Some(_))
+                ) {
                     return;
                 }
                 warn!(agent = %record.name, cost = record.cost_usd, tokens = record.usage.total(), "budget cap hit — stopping agent");
@@ -3625,6 +3657,36 @@ impl Supervisor {
                 baseline_usage: record.usage,
             },
         );
+    }
+
+    /// Mint and durably persist the identity of a fresh launch's completion
+    /// authority, BEFORE that launch's process exists.
+    ///
+    /// Deliberately separate from [`Self::begin_launch`]/[`Self::publish_launch`]:
+    /// both of those run AFTER `harness.launch` returns, because they need the
+    /// live `SessionControl` handle launching produces. This cannot wait that
+    /// long — TKT-vifob-gadil-vufuj's review (artifact
+    /// 01M2F1VK5QVK1KGMDQ0TB7V7QH) rejected an earlier version of this fix
+    /// specifically because stamping a completion-authority marker only after
+    /// `harness.launch` returns lets a fast child publish its own genuine `rk
+    /// done` before the marker exists, which would then reject a completion
+    /// that was never stale in the first place. Calling this BEFORE building
+    /// the launch's `env` (so `RK_ATTEMPT` is fixed before the process can run
+    /// at all) and before `harness.launch` closes that window structurally:
+    /// there is no longer a "before the marker" for a legitimate child to run
+    /// in.
+    ///
+    /// Every real launch path (initial spawn, ordinary/attach respawn,
+    /// transport-outage continuation) calls this once, immediately before
+    /// building `env` via [`Self::agent_env`]. A record with no live entry
+    /// (spawn lost the registry race) is left untouched — the caller's own
+    /// insert/update failure handling covers that.
+    fn begin_attempt(&self, name: &str) -> rk_core::Result<rk_core::id::SpawnId> {
+        let attempt = rk_core::id::SpawnId::new();
+        self.lock_registry().update(name, |r| {
+            r.current_attempt = Some(attempt);
+        })?;
+        Ok(attempt)
     }
 
     /// Native token and frozen launch time for joining this launch's cost/exit
@@ -4373,7 +4435,10 @@ impl Supervisor {
                     // generation's `task_done` exists, reconciliation owns
                     // terminalization and the sweep must not kill the harness
                     // before it can flush its richer final result.
-                    if matches!(self.find_task_done(record.spawn), Ok(Some(_))) {
+                    if matches!(
+                        self.find_task_done(record.spawn, record.current_attempt),
+                        Ok(Some(_))
+                    ) {
                         continue;
                     }
                     warn!(agent = %record.name, kind, %detail, "supervisor sweep killing agent after grace");
@@ -5105,9 +5170,11 @@ impl Supervisor {
         };
         let repo = Repo::discover(&record.repo_root)?;
         let instruction_base = self.instruction_base(&record.role, &record.target_branch, &repo);
+        let attempt = self.begin_attempt(&record.name)?;
         let env = self.agent_env(
             &record.name,
             record.spawn_id(),
+            attempt,
             &record.role,
             &record.repo_name,
             &task,
@@ -5599,6 +5666,7 @@ impl Supervisor {
         name: &str,
         generation: DateTime<Utc>,
         spawn: Option<rk_core::id::SpawnId>,
+        current_attempt: Option<rk_core::id::SpawnId>,
         is_error: bool,
         harness_terminal: bool,
     ) -> TurnClaim {
@@ -5609,7 +5677,7 @@ impl Supervisor {
         // Jcode onboarding runs one headless request with no Bash tool. Its
         // native `done` event is therefore the only safe positive completion
         // signal and, unlike an interactive turn boundary, ends the process.
-        let declared_done = harness_terminal || self.declared_done(name, spawn);
+        let declared_done = harness_terminal || self.declared_done(name, spawn, current_attempt);
         let terminal = is_error || declared_done;
         let mut completions = self.lock_completions();
         let state = completions
@@ -5647,29 +5715,65 @@ impl Supervisor {
         }
     }
 
-    /// Whether this generation of `name` has written its `rk done` tuple.
+    /// Whether this generation of `name` has written its `rk done` tuple, for
+    /// its CURRENT launch.
     ///
     /// The durable `task_done` tuple this generation wrote via `rk done`, if
     /// any — the shared lookup behind [`Self::declared_done`] (bool) and
     /// [`Self::reconcile_task_done`] (needs the tuple itself, for its summary
     /// payload). A generation without a persisted spawn cannot match; no
     /// name/time fallback is allowed.
+    ///
+    /// `current_attempt` ([`AgentRecord::current_attempt`]) additionally
+    /// excludes a `task_done` written by an EARLIER launch of the same
+    /// generation: a respawn keeps the same `SpawnId` (TKT-vifob-gadil-vufuj),
+    /// so `spawn` alone cannot tell "this launch declared done" from "a
+    /// launch before this one did, and I have said nothing yet". This is an
+    /// EXACT identity match, not an ordering comparison — deliberately, after
+    /// a wall-clock floor was rejected on review (artifact
+    /// 01M2F1VK5QVK1KGMDQ0TB7V7QH) for being defeated by a clock rollback, a
+    /// late-arriving predecessor write, and a fast child publishing before
+    /// its floor was even stamped. `current_attempt: None` matches
+    /// unconditionally — a legacy record, or a launch path that has not
+    /// minted one — reproducing pre-migration behavior exactly rather than
+    /// imposing a filter such a record could never satisfy. Every caller
+    /// passes the attempt of the launch it is asking about, never a stale
+    /// one.
+    ///
+    /// Matched against the tuple's parsed `attempt` field, not a raw
+    /// substring search: a second review pass on this fix flagged that a
+    /// `payload_search_and` substring test can be satisfied by an unrelated,
+    /// free-text field (a rat's own `result`/summary text) that happens to
+    /// contain the literal `"attempt":"<id>"` text, which a top-level field
+    /// comparison cannot.
     fn find_task_done(
         &self,
         spawn: Option<rk_core::id::SpawnId>,
+        current_attempt: Option<rk_core::id::SpawnId>,
     ) -> rk_core::Result<Option<Tuple>> {
         let Some(spawn) = spawn else {
             return Ok(None);
         };
         let pattern = Pattern::for_spawn(Category::Event, "task_done", spawn);
-        Ok(self.space.scan(&pattern)?.into_iter().next())
+        let candidates = self.space.scan(&pattern)?;
+        Ok(match current_attempt {
+            Some(attempt) => candidates
+                .into_iter()
+                .find(|t| tuple_attempt_matches(t, attempt)),
+            None => candidates.into_iter().next(),
+        })
     }
 
     /// Fails OPEN — an unreadable space means "publish", which is the behaviour
     /// that predates this gate. Withholding on a storage error would strand
     /// every workflow waiting on the agent until its step timeout.
-    fn declared_done(&self, name: &str, spawn: Option<rk_core::id::SpawnId>) -> bool {
-        match self.find_task_done(spawn) {
+    fn declared_done(
+        &self,
+        name: &str,
+        spawn: Option<rk_core::id::SpawnId>,
+        current_attempt: Option<rk_core::id::SpawnId>,
+    ) -> bool {
+        match self.find_task_done(spawn, current_attempt) {
             Ok(found) => {
                 let found = found.is_some();
                 // Deliberately logged on every call, not just the negative
@@ -5759,7 +5863,7 @@ impl Supervisor {
             if record.state == AgentState::Dismissed {
                 continue;
             }
-            let Some(task_done) = self.find_task_done(record.spawn)? else {
+            let Some(task_done) = self.find_task_done(record.spawn, record.current_attempt)? else {
                 continue;
             };
 
@@ -5800,7 +5904,14 @@ impl Supervisor {
             });
             match updated {
                 Ok(Some(r)) if r.state == AgentState::Completed => {
-                    let claim = self.claim_completion(&r.name, r.created_at, r.spawn, false, false);
+                    let claim = self.claim_completion(
+                        &r.name,
+                        r.created_at,
+                        r.spawn,
+                        r.current_attempt,
+                        false,
+                        false,
+                    );
                     if !claim.publish {
                         continue;
                     }
@@ -5829,12 +5940,29 @@ impl Supervisor {
         Ok(settled)
     }
 
-    /// Whether this exact generation already published its one durable
+    /// Whether this exact LAUNCH already published its one durable
     /// `harness_result`. Unlike the in-memory completion claim, this survives
     /// a daemon restart and therefore closes the CAS-then-publish crash window.
+    ///
+    /// Scoped by [`AgentRecord::current_attempt`] for the same reason
+    /// [`Self::find_task_done`] is: TKT-vifob-gadil-vufuj review (artifact
+    /// 01M2F1VK5QVK1KGMDQ0TB7V7QH) found that a spawn-only version of this
+    /// check silently swallows a genuine resumed completion — a generation
+    /// that already published `harness_result` once via an earlier, premature
+    /// launch, then wrote a fresh `task_done` on a legitimate later launch
+    /// and crashed before its own `harness_result` could publish, would have
+    /// `reconcile_task_done` see the PREDECESSOR's `harness_result` on
+    /// restart, conclude "already published", and never route the resumed
+    /// generation's real completion at all. `record.current_attempt: None`
+    /// (a legacy record, or a launch path that never minted one) falls back
+    /// to spawn-only, matching pre-migration behavior exactly.
     fn harness_result_exists(&self, record: &AgentRecord) -> rk_core::Result<bool> {
         let pattern = Pattern::for_spawn(Category::Event, "harness_result", record.spawn_id());
-        Ok(!self.space.scan(&pattern)?.is_empty())
+        let candidates = self.space.scan(&pattern)?;
+        Ok(match record.current_attempt {
+            Some(attempt) => candidates.iter().any(|t| tuple_attempt_matches(t, attempt)),
+            None => !candidates.is_empty(),
+        })
     }
 
     /// Whether a [`LATE_TASK_DONE_EVIDENCE_IDENTITY`] artifact already exists
@@ -6039,6 +6167,12 @@ impl Supervisor {
                 // namesake predecessor's `harness_result` never carries this
                 // generation's id, so a spawn-keyed reader cannot match it.
                 "spawn": record.spawn_id().to_string(),
+                // LAUNCH join key (TKT-vifob-gadil-vufuj): unlike `spawn`,
+                // this changes across a respawn, so `harness_result_exists`
+                // can tell "THIS launch already published" from "an earlier
+                // launch of the same generation did" instead of treating a
+                // predecessor's result as blocking a genuine later one.
+                "attempt": record.current_attempt.map(|a| a.to_string()),
                 // The completed agent's role ("rat", "reviewer", ...). Carried so
                 // a reactor trigger can scope reactively — e.g. the landing fires
                 // on `"role":"rat"` completions only, which also breaks its own
@@ -8104,6 +8238,7 @@ impl Supervisor {
         &self,
         name: &str,
         spawn: rk_core::id::SpawnId,
+        attempt: rk_core::id::SpawnId,
         role: &str,
         repo_name: &str,
         task: &str,
@@ -8121,6 +8256,12 @@ impl Supervisor {
         // read; RK_SPAWN is the join key `rk done`/`rk out` stamp into their
         // payloads so readers key on `Pattern::for_spawn`.
         env.insert("RK_SPAWN".into(), spawn.to_string());
+        // This LAUNCH's completion-authority identity (TKT-vifob-gadil-vufuj),
+        // minted and durably persisted by `Supervisor::begin_attempt` before
+        // this process existed. `rk done` stamps it into `task_done` so a
+        // respawn — which keeps `RK_SPAWN` unchanged — cannot have an earlier
+        // launch's completion satisfy this one's.
+        env.insert("RK_ATTEMPT".into(), attempt.to_string());
         if let Ok(token) = self.layout.agent_auth_token(name) {
             env.insert("RK_AUTH_TOKEN".into(), token);
         }
@@ -8676,6 +8817,7 @@ mod respawn_tests {
         let env = sup.agent_env(
             "Nibble",
             rk_core::id::SpawnId::new(),
+            rk_core::id::SpawnId::new(),
             "reviewer",
             "repo",
             "review",
@@ -8699,6 +8841,7 @@ mod respawn_tests {
         let env = sup.agent_env(
             "Nibble",
             rk_core::id::SpawnId::new(),
+            rk_core::id::SpawnId::new(),
             "rat",
             "repo",
             "task",
@@ -8719,6 +8862,7 @@ mod respawn_tests {
         sup.set_shared_cargo_target(true);
         let env = sup.agent_env(
             "Nibble",
+            rk_core::id::SpawnId::new(),
             rk_core::id::SpawnId::new(),
             "rat",
             "repo",
@@ -9017,16 +9161,16 @@ mod respawn_tests {
         let dir = tempfile::tempdir().unwrap();
         let supervisor = supervisor(dir.path());
         let generation = Utc::now();
-        let claim = supervisor.claim_completion("Jade", generation, None, false, true);
+        let claim = supervisor.claim_completion("Jade", generation, None, None, false, true);
         assert!(claim.publish);
         assert!(claim.declared_done);
         assert!(
             !supervisor
-                .claim_completion("Jade", generation, None, false, true)
+                .claim_completion("Jade", generation, None, None, false, true)
                 .publish
         );
 
-        let ordinary = supervisor.claim_completion("Whisker", generation, None, false, false);
+        let ordinary = supervisor.claim_completion("Whisker", generation, None, None, false, false);
         assert!(!ordinary.publish);
         assert!(!ordinary.declared_done);
     }
@@ -9431,6 +9575,7 @@ mod respawn_tests {
             transport_outage: None,
             recovery: None,
             recovery_receipt: None,
+            current_attempt: None,
         }
     }
 
@@ -9717,7 +9862,7 @@ mod respawn_tests {
             ))
             .unwrap();
         assert!(
-            !sup.declared_done("Nibble", Some(mine_spawn)),
+            !sup.declared_done("Nibble", Some(mine_spawn), None),
             "a namesake predecessor's task_done must not satisfy this generation's gate"
         );
 
@@ -9731,13 +9876,111 @@ mod respawn_tests {
             ))
             .unwrap();
         assert!(
-            sup.declared_done("Nibble", Some(mine_spawn)),
+            sup.declared_done("Nibble", Some(mine_spawn), None),
             "this generation's own task_done must satisfy the gate"
         );
 
         assert!(
-            !sup.declared_done("Nibble", None),
+            !sup.declared_done("Nibble", None, None),
             "a generation without exact spawn evidence must not match by name/time"
+        );
+    }
+
+    /// TKT-vifob-gadil-vufuj: a resumed generation keeps the same `SpawnId`
+    /// (a respawn deliberately reuses it), so `declared_done` must ALSO
+    /// exclude a `task_done` written by an EARLIER launch of that same
+    /// generation once the caller supplies its own attempt identity —
+    /// otherwise a resumed launch that has said nothing yet reads as already
+    /// done on its predecessor's say-so.
+    ///
+    /// This is an EXACT identity comparison, not a time comparison — no
+    /// clock is read anywhere in it, which is deliberate: an earlier
+    /// wall-clock floor design was rejected on review (artifact
+    /// 01M2F1VK5QVK1KGMDQ0TB7V7QH) because a deterministic clock rollback can
+    /// let an old `task_done` satisfy a later floor. The late-arriving-write
+    /// case below is the other counterexample that review raised: a
+    /// predecessor's `task_done` can land arbitrarily late and must still
+    /// never satisfy a successor's gate, which an identity match guarantees
+    /// structurally (a predecessor's payload carries the predecessor's id
+    /// forever) rather than by timing luck.
+    #[test]
+    fn declared_done_rejects_an_earlier_launchs_task_done_by_identity_not_time() {
+        let home = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let spawn = rk_core::id::SpawnId::new();
+        let first_attempt = rk_core::id::SpawnId::new();
+        let second_attempt = rk_core::id::SpawnId::new();
+
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "castle",
+                json!({
+                    "agent": "Nibble",
+                    "spawn": spawn.to_string(),
+                    "attempt": first_attempt.to_string(),
+                }),
+            ))
+            .unwrap();
+
+        assert!(
+            !sup.declared_done("Nibble", Some(spawn), Some(second_attempt)),
+            "an earlier launch's task_done must not satisfy a later launch's gate"
+        );
+        assert!(
+            sup.declared_done("Nibble", Some(spawn), Some(first_attempt)),
+            "sanity: the tuple satisfies the launch that actually wrote it"
+        );
+        assert!(
+            sup.declared_done("Nibble", Some(spawn), None),
+            "sanity: an attempt-blind caller still finds it, matching \
+             pre-migration behavior for a caller with no attempt evidence"
+        );
+
+        // A late predecessor write: the FIRST attempt's task_done can land
+        // arbitrarily late (a slow RPC, a delayed retry) — even after the
+        // second attempt has already been checked — and must still never
+        // satisfy the second attempt's gate, because it carries the first
+        // attempt's id forever.
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "castle",
+                json!({
+                    "agent": "Nibble",
+                    "spawn": spawn.to_string(),
+                    "attempt": first_attempt.to_string(),
+                }),
+            ))
+            .unwrap();
+        assert!(
+            !sup.declared_done("Nibble", Some(spawn), Some(second_attempt)),
+            "a late-arriving predecessor write must not become the current \
+             launch's completion"
+        );
+
+        // The resumed launch's OWN fresh task_done still satisfies its own
+        // gate normally.
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "castle",
+                json!({
+                    "agent": "Nibble",
+                    "spawn": spawn.to_string(),
+                    "attempt": second_attempt.to_string(),
+                }),
+            ))
+            .unwrap();
+        assert!(
+            sup.declared_done("Nibble", Some(spawn), Some(second_attempt)),
+            "the resumed launch's own fresh task_done must satisfy its own gate"
         );
     }
 
@@ -12376,6 +12619,7 @@ mod stuck_liveness_tests {
             transport_outage: None,
             recovery: None,
             recovery_receipt: None,
+            current_attempt: None,
         }
     }
 
@@ -13774,6 +14018,277 @@ mod native_observation_tests {
             after.usage.total()
         );
         assert_eq!(after.usage.total(), 1_050_000 + 1_500);
+    }
+
+    /// TKT-vifob-gadil-vufuj regression, driven through the real production
+    /// seams (`begin_attempt` and `publish_launch`, the exact functions
+    /// `respawn_mode` calls, in the exact order it calls them — not a
+    /// hand-rolled stand-in): the reported incident had `rk done` write a
+    /// `task_done` at 05:27, the operator reopen the unfinished work and
+    /// respawn the SAME generation at 06:02 (same `SpawnId`, by
+    /// construction — a respawn never mints a new one), and the resumed
+    /// launch's own checkpoint arrive as a `Completed` harness event with no
+    /// fresh `rk done` of its own. `declared_done` used to scope its scan to
+    /// `spawn` alone, which the FIRST launch's `task_done` already satisfied,
+    /// so the resumed launch's ambiguous turn boundary was read as this
+    /// generation's completion and the branch entered landing before the
+    /// resumed work had said anything.
+    #[tokio::test]
+    async fn a_relaunch_does_not_complete_on_an_earlier_launchs_task_done() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, first) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        // The first launch declares done and completes normally.
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "Nibble",
+                json!({"agent": "Nibble", "task": "t", "spawn": spawn.to_string()}),
+            ))
+            .unwrap();
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            completed(Some(1.0), None),
+        );
+        assert_eq!(
+            sup.lock_registry().get("Nibble").unwrap().state,
+            AgentState::Completed,
+            "sanity: the first launch's own task_done completes it"
+        );
+
+        // The operator reopens the unfinished work and respawns the SAME
+        // generation. `begin_attempt` mints and durably persists the new
+        // launch's completion-authority identity BEFORE the (simulated)
+        // child ever runs — exactly the production ordering `respawn_mode`
+        // follows (mint the identity, THEN build `env`/launch the harness)
+        // — and `publish_launch` does the rest of the takeover, exactly what
+        // `respawn_mode` calls, keeping the same `SpawnId` throughout.
+        sup.begin_attempt("Nibble").unwrap();
+        let (_, second) = sup
+            .publish_launch("Nibble", None, |r| {
+                r.state = AgentState::Running;
+                r.result = None;
+                r.crashed = false;
+            })
+            .unwrap();
+
+        // The resumed launch has not written a fresh `task_done` — its
+        // provider is still waiting on a managed check, per the reported
+        // incident. A `Completed` event without its own `rk done` arrives
+        // (the exact ambiguous turn-boundary case `claim_completion` exists
+        // to gate) and must NOT be read as this generation's completion: the
+        // only `task_done` in the space carries the FIRST launch's attempt
+        // id, which is not this launch's.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            completed(Some(0.01), None),
+        );
+
+        assert_eq!(
+            sup.lock_registry().get("Nibble").unwrap().state,
+            AgentState::Paused,
+            "a resumed launch must not complete on an earlier launch's \
+             task_done before writing its own — it must remain awaiting \
+             continuation instead of jumping to Completed"
+        );
+    }
+
+    /// Companion to the regression above: once the RESUMED launch writes its
+    /// own fresh `task_done`, completion must still work normally — the fix
+    /// must not strand a genuine resumed delivery.
+    #[tokio::test]
+    async fn a_relaunch_completes_normally_once_it_writes_its_own_task_done() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, first) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "Nibble",
+                json!({"agent": "Nibble", "task": "t", "spawn": spawn.to_string()}),
+            ))
+            .unwrap();
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            completed(Some(1.0), None),
+        );
+
+        let attempt = sup.begin_attempt("Nibble").unwrap();
+        let (_, second) = sup
+            .publish_launch("Nibble", None, |r| {
+                r.state = AgentState::Running;
+                r.result = None;
+                r.crashed = false;
+            })
+            .unwrap();
+
+        // The resumed launch does its own work and writes its OWN task_done,
+        // carrying the attempt id `begin_attempt` minted for it — exactly
+        // what `rk done` stamps from its `RK_ATTEMPT` env.
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "Nibble",
+                json!({
+                    "agent": "Nibble",
+                    "task": "t",
+                    "spawn": spawn.to_string(),
+                    "attempt": attempt.to_string(),
+                }),
+            ))
+            .unwrap();
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            completed(Some(0.01), None),
+        );
+
+        assert_eq!(
+            sup.lock_registry().get("Nibble").unwrap().state,
+            AgentState::Completed,
+            "a resumed launch's OWN fresh task_done must still complete it \
+             normally — the fix must not strand a genuine delivery"
+        );
+    }
+
+    /// TKT-vifob-gadil-vufuj, second review pass (artifact
+    /// 01M2F1VK5QVK1KGMDQ0TB7V7QH): a generation that already published ONE
+    /// `harness_result` from a premature first launch, then gets genuinely
+    /// resumed, writes its own fresh `task_done` on the second launch, and
+    /// crashes before its own `HarnessEvent::Completed` ever arrives —
+    /// restart-safe reconciliation must still route the resumed launch's
+    /// real completion. Before this, `harness_result_exists` scanned by
+    /// `spawn` alone, so the PREDECESSOR's `harness_result` read as "already
+    /// published" and silently swallowed the resumed generation's own,
+    /// entirely genuine completion forever — the exact failure mode a crash
+    /// right after a resumed `rk done` would hit in production, since
+    /// nothing else re-drives `reconcile_task_done` for a record already
+    /// sitting `Orphaned`.
+    #[tokio::test]
+    async fn a_resumed_generations_own_completion_survives_reconcile_despite_a_predecessors_harness_result(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, first) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        // The first (premature) launch declares done and publishes its own
+        // harness_result live, via handle_event.
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "Nibble",
+                json!({"agent": "Nibble", "task": "t", "spawn": spawn.to_string()}),
+            ))
+            .unwrap();
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            completed(Some(1.0), None),
+        );
+        let harness_results = |sup: &Supervisor| -> Vec<serde_json::Value> {
+            sup.space
+                .scan(&Pattern::category(Category::Event).identity("harness_result"))
+                .unwrap()
+                .into_iter()
+                .map(|t| t.payload)
+                .collect()
+        };
+        assert_eq!(
+            harness_results(&sup).len(),
+            1,
+            "sanity: the first launch published its own harness_result"
+        );
+
+        // The operator reopens the work and respawns the SAME generation.
+        let attempt = sup.begin_attempt("Nibble").unwrap();
+        sup.publish_launch("Nibble", None, |r| {
+            r.state = AgentState::Running;
+            r.result = None;
+            r.crashed = false;
+        })
+        .unwrap();
+
+        // The resumed launch does its own work and writes its own fresh
+        // task_done...
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "Nibble",
+                json!({
+                    "agent": "Nibble",
+                    "task": "t",
+                    "spawn": spawn.to_string(),
+                    "attempt": attempt.to_string(),
+                }),
+            ))
+            .unwrap();
+        // ...and crashes before its own `HarnessEvent::Completed` ever
+        // arrives. Simulate the daemon restart `Registry::orphan_live_agents`
+        // performs on every live record: no event pump survives the crash,
+        // so reconciliation must not wait out the live-harness grace window.
+        sup.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Orphaned)
+            .unwrap();
+
+        let settled = sup.reconcile_task_done().await.unwrap();
+        assert_eq!(
+            settled, 1,
+            "the resumed launch's own completion must settle, not be \
+             swallowed by the predecessor's harness_result"
+        );
+
+        assert_eq!(
+            sup.lock_registry().get("Nibble").unwrap().state,
+            AgentState::Completed
+        );
+
+        let results = harness_results(&sup);
+        assert_eq!(
+            results.len(),
+            2,
+            "the resumed launch's own harness_result must publish alongside \
+             the predecessor's, not be blocked by it: {results:?}"
+        );
+        assert_eq!(
+            results[1]["attempt"].as_str(),
+            Some(attempt.to_string().as_str()),
+            "the second harness_result must carry the RESUMED launch's own \
+             attempt id, not the predecessor's (or none)"
+        );
     }
 
     /// The corrected, never-rolled-back total must still drive the ordinary

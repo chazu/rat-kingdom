@@ -310,6 +310,7 @@ fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
         transport_outage: None,
         recovery: None,
         recovery_receipt: None,
+        current_attempt: None,
     }
 }
 

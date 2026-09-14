@@ -412,6 +412,7 @@ pub fn seed_landing_generation(
         transport_outage: None,
         recovery: None,
         recovery_receipt: None,
+        current_attempt: None,
     };
     Registry::load(&home.join("agents.json"))
         .unwrap()
