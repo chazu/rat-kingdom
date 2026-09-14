@@ -5576,6 +5576,92 @@ mod tests {
         );
     }
 
+    /// POSIX flock(2) releases a lease only once *every* descriptor sharing
+    /// its open file description is closed, or an explicit LOCK_UN is issued
+    /// on any one of them. A fork()'d child duplicates the whole fd table,
+    /// so a collector that only relies on `File`'s implicit close-on-drop
+    /// leaves its lease held for as long as such a child survives, even
+    /// after the owning `ObservationLog` itself is dropped. Reproduces that
+    /// with a real, bounded, explicitly-controlled child (async-signal-safe
+    /// only past the fork, per POSIX) rather than a standalone flock probe.
+    #[test]
+    fn observation_log_lease_releases_despite_a_descriptor_inheriting_child() {
+        let (dir, manifest) = fixture();
+        let log = ObservationLog::open(dir.path(), &manifest).unwrap();
+
+        let mut fds: [libc::c_int; 2] = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // Child: inherited a duplicate of the run's locked descriptor
+            // via fork(). Async-signal-safe only from here -- no
+            // allocation, no panics, no println!. Block for an explicit
+            // one-byte release signal rather than EOF: this test binary is
+            // multithreaded, so an unrelated concurrent fork elsewhere could
+            // inherit our `write_fd` too and keep EOF from ever arriving.
+            // An interrupted read (EINTR) must retry, never be mistaken for
+            // the release -- exiting early would clear the inherited-lock
+            // condition this test exists to hold open.
+            unsafe {
+                libc::close(write_fd);
+                let mut buf = [0u8; 1];
+                loop {
+                    let n = libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                    if n == 1 {
+                        break;
+                    }
+                    if n == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    // EOF or a hard error: not the release signal, but
+                    // nothing left to wait for either -- exit rather than
+                    // busy-loop on a read that will keep returning the same
+                    // way.
+                    break;
+                }
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(read_fd) };
+
+        // Our own handle is gone, but the child's inherited duplicate of
+        // the same open file description is still alive and blocked on the
+        // release byte.
+        drop(log);
+
+        let reopened = ObservationLog::open(dir.path(), &manifest);
+
+        let release = [1u8];
+        loop {
+            let n = unsafe { libc::write(write_fd, release.as_ptr() as *const libc::c_void, 1) };
+            if n == 1 {
+                break;
+            }
+            if n == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            panic!(
+                "failed to signal fork test child: {:?}",
+                std::io::Error::last_os_error()
+            );
+        }
+        unsafe { libc::close(write_fd) };
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        assert!(
+            reopened.is_ok(),
+            "reopening must succeed once the lease is explicitly released, even though \
+             the forked child still holds an inherited duplicate of the descriptor: {:?}",
+            reopened.err()
+        );
+    }
+
     #[test]
     fn declared_wait_retires_on_productive_checkpoint_and_replay_matches() {
         let (dir, mut manifest) = fixture();

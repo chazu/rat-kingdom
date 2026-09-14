@@ -13,11 +13,36 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, RawFd},
     path::{Path, PathBuf},
 };
 
 const CHECKPOINT: &str = "collector.json";
+
+/// Explicit release for the run's `flock(2)` lease. POSIX only grants the
+/// implicit close-time release once *every* descriptor sharing this open
+/// file description is closed; a descriptor a child process inherited (e.g.
+/// via `fork`) keeps that from firing until the child itself exits, even
+/// though this process is long done with the run. An explicit `LOCK_UN` on
+/// any one sharing descriptor releases the lease regardless of how many
+/// others remain open elsewhere, so this guard -- not `File`'s own drop --
+/// is the actual release. It is a bare local (not an `ObservationLog` field)
+/// so it also runs on an early `?` return between acquiring the lock and
+/// constructing `ObservationLog`, not only on the struct's own drop.
+struct FlockGuard(RawFd);
+
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was returned by a successful `flock(LOCK_EX)` on
+        // a descriptor this guard exclusively tracks the lease for, and
+        // remains open (owned by the co-located `File`) until this guard is
+        // dropped. Unlocking is idempotent and only ever affects a lease
+        // this process itself acquired, never a genuine second collector's.
+        unsafe {
+            libc::flock(self.0, libc::LOCK_UN);
+        }
+    }
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Checkpoint {
@@ -41,6 +66,10 @@ struct Checkpoint {
 
 pub(super) struct ObservationLog {
     run: PathBuf,
+    // Declared before `file`: struct fields drop top-to-bottom, and the
+    // lease must be released before the descriptor it names is closed (see
+    // `FlockGuard`).
+    _lock: FlockGuard,
     file: File,
     state: Checkpoint,
     recoveries: Vec<String>,
@@ -56,11 +85,16 @@ impl ObservationLog {
             .write(true)
             .open(run.join(SAMPLES))?;
         // SAFETY: the descriptor is live and owned for the lifetime of this
-        // log. Closing File releases the lock even after process termination.
+        // log (through `file` and, from here, `lock`).
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(std::io::Error::last_os_error())
                 .context("another collector owns this observation run");
         }
+        // Local, not yet moved into `ObservationLog`: on any `?` below,
+        // locals drop in reverse declaration order, so this still releases
+        // the lease before `file` closes -- covering failure between
+        // acquiring the lock and successfully constructing `Self`.
+        let lock = FlockGuard(file.as_raw_fd());
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(manifest)?));
         let cached = fs::read(run.join(CHECKPOINT))
             .ok()
@@ -81,6 +115,7 @@ impl ObservationLog {
         };
         let mut log = Self {
             run: run.into(),
+            _lock: lock,
             file,
             state,
             recoveries: Vec::new(),
