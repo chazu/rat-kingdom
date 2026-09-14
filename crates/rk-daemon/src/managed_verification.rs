@@ -2769,7 +2769,13 @@ mod tests {
         // settling calls the clock again to build the span.
         let corrupt_if_reread = true_ended_at + chrono::Duration::minutes(40);
         let remaining = Arc::new(Mutex::new(
-            vec![true_queued_at, true_started_at, true_ended_at, corrupt_if_reread].into_iter(),
+            vec![
+                true_queued_at,
+                true_started_at,
+                true_ended_at,
+                corrupt_if_reread,
+            ]
+            .into_iter(),
         ));
         let mut resources = VerificationResources::default();
         resources.clock = SpanClock::from_fn(move || {

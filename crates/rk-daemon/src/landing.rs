@@ -16897,13 +16897,14 @@ checks: [
     /// `RunProgress::queued_at_wall`/`started_at_wall`/`settled`) is wired to
     /// the real `ManagedVerification::run` clock capture — not just that the
     /// helper constructors (`PhaseSpan::from_observed`) behave correctly in
-    /// isolation. An injected counting clock hands out a strictly increasing
-    /// sequence; `run()` reads it exactly three times per check (queued,
-    /// started, settled) and nothing downstream — this pipeline's own
-    /// `record_check_verification_span` call sites included — reads it
-    /// again to build the span. If a call site regressed back to deriving
-    /// its own `Utc::now()`, the recorded call count would exceed
-    /// `3 * checks_run` and this test would fail.
+    /// isolation. The injected clock LOGS every value it hands out, in
+    /// order; each recorded span's `queued_at`/`started_at`/`ended_at` must
+    /// be exactly one of the logged consecutive triples, not merely three
+    /// present strings. A raw `Utc::now()` slipped in downstream of `run()`
+    /// settling (bypassing the injected clock entirely, so it would NOT
+    /// change the call count) would produce a timestamp absent from the log
+    /// and fail the membership check below — a stronger oracle than call
+    /// count alone, which only catches an extra read THROUGH this clock.
     #[tokio::test]
     async fn landing_gate_spans_are_wired_to_the_real_run_clock_capture_not_a_later_read() {
         let home = tempfile::tempdir().unwrap();
@@ -16920,16 +16921,19 @@ checks: [
         let space = Space::open_in_memory().unwrap();
         let pipeline = test_pipeline(home.path(), space.clone());
 
-        let call_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let log = Arc::new(Mutex::new(Vec::<DateTime<Utc>>::new()));
         let base = Utc::now();
-        let counting = Arc::clone(&call_count);
+        let logging = Arc::clone(&log);
         pipeline
             .supervisor
             .verification_resources()
             .clock
             .set(move || {
-                let n = counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                base + chrono::Duration::milliseconds(i64::try_from(n).unwrap() * 10)
+                let mut log = logging.lock().unwrap();
+                let value =
+                    base + chrono::Duration::milliseconds(i64::try_from(log.len()).unwrap() * 10);
+                log.push(value);
+                value
             });
 
         let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
@@ -16953,23 +16957,50 @@ checks: [
             .unwrap();
         assert_eq!(outcome, GateRunOutcome::Pass);
 
-        let spans = crate::span::spans_for_task(&space, "code-repo", "landing clock wiring").unwrap();
-        let verification_spans: Vec<&Value> =
-            spans.iter().filter(|s| s["phase"] == "verification").collect();
+        let spans =
+            crate::span::spans_for_task(&space, "code-repo", "landing clock wiring").unwrap();
+        let verification_spans: Vec<&Value> = spans
+            .iter()
+            .filter(|s| s["phase"] == "verification")
+            .collect();
         assert!(!verification_spans.is_empty(), "{spans:?}");
-        for span in &verification_spans {
-            assert_eq!(span["timestamp_provenance"], "observed", "{span:?}");
-            assert_eq!(span["duration_semantic"], "additive", "{span:?}");
-            assert!(span["queued_at"].is_string(), "{span:?}");
-            assert!(span["started_at"].is_string(), "{span:?}");
-            assert!(span["ended_at"].is_string(), "{span:?}");
-        }
+
+        let logged = log.lock().unwrap().clone();
         assert_eq!(
-            call_count.load(std::sync::atomic::Ordering::SeqCst),
-            u64::try_from(verification_spans.len()).unwrap() * 3,
+            logged.len(),
+            verification_spans.len() * 3,
             "each check reads the clock exactly 3 times (queued/started/settled); any more \
              means something downstream of run() settling re-read it to build the span"
         );
+        let mut expected_triples: Vec<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> =
+            logged.chunks_exact(3).map(|c| (c[0], c[1], c[2])).collect();
+        for span in &verification_spans {
+            assert_eq!(span["timestamp_provenance"], "observed", "{span:?}");
+            assert_eq!(span["duration_semantic"], "additive", "{span:?}");
+            let actual = (
+                parse_rfc3339_span_time(&span["queued_at"]),
+                parse_rfc3339_span_time(&span["started_at"]),
+                parse_rfc3339_span_time(&span["ended_at"]),
+            );
+            let matched = expected_triples.iter().position(|t| *t == actual);
+            assert!(
+                matched.is_some(),
+                "span's exact (queued_at, started_at, ended_at) must be one of the clock's own \
+                 logged triples, not an independently-read Utc::now(): {actual:?} not in \
+                 {expected_triples:?}, span={span:?}"
+            );
+            expected_triples.remove(matched.unwrap());
+        }
+        assert!(
+            expected_triples.is_empty(),
+            "every logged triple must be claimed by exactly one span: {expected_triples:?}"
+        );
+    }
+
+    fn parse_rfc3339_span_time(v: &Value) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(v.as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     /// A candidate that advances the same task through a second landing

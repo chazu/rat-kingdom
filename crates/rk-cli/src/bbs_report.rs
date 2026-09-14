@@ -5455,7 +5455,10 @@ mod tests {
         let c = capture(vec![discontinuous_span], Order::Unknown);
         let report = compute(&m, &c, &[]).unwrap();
         assert!(
-            report.invalid_records.iter().all(|i| i.record != "span-discontinuous"),
+            report
+                .invalid_records
+                .iter()
+                .all(|i| i.record != "span-discontinuous"),
             "a self-declared discontinuity is real telemetry, not a malformed record: {:?}",
             report.invalid_records
         );

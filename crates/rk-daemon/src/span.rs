@@ -880,7 +880,10 @@ mod tests {
             Some(true_ended_at),
             "an inferred span anchored on a delayed `now` must not be mistaken for the real end time"
         );
-        assert_eq!(corrupted.started_at, Some(delayed_now - chrono::Duration::milliseconds(duration_ms as i64)));
+        assert_eq!(
+            corrupted.started_at,
+            Some(delayed_now - chrono::Duration::milliseconds(duration_ms as i64))
+        );
         assert_ne!(
             corrupted.started_at,
             Some(true_started_at),
@@ -1005,10 +1008,20 @@ mod tests {
         let monotonic_duration_ms = 90_000u64;
         let ended_at = started_at + chrono::Duration::minutes(40) + chrono::Duration::seconds(90);
 
-        let span = PhaseSpan::from_observed("TKT-suspend", Phase::VerificationQueued, None, Some(started_at), Some(ended_at))
-            .duration_ms_monotonic(monotonic_duration_ms);
+        let span = PhaseSpan::from_observed(
+            "TKT-suspend",
+            Phase::VerificationQueued,
+            None,
+            Some(started_at),
+            Some(ended_at),
+        )
+        .duration_ms_monotonic(monotonic_duration_ms);
 
-        assert_eq!(span.duration_ms(), Some(2_490_000), "wall elapsed reflects the real suspend");
+        assert_eq!(
+            span.duration_ms(),
+            Some(2_490_000),
+            "wall elapsed reflects the real suspend"
+        );
         assert_eq!(span.duration_ms_monotonic, Some(monotonic_duration_ms));
         assert_ne!(
             span.duration_ms().map(|v| v as u64),
