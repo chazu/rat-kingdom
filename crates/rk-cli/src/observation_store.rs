@@ -26,9 +26,10 @@ const CHECKPOINT: &str = "collector.json";
 /// though this process is long done with the run. An explicit `LOCK_UN` on
 /// any one sharing descriptor releases the lease regardless of how many
 /// others remain open elsewhere, so this guard -- not `File`'s own drop --
-/// is the actual release. It is a bare local (not an `ObservationLog` field)
-/// so it also runs on an early `?` return between acquiring the lock and
-/// constructing `ObservationLog`, not only on the struct's own drop.
+/// is the actual release. `open` starts it as a bare local, before it is
+/// ever moved into `ObservationLog`'s `_lock` field, so it also runs on an
+/// early `?` return between acquiring the lock and successfully
+/// constructing `Self` -- not only on the constructed struct's own drop.
 struct FlockGuard(RawFd);
 
 impl Drop for FlockGuard {

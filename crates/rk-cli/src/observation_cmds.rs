@@ -5576,6 +5576,34 @@ mod tests {
         );
     }
 
+    /// Bounds cleanup of a forked test child: reaps it non-blockingly up to
+    /// a short deadline, then kills and reaps outright. Owning the pid in a
+    /// guard (rather than a bare final `waitpid`) means a child gets
+    /// reaped even if the parent unwinds early -- e.g. panics signalling
+    /// the release byte -- instead of leaking a hung or zombie process.
+    struct ChildGuard(libc::pid_t);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut status: libc::c_int = 0;
+            loop {
+                let reaped = unsafe { libc::waitpid(self.0, &mut status, libc::WNOHANG) };
+                if reaped != 0 {
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    unsafe {
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, &mut status, 0);
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
     /// POSIX flock(2) releases a lease only once *every* descriptor sharing
     /// its open file description is closed, or an explicit LOCK_UN is issued
     /// on any one of them. A fork()'d child duplicates the whole fd table,
@@ -5627,6 +5655,7 @@ mod tests {
                 libc::_exit(0);
             }
         }
+        let _child = ChildGuard(pid);
         unsafe { libc::close(read_fd) };
 
         // Our own handle is gone, but the child's inherited duplicate of
@@ -5651,8 +5680,6 @@ mod tests {
             );
         }
         unsafe { libc::close(write_fd) };
-        let mut status: libc::c_int = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
 
         assert!(
             reopened.is_ok(),
