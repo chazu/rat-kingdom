@@ -730,6 +730,12 @@ enum ExecutionOutcome {
 #[cfg(all(test, unix))]
 mod fd_guard_tests {
     use super::*;
+    use std::time::Instant;
+
+    /// How long a test child is given before it's treated as wedged and
+    /// killed rather than left to hang the suite — these commands are
+    /// trivial (`echo`/`cat`) and should return in milliseconds.
+    const TEST_CHILD_BOUND: Duration = Duration::from_secs(5);
 
     /// Opens a real, deliberately non-close-on-exec pipe — the exact state a
     /// pipe is briefly in between `pipe()` and `fcntl(F_SETFD, FD_CLOEXEC)`
@@ -744,6 +750,31 @@ mod fd_guard_tests {
             std::io::Error::last_os_error()
         );
         (fds[0], fds[1])
+    }
+
+    /// Bounded wait for a real `std::process::Child`, killing and reaping it
+    /// on overrun instead of leaving an unbounded `wait_with_output` in a
+    /// test — `guarded_spawn` itself has no timeout of its own (that's
+    /// `verify`'s `contract.timeout`/`tokio::time::timeout`, unused when a
+    /// test calls the sync helper directly), so this test owns its own
+    /// finite bound and cleans up the child rather than trusting it to exit.
+    fn wait_bounded_or_kill(mut child: std::process::Child, timeout: Duration) -> Output {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "guarded_spawn test child exceeded its {}s bound and was killed",
+                    timeout.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.wait_with_output().unwrap()
     }
 
     /// TKT-nivab-fazoz-hajol: `named_check_command` — the exact function
@@ -771,7 +802,12 @@ mod fd_guard_tests {
 
         let mut command = named_check_command(&contract, &cwd);
         let child = command.spawn().unwrap();
-        let output = child.wait_with_output().await.unwrap();
+        // `named_check_command` sets `kill_on_drop(true)`, so a timeout here
+        // drops (and thereby kills/reaps) the child rather than leaking it.
+        let output = tokio::time::timeout(TEST_CHILD_BOUND, child.wait_with_output())
+            .await
+            .expect("named_check_command test child exceeded its bound and was killed")
+            .unwrap();
 
         unsafe {
             libc::close(leak_r);
@@ -814,7 +850,7 @@ mod fd_guard_tests {
             .unwrap()
             .write_all(b"round-trip-me")
             .unwrap();
-        let output = child.wait_with_output().unwrap();
+        let output = wait_bounded_or_kill(child, TEST_CHILD_BOUND);
 
         unsafe {
             libc::close(leak_r);
