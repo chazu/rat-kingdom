@@ -206,25 +206,20 @@ pub fn is_excluded_from_discovery(tuple: &Tuple) -> bool {
 /// Which BBS discovery ranking a briefing selection actually applied. See
 /// `crates/rk-daemon/src/bbs_discovery.rs` (P8/P11 first slice: design doc
 /// `docs/2026-09-13-continuous-validation-promotion.md` section 7.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RankingVariant {
     /// Every title word (length >= 5, minus a fixed stoplist) scores a
     /// "task topic" match equally. Always the default and the fallback: a
     /// repo with no explicit setting, a disabled setting, or a config read
     /// failure all resolve here.
+    #[default]
     Baseline,
     /// Baseline plus a small set of additional excluded words, shown by a
     /// retained pre-outcome observation (BBS artifact
     /// `01M2ERKFJ8KCQ78TTBK42VVASP`) to produce unrelated landing/review
     /// noise on generic title-word overlap. Opt-in per repository.
     ObservedGenericWordFilter,
-}
-
-impl Default for RankingVariant {
-    fn default() -> Self {
-        Self::Baseline
-    }
 }
 
 impl RankingVariant {
@@ -241,24 +236,19 @@ impl RankingVariant {
 /// interchangeable, reasons — collapsing them would let an unreadable
 /// registry silently masquerade as "operator confirmed this repo is
 /// unconfigured".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigStatus {
     /// An explicit per-repo record exists and was read successfully.
     Explicit,
     /// The registry itself was read successfully and genuinely has no record
     /// for this repo — a confirmed, not assumed, absence.
+    #[default]
     DefaultAbsent,
     /// The registry could not be read (I/O or parse error). The baseline was
     /// applied as a safe fallback, but whether this repo has an explicit
     /// setting is UNKNOWN, not confirmed absent.
     UnreadableFallback,
-}
-
-impl Default for ConfigStatus {
-    fn default() -> Self {
-        Self::DefaultAbsent
-    }
 }
 
 impl ConfigStatus {
