@@ -176,6 +176,35 @@ pub struct PhaseSpan {
     /// derived `queued_at` double-count the wait when added back. Old rows
     /// are left exactly as recorded rather than retroactively reinterpreted.
     pub duration_semantic: Option<&'static str>,
+    /// Whether `queued_at`/`started_at`/`ended_at` are real wall-clock
+    /// boundaries the producer captured at the moment each occurred
+    /// (`Some("observed")`, set by [`PhaseSpan::from_observed`]), or were
+    /// back-computed by subtracting a measured duration from a later `now`
+    /// (`Some("inferred")`, set by [`PhaseSpan::from_durations`]). `None`
+    /// covers every span built before this field existed, via the plain
+    /// timestamp builders (`queued_at`/`started_at`/`ended_at` called
+    /// directly with a value the caller already holds — e.g. a stored
+    /// `created_at`), or [`PhaseSpan::new`] alone. An "inferred" span's
+    /// timestamps are only as accurate as the gap between the real
+    /// occurrence and whenever the producer finally called `Utc::now()`; if
+    /// anything delayed that call — a slow downstream `.await`, the host
+    /// itself suspending — the reconstructed timeline silently drifts from
+    /// what actually happened, which is exactly why a consumer must not read
+    /// an "inferred" span's timestamps as exact observed boundaries.
+    pub timestamp_provenance: Option<&'static str>,
+    /// Admission-queue wait measured directly off a monotonic clock
+    /// (`Instant::elapsed`) at the producer, independent of
+    /// `queued_at`/`started_at` and of any wall-clock discontinuity between
+    /// them (a host suspend during the wait makes the wall gap larger than
+    /// this without changing it). Kept distinct from
+    /// [`PhaseSpan::queue_wait_ms`] (the wall-clock difference derived from
+    /// the timestamps) so a reader can tell the two apart rather than
+    /// silently trusting whichever one a payload happens to carry.
+    pub queue_wait_ms_monotonic: Option<u64>,
+    /// Active execution duration measured directly off a monotonic clock,
+    /// the `duration_ms_monotonic` counterpart to
+    /// [`Self::queue_wait_ms_monotonic`] — see that field's doc.
+    pub duration_ms_monotonic: Option<u64>,
 }
 
 impl PhaseSpan {
@@ -197,6 +226,9 @@ impl PhaseSpan {
             proof_reused: None,
             authority: None,
             duration_semantic: None,
+            timestamp_provenance: None,
+            queue_wait_ms_monotonic: None,
+            duration_ms_monotonic: None,
         }
     }
 
@@ -265,6 +297,16 @@ impl PhaseSpan {
         self
     }
 
+    pub fn queue_wait_ms_monotonic(mut self, ms: u64) -> Self {
+        self.queue_wait_ms_monotonic = Some(ms);
+        self
+    }
+
+    pub fn duration_ms_monotonic(mut self, ms: u64) -> Self {
+        self.duration_ms_monotonic = Some(ms);
+        self
+    }
+
     /// Duration from queued to started, when both are known.
     pub fn queue_wait_ms(&self) -> Option<i64> {
         Some((self.started_at? - self.queued_at?).num_milliseconds())
@@ -273,6 +315,44 @@ impl PhaseSpan {
     /// Duration from started to ended, when both are known.
     pub fn duration_ms(&self) -> Option<i64> {
         Some((self.ended_at? - self.started_at?).num_milliseconds())
+    }
+
+    /// Build a span directly from real wall-clock boundaries a producer
+    /// captured at the moment each actually occurred — e.g. `Utc::now()`
+    /// read at the same statement as the `Instant::now()` that starts an
+    /// admission wait, not reconstructed later by subtracting a duration
+    /// from whatever `Utc::now()` happens to return when the span is finally
+    /// recorded. Never fabricates a value: a boundary the producer never
+    /// observed (still queued, cancelled before it started, etc.) stays
+    /// `None` rather than being inferred from the ones that are known.
+    /// Tagged [`PhaseSpan::timestamp_provenance`] `"observed"` whenever at
+    /// least one of the three is `Some`, so a reader can trust
+    /// [`PhaseSpan::queue_wait_ms`]/[`PhaseSpan::duration_ms`] (both derived
+    /// from these timestamps) as real elapsed wall-clock time, including
+    /// across a discontinuity (a host suspend, a delayed publish) between
+    /// two of the boundaries — unlike [`Self::from_durations`], nothing here
+    /// depends on when the caller happens to invoke this constructor.
+    pub fn from_observed(
+        task: impl Into<String>,
+        phase: Phase,
+        queued_at: Option<DateTime<Utc>>,
+        started_at: Option<DateTime<Utc>>,
+        ended_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        let mut span = Self::new(task, phase);
+        if let Some(q) = queued_at {
+            span = span.queued_at(q);
+        }
+        if let Some(s) = started_at {
+            span = span.started_at(s);
+        }
+        if let Some(e) = ended_at {
+            span = span.ended_at(e);
+        }
+        if queued_at.is_some() || started_at.is_some() || ended_at.is_some() {
+            span.timestamp_provenance = Some("observed");
+        }
+        span
     }
 
     /// Derive a span's start/end from durations alone, anchored so
@@ -296,6 +376,18 @@ impl PhaseSpan {
     /// [`PhaseSpan::duration_semantic`] `"additive"` so a consumer can tell
     /// it followed this contract, as opposed to an older row with no such
     /// tag at all.
+    ///
+    /// LAST RESORT ONLY — this constructor's whole reconstruction rests on
+    /// `now` actually being close to the real `ended_at`. A producer that
+    /// captured `now` well after the occurrence truly ended (a slow
+    /// downstream `.await`, a host suspend in between) silently shifts every
+    /// derived timestamp forward by exactly that gap, presenting a
+    /// fabricated timeline as if it were observed
+    /// (docs/proposals/prompts/0009, TKT-hodij-lujak-kibon). Tagged
+    /// [`PhaseSpan::timestamp_provenance`] `"inferred"` for exactly this
+    /// reason. Prefer [`Self::from_observed`] whenever the producer can
+    /// capture its own `queued_at`/`started_at`/`ended_at` at the moment each
+    /// occurs instead of only holding a duration until later.
     pub fn from_durations(
         task: impl Into<String>,
         phase: Phase,
@@ -319,6 +411,7 @@ impl PhaseSpan {
             span = span.queued_at(q);
         }
         span.duration_semantic = Some("additive");
+        span.timestamp_provenance = Some("inferred");
         span
     }
 
@@ -333,6 +426,9 @@ impl PhaseSpan {
             "queue_wait_ms": self.queue_wait_ms(),
             "duration_ms": self.duration_ms(),
             "duration_semantic": self.duration_semantic,
+            "timestamp_provenance": self.timestamp_provenance,
+            "queue_wait_ms_monotonic": self.queue_wait_ms_monotonic,
+            "duration_ms_monotonic": self.duration_ms_monotonic,
             "terminal_reason": self.terminal_reason,
             "repo": self.repo,
             "target": self.target,
@@ -695,5 +791,158 @@ mod tests {
         // Exact replay against the same target stays idempotent.
         assert!(!record_phase_span(&space, SYSTEM_SCOPE, "daemon", &onto_main).unwrap());
         assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 2);
+    }
+
+    /// Reproduces TKT-hodij-lujak-kibon's reported defect in isolation, with
+    /// no real sleep or `Utc::now()` call needed: `from_durations` anchors
+    /// `ended_at` on whatever `now` the CALLER passes in, which is only
+    /// correct if the caller invokes it right as the occurrence ends. A
+    /// caller delayed by a slow downstream `.await` (or a host suspend in
+    /// between) passes a `now` well past the true end, and every derived
+    /// timestamp silently shifts forward by exactly that gap — the evidence's
+    /// verification span reported `queued_at`/`started_at`/`ended_at` roughly
+    /// 3m20s later than the real timeline the underlying
+    /// `verification_admission` event captured for the identical occurrence.
+    #[test]
+    fn delayed_recording_corrupts_inferred_reconstruction() {
+        let true_ended_at = Utc::now();
+        let recording_delay = chrono::Duration::minutes(3) + chrono::Duration::seconds(20);
+        let delayed_now = true_ended_at + recording_delay;
+        let queue_wait_ms = 5_000u64;
+        let duration_ms = 697_850u64;
+
+        // What the real occurrence's own admission event recorded (accurate:
+        // published right as the run settled).
+        let true_started_at = true_ended_at - chrono::Duration::milliseconds(duration_ms as i64);
+        let true_queued_at = true_started_at - chrono::Duration::milliseconds(queue_wait_ms as i64);
+
+        // The buggy reconstruction: identical durations, but `now` is read
+        // late (the only difference from a producer that settled instantly).
+        let corrupted = PhaseSpan::from_durations(
+            "TKT-sleep",
+            Phase::VerificationQueued,
+            Some(queue_wait_ms),
+            Some(duration_ms),
+            delayed_now,
+        );
+        assert_eq!(corrupted.timestamp_provenance, Some("inferred"));
+        assert_eq!(corrupted.ended_at, Some(delayed_now));
+        assert_ne!(
+            corrupted.ended_at,
+            Some(true_ended_at),
+            "an inferred span anchored on a delayed `now` must not be mistaken for the real end time"
+        );
+        assert_eq!(corrupted.started_at, Some(delayed_now - chrono::Duration::milliseconds(duration_ms as i64)));
+        assert_ne!(
+            corrupted.started_at,
+            Some(true_started_at),
+            "the whole reconstructed timeline drifts forward by the recording delay, not just ended_at"
+        );
+        assert_eq!(
+            (corrupted.ended_at.unwrap() - true_ended_at),
+            recording_delay,
+            "the drift is exactly the gap between the real end and when `from_durations` was finally called"
+        );
+        assert_ne!(corrupted.queued_at, Some(true_queued_at));
+    }
+
+    /// The fix: a producer that captures its own `queued_at`/`started_at`/
+    /// `ended_at` at the moment each occurs and threads them through (rather
+    /// than only holding a duration until some later, possibly delayed, call)
+    /// gets the true timeline back no matter how late `from_observed` itself
+    /// is finally invoked — nothing here depends on "now".
+    #[test]
+    fn from_observed_preserves_the_real_timeline_regardless_of_recording_delay() {
+        let true_queued_at = Utc::now() - chrono::Duration::minutes(20);
+        let true_started_at = true_queued_at + chrono::Duration::seconds(5);
+        let true_ended_at = true_started_at + chrono::Duration::seconds(698);
+
+        // Simulate an arbitrarily late call to the constructor — the
+        // producer captured the three real timestamps long before actually
+        // getting around to building the span.
+        let span = PhaseSpan::from_observed(
+            "TKT-sleep",
+            Phase::VerificationQueued,
+            Some(true_queued_at),
+            Some(true_started_at),
+            Some(true_ended_at),
+        );
+        assert_eq!(span.timestamp_provenance, Some("observed"));
+        assert_eq!(span.queued_at, Some(true_queued_at));
+        assert_eq!(span.started_at, Some(true_started_at));
+        assert_eq!(span.ended_at, Some(true_ended_at));
+        assert_eq!(span.queue_wait_ms(), Some(5_000));
+        assert_eq!(span.duration_ms(), Some(698_000));
+    }
+
+    /// A boundary the producer never actually observed (still queued when
+    /// cancelled, never started) stays `None` rather than being fabricated —
+    /// `from_observed` never infers a missing endpoint from the ones it has.
+    #[test]
+    fn from_observed_never_fabricates_a_missing_boundary() {
+        let span = PhaseSpan::from_observed(
+            "TKT-cancelled",
+            Phase::VerificationQueued,
+            Some(Utc::now()),
+            None,
+            None,
+        );
+        assert!(span.started_at.is_none());
+        assert!(span.ended_at.is_none());
+        assert_eq!(span.queue_wait_ms(), None);
+        assert_eq!(span.duration_ms(), None);
+        assert_eq!(span.timestamp_provenance, Some("observed"));
+    }
+
+    /// Queue wait, active execution duration and wall elapsed duration stay
+    /// three distinct numbers: a host suspend spanning the check's actual
+    /// execution makes the wall-clock gap (`duration_ms`, derived from real
+    /// `started_at`/`ended_at`) far larger than the monotonic
+    /// `duration_ms_monotonic` an `Instant` measured for the same occurrence,
+    /// and neither is silently added into the other.
+    #[test]
+    fn wall_elapsed_and_monotonic_duration_diverge_under_a_host_suspend_without_double_counting() {
+        let started_at = Utc::now();
+        // The check was actually only busy for 90s of monotonic/active time,
+        // but the host slept for 40 minutes in the middle of it, so the wall
+        // clock shows a much larger gap to the real `ended_at`.
+        let monotonic_duration_ms = 90_000u64;
+        let ended_at = started_at + chrono::Duration::minutes(40) + chrono::Duration::seconds(90);
+
+        let span = PhaseSpan::from_observed("TKT-suspend", Phase::VerificationQueued, None, Some(started_at), Some(ended_at))
+            .duration_ms_monotonic(monotonic_duration_ms);
+
+        assert_eq!(span.duration_ms(), Some(2_490_000), "wall elapsed reflects the real suspend");
+        assert_eq!(span.duration_ms_monotonic, Some(monotonic_duration_ms));
+        assert_ne!(
+            span.duration_ms().map(|v| v as u64),
+            span.duration_ms_monotonic,
+            "the two must never collapse to the same value under a suspend"
+        );
+    }
+
+    /// `record_phase_span`'s idempotency key is unaffected by any of the new
+    /// fields: an `from_observed` span still dedups on `(task, phase,
+    /// attempt)` (plus the existing fences) exactly like an `from_durations`
+    /// one, and restart-safety carries over unchanged.
+    #[test]
+    fn from_observed_spans_still_dedup_like_from_durations_spans() {
+        let space = space();
+        let task = "TKT-observed-dedup";
+        let span = PhaseSpan::from_observed(
+            task,
+            Phase::VerificationQueued,
+            Some(Utc::now() - chrono::Duration::seconds(10)),
+            Some(Utc::now() - chrono::Duration::seconds(8)),
+            Some(Utc::now()),
+        )
+        .candidate("sha-observed")
+        .lane("verify");
+        assert!(record_phase_span(&space, SYSTEM_SCOPE, "daemon", &span).unwrap());
+        assert!(
+            !record_phase_span(&space, SYSTEM_SCOPE, "daemon", &span).unwrap(),
+            "an exact replay of the same observed occurrence must not duplicate"
+        );
+        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, task).unwrap().len(), 1);
     }
 }
