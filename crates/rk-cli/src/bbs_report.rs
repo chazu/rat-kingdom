@@ -211,6 +211,10 @@ const SPAN_PHASES: [&str; 12] = [
 ];
 /// `PhaseSpan::from_durations` declares queue wait and duration disjoint.
 const ADDITIVE_DURATION: &str = "additive";
+/// `PhaseSpan::from_observed` sets this when its own raw timestamps disagree
+/// on chronological order — a genuine wall-clock discontinuity (NTP
+/// correction, leap second) between two capture points, not a producer bug.
+const DISCONTINUOUS_PROVENANCE: &str = "observed_discontinuous";
 
 /// Native events that prove an agent generation actually started a process, so
 /// a prepared exposure can be joined to a LAUNCHED consumer rather than
@@ -1533,11 +1537,20 @@ fn task_span_defect(t: &Value) -> Option<String> {
             other => return Some(format!("payload.{field} {other} is not a time")),
         }
     }
-    if let Some(w) = times.windows(2).find(|w| w[0].1 > w[1].1) {
-        return Some(format!(
-            "payload.{} is after payload.{}; a span cannot run backwards",
-            w[0].0, w[1].0
-        ));
+    // A span the producer itself flagged as spanning a wall-clock
+    // discontinuity (`PhaseSpan::from_observed`'s doc, TKT-hodij-lujak-kibon)
+    // is honest telemetry about a real clock step, not malformed data — its
+    // raw timestamps are expected to disagree on order, and rejecting the
+    // whole record would discard a real observation instead of representing
+    // it. Every other span is still held to strict chronological order:
+    // that's the producer-bug signature this check exists to catch.
+    if t["payload"]["timestamp_provenance"] != DISCONTINUOUS_PROVENANCE {
+        if let Some(w) = times.windows(2).find(|w| w[0].1 > w[1].1) {
+            return Some(format!(
+                "payload.{} is after payload.{}; a span cannot run backwards",
+                w[0].0, w[1].0
+            ));
+        }
     }
     // Producer durations are nonnegative differences between their timestamps.
     for field in ["queue_wait_ms", "duration_ms"] {
@@ -5327,6 +5340,136 @@ mod tests {
         assert_eq!(
             d.phase_ms.verification_ms_legacy_spans, 1,
             "the untagged span is an explicit coverage gap, never guessed into the total"
+        );
+    }
+
+    /// `rk_daemon::span::PhaseSpan::from_observed` (TKT-hodij-lujak-kibon)
+    /// tags real-timestamp spans `duration_semantic: "additive"` exactly
+    /// like `from_durations` — a span this producer emits must sum into
+    /// `verification_ms` the same way a legacy `from_durations` span always
+    /// has, not fall into the legacy/unknown bucket just because its
+    /// `timestamp_provenance` is "observed" rather than absent. Also proves
+    /// the new `queue_wait_ms_monotonic`/`duration_ms_monotonic` fields
+    /// (present alongside the wall-clock ones, informational only) do not
+    /// perturb the wall-clock total this report actually sums.
+    #[test]
+    fn observed_provenance_spans_sum_into_verification_ms_like_legacy_additive_spans() {
+        let m = task_manifest("TKT-verify-observed");
+        let observed_span = span_full(
+            "span-observed",
+            json!({
+                "task": "TKT-verify-observed", "phase": "verification", "attempt": 1,
+                "queued_at": T0,
+                "started_at": "2026-01-01T00:00:00.500Z",
+                "ended_at": "2026-01-01T00:00:00.550Z",
+                "queue_wait_ms": 500, "duration_ms": 50,
+                "duration_semantic": ADDITIVE_DURATION,
+                "timestamp_provenance": "observed",
+                "queue_wait_ms_monotonic": 501, "duration_ms_monotonic": 49,
+                "repo": "repo"
+            }),
+        );
+        let c = capture(vec![observed_span], Order::Unknown);
+        let report = compute(&m, &c, &[]).unwrap();
+        assert_eq!(report.deliveries.len(), 1);
+        let d = &report.deliveries[0];
+        assert_eq!(
+            d.phase_ms.verification_ms,
+            Some(550),
+            "an observed-provenance span sums exactly like a legacy additive one: {:?}",
+            d.phase_ms
+        );
+        assert_eq!(
+            d.phase_ms.verification_ms_legacy_spans, 0,
+            "an observed, additive-tagged span is never treated as a coverage gap"
+        );
+    }
+
+    /// A span recorded well after its real occurrence ended (a delayed
+    /// publish, or a producer whose `.await` chain spans a host suspend)
+    /// still totals on the same real `queued_at`/`started_at`/`ended_at` it
+    /// carries — the report has no separate "publish time" to be misled by,
+    /// it only ever reads the timestamps a producer actually wrote. This is
+    /// the consumer-side half of TKT-hodij-lujak-kibon's fix: the producer
+    /// change (freezing `ended_at` at the real settle point instead of
+    /// re-deriving it from a later `now`) is what keeps these timestamps
+    /// truthful in the first place; this only proves the report doesn't
+    /// itself reintroduce drift once they arrive correct.
+    #[test]
+    fn a_span_recorded_long_after_its_real_occurrence_still_totals_on_its_true_timestamps() {
+        let m = task_manifest("TKT-verify-delayed");
+        let true_started_at = "2026-01-01T00:00:00.500Z";
+        let true_ended_at = "2026-01-01T00:00:00.550Z";
+        let delayed_publish_span = span_full(
+            "span-delayed-publish",
+            json!({
+                "task": "TKT-verify-delayed", "phase": "verification", "attempt": 1,
+                "queued_at": T0,
+                "started_at": true_started_at,
+                "ended_at": true_ended_at,
+                "queue_wait_ms": 500, "duration_ms": 50,
+                "duration_semantic": ADDITIVE_DURATION,
+                "timestamp_provenance": "observed",
+                "repo": "repo"
+            }),
+        );
+        let c = capture(vec![delayed_publish_span], Order::Unknown);
+        let report = compute(&m, &c, &[]).unwrap();
+        let d = &report.deliveries[0];
+        assert_eq!(
+            d.phase_ms.verification_ms,
+            Some(550),
+            "totals on the span's own true timestamps regardless of when it was actually published"
+        );
+    }
+
+    /// A span whose producer self-declared a wall-clock discontinuity
+    /// (`timestamp_provenance: "observed_discontinuous"`, TKT-hodij-lujak-kibon
+    /// — a real NTP correction or leap second between two capture points, not
+    /// a producer bug) must survive validation rather than being thrown away
+    /// as malformed: before this fix, ANY span with a backwards timestamp
+    /// pair was rejected outright (`task_span_defect`'s "a span cannot run
+    /// backwards"), discarding real observed telemetry along with genuine
+    /// producer bugs. It still contributes nothing to the additive
+    /// verification total (there is no sound elapsed duration across a
+    /// discontinuity) and is counted as coverage-gap "legacy", not silently
+    /// summed as if nothing happened.
+    #[test]
+    fn a_self_declared_clock_discontinuity_survives_validation_as_unknown_not_rejected() {
+        let m = task_manifest("TKT-clock-step");
+        let discontinuous_span = span_full(
+            "span-discontinuous",
+            json!({
+                "task": "TKT-clock-step", "phase": "verification", "attempt": 1,
+                "queued_at": "2026-01-01T00:01:00Z",
+                // Wall clock stepped backwards a minute between captures.
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": "2026-01-01T00:00:05Z",
+                // Honest: no sound queue_wait_ms across the discontinuity,
+                // only the internally-consistent started..ended leg.
+                "queue_wait_ms": null, "duration_ms": 5000,
+                "timestamp_provenance": "observed_discontinuous",
+                "repo": "repo"
+            }),
+        );
+        let c = capture(vec![discontinuous_span], Order::Unknown);
+        let report = compute(&m, &c, &[]).unwrap();
+        assert!(
+            report
+                .invalid_records
+                .iter()
+                .all(|i| i.record != "span-discontinuous"),
+            "a self-declared discontinuity is real telemetry, not a malformed record: {:?}",
+            report.invalid_records
+        );
+        let d = &report.deliveries[0];
+        assert_eq!(
+            d.phase_ms.verification_ms, None,
+            "never summed as if the interval across the discontinuity were sound"
+        );
+        assert_eq!(
+            d.phase_ms.verification_ms_legacy_spans, 1,
+            "counted as an explicit coverage gap, not silently dropped or fabricated into a total"
         );
     }
 
