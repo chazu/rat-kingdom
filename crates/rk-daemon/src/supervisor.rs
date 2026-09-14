@@ -620,7 +620,21 @@ struct AttemptWatch {
     /// raw running total, which can still carry an earlier launch's
     /// provider-reported spend. Subtracting this isolates what accrued from THIS
     /// launch's own `HarnessEvent::Usage` increments.
+    ///
+    /// Also the floor a `HarnessEvent::Completed.cost_usd`/`usage` total is
+    /// added onto (not replaced by) when applied to the record: that total is
+    /// cumulative only within THIS launch's own provider query, even across a
+    /// `--resume` of the same provider session — a fresh process/query segment
+    /// reports its own total from zero, not the full session history. Writing
+    /// it straight into `AgentRecord.cost_usd` would let a resumed launch's
+    /// smaller first total roll back everything earlier launches already
+    /// spent, restoring budget allowance that was genuinely consumed.
     baseline_cost_usd: f64,
+    /// `AgentRecord.usage` when this launch began, for the same reason as
+    /// [`Self::baseline_cost_usd`]: a launch's own `Completed.usage` is this
+    /// query segment's total, not the generation's, so it is added onto this
+    /// baseline rather than overwriting the record.
+    baseline_usage: TokenUsage,
 }
 
 impl AttemptWatch {
@@ -2845,6 +2859,17 @@ impl Supervisor {
                     warn!(agent = name, "completion event for an unknown agent");
                     return;
                 };
+                // This launch's own baseline, frozen at `begin_launch`. A
+                // `Completed.cost_usd`/`usage` total below is only ever this
+                // launch's own query-segment total — added onto this baseline,
+                // never substituted for the generation-cumulative record — so a
+                // respawn (or a `--resume` of the same provider session, which
+                // still starts a fresh query segment) can never roll the
+                // record's spend backward. See `AttemptWatch::baseline_cost_usd`.
+                let (baseline_cost_usd, baseline_usage) = self
+                    .attempt_watch(session)
+                    .map(|w| (w.baseline_cost_usd, w.baseline_usage))
+                    .unwrap_or_default();
                 // A deliberate stop, or a completion already settled by
                 // `reconcile_task_done` reacting to the durable `task_done`
                 // tuple directly, wins races with a final harness event.
@@ -2885,10 +2910,12 @@ impl Supervisor {
                             r.result = Some(result.clone());
                         }
                         if usage.total() > 0 {
-                            r.usage = usage;
+                            let mut total = baseline_usage;
+                            total.add(&usage);
+                            r.usage = total;
                         }
                         if let Some(cost) = cost_usd {
-                            r.cost_usd = cost;
+                            r.cost_usd = baseline_cost_usd + cost;
                         }
                         self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
                         if session_id.is_some() {
@@ -2942,10 +2969,12 @@ impl Supervisor {
                     };
                     r.result = Some(result.clone());
                     if usage.total() > 0 {
-                        r.usage = usage;
+                        let mut total = baseline_usage;
+                        total.add(&usage);
+                        r.usage = total;
                     }
                     if let Some(cost) = cost_usd {
-                        r.cost_usd = cost;
+                        r.cost_usd = baseline_cost_usd + cost;
                     }
                     self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
                     if session_id.is_some() {
@@ -3593,6 +3622,7 @@ impl Supervisor {
                 usage_since_result: false,
                 saw_provider_cost: false,
                 baseline_cost_usd: record.cost_usd,
+                baseline_usage: record.usage,
             },
         );
     }
@@ -13647,6 +13677,266 @@ mod native_observation_tests {
             usage[1]["cost_usd"].as_f64().unwrap(),
             cumulative_after_usage,
             "the raw cumulative record total must never be reported as this launch's cost"
+        );
+    }
+
+    /// TKT-hitol-kifih-sovum regression: a respawned launch's own provider
+    /// total can be SMALLER than the cumulative total already recorded — the
+    /// reported incident saw a resumed provider session's fresh query segment
+    /// report $0.2283182 after a predecessor launch of the same generation
+    /// had already reported $6.260173. `AgentRecord.cost_usd`/`usage` must
+    /// never roll backward: the smaller segment total lands ON TOP of the
+    /// baseline this launch began with, never in place of it.
+    #[test]
+    fn a_relaunch_reporting_a_smaller_segment_total_never_rolls_back_recorded_spend() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let (rec, first) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        // First launch: a large provider-reported total and usage.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            HarnessEvent::Completed {
+                result: "r".into(),
+                is_error: false,
+                usage: TokenUsage {
+                    input: 1_000_000,
+                    output: 50_000,
+                    ..Default::default()
+                },
+                cost_usd: Some(6.260173),
+                session_id: Some("provider-sess".into()),
+            },
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            HarnessEvent::Exited { code: Some(0) },
+        );
+        let before = sup.lock_registry().get("Nibble").unwrap().clone();
+        assert_eq!(before.cost_usd, 6.260173);
+        assert_eq!(before.usage.total(), 1_050_000);
+
+        // A rollover-orphan recovery relaunches the SAME provider session
+        // (`--resume`) under a fresh daemon-side token; the harness reports
+        // its own fresh query segment — smaller than everything already
+        // spent, even though it is a resume of the identical provider
+        // session id.
+        sup.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Running)
+            .unwrap();
+        let second = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), second);
+        sup.begin_launch("Nibble", second);
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            HarnessEvent::Completed {
+                result: "r".into(),
+                is_error: false,
+                usage: TokenUsage {
+                    input: 1_000,
+                    output: 500,
+                    ..Default::default()
+                },
+                cost_usd: Some(0.2283182),
+                session_id: Some("provider-sess".into()),
+            },
+        );
+
+        let after = sup.lock_registry().get("Nibble").unwrap().clone();
+        assert!(
+            after.cost_usd >= before.cost_usd,
+            "recorded spend must never decrease across a respawn: {} -> {}",
+            before.cost_usd,
+            after.cost_usd
+        );
+        assert!(
+            (after.cost_usd - (6.260173 + 0.2283182)).abs() < 1e-9,
+            "the smaller segment total must be ADDED onto the prior baseline, \
+             never substituted for it: {}",
+            after.cost_usd
+        );
+        assert!(
+            after.usage.total() >= before.usage.total(),
+            "recorded token usage must never decrease across a respawn: {} -> {}",
+            before.usage.total(),
+            after.usage.total()
+        );
+        assert_eq!(after.usage.total(), 1_050_000 + 1_500);
+    }
+
+    /// The corrected, never-rolled-back total must still drive the ordinary
+    /// budget-stop fence: a respawn's smaller reported segment must not let a
+    /// generation coast under the cap once its TRUE cumulative spend already
+    /// crossed it — that would silently mint back allowance the fleet/repo
+    /// budget machinery had already correctly consumed.
+    #[test]
+    fn a_relaunch_reporting_a_smaller_segment_total_still_trips_the_budget_stop() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        let sup = Arc::new(
+            Supervisor::new(
+                Layout::at(home.path()),
+                "castle".into(),
+                "fake".into(),
+                Budget {
+                    max_usd: 6.30,
+                    max_tokens: 0,
+                    warn_at: 0.99,
+                },
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        );
+        let (rec, first) = launched(&sup, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            completed(Some(6.26), Some("provider-sess")),
+        );
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            HarnessEvent::Exited { code: Some(0) },
+        );
+
+        sup.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Running)
+            .unwrap();
+        let second = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert("Nibble".into(), second);
+        sup.begin_launch("Nibble", second);
+
+        // The resumed segment's own total is tiny — under the cap on its
+        // own — but the TRUE cumulative total ($6.36) is already past it.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            completed(Some(0.10), Some("provider-sess")),
+        );
+        let after_completed = sup.lock_registry().get("Nibble").unwrap().cost_usd;
+        assert!(
+            (after_completed - 6.36).abs() < 1e-9,
+            "the resumed segment must land on top of the $6.26 already spent: {}",
+            after_completed
+        );
+
+        // `enforce_budget` is checked off `HarnessEvent::Usage`, not
+        // `Completed` — a further, even trivial, usage event is what proves
+        // the budget machinery reads the corrected (never-rolled-back) total
+        // rather than the smaller segment figure the bug would have left
+        // behind.
+        sup.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            HarnessEvent::Usage {
+                usage: TokenUsage::default(),
+            },
+        );
+        let stopped = sup.status("Nibble").unwrap();
+        assert_eq!(
+            stopped.state,
+            AgentState::Stopped,
+            "the budget-stop fence must still fire off the corrected cumulative \
+             spend, not a total the bug would have reset to $0.10"
+        );
+    }
+
+    /// TKT-hitol-kifih-sovum, the restart half: the reported incident was
+    /// recovering an orphaned worker, which crosses exactly this kind of gap.
+    /// Every in-memory `AttemptWatch` is gone after a daemon restart, but the
+    /// persisted `AgentRecord.cost_usd` survives — and it must still be the
+    /// baseline a post-restart relaunch's own (possibly smaller) segment
+    /// total lands on, not a spend that quietly resets because no live watch
+    /// from the pre-restart launch survives to remember it.
+    #[test]
+    fn a_post_restart_relaunch_still_adds_onto_the_persisted_spend() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+
+        let sup1 = supervisor(home.path());
+        let (rec, first) = launched(&sup1, repo.path(), "Nibble");
+        let spawn = rec.spawn_id();
+        sup1.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            completed(Some(6.260173), Some("provider-sess")),
+        );
+        sup1.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            first,
+            HarnessEvent::Exited { code: Some(0) },
+        );
+        assert_eq!(
+            sup1.lock_registry().get("Nibble").unwrap().cost_usd,
+            6.260173
+        );
+
+        // The daemon restarts: every in-memory `AttemptWatch`/session token
+        // is gone, but a fresh `Supervisor` over the SAME home sees exactly
+        // what the dead process persisted.
+        drop(sup1);
+        let sup2 = supervisor(home.path());
+        assert_eq!(
+            sup2.lock_registry().get("Nibble").unwrap().cost_usd,
+            6.260173
+        );
+
+        // Recovery relaunches the generation under a brand-new token; its own
+        // `begin_launch` must freeze the baseline from the PERSISTED total.
+        sup2.lock_registry()
+            .update("Nibble", |r| r.state = AgentState::Running)
+            .unwrap();
+        let second = rk_core::id::SpawnId::new();
+        sup2.lock_session_tokens().insert("Nibble".into(), second);
+        sup2.begin_launch("Nibble", second);
+        sup2.handle_event(
+            "Nibble",
+            rec.created_at,
+            spawn,
+            second,
+            completed(Some(0.2283182), Some("provider-sess")),
+        );
+
+        let after = sup2.lock_registry().get("Nibble").unwrap().cost_usd;
+        assert!(
+            (after - (6.260173 + 0.2283182)).abs() < 1e-9,
+            "a relaunch after a daemon restart must still add its segment \
+             onto the persisted baseline, not reset it: {}",
+            after
         );
     }
 
