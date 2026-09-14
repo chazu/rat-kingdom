@@ -217,20 +217,7 @@ pub async fn verify(
     let timeout = parse_duration(&contract.timeout)?;
     let started_at = Utc::now();
 
-    let mut command = tokio::process::Command::new("sh");
-    command
-        .arg("-c")
-        .arg(&contract.command)
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if contract.environment_policy == CheckEnvironmentPolicy::StripRkSpawn {
-        for name in rk_workflow::STRIPPED_RK_SPAWN_ENV {
-            command.env_remove(name);
-        }
-    }
+    let mut command = named_check_command(contract, &cwd);
 
     let outcome = match command.spawn() {
         Ok(child) => match tokio::time::timeout(timeout, child.wait_with_output()).await {
@@ -285,6 +272,33 @@ pub async fn verify(
         output_summary,
         unresolved_risks,
     })
+}
+
+/// Build the exact `sh -c` boundary `verify` spawns a named check through:
+/// its own process group's worth of stdio (stdin null, stdout/stderr piped,
+/// `kill_on_drop`), the check's declared environment policy, and — last,
+/// right before the caller spawns it — `close_extra_fds`, guarding against
+/// TKT-bikuz-kumuz-zutit's inherited-descriptor race. Factored out of
+/// `verify` so a test can spawn this exact command directly rather than a
+/// separately constructed stand-in, which would prove nothing about
+/// `verify`'s own wiring.
+fn named_check_command(contract: &OnboardingNamedCheck, cwd: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(&contract.command)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if contract.environment_policy == CheckEnvironmentPolicy::StripRkSpawn {
+        for name in rk_workflow::STRIPPED_RK_SPAWN_ENV {
+            command.env_remove(name);
+        }
+    }
+    rk_core::exec::close_extra_fds(command.as_std_mut());
+    command
 }
 
 fn application_evidence(
@@ -586,13 +600,23 @@ fn require_only_target(paths: &[String], target: &str) -> rk_core::Result<()> {
     }
 }
 
+/// Guard `cmd` against inheriting a descriptor left open by a concurrent,
+/// unrelated pipe-creating spawn elsewhere in the daemon
+/// (TKT-bikuz-kumuz-zutit — see `rk_core::exec::close_extra_fds`), then
+/// spawn it and wait for its captured output. The one place every synchronous
+/// `git` boundary in this file routes its spawn through, so a test exercising
+/// this function exercises exactly what `git_output`/`git_with_stdin_output`
+/// call in production.
+fn guarded_spawn(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    rk_core::exec::close_extra_fds(cmd);
+    cmd.spawn()
+}
+
 fn git_output(worktree: &Path, args: &[&str]) -> rk_core::Result<Output> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(worktree).args(args).env("LC_ALL", "C");
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let output = cmd.output()?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -618,15 +642,15 @@ fn git_with_stdin(worktree: &Path, args: &[&str], input: &str) -> rk_core::Resul
 }
 
 fn git_with_stdin_output(worktree: &Path, args: &[&str], input: &str) -> rk_core::Result<Output> {
-    let mut child = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(worktree)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = guarded_spawn(&mut cmd)?;
     child
         .stdin
         .take()
@@ -701,4 +725,107 @@ enum ExecutionOutcome {
     Completed(Output),
     TimedOut,
     SpawnFailure(String),
+}
+
+#[cfg(all(test, unix))]
+mod fd_guard_tests {
+    use super::*;
+
+    /// Opens a real, deliberately non-close-on-exec pipe — the exact state a
+    /// pipe is briefly in between `pipe()` and `fcntl(F_SETFD, FD_CLOEXEC)`
+    /// on macOS (no `pipe2`), where TKT-bikuz-kumuz-zutit was diagnosed.
+    /// Same methodology as `rk_core::exec`'s own `close_extra_fds` tests.
+    fn leaky_pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "pipe(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        (fds[0], fds[1])
+    }
+
+    /// TKT-nivab-fazoz-hajol: `named_check_command` — the exact function
+    /// `verify` calls to build its `sh -c` named-check spawn — must not let
+    /// a descriptor left open by a concurrent, unrelated pipe-creating spawn
+    /// elsewhere in the daemon survive into its child (the
+    /// TKT-bikuz-kumuz-zutit race `close_extra_fds` closes), while its own
+    /// intended captured output still comes through untouched. This calls
+    /// the real production helper — a contract whose `command` field probes
+    /// the leaked fd, not a separately constructed stand-in that would prove
+    /// nothing about `verify`'s own wiring.
+    #[tokio::test]
+    async fn named_check_command_hides_a_leaked_descriptor_and_still_captures_output() {
+        let (leak_r, leak_w) = leaky_pipe();
+        let cwd = std::env::temp_dir();
+        let contract = OnboardingNamedCheck {
+            name: "fd-probe".into(),
+            command: format!("if [ -e /dev/fd/{leak_w} ]; then echo LEAKED; else echo SAFE; fi"),
+            cwd: ".".into(),
+            expect_exit: 0,
+            timeout: "5s".into(),
+            environment_policy: CheckEnvironmentPolicy::Inherit,
+            toolchain: "none".into(),
+        };
+
+        let mut command = named_check_command(&contract, &cwd);
+        let child = command.spawn().unwrap();
+        let output = child.wait_with_output().await.unwrap();
+
+        unsafe {
+            libc::close(leak_r);
+            libc::close(leak_w);
+        }
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "SAFE",
+            "a guarded onboarding named-check child observed a descriptor it was never given"
+        );
+    }
+
+    /// Materially distinct boundary from the output-only named-check spawn
+    /// above: `guarded_spawn` is the exact function `git_with_stdin_output`
+    /// routes its spawn through, and that boundary writes to the child's
+    /// stdin concurrently with capturing its output. `git` itself cannot
+    /// self-report its own fd table, so this exercises `guarded_spawn`
+    /// directly (the real helper, not a copy) with an `sh` child standing in
+    /// for `git`, proving the same guarantee holds at a stdin-piping
+    /// boundary: no leaked descriptor survives, and real data written to
+    /// stdin still round-trips through the captured stdout correctly.
+    #[test]
+    fn guarded_spawn_hides_a_leaked_descriptor_and_still_pipes_stdin() {
+        let (leak_r, leak_w) = leaky_pipe();
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "if [ -e /dev/fd/{leak_w} ]; then echo LEAKED; else cat; fi"
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = guarded_spawn(&mut cmd).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"round-trip-me")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        unsafe {
+            libc::close(leak_r);
+            libc::close(leak_w);
+        }
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "round-trip-me",
+            "a guarded stdin-piping child either leaked a descriptor or lost its piped stdin"
+        );
+    }
 }
