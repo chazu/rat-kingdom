@@ -1,7 +1,8 @@
 # Continuous validation, promotion, and recovery
 
-Status: draft for adversarial review; implementation is authorized after this
-plan is stabilized. Date: 2026-09-13. Initial source audit: `3cfabbe90337b8d7214fe4d5791a16dd7ce44b03`.
+Status: stabilized after two independent adversarial review rounds; execution
+authorized. Reviewed content: `66aa837e47f2a06bd4fa9143b74913655ad714ae`.
+Date: 2026-09-13. Initial source audit: `3cfabbe90337b8d7214fe4d5791a16dd7ce44b03`.
 
 ## 1. Mandate and operating principle
 

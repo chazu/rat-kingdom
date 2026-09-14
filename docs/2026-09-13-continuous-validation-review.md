@@ -49,4 +49,17 @@ results were found sound.
 ## Status
 
 Round 1: request changes, 5 standards blockers and 2 requirements blockers.
-All seven have proposed corrections in the revised plan. Round 2 pending.
+Round 2 reviewed commit: `66aa837e47f2a06bd4fa9143b74913655ad714ae`.
+
+Standards/operational review: approved; all five original blockers resolved in
+the plan, no new concrete blocker. Explicitly requires implementation tests to
+exercise the real production entry points and failure sequences.
+
+Requirements review: approved; both original blockers resolved, original goals
+preserved, no dependency cycle or new standing agent. The public journeys and
+policy authority distinction are concrete enough to execute.
+
+All seven round-1 blockers are closed at the plan level. This approval does not
+claim source implementation, installed behavior, or operational proof. Ticket
+acceptance retains the failure sequences. The subsequent status edit and this
+review disposition are administrative; reviewed design content is unchanged.
