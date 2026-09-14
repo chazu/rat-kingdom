@@ -57,11 +57,17 @@ run = "./scripts/verify-changed.sh"
 [tasks.verify-full]
 description = "Full workspace build, test, and lint — reserved for CI and protected-final landing"
 # The recipe itself lives in scripts/verify-full.sh (TKT-dagom-lajub-hijug),
-# not here, so CI (.github/workflows/ci.yml), this task, and
-# crates/rk-core/tests/verify_full_recipe_regression.rs all run the exact
-# same maintained commands instead of hand-kept copies that can drift —
-# mirroring how [tasks.verify] already delegates to verify-changed.sh. See
-# that script's header for the nextest/doctest/job-bound rationale.
+# not here, so this task and crates/rk-core/tests/verify_full_recipe_regression.rs
+# run the exact same maintained commands instead of a hand-kept copy that can
+# drift — mirroring how [tasks.verify] already delegates to verify-changed.sh.
+# See that script's header for the nextest/doctest/job-bound rationale.
+#
+# .github/workflows/ci.yml is NOT yet wired onto this script: .github is a
+# protected path, so that edit needs the explicit protected-change
+# authorization route rather than landing alongside this local recipe.
+# Tracked as TKT-sojuz-bogij-bapip (blocked on this ticket); the prepared CI
+# hunk is retained there. Until it lands, CI and protected-final landing run
+# different recipes — this is a real, tracked gap, not full CI/local parity.
 run = "./scripts/verify-full.sh"
 
 [tasks.clean]

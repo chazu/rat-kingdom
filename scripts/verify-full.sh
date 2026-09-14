@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Full workspace build, test, and lint — the single maintained recipe for
-# both CI (.github/workflows/ci.yml) and protected-final landing
-# (mise.toml [tasks.verify-full], .rk/checks.cue's `verify` check). Extracted
-# out of mise.toml's `run` string (TKT-dagom-lajub-hijug) so it is one file
-# that CI, the landing gate, a human, and
-# crates/rk-core/tests/verify_full_recipe_regression.rs can all execute
-# identically instead of three hand-kept copies that can drift.
+# Full workspace build, test, and lint — the maintained recipe for
+# protected-final landing (mise.toml [tasks.verify-full], .rk/checks.cue's
+# `verify` check). Extracted out of mise.toml's `run` string
+# (TKT-dagom-lajub-hijug) so this task, a human, and
+# crates/rk-core/tests/verify_full_recipe_regression.rs all execute it
+# identically instead of hand-kept copies that can drift.
+#
+# NOT yet wired into .github/workflows/ci.yml: `.github` is a protected path,
+# so adopting this recipe in CI needs the explicit protected-change
+# authorization route rather than landing alongside this local recipe.
+# Tracked separately as TKT-sojuz-bogij-bapip, which retains the prepared CI
+# hunk. Until that lands, CI and protected-final landing run different
+# recipes.
 #
 # The test phase runs cargo-nextest (pinned in mise.toml's [tools], already
 # used by verify-changed.sh) instead of `cargo test --workspace`, because

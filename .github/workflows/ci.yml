@@ -8,7 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
 
 jobs:
   check:
@@ -25,13 +24,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # Installs the exact tool versions pinned in mise.toml's [tools] (rust
-      # 1.95.0, cargo-nextest 0.9.143) and puts their shims on PATH, so CI
-      # and protected-final landing (.rk/checks.cue's `verify` check, which
-      # runs `mise run verify-full`) share one pinned toolchain instead of
-      # CI drifting to whatever `stable` resolves to on a given day
-      # (TKT-dagom-lajub-hijug). Replaces dtolnay/rust-toolchain@stable.
-      - uses: jdx/mise-action@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # rk-workflow validates workflow definitions by shelling out to the cue
       # CLI; without it the workflow/onboarding/product-to-code test families
@@ -39,8 +34,9 @@ jobs:
       - uses: cue-lang/setup-cue@v1.0.1
         with:
           version: v0.12.0
-      # scripts/verify-full.sh is the single maintained recipe (fmt, build,
-      # nextest, doctests, clippy) shared with protected-final landing — see
-      # that script and mise.toml's [tasks.verify-full] for the rationale.
-      - name: verify-full
-        run: mise run verify-full
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets
+      - name: test
+        run: cargo test --workspace --no-fail-fast

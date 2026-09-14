@@ -1,7 +1,8 @@
 //! Command-level regression coverage for the shared verify-full recipe
-//! (scripts/verify-full.sh, wired into mise.toml's `[tasks.verify-full]` and
-//! `.github/workflows/ci.yml` — TKT-dagom-lajub-hijug). Runs the real script
-//! file against a tiny broken fixture crate for each phase, rather than a
+//! (scripts/verify-full.sh, wired into mise.toml's `[tasks.verify-full]` —
+//! TKT-dagom-lajub-hijug; CI adoption is a separate protected-path change
+//! tracked as TKT-sojuz-bogij-bapip). Runs the real script file against a
+//! tiny broken fixture crate for each phase, rather than a
 //! hand-copied command list, so deleting or reordering a phase in the
 //! maintained recipe fails this test instead of leaving it green. Also
 //! proves an earlier phase's failure actually stops the pipeline
