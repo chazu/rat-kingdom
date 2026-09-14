@@ -348,6 +348,28 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
 
     let repo = crate::repo_cmds::resolve_path(&mut client, &repo_arg).await?;
 
+    // Refuse an unmergeable base BEFORE any side effect. `--base` names a
+    // landing target branch, not a starting commit: a detached SHA resolves
+    // fine as a starting revision but can never receive a merge, and the
+    // landing queue has no way to recover once it is persisted as a
+    // spawn's target — so this must be caught here, ahead of the
+    // ticket-status write below, not discovered later at `agent.spawn` or
+    // (worse) at landing time.
+    if let Some(base) = &args.base {
+        let result = client
+            .call(
+                "repo.branch_exists",
+                json!({ "repo": repo, "branch": base }),
+            )
+            .await?;
+        if result["exists"] == json!(false) {
+            anyhow::bail!(
+                "--base {base:?} is not an existing branch in {repo_arg}; a landing target \
+                 must be a real branch, not a bare commit"
+            );
+        }
+    }
+
     // Mark the ticket in_progress BEFORE launching the rat. A fast rat can
     // finish (and auto-set `done`) before this returns, so it must not run
     // after the spawn or it would clobber that `done`.

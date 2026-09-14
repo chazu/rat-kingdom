@@ -2262,6 +2262,9 @@ impl LandingPipeline {
             let repo_path = repo_path.clone();
             blocking(move || rk_git::Repo::discover(&repo_path)).await?
         };
+        if let Some(outcome) = self.quarantine_invalid_target(&entry, &git_repo)? {
+            return Ok(outcome);
+        }
         if let Some(outcome) = self.recover_completed_land(&entry, &git_repo).await? {
             return Ok(outcome);
         }
@@ -19118,6 +19121,89 @@ checks: [
             .unwrap()
             .is_ancestor(&invalid.head_sha, "main"));
     }
+
+    #[tokio::test]
+    async fn malformed_landing_target_is_quarantined_and_survives_a_crash_before_queue_removal() {
+        let (home, dir, space, pipeline, mut entry) = admission_fixture();
+        // The exact shape of the reported bug: an operator (or a workflow)
+        // passes a detached commit as `--base`, and it gets persisted as
+        // this entry's `target` — a landing target that can never receive a
+        // merge because it is not a branch.
+        let detached_sha = rev_parse(dir.path(), "main");
+        entry.target = detached_sha.clone();
+        entry.admission = None;
+        pipeline.queue.enqueue(entry.clone()).unwrap();
+
+        let claimed = pipeline
+            .queue
+            .claim_batch("code-repo", &detached_sha, 8)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        // Simulate archive-before-remove (a crash between the two): the next
+        // pass must reuse this archive instead of hot-looping on "merge
+        // target does not exist" or writing a second piece of evidence.
+        let git_repo = rk_git::Repo::discover(dir.path()).unwrap();
+        assert!(matches!(
+            pipeline
+                .quarantine_invalid_target(&claimed[0], &git_repo)
+                .unwrap(),
+            Some(LandingOutcome::Quarantined(_))
+        ));
+
+        drop(pipeline);
+        drop(space);
+        let space = Space::open(&home.path().join("test-space.db")).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+
+        // The row is still queued (the simulated crash never called
+        // `remove`); an actual daemon restart draining it must settle it
+        // exactly once more and leave the active queue, not repeat the
+        // failure forever.
+        let outcomes = pipeline
+            .drain_key("code-repo", &detached_sha)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], LandingOutcome::Quarantined(_)));
+        assert!(pipeline.queue.pending_keys().unwrap().is_empty());
+        assert!(!home.path().join("executed").exists(), "no gate ever ran");
+
+        let quarantines = space
+            .scan(&Pattern::category(Category::Event).identity("landing_queue_quarantine"))
+            .unwrap();
+        assert_eq!(
+            quarantines.len(),
+            1,
+            "restart replays the existing verdict rather than duplicating evidence"
+        );
+        assert!(quarantines[0].payload["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not an existing branch"));
+        // Original queue identity (source/task/target/generation) is preserved
+        // in the durable evidence, not discarded.
+        assert_eq!(quarantines[0].payload["entry"]["target"], detached_sha);
+        assert_eq!(
+            quarantines[0].payload["entry"]["task"],
+            "bounded admission fixture"
+        );
+
+        // A separate, valid target is unaffected and can still land.
+        let mut valid = entry;
+        valid.target = "main".into();
+        valid.admission = None;
+        pipeline.queue.enqueue(valid).unwrap();
+        let landed = pipeline
+            .process_next("code-repo", "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(landed, LandingOutcome::Landed(_)));
+    }
+
     #[tokio::test]
     async fn admission_restart_keeps_prepared_singletons_separate_from_fresh_peers() {
         let (home, dir, space, pipeline, mut first) = admission_fixture();

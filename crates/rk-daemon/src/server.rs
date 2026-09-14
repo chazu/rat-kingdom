@@ -3918,6 +3918,7 @@ impl Daemon {
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
             }),
             "repo.get" => reply(self.handle_repo_get(req)),
+            "repo.branch_exists" => reply(self.handle_repo_branch_exists(req).await),
             "repo.onboard.start" => reply(self.handle_onboarding_start(req).await),
             "repo.onboard.propose" => reply(self.handle_onboarding_propose(req).await),
             "repo.onboard.approve" => reply(self.handle_onboarding_approve(req)),
@@ -7883,6 +7884,33 @@ impl Daemon {
         match reg.get(&params.name) {
             Some(record) => Response::ok(req.id, json!({"repo": record})),
             None => Response::ok(req.id, json!({"repo": null})),
+        }
+    }
+
+    /// Front-gate for `rk spawn --base <ref>`: lets the CLI confirm a
+    /// caller-supplied base resolves to a real local branch — not a bare
+    /// commit that would later be persisted as an unmergeable landing
+    /// target — before it flips a ticket to `in_progress` or calls
+    /// `agent.spawn`. `agent.spawn` itself re-checks this at the native
+    /// boundary (`Supervisor::spawn_async`); this RPC exists so the CLI's
+    /// ticket-status write, which happens before that call, can be gated on
+    /// the same answer instead of racing ahead of it.
+    async fn handle_repo_branch_exists(&self, req: Request) -> Response {
+        let params: BranchExistsParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let repo_path = std::path::PathBuf::from(&params.repo);
+        let branch = params.branch;
+        let result = tokio::task::spawn_blocking(move || {
+            let repo = rk_git::Repo::discover(&repo_path)?;
+            repo.branch_exists_checked(&branch)
+        })
+        .await;
+        match result {
+            Ok(Ok(exists)) => Response::ok(req.id, json!({"exists": exists})),
+            Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
 
@@ -12105,6 +12133,12 @@ struct WorkflowApproveParams {
 #[derive(Deserialize)]
 struct NameParams {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct BranchExistsParams {
+    repo: String,
+    branch: String,
 }
 
 #[derive(Deserialize)]

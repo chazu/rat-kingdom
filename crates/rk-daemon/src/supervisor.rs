@@ -1832,6 +1832,31 @@ impl Supervisor {
                 })?
                 .delivery_target(&repo.current_branch()?),
         };
+        // `target_branch` is persisted as this spawn's landing target — for
+        // every role alike, an explicit `--base` (CLI dispatch, reviewer or
+        // rework spawns) and the policy-derived default alike, since
+        // `record.target_branch` and the landing pipeline's later merge
+        // both read it without distinguishing why it was set. It must name
+        // a real branch: `rev_parse` a few lines below resolves a bare
+        // commit SHA just fine, silently accepting one as a "branch" the
+        // landing pipeline can never merge into — caught instead here,
+        // before any worktree or provider generation exists, rather than
+        // the landing queue hot-looping on it forever later.
+        match repo.branch_exists_checked(&target_branch) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(rk_core::Error::other(format!(
+                    "landing target {target_branch:?} is not an existing branch; a landing \
+                     target must be a real branch, not a bare commit"
+                )));
+            }
+            // A transient read failure is not proof of absence, but it is
+            // also not permission to launch a generation against a target
+            // that was never actually verified: propagate it and let the
+            // caller retry the spawn, rather than silently proceeding or
+            // manufacturing a permanent refusal from an inconclusive check.
+            Err(error) => return Err(error),
+        }
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
         // Capture before creating the branch. Unlike a later merge-base read,
         // this remains the original fork even after a forge fast-forwards the
