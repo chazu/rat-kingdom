@@ -107,8 +107,10 @@ fn write_checks_with_timeouts(repo: &Path, shared: &Path, checks: &[(&str, &str,
 /// generous shared 30s timeout — the common case, for a test with no need
 /// for a per-check admission-wait budget of its own.
 fn write_barrier_checks(repo: &Path, shared: &Path, checks: &[(&str, &str)]) {
-    let with_timeouts: Vec<(&str, &str, &str)> =
-        checks.iter().map(|(name, marker)| (*name, *marker, "30s")).collect();
+    let with_timeouts: Vec<(&str, &str, &str)> = checks
+        .iter()
+        .map(|(name, marker)| (*name, *marker, "30s"))
+        .collect();
     write_checks_with_timeouts(repo, shared, &with_timeouts);
 }
 
@@ -438,7 +440,8 @@ async fn repo_specific_cap_still_holds_under_a_higher_aggregate_cap() {
         .expect("go2 must settle once its own 1s admission-wait budget elapses")
         .unwrap();
     assert_eq!(
-        call2_result["verdict"], json!("infra"),
+        call2_result["verdict"],
+        json!("infra"),
         "go2, blocked behind go1 on repo A's own saturated WIP=1 lane, must report a genuine \
          admission-timeout verdict, not run: {call2_result:#?}"
     );
@@ -504,7 +507,8 @@ async fn aggregate_cap_disabled_preserves_prior_behavior() {
 
     let while_running = status(&mut client).await;
     assert_eq!(
-        while_running["verification_host"]["limit"], json!(0),
+        while_running["verification_host"]["limit"],
+        json!(0),
         "disabled must never report a nonzero limit while checks run: {while_running}"
     );
     assert_eq!(while_running["verification_host"]["executing"], json!(0));

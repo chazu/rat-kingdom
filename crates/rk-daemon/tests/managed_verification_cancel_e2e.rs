@@ -906,8 +906,12 @@ async fn daemon_restart_cleans_owned_verification_work_before_admitting_replacem
     // immediately admit its own fresh `verify.run` against the very same
     // repo under the same aggregate limit=1 — unblocked by any trace of the
     // dead run daemon A left behind.
-    let (second_agent, worktree_2) =
-        spawn_verify_holder(&mut client, repo_dir.path(), "restart-in-flight-aggregate-2").await;
+    let (second_agent, worktree_2) = spawn_verify_holder(
+        &mut client,
+        repo_dir.path(),
+        "restart-in-flight-aggregate-2",
+    )
+    .await;
     let child_pid_2 = wait_for_pid(&worktree_2.join("verify.pid")).await;
     assert!(
         process_alive(child_pid_2),
