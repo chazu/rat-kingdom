@@ -161,6 +161,14 @@ impl<'a> ManagedVerification<'a> {
     /// same drop-based cleanup `run_check_in` already relies on for a
     /// timeout — and this records a durable cancellation outcome instead of
     /// ever writing a reusable proof for it.
+    ///
+    /// A settled, non-passing verdict is never silently lost either
+    /// (TKT-lurin-bulif-gabik): [`record_verification_failure_receipt`](Self::record_verification_failure_receipt)
+    /// persists a versioned, bounded failure receipt and its id is folded
+    /// into the returned `Value` as `failure_receipt_id` — or
+    /// `failure_receipt_error` if persisting it failed — so a caller who
+    /// loses this call's own stdout/stderr can still retrieve the exact
+    /// diagnostic later without rerunning the check.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn verify_repo_check(
         &self,
@@ -224,6 +232,13 @@ impl<'a> ManagedVerification<'a> {
             }
         }
 
+        // Minted here — exactly once per ACTUAL invocation, past the cache-hit
+        // early return above — never derived from `request_key`/`conn_id`,
+        // which reset across a daemon restart and so cannot safely identify
+        // one real occurrence long-term. See
+        // `record_verification_failure_receipt`'s doc for why this is the
+        // failure receipt's idempotency boundary.
+        let occurrence_id = rk_core::id::RecordId::new();
         let progress = Arc::new(Mutex::new(RunProgress::default()));
         let (managed_id, mut cancel_rx) =
             self.resources.runs.register(agent, generation, request_key);
@@ -255,7 +270,7 @@ impl<'a> ManagedVerification<'a> {
         };
         drop(registration);
 
-        let result = match outcome {
+        let mut result = match outcome {
             Ok(result) => result?,
             Err(reason) => {
                 // A cancellation is settled right here, at the moment it's
@@ -306,28 +321,68 @@ impl<'a> ManagedVerification<'a> {
             }
         };
 
+        let (queued_at, started_at, ended_at, queue_wait_ms, duration_ms) = {
+            let p = progress.lock().unwrap();
+            (
+                p.queued_at_wall,
+                p.started_at_wall,
+                p.settled.map(|s| s.ended_at_wall),
+                p.queue_wait_ms,
+                p.settled.map(|s| s.duration_ms),
+            )
+        };
+        let verdict_is_pass = result.get("verdict").and_then(Value::as_str) == Some("pass");
+        let candidate_label = candidate_sha.as_deref().unwrap_or("dirty");
+
         if let Some(sha) = &candidate_sha {
-            if result.get("verdict").and_then(Value::as_str) == Some("pass") {
+            if verdict_is_pass {
                 self.record_verification_proof(repo_name, sha, &check, &result);
             }
         }
 
+        if !verdict_is_pass {
+            match self.record_verification_failure_receipt(VerificationFailureReceiptInput {
+                occurrence_id,
+                repo_name,
+                check_name,
+                check: &check,
+                candidate: candidate_label,
+                agent,
+                generation,
+                request_key,
+                task,
+                result: &result,
+                queued_at,
+                started_at,
+                ended_at,
+                queue_wait_ms,
+                duration_ms,
+            }) {
+                Ok(id) => {
+                    if let Value::Object(map) = &mut result {
+                        map.insert("failure_receipt_id".into(), json!(id));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        repo = repo_name,
+                        check = check_name,
+                        error = %e,
+                        "failed to persist verification failure receipt"
+                    );
+                    if let Value::Object(map) = &mut result {
+                        map.insert("failure_receipt_error".into(), json!(e));
+                    }
+                }
+            }
+        }
+
         if let Some(task) = task {
-            let (queued_at, started_at, ended_at, queue_wait_ms, duration_ms) = {
-                let p = progress.lock().unwrap();
-                (
-                    p.queued_at_wall,
-                    p.started_at_wall,
-                    p.settled.map(|s| s.ended_at_wall),
-                    p.queue_wait_ms,
-                    p.settled.map(|s| s.duration_ms),
-                )
-            };
             self.record_ad_hoc_verification_span(AdHocVerificationSpan {
                 task,
                 repo_name,
                 check_name,
-                candidate: candidate_sha.as_deref().unwrap_or("dirty"),
+                candidate: candidate_label,
                 queued_at,
                 started_at,
                 ended_at,
@@ -554,6 +609,143 @@ impl<'a> ManagedVerification<'a> {
             )
             .with_lifecycle(Lifecycle::Furniture),
         );
+    }
+
+    /// Persist a versioned, bounded failure receipt for one `verify.run` /
+    /// `rk verify` call whose settled result was not `verdict: "pass"`
+    /// (TKT-lurin-bulif-gabik) — the durable counterpart a caller who
+    /// loses or discards the RPC's own stdout/stderr (a shell pipeline that
+    /// swallows the exit status, a disconnect before it prints) can
+    /// retrieve later via `rk scan artifact <repo> verification-failure-receipt`,
+    /// without rerunning the check.
+    ///
+    /// Deliberately a DIFFERENT identity than
+    /// [`record_gate_failure`](Self::record_gate_failure)'s `gate-failure`
+    /// artifact, which keeps firing unconditionally from inside
+    /// [`run`](Self::run) for every caller (workflow `run` steps and
+    /// landing gates included) — this one adds the ad-hoc-caller identity
+    /// (`agent`/`generation`/`request_key`/`task`/`candidate`) that only
+    /// [`verify_repo_check`](Self::verify_repo_check) has, and is NEVER read
+    /// back as a pass proof: unlike [`VERIFICATION_PROOF_IDENTITY`], nothing
+    /// ever looks this identity up to satisfy a gate or skip a re-run.
+    ///
+    /// Keyed on `input.occurrence_id` alone — a fresh id
+    /// [`verify_repo_check`](Self::verify_repo_check) mints exactly once per
+    /// ACTUAL invocation (never a cache hit), before this method is ever
+    /// called. Deliberately NOT keyed on `request_key`/`conn_id`: those are
+    /// transport-level identities `server.rs` resets to 0 on every daemon
+    /// restart, so the exact same value can legitimately name two entirely
+    /// different runs across a restart (or a reused connection sequence
+    /// number) — deduplicating on them would let a stale diagnostic from an
+    /// unrelated earlier run answer a lookup for a brand new one. Using the
+    /// occurrence id both as the lookup key AND the written tuple's own id
+    /// makes the idempotency check a single bounded [`Space::get`] — no
+    /// scan, no scan-then-write race — so a caller or daemon path that
+    /// somehow re-enters this for the SAME occurrence settles on the SAME
+    /// receipt id, while two genuinely distinct occurrences (however
+    /// identical their transport identity) always mint distinct ids and so
+    /// always get distinct receipts.
+    ///
+    /// Never turns a failing check green: this only ever records evidence
+    /// alongside the verdict `run` already computed, and a storage failure
+    /// here is surfaced back to the caller as `Err` (rendered into the RPC
+    /// result's `failure_receipt_error`, never silently swallowed) — the
+    /// caller must not conclude evidence was preserved when it was not.
+    fn record_verification_failure_receipt(
+        &self,
+        input: VerificationFailureReceiptInput<'_>,
+    ) -> Result<String, String> {
+        // Bounded exact-id read, not a scan: settling the same occurrence
+        // twice must find its own prior receipt directly.
+        match self.space.get(input.occurrence_id) {
+            Ok(Some(existing)) if is_failure_receipt(&existing) => {
+                return Ok(existing.id.to_string());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(format!(
+                    "could not check for an existing failure receipt: {e}"
+                ))
+            }
+        }
+
+        let result = input.result;
+        let stdout_full = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+        let stderr_full = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+        let (stdout_tail, stdout_tail_truncated) =
+            bounded_tail_and_truncated(stdout_full, GATE_EVIDENCE_LIMIT);
+        let (stderr_tail, stderr_tail_truncated) =
+            bounded_tail_and_truncated(stderr_full, GATE_EVIDENCE_LIMIT);
+        // The truthful flag is the union of both truncation sources: the
+        // runner's own capture bound (`MAX_RUN_OUTPUT_BYTES`, already baked
+        // into `result`'s own `stdout_truncated`/`stderr_truncated`) AND this
+        // receipt's own further bound (`GATE_EVIDENCE_LIMIT`) — copying only
+        // the former would silently claim "complete" evidence that this
+        // receipt itself just cut down further.
+        let stdout_truncated = result
+            .get("stdout_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || stdout_tail_truncated;
+        let stderr_truncated = result
+            .get("stderr_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || stderr_tail_truncated;
+
+        let scope = repo_identity(self.layout, input.repo_name);
+        let mut tuple = Tuple::new(
+            Category::Artifact,
+            scope,
+            VERIFICATION_FAILURE_RECEIPT_IDENTITY,
+            "daemon",
+            json!({
+                "schema_version": VERIFICATION_FAILURE_RECEIPT_SCHEMA_VERSION,
+                "repo": input.repo_name,
+                "check": input.check_name,
+                "command": input.check.command,
+                "toolchain": input.check.toolchain,
+                "environment_policy": input.check.environment_policy.to_string(),
+                "candidate": input.candidate,
+                "agent": input.agent,
+                "generation": input.generation.map(|g| g.to_string()),
+                "request_key": input.request_key,
+                "task": input.task,
+                "exit": result.get("exit"),
+                "verdict": result.get("verdict"),
+                "timed_out": result.get("timed_out"),
+                "no_exit_code": result.get("no_exit_code"),
+                "signal": result.get("signal"),
+                "stdout_tail": stdout_tail,
+                "stdout_truncated": stdout_truncated,
+                "stderr_tail": stderr_tail,
+                "stderr_truncated": stderr_truncated,
+                "retries": bounded_retries(result.get("retries")),
+                "queued_at": input.queued_at,
+                "started_at": input.started_at,
+                "ended_at": input.ended_at,
+                "queue_wait_ms": input.queue_wait_ms,
+                "duration_ms": input.duration_ms,
+            }),
+        );
+        tuple.id = input.occurrence_id;
+        let id = tuple.id.to_string();
+        match self.space.out(tuple) {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                // Lost a race settling the exact same occurrence to another
+                // writer under this same id — a successful settlement, not a
+                // failed one.
+                if let Ok(Some(existing)) = self.space.get(input.occurrence_id) {
+                    if is_failure_receipt(&existing) {
+                        return Ok(existing.id.to_string());
+                    }
+                }
+                Err(format!(
+                    "failed to persist verification-failure-receipt: {e}"
+                ))
+            }
+        }
     }
 
     /// Run one resolved check to completion in `dir`, with retry/timeout
@@ -1261,6 +1453,22 @@ pub(crate) const VERIFICATION_PROOF_IDENTITY: &str = "verification_proof";
 /// writes [`VERIFICATION_PROOF_IDENTITY`] either, so it can never be reused.
 pub(crate) const VERIFICATION_CANCELLED_IDENTITY: &str = "verification_cancelled";
 
+/// Durable `(Artifact, <repo>, "verification-failure-receipt")` identity
+/// (TKT-lurin-bulif-gabik) — a versioned, bounded failure diagnostic for one
+/// [`ManagedVerification::verify_repo_check`] call (`verify.run` / `rk
+/// verify`) whose settled result was not `verdict: "pass"`. Never read back
+/// by [`ManagedVerification::lookup_verification_proof`] or anything else
+/// that would let a failed, unknown, or cancelled outcome satisfy a gate or
+/// a pass-proof lookup — see
+/// [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt).
+pub(crate) const VERIFICATION_FAILURE_RECEIPT_IDENTITY: &str = "verification-failure-receipt";
+
+/// Bump when [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt)'s
+/// payload shape changes, so a consumer reading an older receipt can tell it
+/// is a different generation rather than silently misreading a missing
+/// field as absent evidence.
+pub(crate) const VERIFICATION_FAILURE_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
 /// Pause between a failed attempt and a `retryOnFail` retry. Fixed rather than
 /// configurable: this exists to ride out a transient condition (machine load,
 /// a build-lock hold), not to be tuned per workflow.
@@ -1408,6 +1616,45 @@ pub(crate) struct AdHocVerificationSpan<'a> {
     duration_ms_monotonic: Option<u64>,
     proof_reused: bool,
     terminal_reason: &'a str,
+}
+
+/// One `verify_repo_check` call's non-passing settled result, bundled for
+/// [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt)
+/// — see that method for what each field means and why this identity is
+/// separate from [`AdHocVerificationSpan`] (timing telemetry) and
+/// `gate-failure` (the generic, caller-agnostic evidence `run` already
+/// writes for every non-pass verdict).
+pub(crate) struct VerificationFailureReceiptInput<'a> {
+    /// Minted exactly once per ACTUAL invocation of
+    /// [`ManagedVerification::verify_repo_check`] (never for a cache hit,
+    /// never derived from `request_key`) — see
+    /// [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt)
+    /// for why this, and not any transport-level identity, is the
+    /// idempotency boundary.
+    pub(crate) occurrence_id: rk_core::id::RecordId,
+    pub(crate) repo_name: &'a str,
+    pub(crate) check_name: &'a str,
+    pub(crate) check: &'a rk_workflow::Check,
+    /// The candidate sha `clean_candidate_sha` resolved, or `"dirty"` when
+    /// the worktree had uncommitted changes (or the git probe itself
+    /// failed) — same convention `verify_repo_check` already uses for
+    /// [`AdHocVerificationSpan::candidate`], so a reader never sees this
+    /// field silently absent.
+    pub(crate) candidate: &'a str,
+    pub(crate) agent: &'a str,
+    pub(crate) generation: Option<rk_core::id::SpawnId>,
+    pub(crate) request_key: &'a str,
+    pub(crate) task: Option<&'a str>,
+    /// The settled `run` result: `exit`/`verdict`/`timed_out`/`no_exit_code`/
+    /// `signal`/`stdout`/`stdout_truncated`/`stderr`/`stderr_truncated`/
+    /// `retries`, read out of here rather than threaded as separate
+    /// arguments.
+    pub(crate) result: &'a Value,
+    pub(crate) queued_at: Option<DateTime<Utc>>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+    pub(crate) ended_at: Option<DateTime<Utc>>,
+    pub(crate) queue_wait_ms: Option<u64>,
+    pub(crate) duration_ms: Option<u64>,
 }
 
 /// Decode a `spawn_check_child` outcome into the flat tuple `run_check_in`
@@ -2144,6 +2391,42 @@ pub(crate) fn bounded_tail(text: &str, limit: usize) -> String {
         .map(|(i, _)| i)
         .unwrap_or(0);
     trimmed[start..].to_string()
+}
+
+/// [`bounded_tail`] plus whether THIS bound cut anything off — computed on
+/// the same char-count basis `bounded_tail` slices on (never a byte length,
+/// which would misjudge a multibyte boundary) so a receipt's own truncation
+/// flag is truthful even when the text is well under any earlier capture
+/// bound but still exceeds `limit`.
+pub(crate) fn bounded_tail_and_truncated(text: &str, limit: usize) -> (String, bool) {
+    let truncated = text.trim().chars().count() > limit;
+    (bounded_tail(text, limit), truncated)
+}
+
+/// Cap a failure receipt's embedded retry-history array at
+/// [`MAX_RETRY_ON_FAIL`] entries, keeping the most recent — already the
+/// runtime's own upper bound on how many retries a single run can have
+/// (`validate_retry_on_fail`), enforced again here so the receipt can never
+/// grow unbounded even if that upstream invariant is ever loosened.
+pub(crate) fn bounded_retries(retries: Option<&Value>) -> Value {
+    match retries.and_then(Value::as_array) {
+        Some(entries) => {
+            let start = entries.len().saturating_sub(MAX_RETRY_ON_FAIL as usize);
+            json!(entries[start..].to_vec())
+        }
+        None => json!([]),
+    }
+}
+
+/// Whether `tuple` is a [`VERIFICATION_FAILURE_RECEIPT_IDENTITY`] artifact —
+/// the narrow identity check
+/// [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt)
+/// applies before trusting an exact-id [`Space::get`] hit as "this
+/// occurrence already settled", so an unrelated tuple that happened to land
+/// on the same id (a practical-impossibility ULID collision) is never
+/// mistaken for a prior receipt.
+fn is_failure_receipt(tuple: &Tuple) -> bool {
+    tuple.category == Category::Artifact && tuple.identity == VERIFICATION_FAILURE_RECEIPT_IDENTITY
 }
 
 /// Bounded stdout/stderr tails for a failed check's instance error, so the
@@ -3034,5 +3317,447 @@ mod tests {
         DateTime::parse_from_rfc3339(v.as_str().unwrap())
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    /// TKT-lurin-bulif-gabik: a failing named check must leave a durable,
+    /// bounded failure receipt a caller can retrieve later — even one who
+    /// lost this exact RPC's own stdout/stderr — without rerunning the
+    /// check. The receipt id must also be folded into the RPC result
+    /// itself, so a CLI/JSON consumer sees it right away. The real
+    /// RPC-level version of this journey (a genuine subprocess through
+    /// `verify.run`, then a completely independent reader of the on-disk
+    /// store) lives in
+    /// `crates/rk-daemon/tests/verification_failure_receipt_rpc.rs`; this is
+    /// the fast, focused engine-level counterpart.
+    #[tokio::test]
+    async fn verify_repo_check_persists_a_bounded_failure_receipt_and_exposes_its_id() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify",
+            command: "echo out-marker; echo err-marker 1>&2; exit 7", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        let result = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-failing",
+                Some("TKT-failing"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["verdict"], "fail");
+        assert_eq!(result["exit"], 7);
+        assert!(
+            result["failure_receipt_error"].is_null(),
+            "storage did not fail: {result}"
+        );
+        let receipt_id = result["failure_receipt_id"]
+            .as_str()
+            .expect("a failing check must expose a failure_receipt_id")
+            .to_string();
+
+        // Drop the in-process result entirely — the retrieval below must
+        // stand on its own, straight out of durable storage by id, exactly
+        // as a reconnected caller who lost this response would have to.
+        drop(result);
+        let record_id: rk_core::id::RecordId = receipt_id.parse().unwrap();
+        let receipt = space
+            .get(record_id)
+            .unwrap()
+            .expect("failure_receipt_id must resolve via a direct keyed lookup");
+        assert_eq!(receipt.category, Category::Artifact);
+        assert_eq!(receipt.identity, VERIFICATION_FAILURE_RECEIPT_IDENTITY);
+        assert_eq!(
+            receipt.payload["schema_version"],
+            VERIFICATION_FAILURE_RECEIPT_SCHEMA_VERSION
+        );
+        assert_eq!(receipt.payload["repo"], "repo");
+        assert_eq!(receipt.payload["check"], "verify");
+        assert_eq!(receipt.payload["verdict"], "fail");
+        assert_eq!(receipt.payload["exit"], 7);
+        assert_eq!(receipt.payload["candidate"], "dirty");
+        assert_eq!(receipt.payload["agent"], "operator");
+        assert_eq!(receipt.payload["task"], "TKT-failing");
+        assert_eq!(receipt.payload["request_key"], "req-failing");
+        assert!(receipt.payload["stdout_tail"]
+            .as_str()
+            .unwrap()
+            .contains("out-marker"));
+        assert!(receipt.payload["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .contains("err-marker"));
+        assert_eq!(receipt.payload["stdout_truncated"], false);
+        assert_eq!(receipt.payload["stderr_truncated"], false);
+        assert_eq!(tuples_for(&space, "repo").len(), 1);
+    }
+
+    /// The mirror image: a passing check must never write a failure receipt
+    /// or carry either receipt field in its result.
+    #[tokio::test]
+    async fn verify_repo_check_never_writes_a_failure_receipt_on_pass() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "true", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        let result = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-passing",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["verdict"], "pass");
+        assert!(result["failure_receipt_id"].is_null());
+        assert!(result["failure_receipt_error"].is_null());
+        assert!(tuples_for(&space, "repo").is_empty());
+    }
+
+    /// A real clean git worktree's failing run must NOT poison the pass-proof
+    /// cache for its own candidate sha: `lookup_verification_proof` — the
+    /// exact lookup a later caller's `verify_repo_check` cache-hit path
+    /// reads — must still return `None` for that candidate/check after a
+    /// failure receipt was written, and a fresh, independent
+    /// `verify_repo_check` call for the SAME candidate must actually re-run
+    /// rather than short-circuit on a false "pass" hit.
+    #[tokio::test]
+    async fn a_failing_run_never_satisfies_the_pass_proof_lookup_for_its_own_real_candidate() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "exit 1", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        git_init_clean(dir.path());
+        let candidate_sha = git_head(dir.path());
+
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        let result = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-1",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["verdict"], "fail");
+        let receipt_payload = tuples_for(&space, "repo")
+            .into_iter()
+            .next()
+            .expect("a failure receipt must exist")
+            .payload;
+        assert_eq!(receipt_payload["candidate"], candidate_sha);
+
+        let check = verifier
+            .find_check(&dir.path().display().to_string(), "verify")
+            .unwrap();
+        assert!(
+            verifier
+                .lookup_verification_proof("repo", &candidate_sha, &check)
+                .is_none(),
+            "a failure receipt existing must never satisfy a pass-proof lookup"
+        );
+
+        // A second, independent call for the exact same real candidate must
+        // genuinely re-run (a real second failure, not a fabricated cached
+        // "pass") rather than short-circuit on a false cache hit.
+        let second = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-2",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["verdict"], "fail");
+        assert_eq!(
+            tuples_for(&space, "repo").len(),
+            2,
+            "two real runs, two receipts"
+        );
+    }
+
+    /// The receipt's idempotency boundary is `occurrence_id` alone — a fresh
+    /// id `verify_repo_check` mints once per actual invocation — so settling
+    /// the exact SAME occurrence twice collapses to one receipt.
+    #[tokio::test]
+    async fn record_verification_failure_receipt_is_idempotent_on_the_same_occurrence_id() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "exit 1", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+        let check = verifier
+            .find_check(&dir.path().display().to_string(), "verify")
+            .unwrap();
+        let result = failing_result();
+        let occurrence_id = rk_core::id::RecordId::new();
+
+        let first = verifier
+            .record_verification_failure_receipt(receipt_input(&check, &result, occurrence_id))
+            .unwrap();
+        let second = verifier
+            .record_verification_failure_receipt(receipt_input(&check, &result, occurrence_id))
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "the same occurrence_id must settle on one receipt id"
+        );
+        assert_eq!(
+            tuples_for(&space, "repo").len(),
+            1,
+            "duplicate settlement of ONE occurrence must not multiply artifacts"
+        );
+    }
+
+    /// The mirror requirement: two DISTINCT actual invocations that happen
+    /// to share the exact same transport-level `request_key` (exactly what
+    /// `server.rs`'s `conn_seq` resetting to 0 on every daemon restart can
+    /// produce — a genuinely new run reusing an old connection/request
+    /// identity) must NEVER collapse into one receipt. `verify_repo_check`
+    /// mints a fresh `occurrence_id` per call regardless of `request_key`,
+    /// so this is proved at the `verify_repo_check` level, not just the
+    /// lower-level `record_verification_failure_receipt` unit.
+    #[tokio::test]
+    async fn two_distinct_runs_sharing_a_repeated_transport_key_never_deduplicate() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify",
+            command: "echo $$; exit 5", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        // Same literal `request_key` on both calls — simulating a
+        // post-restart `conn_seq` collision with an unrelated earlier run —
+        // must still yield two independent receipts for two independent
+        // occurrences.
+        let first = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "reused-transport-key",
+                None,
+            )
+            .await
+            .unwrap();
+        let second = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "reused-transport-key",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let first_id = first["failure_receipt_id"].as_str().unwrap();
+        let second_id = second["failure_receipt_id"].as_str().unwrap();
+        assert_ne!(
+            first_id, second_id,
+            "two distinct executions must never be deduplicated by a repeated transport key"
+        );
+        assert_eq!(tuples_for(&space, "repo").len(), 2);
+    }
+
+    /// A real storage failure at the receipt's own write boundary — a
+    /// genuine sqlite `PRIMARY KEY` violation, forced by pre-occupying the
+    /// exact `occurrence_id` this call will try to write under with an
+    /// unrelated tuple — must surface as `Err`, never be swallowed, and must
+    /// never be reported as if it had settled successfully.
+    #[tokio::test]
+    async fn a_real_storage_failure_at_the_write_boundary_is_surfaced_not_swallowed() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "exit 1", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+        let check = verifier
+            .find_check(&dir.path().display().to_string(), "verify")
+            .unwrap();
+
+        // Occupy the exact id this call will try to write under, with an
+        // unrelated tuple of a DIFFERENT identity — `is_failure_receipt`
+        // must refuse to treat this as an already-settled receipt, so the
+        // write is genuinely attempted and genuinely collides.
+        let occurrence_id = rk_core::id::RecordId::new();
+        let mut squatter = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "unrelated-artifact",
+            "daemon",
+            json!({"unrelated": true}),
+        );
+        squatter.id = occurrence_id;
+        space.out(squatter).unwrap();
+
+        let result = failing_result();
+        let outcome = verifier.record_verification_failure_receipt(receipt_input(
+            &check,
+            &result,
+            occurrence_id,
+        ));
+        let err = outcome.expect_err("a real primary-key collision must surface as Err");
+        assert!(
+            err.contains("failed to persist"),
+            "error must name the real persistence failure: {err}"
+        );
+
+        // The verdict computed independently of this call must be
+        // untouched: a storage failure here can never turn (or report) a
+        // failing check as green.
+        assert_eq!(result["verdict"], "fail");
+    }
+
+    fn failing_result() -> Value {
+        json!({
+            "exit": 1, "verdict": "fail", "timed_out": false, "no_exit_code": false,
+            "signal": Value::Null,
+            "stdout": "", "stdout_truncated": false,
+            "stderr": "", "stderr_truncated": false,
+        })
+    }
+
+    fn receipt_input<'a>(
+        check: &'a rk_workflow::Check,
+        result: &'a Value,
+        occurrence_id: rk_core::id::RecordId,
+    ) -> VerificationFailureReceiptInput<'a> {
+        VerificationFailureReceiptInput {
+            occurrence_id,
+            repo_name: "repo",
+            check_name: "verify",
+            check,
+            candidate: "dirty",
+            agent: "operator",
+            generation: None,
+            request_key: "req",
+            task: None,
+            result,
+            queued_at: None,
+            started_at: None,
+            ended_at: None,
+            queue_wait_ms: None,
+            duration_ms: None,
+        }
+    }
+
+    fn tuples_for(space: &Space, repo: &str) -> Vec<Tuple> {
+        space
+            .scan(
+                &Pattern::category(Category::Artifact)
+                    .identity(VERIFICATION_FAILURE_RECEIPT_IDENTITY)
+                    .scope(repo),
+            )
+            .unwrap()
+    }
+
+    fn git_init_clean(dir: &Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "r@x"]);
+        run(&["config", "user.name", "R"]);
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    fn git_head(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 }
