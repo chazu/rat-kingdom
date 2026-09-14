@@ -81,14 +81,19 @@ fn cue_command(body: &str) -> String {
     body.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Installs one named check per `(check_name, marker)` pair in `checks`,
-/// each running [`barrier_check_body`] under its own marker.
-fn write_barrier_checks(repo: &Path, shared: &Path, checks: &[(&str, &str)]) {
+/// Installs one named check per `(check_name, marker, timeout)` triple in
+/// `checks`, each running [`barrier_check_body`] under its own marker and
+/// its own declared timeout — the timeout doubles as the check's own
+/// admission-wait budget (`verify_repo_check` always passes
+/// `admission_timeout: None`, so `ManagedVerification::run` falls back to
+/// the check's own timeout), letting a test give one check a short,
+/// deterministic admission-wait window distinct from its siblings'.
+fn write_checks_with_timeouts(repo: &Path, shared: &Path, checks: &[(&str, &str, &str)]) {
     let mut cue = String::from("checks: [\n");
-    for (name, marker) in checks {
+    for (name, marker, timeout) in checks {
         let body = barrier_check_body(shared, marker);
         cue.push_str(&format!(
-            "    {{name: \"{name}\", command: \"{}\", timeout: \"30s\", environmentPolicy: \"strip_rk_spawn\"}},\n",
+            "    {{name: \"{name}\", command: \"{}\", timeout: \"{timeout}\", environmentPolicy: \"strip_rk_spawn\"}},\n",
             cue_command(&body)
         ));
     }
@@ -96,6 +101,15 @@ fn write_barrier_checks(repo: &Path, shared: &Path, checks: &[(&str, &str)]) {
     let rk_dir = repo.join(".rk");
     std::fs::create_dir_all(&rk_dir).unwrap();
     std::fs::write(rk_dir.join("checks.cue"), cue).unwrap();
+}
+
+/// Installs one named check per `(check_name, marker)` pair, all under a
+/// generous shared 30s timeout — the common case, for a test with no need
+/// for a per-check admission-wait budget of its own.
+fn write_barrier_checks(repo: &Path, shared: &Path, checks: &[(&str, &str)]) {
+    let with_timeouts: Vec<(&str, &str, &str)> =
+        checks.iter().map(|(name, marker)| (*name, *marker, "30s")).collect();
+    write_checks_with_timeouts(repo, shared, &with_timeouts);
 }
 
 fn release(shared: &Path, marker: &str) {
@@ -138,12 +152,24 @@ fn assert_not_started_yet(path: &Path, context: &str) {
     );
 }
 
+/// Bound on a single `status` RPC round-trip — independent of, and much
+/// smaller than, [`POLL_DEADLINE`]'s overall condition budget. Without this,
+/// a wedged daemon connection would hang this `.await` forever: the
+/// deadline check in [`poll_status_until`] below only runs AFTER an await
+/// returns, so it can never bound an RPC call that itself never returns.
+const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn status(client: &mut Client) -> Value {
-    client.call("status", json!({})).await.unwrap()
+    tokio::time::timeout(RPC_CALL_TIMEOUT, client.call("status", json!({})))
+        .await
+        .expect("status RPC must respond within its own bounded timeout, not hang indefinitely")
+        .unwrap()
 }
 
-/// Poll `status` until `pred` holds, bounded by [`POLL_DEADLINE`]. Returns
-/// the passing status for further inspection.
+/// Poll `status` until `pred` holds, bounded by [`POLL_DEADLINE`] overall —
+/// AND by [`RPC_CALL_TIMEOUT`] on every individual `status` call, so a
+/// single stuck round-trip cannot silently turn this into an unbounded
+/// hang. Returns the passing status for further inspection.
 async fn poll_status_until(
     client: &mut Client,
     description: &str,
@@ -334,84 +360,117 @@ async fn aggregate_cap_2_allows_two_concurrent_checks() {
 }
 
 /// A repository's own per-repo `verification_admission_limit_by_repo` still
-/// holds even under a much more generous aggregate cap — and a request
-/// still queued behind its OWN repo's saturated per-repo semaphore never
-/// reaches (and so is never counted by) the aggregate host semaphore:
-/// `verification_host.waiting` stays 0 for it, exactly the documented
-/// acquire order in `ManagedVerification::run`.
+/// holds even under a much more generous aggregate cap. Proven two ways,
+/// deliberately NOT by inferring anything from elapsed wall-clock time:
+///
+/// 1. `go2` declares its OWN short (1s) timeout — the check's own timeout
+///    doubles as its admission-wait budget (`write_checks_with_timeouts`),
+///    so while `go1` still holds repo A's one permit, `go2` is GUARANTEED
+///    to exhaust that budget and report back a genuine, daemon-produced
+///    `"verdict": "infra"` / `"reason": "admission-timeout"` outcome — not
+///    an inference from "it hasn't started yet after N polls", which
+///    cannot distinguish "genuinely blocked on admission" from "merely
+///    slow to reach the daemon over the wire".
+/// 2. An ELIGIBLE DIFFERENT repo (B, well under the generous aggregate=5
+///    cap) is fired and proven to genuinely execute CONCURRENTLY while
+///    `go2` is still blocked on repo A's own saturated lane — the actual
+///    cross-repo head-of-line-blocking property `ManagedVerification::run`'s
+///    acquire order exists to prevent. A test that registers only one repo
+///    cannot exercise this at all.
+///
+/// Also confirms `go2` never reaches (and so is never counted by) the
+/// aggregate host semaphore — architecturally guaranteed, since its own
+/// admission-timeout firing at the per-repo layer means the sequential
+/// acquire chain in `ManagedVerification::run` never gets far enough to
+/// even attempt the host semaphore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn repo_specific_cap_still_holds_under_a_higher_aggregate_cap() {
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::at(home.path());
     layout.ensure().unwrap();
     let shared = tempfile::tempdir().unwrap();
-    let a = prepare_repo(shared.path(), &[("go1", "a1"), ("go2", "a2")]);
+    let a_dir = tempfile::tempdir().unwrap();
+    let a_name = init_repo(a_dir.path());
+    write_checks_with_timeouts(
+        a_dir.path(),
+        shared.path(),
+        &[("go1", "a1", "30s"), ("go2", "a2", "1s")],
+    );
+    let b = prepare_repo(shared.path(), &[("go", "b")]);
 
-    spawn_daemon_with_limits(&layout, 5, HashMap::from([(a.name.clone(), 1)])).await;
+    spawn_daemon_with_limits(&layout, 5, HashMap::from([(a_name.clone(), 1)])).await;
     let mut client = connect(&layout).await;
-    register(&mut client, &a.name, a.dir.path()).await;
+    register(&mut client, &a_name, a_dir.path()).await;
+    register(&mut client, &b.name, b.dir.path()).await;
 
-    let call1 = spawn_verify(layout.clone(), a.name.clone(), "go1".into());
+    let call1 = spawn_verify(layout.clone(), a_name.clone(), "go1".into());
     wait_for_start(&pid_path(shared.path(), "a1")).await;
     poll_status_until(
         &mut client,
-        "check1 occupies repo A's own WIP=1 permit",
-        |s| repo_verify_in_flight(s, &a.name) == 1,
+        "check1 occupies repo A's own WIP=1 permit and the aggregate permit",
+        |s| repo_verify_in_flight(s, &a_name) == 1 && host_executing(s) == 1,
     )
     .await;
-    // The aggregate cap (5) is nowhere near saturated by this one check.
-    let mid = status(&mut client).await;
-    assert_eq!(
-        host_executing(&mid),
-        1,
-        "the aggregate semaphore still correctly reflects check1's real permit: {mid}"
-    );
 
-    let call2 = spawn_verify(layout.clone(), a.name.clone(), "go2".into());
+    // go2 genuinely reaches the daemon and blocks on repo A's own saturated
+    // per-repo semaphore; its 1s admission-wait budget will deterministically
+    // elapse while go1 is still held.
+    let call2 = spawn_verify(layout.clone(), a_name.clone(), "go2".into());
+
+    // While go2 is genuinely blocked, repo B — an eligible different repo —
+    // must progress concurrently: exactly the cross-repo
+    // head-of-line-blocking property under test.
+    let call_b = spawn_verify(layout.clone(), b.name.clone(), "go".into());
+    wait_for_start(&pid_path(shared.path(), "b")).await;
     poll_status_until(
         &mut client,
-        "check2 is queued behind repo A's OWN saturated per-repo lane",
-        |s| repo_verify_in_flight(s, &a.name) == 1,
+        "repo B genuinely executes concurrently while repo A's own lane is saturated",
+        |s| host_executing(s) == 2,
     )
     .await;
-    // Give check2's task a real chance to have reached (and been counted by)
-    // the aggregate semaphore if it incorrectly could — poll a bounded
-    // number of times on the *aggregate* view specifically, expecting it to
-    // stay put, rather than a single point-in-time read.
-    for _ in 0..5 {
-        let s = status(&mut client).await;
-        assert_eq!(
-            host_executing(&s),
-            1,
-            "check2, still blocked on repo A's own per-repo semaphore, must not add a second \
-             aggregate permit: {s}"
-        );
-        assert_eq!(
-            host_waiting(&s),
-            0,
-            "check2 has not reached the aggregate semaphore yet (still queued at the per-repo \
-             layer) and so must not be counted as 'waiting' there: {s}"
-        );
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
     assert_not_started_yet(
         &pid_path(shared.path(), "a2"),
-        "repo A's own WIP=1 cap must still serialize check2 behind check1",
+        "repo A's own WIP=1 cap must still serialize go2 behind go1",
     );
+
+    let call2_result = tokio::time::timeout(Duration::from_secs(10), call2)
+        .await
+        .expect("go2 must settle once its own 1s admission-wait budget elapses")
+        .unwrap();
+    assert_eq!(
+        call2_result["verdict"], json!("infra"),
+        "go2, blocked behind go1 on repo A's own saturated WIP=1 lane, must report a genuine \
+         admission-timeout verdict, not run: {call2_result:#?}"
+    );
+    assert_eq!(
+        call2_result["reason"],
+        json!("admission-timeout"),
+        "{call2_result:#?}"
+    );
+    assert!(
+        !pid_path(shared.path(), "a2").exists(),
+        "go2 must never have spawned a real process at all — it never left repo A's own \
+         admission queue"
+    );
+
+    let after_call2 = status(&mut client).await;
+    assert_eq!(
+        host_waiting(&after_call2),
+        0,
+        "go2 timed out at the per-repo layer and so architecturally never reached the \
+         aggregate semaphore — it must never appear in its waiting count: {after_call2}"
+    );
+
+    release(shared.path(), "b");
+    assert_eq!(call_b.await.unwrap()["exit"], json!(0));
 
     release(shared.path(), "a1");
     assert_eq!(call1.await.unwrap()["exit"], json!(0));
 
-    wait_for_start(&pid_path(shared.path(), "a2")).await;
-    poll_status_until(
-        &mut client,
-        "check2 now occupies repo A's freed per-repo permit",
-        |s| repo_verify_in_flight(s, &a.name) == 1,
-    )
+    poll_status_until(&mut client, "capacity fully drains", |s| {
+        host_executing(s) == 0 && repo_verify_in_flight(s, &a_name) == 0
+    })
     .await;
-
-    release(shared.path(), "a2");
-    assert_eq!(call2.await.unwrap()["exit"], json!(0));
 }
 
 /// aggregate limit 0 (disabled, the default) preserves prior behavior: two

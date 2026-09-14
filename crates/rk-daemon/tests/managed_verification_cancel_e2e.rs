@@ -884,6 +884,16 @@ async fn daemon_restart_cleans_owned_verification_work_before_admitting_replacem
     // presumed dead — the same regression proof as the sibling test.
     wait_for_death(child_pid).await;
 
+    let agent_status = client
+        .call("agent.status", json!({"name": &agent}))
+        .await
+        .unwrap();
+    assert_eq!(
+        agent_status["agent"]["state"].as_str(),
+        Some("orphaned"),
+        "the dead generation's agent record must not still claim to be live: {agent_status}"
+    );
+
     let status = client.call("status", json!({})).await.unwrap();
     assert_eq!(
         status["verification_host"]["executing"].as_u64(),
@@ -896,7 +906,7 @@ async fn daemon_restart_cleans_owned_verification_work_before_admitting_replacem
     // immediately admit its own fresh `verify.run` against the very same
     // repo under the same aggregate limit=1 — unblocked by any trace of the
     // dead run daemon A left behind.
-    let (_second_agent, worktree_2) =
+    let (second_agent, worktree_2) =
         spawn_verify_holder(&mut client, repo_dir.path(), "restart-in-flight-aggregate-2").await;
     let child_pid_2 = wait_for_pid(&worktree_2.join("verify.pid")).await;
     assert!(
@@ -911,10 +921,17 @@ async fn daemon_restart_cleans_owned_verification_work_before_admitting_replacem
         "daemon B's replacement run must genuinely hold the aggregate cap's one permit: {status}"
     );
 
-    // Best-effort cleanup of daemon B's own still-running check.
-    let _ = Command::new("kill")
-        .args(["-9", &child_pid_2.to_string()])
-        .status();
+    // Clean up daemon B's own still-running check through the daemon's OWN
+    // owned-cancellation path (`agent.dismiss` -> `Supervisor::dismiss` ->
+    // `cancel_managed_verification_for_agent`, the same real mechanism
+    // `dismissing_a_live_agent_kills_its_own_in_flight_verify_run` proves
+    // end to end) rather than a raw external `kill -9` outside the
+    // daemon's own bookkeeping.
+    client
+        .call("agent.dismiss", json!({"name": second_agent}))
+        .await
+        .unwrap();
+    wait_for_death(child_pid_2).await;
 
     handle_b.abort();
     let _ = handle_b.await;
