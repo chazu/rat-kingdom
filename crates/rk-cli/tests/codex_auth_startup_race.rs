@@ -98,6 +98,68 @@ async fn wait_for_markers(markers: &[PathBuf]) {
     panic!("first-call markers did not appear: {missing:?}");
 }
 
+/// Parses `ps -Ao pid=,ppid=,comm=` output into `(pid, ppid, comm)` rows.
+/// `ps` right-pads/aligns numeric columns with a variable RUN of spaces
+/// (not exactly one), so splitting on a single whitespace char at each
+/// occurrence (`str::splitn(_, char::is_whitespace)`) treats each space in
+/// that run as its own delimiter and yields empty fields between them,
+/// which then fail to parse as a pid/ppid and silently drop the row — an
+/// earlier draft did exactly that and dropped nearly every real row.
+/// `split_whitespace` treats a whole run of whitespace as one separator and
+/// skips empty fields, which is what padded `ps` output actually needs.
+fn parse_ps_pid_ppid_comm(output: &str) -> Vec<(u32, u32, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let this_pid = parts.next()?.parse().ok()?;
+            let ppid = parts.next()?.parse().ok()?;
+            let comm = parts.collect::<Vec<_>>().join(" ");
+            Some((this_pid, ppid, comm))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod parse_ps_tests {
+    use super::parse_ps_pid_ppid_comm;
+
+    /// A realistic sample: right-aligned numeric columns padded with a
+    /// variable run of spaces, exactly as `ps -Ao pid=,ppid=,comm=` prints
+    /// on a real host (not the single-space-joined fixture an earlier draft
+    /// was implicitly assuming).
+    #[test]
+    fn parses_padded_ps_columns() {
+        let sample = "\
+    1     0 launchd
+  501     1 launchd
+50234   501 zsh
+50291 50234 cargo
+50310 50291 codex_auth_startup_race
+";
+        let rows = parse_ps_pid_ppid_comm(sample);
+        assert_eq!(
+            rows,
+            vec![
+                (1, 0, "launchd".to_string()),
+                (501, 1, "launchd".to_string()),
+                (50234, 501, "zsh".to_string()),
+                (50291, 50234, "cargo".to_string()),
+                (50310, 50291, "codex_auth_startup_race".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_unparseable_lines_without_dropping_valid_ones() {
+        let sample = "garbage line\n  501     1 launchd\n";
+        assert_eq!(
+            parse_ps_pid_ppid_comm(sample),
+            vec![(501, 1, "launchd".to_string())]
+        );
+    }
+}
+
 /// Every process on the host with `pid` as an ancestor, found by walking
 /// `ps`'s `pid`/`ppid` columns transitively from `pid` — cheap, portable
 /// (no `/proc` dependency), and exact: it names only this process's own
@@ -114,16 +176,10 @@ fn descendants_of(pid: u32) -> Vec<(u32, String)> {
     else {
         return Vec::new();
     };
-    let rows: Vec<(u32, u32, String)> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.trim().splitn(3, char::is_whitespace);
-            let this_pid = parts.next()?.trim().parse().ok()?;
-            let ppid = parts.next()?.trim().parse().ok()?;
-            let comm = parts.next()?.trim().to_string();
-            Some((this_pid, ppid, comm))
-        })
-        .collect();
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let rows = parse_ps_pid_ppid_comm(&String::from_utf8_lossy(&output.stdout));
 
     let mut descendants = Vec::new();
     let mut seen = std::collections::HashSet::new();
