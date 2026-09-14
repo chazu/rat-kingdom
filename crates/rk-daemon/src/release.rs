@@ -795,10 +795,13 @@ enum BlobObservation {
 
 /// Read a file's content at an exact commit, distinguishing "confirmed
 /// absent" from "could not observe" (see `FileObservation`'s doc comment for
-/// why collapsing the two is unsafe). `git cat-file -e` first: its exit code
-/// is a well-defined /0 exists, 1 absent/, so anything else (a different
-/// exit code, or `git` failing to run at all) is treated as `Unavailable`,
-/// never silently coerced to `Absent`.
+/// why collapsing the two is unsafe). `git cat-file -e` first: for a
+/// `<tree-ish>:<path>` spec (as opposed to a bare object hash), git reports a
+/// missing PATH as exit 128 with a `fatal: path '<path>' does not exist in
+/// '<sha>'` message — not exit 1, which is reserved for a missing OBJECT
+/// hash. Only that specific, stable message at exit 128 is treated as
+/// `Absent`; any other exit code or message is `Unavailable`, never silently
+/// coerced to `Absent`.
 fn read_blob_at(repo_path: &Path, sha: &str, rel_path: &str) -> BlobObservation {
     let spec = format!("{sha}:{rel_path}");
     match std::process::Command::new("git")
@@ -810,7 +813,12 @@ fn read_blob_at(repo_path: &Path, sha: &str, rel_path: &str) -> BlobObservation 
         .output()
     {
         Ok(out) if out.status.code() == Some(0) => {}
-        Ok(out) if out.status.code() == Some(1) => return BlobObservation::Absent,
+        Ok(out)
+            if out.status.code() == Some(128)
+                && String::from_utf8_lossy(&out.stderr).contains("does not exist in") =>
+        {
+            return BlobObservation::Absent;
+        }
         Ok(out) => {
             return BlobObservation::Unavailable(format!(
                 "git cat-file -e {spec} exited {:?}: {}",
