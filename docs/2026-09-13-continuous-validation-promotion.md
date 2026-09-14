@@ -118,26 +118,50 @@ unavailable credentials, or genuinely new authority reach the King/human.
 
 ## 4. Landing scheduling and integration
 
-### 4.1 Remove review serialization in two bounded steps
+### 4.1 Reuse in-flight work, then remove review serialization
+
+Before overlapping review and checks, coalesce concurrent requests for the same
+exact reusable check identity. Today a reviewer can miss the cache while a gate
+is running, wait for admission, then execute the check again. A completed-cache
+lookup alone does not prevent this. Publish settlement/proof before releasing
+execution ownership. Each requesting caller owns a subscription; cancelling one
+subscriber must not kill work still required by another. Cancel and reap the
+actual child when the last owner leaves. Dirty/unidentified inputs do not share.
+Validate actual candidate bytes and complete execution context before joining.
+The regression must prove a gate and reviewer execute one identical check once,
+including concurrent cancellation and the proof-publication/admission race.
 
 First run a candidate's independent semantic review and named checks concurrently
 after cheap source/protected-path/diff-scope admission. Both must pass before
 target advancement. A failed gate cancels/settles any now-unneeded review using
 its exact attempt, preserving cost and late verdict evidence. Neither result
-authorizes advancement by itself. Retain existing review reuse constraints.
+authorizes advancement by itself. If review rejects first, cancel/settle the
+now-unneeded check symmetrically without cancelling another subscribed owner.
+Retain existing review reuse constraints.
 
-Next allow a bounded second candidate to prepare/check while the first awaits
-review. Default remains one in-flight candidate until explicit activation; trial
-cap is two per target and one expensive check per repository. Release the broad
+Next allow a bounded second candidate's source review and cheap preparation to
+proceed while the first awaits review. Default remains one active candidate
+until explicit activation; trial cap is two per target. Keep expensive merged
+candidate checks at the current FIFO head after capturing its actual target.
+Checking B against T while approved A is about to advance T predictably wastes a
+full check; this design explicitly excludes that speculation. Release the broad
 target lock around waiting work; use short fenced claims and final target CAS.
 Do not remove source fences or allow two actors to own one candidate phase.
 
-Initially candidates use a captured actual target base, not an unreviewed
-predecessor. If target advancement makes a checked candidate stale, reprepare
-and recheck the changed candidate; never reuse the old SHA proof for it. Bound
-lookahead to one, record wasted checks, and disable lookahead if it loses more
-compute than it saves. A later general merge train is not required for this
-program; the release snapshot path below provides amortization without it.
+Source review remains bound to source SHA, task, target and declared review
+context. Its reuse asserts only that scope; integration checks cover the final
+assembled candidate. Any review claim dependent on a superseded target context
+requires a fresh review. A later general merge train is not required for this
+program. Independent integration/release selection does not depend on lookahead.
+Measure total delivery latency and total check minutes; extra concurrency alone
+does not prove improvement.
+
+Workspace ownership is separate from execution admission. Existing gate trees
+are keyed by repo/target and reset before admission. A new candidate must not
+reset a checkout still read by an earlier check. Hold an exclusive workspace
+lease spanning reset through confirmed child cleanup, or use candidate-specific
+trees. A barrier test makes A read its source after B starts preparation and
+checks that A's proof still describes those exact bytes. Retain bounded cleanup.
 
 Restart must reconstruct active/waiting phases from durable records. Read-only
 queue/status views must continue to work while gates/reviews wait. A slow review
@@ -156,7 +180,23 @@ Select immutable release snapshots from integrated commits. While a snapshot is
 validated, newer work may continue integrating. Maintain at most one running and
 one coalesced pending release candidate per environment/stream. Never mutate the
 running candidate or restart it on each new commit. Record superseded pending
-candidates and included ticket membership. A failed snapshot holds its release;
+candidates and included ticket membership. Snapshot selection applies aggregate
+scope admission before enqueue: choose the oldest admissible immutable prefix
+of integration deliveries within the existing target's file/line budget and
+retain overflow for the next snapshot. Do not repeatedly select an over-budget
+latest head. If one constituent is inadmissible, retain it with an explicit
+disposition; split/correct it or obtain a separately bounded activated release
+policy. Other independently selectable work is not silently discarded.
+
+Protected-path authority is edge-specific. A source integration approval is
+evidence, not automatic approval of its later release edge. An activated release
+policy may explicitly allow exact constituent changes with matching retained
+authorization, path and digest bindings; otherwise the protected edge requests
+its required decision. Never erase the path guard or infer approval from merge.
+Tests include two individually admissible changes whose aggregate is over budget,
+overflow progress, and missing/stale protected-path authorization.
+
+A failed snapshot holds its release;
 revert/correct the implicated change and select a new snapshot. Independent
 features may remain integrated with exposure disabled.
 
@@ -213,8 +253,22 @@ Use the existing rollover lifecycle to preserve workers. A small separately
 installed stable launcher starts the selected daemon, checks its release identity
 and bounded read-only health probe, and can restore the prior compatible release
 if the candidate cannot boot. It must work when the candidate daemon is absent.
+Before stopping the current daemon, the transition durably records the exact
+live/parked generation set, their launch identities and prior dispatch state.
+Record each recovery outcome separately. On interruption, reconcile those exact
+generations; never adopt unrelated pre-existing or deliberately parked orphans.
+Current rollover's local vector is insufficient after its CLI crashes.
+
 The launcher has a filesystem lock, bounded retries, and durable receipts that
-the recovered daemon ingests; it does not start a second controller agent.
+the recovered daemon ingests; it does not start a second controller agent. It
+also provides bounded post-boot supervision using an activated operational-health
+contract and an authenticated local rollback command independent of the candidate
+daemon. After boot-health success, use a low-cost external progress/read probe
+with an explicit maximum observation interval and recovery budget. A responsive
+RPC with broken dispatch/landing progress is not sufficient health. Missing
+traffic is not failure: progress checks require known eligible work and account
+for declared admission/approval waits. The launcher can stop and replace an
+unhealthy candidate under its existing transition policy without its cooperation.
 
 Health includes process liveness, correct release identity, successful bounded
 read, and ability to access current state. Read-only health checks cannot prove
@@ -223,14 +277,20 @@ regression feedback may disable a feature or request a preauthorized rollback.
 Do not run two writable daemons against the production tuplespace.
 
 Rollback changes binaries/config/exposure, not the journal or ticket history.
-Declare supported state schema read/write ranges. Prefer additive compatible
-changes; refuse automatic binary rollback across incompatible state writes.
+Declare supported state schema read/write ranges, persisted-record formats,
+activated repository-policy versions, and CLI/MCP protocol ranges. Bind effective
+configuration including environment overrides, not only config-file bytes.
+Validate the rollback bundle against that effective configuration before opening
+live state. Surviving clients must be compatible or explicitly reconnect; a
+version mismatch warning alone cannot establish compatibility. Prefer additive
+compatible changes; refuse automatic binary rollback across incompatible writes.
 Record a human gate or a named forward-recovery action in that case. Retain the
 current and previous healthy release while pruning only unreferenced artifacts.
 
 Acceptance includes the CLI/MCP pair, existing session recovery, a boot-failing
-candidate, a healthy candidate, interrupted activation, stale rollback, and a
-rollback that preserves work created after activation.
+candidate, a healthy candidate, interrupted activation/partial worker recovery,
+stale rollback, incompatible override or surviving MCP client, a read-responsive
+but operationally failed successor, and recovery preserving new work.
 
 ## 7. Feature exposure and fitness
 
@@ -301,7 +361,7 @@ claims of improvement. Record the activated numeric profile before each exercise
 
 | Objective | Decision and evidence |
 | --- | --- |
-| Landing overlap | Barrier-based test proves review A waiting does not prevent an admitted check B, with cap 2 and heavy cap 1; no duplicate advancement or stale proof reuse |
+| Landing overlap | Barrier-based test proves gate/review overlap and review B progresses while A waits, with cap 2 and heavy cap 1; concurrent exact check requests execute once; no duplicate advancement or stale proof reuse |
 | Scheduling improvement | Matched bounded fake-harness workload separates review waits and check execution; new critical path overlaps stages and reports any extra stale work |
 | Integration progress | A later independent change integrates while a frozen release candidate is validating; it does not alter that candidate |
 | Release recovery | Initial local profile: boot identity/read healthy within 30 s; failed boot recovers previous compatible release within 60 s; one rollback attempt, then explicit degraded state |
@@ -357,6 +417,34 @@ not an excuse to leave the external action interface unimplemented here.
 
 ## 11. Dependency-ordered execution slices
 
+### Public journeys to implement
+
+These are proposed interfaces, not commands available at the initial source:
+
+- `rk release prepare --repo R --candidate SHA --recipe NAME` creates a verified
+  immutable bundle through named managed execution; `rk release show ID` and
+  `rk release status --repo R --environment E` expose provenance and desired/
+  observed state, including pending/unknown transitions.
+- `rk release activate ID --environment E --expect-revision N` and
+  `rk release rollback --repo R --environment E --expect-revision N` use activated
+  authority and exact transition receipts. The independent launcher exposes the
+  same narrowly authenticated local rollback route when the daemon is absent.
+- `rk feature show FEATURE --repo R`, `rk feature set FEATURE --repo R
+  --mode MODE --expect-revision N`, and `rk feature disable FEATURE --repo R
+  --expect-revision N` expose assigned/configured/disabled states distinctly.
+  Cohort definition and objective references come from validated policy/input.
+- Existing `rk factory scorecards`, `rk factory recommend`, native factory
+  snapshot/replay/watch and MCP typed reads expose added evidence without
+  acquiring mutation side effects. Add explicit assessment reads as needed.
+
+JSON mode must provide versioned structured results and actual transition IDs.
+CLI, RPC and MCP use the same daemon authority/resolution contracts. Reusable
+activated policy grants are distinct from Foreman's existing exact one-action
+human approval grants; retain both and reject an action without either the
+required specific grant or applicable preauthorized policy.
+
+### Slices
+
 All slices are AFK within activated policy except final operator activation and
 any actual new credentials/irreversible decisions. File native RK tickets only
 after review stabilization. Mark only currently authorized ready slices for
@@ -364,11 +452,12 @@ dispatch. Split a slice further if its reviewed diff exceeds repository limits.
 
 | Slice | Deliverable and decisive acceptance | Dependencies |
 | --- | --- | --- |
-| P1 | Overlap one candidate's review and full gate; both must pass, stale/failed/cancelled cases settle correctly, phase metrics truthful | Plan |
-| P2 | Bounded preparation/check progress behind a pending review; phase claims survive restart and final target CAS remains serial | P1 |
-| P3 | Host-wide weighted admission for named checks across two repositories, managed cancellation and fairness | Plan |
+| P0 | Coalesce concurrent identical reusable checks with independent caller ownership and proof settlement before release | Plan |
+| P1 | Overlap one candidate's review and full gate; both must pass, stale/failed/cancelled cases settle correctly, phase metrics truthful | P0 |
+| P2 | Bounded source-review/cheap-preparation lookahead; no speculative full gate, phase claims and workspace isolation survive restart | P1 |
+| P3 | Host-wide weighted admission for named checks across two repositories, managed cancellation and fairness | P0 |
 | P4 | Named artifact-build/experiment routing through host budget, bounded child fan-out and visible unmanaged boundary | P3 |
-| P5 | Explicit integration/release roles and one running/one pending immutable candidate; focused inner checks and separate status | P2, P4 |
+| P5 | Explicit integration/release roles and one running/one pending bounded immutable candidate; aggregate scope/authority admission, focused inner checks and separate status | P1, P4 |
 | P6 | Versioned release inventory and paired RK/MCP artifact installation with source/check/config provenance | P4 |
 | P7 | Stable launcher, transactional activation, health observation and compatible rollback preserving live state | P6 |
 | P8 | Typed feature config and deterministic cohort assignment, emergency disable, restart/reconnect persistence | P6 |
@@ -379,6 +468,7 @@ dispatch. Split a slice further if its reviewed diff exceeds repository limits.
 | P13 | Activate RK integration/release policy and install release controller; demonstrate continued integration during validation and local recovery | P5, P7, P10 |
 | P14 | Real work under BBS cohort, continuous scorecards, lifecycle/throughput report and honest benefit verdict; update operator docs | P11, P12, P13 |
 
+P0 lands before P1/P3 so they consume one stable published execution contract.
 P1/P2 share landing internals; P3/P4 share managed execution. At most two
 implementers initially, assigning disjoint areas where possible. Publish
 cross-area contracts on BBS before dependent integration. Preserve current
@@ -415,7 +505,7 @@ to feature promotion; preserve those historical plans and mark unrun arms as
 superseded, not passed. Carry useful pending bug tickets forward without
 redispatching duplicates or losing prior delivery provenance.
 
-Completion audit maps every R1-R9 requirement and P1-P14 slice to source delivery,
+Completion audit maps every R1-R9 requirement and P0-P14 slice to source delivery,
 check/review evidence, installed identity, and an actual product journey. Missing
 evidence keeps the program incomplete. A null BBS benefit verdict is a valid
 experimental result; absence of a working feature/exposure/reporting path is not.
@@ -436,4 +526,3 @@ experimental result; absence of a working feature/exposure/reporting path is not
   current local activation boundary.
 - `docs/factory-foreman.md`, `docs/repository-policy.md`,
   `docs/2026-09-12-stigmergy-evidence-and-trial.md`: existing authority and evidence.
-
