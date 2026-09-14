@@ -4423,18 +4423,23 @@ impl Daemon {
 
         // Both branch-shaped self-clearing checks reuse the exact machinery
         // `rk inbox` uses: the dropped-land half of `cleared_branches`, and a
-        // dedicated ancestry check per ticket's own delivery record.
-        let cleared_branches = self.cleared_branches(&[&lands]).await?;
-
+        // dedicated ancestry check per ticket's own delivery record. Neither
+        // reads the other's result, so run them concurrently rather than
+        // paying their git-subprocess cost twice in sequence — each already
+        // runs on its own blocking thread, so this only removes the
+        // add-them-up wait, never the per-source freshness: both are still
+        // derived from the repository's current state on every call.
         let delivered_pairs: HashSet<(String, String)> = tickets
             .iter()
             .filter_map(crate::tickets::delivery_of)
             .filter(|d| !d.merge_commit.is_empty())
             .map(|d| (d.merge_commit, d.target))
             .collect();
-        let is_ancestor = self
-            .merge_commit_ancestry(&repo, delivered_pairs.into_iter().collect())
-            .await?;
+        let land_sets = [lands.as_slice()];
+        let (cleared_branches, is_ancestor) = tokio::try_join!(
+            self.cleared_branches(&land_sets),
+            self.merge_commit_ancestry(&repo, delivered_pairs.into_iter().collect())
+        )?;
 
         let git = crate::reconcile::GitFacts {
             is_ancestor,
@@ -11379,11 +11384,27 @@ fn cleared_branches_for_paths(
     for (scope, branch, target, content_proven) in events {
         *branches.entry((scope, branch, target)).or_default() |= content_proven;
     }
+    // `Repo::open_checkout` shells out twice (`rev-parse --show-toplevel`,
+    // then `discover`'s own `rev-parse --git-common-dir`) to open a single
+    // checkout. Every dropped-land event for the same scope names the same
+    // path, so opening it once here and reusing the handle for every branch
+    // in that scope avoids re-paying that cost per branch — under a system
+    // already busy with concurrent verification's own git/build subprocess
+    // load, each redundant open is one more fork/exec competing for the same
+    // scheduler time, which is what made this loop's total wall time scale
+    // with event count instead of distinct-repo count (see reconcile.report
+    // RPC-deadline load report, 2026-09-12). No caching ACROSS calls: this
+    // map lives only for this one invocation, so every result is still
+    // derived fresh from the repository's current state.
+    let mut repos: HashMap<String, Option<rk_git::Repo>> = HashMap::new();
     for ((scope, branch, target), content_proven) in branches {
         let Some(path) = paths.get(&scope) else {
             continue;
         };
-        let Ok(repo) = rk_git::Repo::open_checkout(path) else {
+        let repo = repos
+            .entry(scope.clone())
+            .or_insert_with(|| rk_git::Repo::open_checkout(path).ok());
+        let Some(repo) = repo else {
             continue;
         };
         let resolved = match repo.branch_exists_checked(&branch) {
@@ -11547,6 +11568,79 @@ mod branch_clear_tests {
         std::fs::remove_dir_all(path.join(".git")).unwrap();
         assert!(repo.branch_exists_checked("legacy").is_err());
         assert!(cleared_branches_for_paths(events, paths).is_empty());
+    }
+
+    /// `cleared_branches_for_paths` opens each distinct scope's repository at
+    /// most once per call (TKT-pijug-puzav-tihud), reusing that one handle
+    /// across every branch named for that scope. Two distinct repos, each
+    /// with two branches in a DIFFERENT resolved state, in the SAME call:
+    /// proves the per-call open-once map still resolves every branch against
+    /// its own scope's repository and never leaks one scope's git state into
+    /// another's (e.g. `dead` retired in `repo-a` must not make `dead` in
+    /// `repo-b`, which never existed there, read as anything but corrupt/
+    /// unresolved — not silently "cleared" by borrowing repo-a's answer).
+    #[test]
+    fn cleared_branches_for_paths_opens_each_scope_repo_once_and_keeps_scopes_isolated() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let repo_a = dir_a.path();
+        git(repo_a, &["init", "-b", "main"]);
+        git(repo_a, &["config", "user.email", "r@x"]);
+        git(repo_a, &["config", "user.name", "R"]);
+        std::fs::write(repo_a.join("f"), "base\n").unwrap();
+        git(repo_a, &["add", "."]);
+        git(repo_a, &["commit", "-m", "base"]);
+        // repo-a/dead: branch retired (renamed away) — clears.
+        git(repo_a, &["branch", "dead", "main"]);
+        git(repo_a, &["branch", "-m", "dead", "archive/dead"]);
+        // repo-a/live: still-open branch with a real, proven merge — clears.
+        git(repo_a, &["checkout", "-b", "live", "main"]);
+        std::fs::write(repo_a.join("g"), "work\n").unwrap();
+        git(repo_a, &["add", "."]);
+        git(repo_a, &["commit", "-m", "work"]);
+        git(repo_a, &["checkout", "main"]);
+        git(repo_a, &["merge", "--ff-only", "live"]);
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let repo_b = dir_b.path();
+        git(repo_b, &["init", "-b", "main"]);
+        git(repo_b, &["config", "user.email", "r@x"]);
+        git(repo_b, &["config", "user.name", "R"]);
+        std::fs::write(repo_b.join("f"), "base\n").unwrap();
+        git(repo_b, &["add", "."]);
+        git(repo_b, &["commit", "-m", "base"]);
+        // repo-b/dead: same branch NAME as repo-a's, but here it is still open
+        // and unmerged — must NOT clear just because repo-a's namesake did.
+        git(repo_b, &["checkout", "-b", "dead", "main"]);
+        std::fs::write(repo_b.join("h"), "unmerged\n").unwrap();
+        git(repo_b, &["add", "."]);
+        git(repo_b, &["commit", "-m", "unmerged work"]);
+        git(repo_b, &["checkout", "main"]);
+        // repo-b/live: still open, no content proof offered — must stay held.
+        git(repo_b, &["branch", "live", "main"]);
+
+        let paths = HashMap::from([
+            ("repo-a".to_string(), repo_a.to_path_buf()),
+            ("repo-b".to_string(), repo_b.to_path_buf()),
+        ]);
+        let events = vec![
+            ("repo-a".into(), "dead".into(), "main".into(), false),
+            ("repo-a".into(), "live".into(), "main".into(), true),
+            ("repo-b".into(), "dead".into(), "main".into(), true),
+            ("repo-b".into(), "live".into(), "main".into(), false),
+        ];
+        let cleared = cleared_branches_for_paths(events, paths);
+        assert!(cleared.contains(&("repo-a".into(), "dead".into())));
+        assert!(cleared.contains(&("repo-a".into(), "live".into())));
+        assert!(
+            !cleared.contains(&("repo-b".into(), "dead".into())),
+            "repo-b's own unmerged `dead` must not clear via repo-a's retired \
+             namesake: {cleared:?}"
+        );
+        assert!(
+            !cleared.contains(&("repo-b".into(), "live".into())),
+            "an open branch without content proof stays held regardless of \
+             another scope's state: {cleared:?}"
+        );
     }
 
     #[test]
