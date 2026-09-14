@@ -16892,6 +16892,86 @@ checks: [
         assert_eq!(held_check["duration_semantic"], "additive");
     }
 
+    /// Proves the LANDING pipeline's own producer
+    /// (`LandingPipeline::record_check_verification_span`, reading
+    /// `RunProgress::queued_at_wall`/`started_at_wall`/`settled`) is wired to
+    /// the real `ManagedVerification::run` clock capture — not just that the
+    /// helper constructors (`PhaseSpan::from_observed`) behave correctly in
+    /// isolation. An injected counting clock hands out a strictly increasing
+    /// sequence; `run()` reads it exactly three times per check (queued,
+    /// started, settled) and nothing downstream — this pipeline's own
+    /// `record_check_verification_span` call sites included — reads it
+    /// again to build the span. If a call site regressed back to deriving
+    /// its own `Utc::now()`, the recorded call count would exceed
+    /// `3 * checks_run` and this test would fail.
+    #[tokio::test]
+    async fn landing_gate_spans_are_wired_to_the_real_run_clock_capture_not_a_later_read() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+
+        let call_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let base = Utc::now();
+        let counting = Arc::clone(&call_count);
+        pipeline
+            .supervisor
+            .verification_resources()
+            .clock
+            .set(move || {
+                let n = counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                base + chrono::Duration::milliseconds(i64::try_from(n).unwrap() * 10)
+            });
+
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "landing clock wiring".into(),
+            ..Default::default()
+        };
+        let plan = pipeline
+            .resolve_gate_plan_at(&entry, &git_repo, &GateConfig::default(), &head_sha)
+            .await
+            .unwrap();
+        let outcome = pipeline
+            .execute_gate_plan_at(&mut entry, &git_repo, plan, &head_sha)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+
+        let spans = crate::span::spans_for_task(&space, "code-repo", "landing clock wiring").unwrap();
+        let verification_spans: Vec<&Value> =
+            spans.iter().filter(|s| s["phase"] == "verification").collect();
+        assert!(!verification_spans.is_empty(), "{spans:?}");
+        for span in &verification_spans {
+            assert_eq!(span["timestamp_provenance"], "observed", "{span:?}");
+            assert_eq!(span["duration_semantic"], "additive", "{span:?}");
+            assert!(span["queued_at"].is_string(), "{span:?}");
+            assert!(span["started_at"].is_string(), "{span:?}");
+            assert!(span["ended_at"].is_string(), "{span:?}");
+        }
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            u64::try_from(verification_spans.len()).unwrap() * 3,
+            "each check reads the clock exactly 3 times (queued/started/settled); any more \
+             means something downstream of run() settling re-read it to build the span"
+        );
+    }
+
     /// A candidate that advances the same task through a second landing
     /// round (a rework/conflict-correction round preparing a new merge
     /// object) must get its own check spans, never silently shadowed by the

@@ -48,24 +48,37 @@ pub(crate) struct VerificationResources {
 /// `RetrySchedule`: nothing outside this one field reads through it, so a
 /// frozen/advancing test clock here cannot distort unrelated behavior.
 pub(crate) struct SpanClock {
-    now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    now: std::sync::Mutex<Box<dyn Fn() -> DateTime<Utc> + Send + Sync>>,
 }
 
 impl SpanClock {
     pub(crate) fn now(&self) -> DateTime<Utc> {
-        (self.now)()
+        (self.now.lock().unwrap())()
     }
 
     #[cfg(test)]
     pub(crate) fn from_fn(now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
-        Self { now: Box::new(now) }
+        Self {
+            now: std::sync::Mutex::new(Box::new(now)),
+        }
+    }
+
+    /// Swap the wall-clock function on an already-constructed
+    /// [`VerificationResources`] — for a test whose harness only builds one
+    /// via a `Supervisor`/`WorkflowEngine` it doesn't otherwise control the
+    /// construction of (`landing.rs`'s `test_pipeline`), rather than
+    /// threading a clock through every production constructor just to make
+    /// it reachable from a test.
+    #[cfg(test)]
+    pub(crate) fn set(&self, now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) {
+        *self.now.lock().unwrap() = Box::new(now);
     }
 }
 
 impl Default for SpanClock {
     fn default() -> Self {
         Self {
-            now: Box::new(Utc::now),
+            now: std::sync::Mutex::new(Box::new(Utc::now)),
         }
     }
 }

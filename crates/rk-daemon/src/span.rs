@@ -193,17 +193,21 @@ pub struct PhaseSpan {
     /// an "inferred" span's timestamps as exact observed boundaries.
     pub timestamp_provenance: Option<&'static str>,
     /// Admission-queue wait measured directly off a monotonic clock
-    /// (`Instant::elapsed`) at the producer, independent of
+    /// (`Instant::elapsed`) at the producer, recorded independently of
     /// `queued_at`/`started_at` and of any wall-clock discontinuity between
-    /// them (a host suspend during the wait makes the wall gap larger than
-    /// this without changing it). Kept distinct from
+    /// them. This is a monotonic-clock reading, not a claim about CPU or
+    /// active-work time — whether it includes time the host spent suspended
+    /// is a platform/runtime detail this field does not assume one way or
+    /// the other, so a wall-clock discontinuity during the wait can make the
+    /// two figures diverge in either direction. Kept distinct from
     /// [`PhaseSpan::queue_wait_ms`] (the wall-clock difference derived from
     /// the timestamps) so a reader can tell the two apart rather than
     /// silently trusting whichever one a payload happens to carry.
     pub queue_wait_ms_monotonic: Option<u64>,
-    /// Active execution duration measured directly off a monotonic clock,
-    /// the `duration_ms_monotonic` counterpart to
-    /// [`Self::queue_wait_ms_monotonic`] — see that field's doc.
+    /// Execution-phase duration measured directly off a monotonic clock, the
+    /// `duration_ms_monotonic` counterpart to
+    /// [`Self::queue_wait_ms_monotonic`] — see that field's doc, including
+    /// its caveat about not assuming a fixed relationship to a host suspend.
     pub duration_ms_monotonic: Option<u64>,
 }
 
@@ -307,14 +311,23 @@ impl PhaseSpan {
         self
     }
 
-    /// Duration from queued to started, when both are known.
+    /// Duration from queued to started, when both are known — `None` (never
+    /// a negative number) if the wall clock itself ran backwards between the
+    /// two, e.g. an NTP correction or a leap-second adjustment landing mid-
+    /// wait. A negative difference is not a real duration to report; treating
+    /// it as "unknown" is honest, where reporting the raw negative value
+    /// would be a lie dressed up as a measurement.
     pub fn queue_wait_ms(&self) -> Option<i64> {
-        Some((self.started_at? - self.queued_at?).num_milliseconds())
+        let ms = (self.started_at? - self.queued_at?).num_milliseconds();
+        (ms >= 0).then_some(ms)
     }
 
-    /// Duration from started to ended, when both are known.
+    /// Duration from started to ended, when both are known — see
+    /// [`Self::queue_wait_ms`]'s doc for why a backward pair yields `None`
+    /// rather than a negative number.
     pub fn duration_ms(&self) -> Option<i64> {
-        Some((self.ended_at? - self.started_at?).num_milliseconds())
+        let ms = (self.ended_at? - self.started_at?).num_milliseconds();
+        (ms >= 0).then_some(ms)
     }
 
     /// Build a span directly from real wall-clock boundaries a producer
@@ -322,27 +335,39 @@ impl PhaseSpan {
     /// read at the same statement as the `Instant::now()` that starts an
     /// admission wait, not reconstructed later by subtracting a duration
     /// from whatever `Utc::now()` happens to return when the span is finally
-    /// recorded. Never fabricates a value: a boundary the producer never
-    /// observed (still queued, cancelled before it started, etc.) stays
-    /// `None` rather than being inferred from the ones that are known.
-    /// Tagged [`PhaseSpan::timestamp_provenance`] `"observed"` whenever at
-    /// least one of the three is `Some`, so a reader can trust
-    /// [`PhaseSpan::queue_wait_ms`]/[`PhaseSpan::duration_ms`] (both derived
-    /// from these timestamps) as real elapsed wall-clock time, including
-    /// across a discontinuity (a host suspend, a delayed publish) between
-    /// two of the boundaries — unlike [`Self::from_durations`], nothing here
-    /// depends on when the caller happens to invoke this constructor.
+    /// recorded. Never fabricates OR discards a value: a boundary the
+    /// producer never observed (still queued, cancelled before it started,
+    /// etc.) stays `None` rather than being inferred from the ones that are
+    /// known, and a boundary it DID observe is kept exactly as captured even
+    /// when the three disagree on order (below) — the raw observation is
+    /// preserved either way, never silently corrected.
     ///
-    /// Also tagged [`PhaseSpan::duration_semantic`] `"additive"`: a
-    /// producer's own `queued_at`/`started_at`/`ended_at`, captured in the
-    /// order they actually happened, are non-overlapping by construction
-    /// (execution cannot start before it was queued, or end before it
-    /// started), so `queue_wait_ms + duration_ms` is exactly as sound a
-    /// total here as it is for [`Self::from_durations`]'s contract-checked
-    /// disjoint durations. A verification-phase reader
-    /// (`rk-cli`'s `bbs_report`) only totals spans carrying this tag; leaving
-    /// it unset here would silently drop every observed span into the
-    /// legacy/unknown bucket instead of the real total.
+    /// Ordinarily tagged [`PhaseSpan::timestamp_provenance`] `"observed"` and
+    /// [`PhaseSpan::duration_semantic`] `"additive"`: a producer's own
+    /// `queued_at`/`started_at`/`ended_at`, captured in the order they
+    /// actually happened, are non-overlapping (execution cannot start before
+    /// it was queued, or end before it started), so
+    /// `queue_wait_ms + duration_ms` is exactly as sound a total here as it
+    /// is for [`Self::from_durations`]'s contract-checked disjoint durations.
+    /// A verification-phase reader (`rk-cli`'s `bbs_report`) only totals
+    /// spans carrying the `"additive"` tag; leaving it unset would silently
+    /// drop every observed span into the legacy/unknown bucket instead of
+    /// the real total.
+    ///
+    /// That ordering assumption can break: a genuine wall-clock
+    /// discontinuity between two capture points (an NTP correction, a leap
+    /// second — never assume a monotonic clock's behavior across a host
+    /// suspend is the same on every platform either) can make a later
+    /// boundary read earlier than one already captured. Detected here by
+    /// comparing every present pair; when any runs backwards the span is
+    /// instead tagged `timestamp_provenance` `"observed_discontinuous"` and
+    /// `duration_semantic` is left `None` — the raw timestamps are still
+    /// recorded (never swapped or dropped), but nothing claims the interval
+    /// between them is a sound elapsed duration, and a totaling reader
+    /// correctly treats it as unknown coverage rather than summing a
+    /// fabricated number. [`Self::queue_wait_ms`]/[`Self::duration_ms`]
+    /// independently yield `None` rather than a negative figure for exactly
+    /// this case.
     pub fn from_observed(
         task: impl Into<String>,
         phase: Phase,
@@ -361,8 +386,19 @@ impl PhaseSpan {
             span = span.ended_at(e);
         }
         if queued_at.is_some() || started_at.is_some() || ended_at.is_some() {
-            span.timestamp_provenance = Some("observed");
-            span.duration_semantic = Some("additive");
+            let backwards = [
+                (queued_at, started_at),
+                (started_at, ended_at),
+                (queued_at, ended_at),
+            ]
+            .into_iter()
+            .any(|(earlier, later)| matches!((earlier, later), (Some(e), Some(l)) if e > l));
+            if backwards {
+                span.timestamp_provenance = Some("observed_discontinuous");
+            } else {
+                span.timestamp_provenance = Some("observed");
+                span.duration_semantic = Some("additive");
+            }
         }
         span
     }
@@ -906,18 +942,66 @@ mod tests {
         assert_eq!(span.timestamp_provenance, Some("observed"));
     }
 
-    /// Queue wait, active execution duration and wall elapsed duration stay
-    /// three distinct numbers: a host suspend spanning the check's actual
-    /// execution makes the wall-clock gap (`duration_ms`, derived from real
-    /// `started_at`/`ended_at`) far larger than the monotonic
-    /// `duration_ms_monotonic` an `Instant` measured for the same occurrence,
-    /// and neither is silently added into the other.
+    /// A genuine wall-clock discontinuity between two capture points (an NTP
+    /// correction, a leap second) — `started_at` reading earlier than
+    /// `queued_at` — must not be silently corrected or dropped: the raw
+    /// observations are kept exactly as captured, but the span is tagged
+    /// `"observed_discontinuous"` rather than plain `"observed"`, and
+    /// `duration_semantic` is left unset so a totaling reader never sums a
+    /// fabricated interval across the discontinuity.
+    #[test]
+    fn a_backwards_wall_clock_pair_is_preserved_raw_and_tagged_discontinuous_not_dropped() {
+        let queued_at = Utc::now();
+        // The wall clock stepped backwards by a minute between the two
+        // captures — started_at reads earlier than queued_at.
+        let started_at = queued_at - chrono::Duration::minutes(1);
+        let ended_at = started_at + chrono::Duration::seconds(30);
+
+        let span = PhaseSpan::from_observed(
+            "TKT-clock-step",
+            Phase::VerificationQueued,
+            Some(queued_at),
+            Some(started_at),
+            Some(ended_at),
+        );
+        assert_eq!(
+            span.queued_at,
+            Some(queued_at),
+            "the raw observation is preserved even though it disagrees with started_at"
+        );
+        assert_eq!(span.started_at, Some(started_at));
+        assert_eq!(span.ended_at, Some(ended_at));
+        assert_eq!(span.timestamp_provenance, Some("observed_discontinuous"));
+        assert_eq!(
+            span.duration_semantic, None,
+            "a discontinuous span is never tagged additive"
+        );
+        assert_eq!(
+            span.queue_wait_ms(),
+            None,
+            "a negative wall-clock difference is reported unknown, never as a lie"
+        );
+        // The started_at..ended_at leg is internally consistent even though
+        // the overall span is discontinuous, so duration_ms is still sound.
+        assert_eq!(span.duration_ms(), Some(30_000));
+    }
+
+    /// Queue wait, execution-phase monotonic duration and wall elapsed
+    /// duration stay three distinct numbers. Modeling one concrete platform
+    /// behavior (a monotonic clock that does not advance across a host
+    /// suspend, while the wall clock necessarily does): a suspend spanning
+    /// the check's execution makes the wall-clock gap (`duration_ms`,
+    /// derived from real `started_at`/`ended_at`) far larger than the
+    /// monotonic `duration_ms_monotonic` an `Instant` measured for the same
+    /// occurrence, and neither is silently added into the other. This is one
+    /// possible relationship, not a claim about every platform — the two
+    /// figures are recorded independently precisely so a reader is never
+    /// forced to assume how they relate.
     #[test]
     fn wall_elapsed_and_monotonic_duration_diverge_under_a_host_suspend_without_double_counting() {
         let started_at = Utc::now();
-        // The check was actually only busy for 90s of monotonic/active time,
-        // but the host slept for 40 minutes in the middle of it, so the wall
-        // clock shows a much larger gap to the real `ended_at`.
+        // Models a monotonic clock unaffected by the suspend (90s of
+        // measured execution) against a wall clock that necessarily is.
         let monotonic_duration_ms = 90_000u64;
         let ended_at = started_at + chrono::Duration::minutes(40) + chrono::Duration::seconds(90);
 
