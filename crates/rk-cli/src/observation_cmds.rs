@@ -358,6 +358,19 @@ struct SamplingEvidence {
     /// rather than silently advancing past an event nothing ever read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     oversized_event_after: Option<String>,
+    /// Whether this sample was collected by a `SampleReader` that reconnects
+    /// after an RPC-level (not sample-level) timeout — see
+    /// `SampleReader::ensure_connected`. When true, an "RPC deadline
+    /// exceeded" error on one method is evidence about THAT method only:
+    /// every later read in the same sample was still attempted on a fresh
+    /// connection and must be judged on its own outcome. Absent/false on
+    /// samples collected before TKT-hapar-migur-vujuv (and on any sample
+    /// predating `ensure_connected` itself), when a timed-out connection was
+    /// never reopened and any later scheduled read genuinely never ran — for
+    /// those, an earlier RPC-level timeout must still be read the old,
+    /// conservative way (see `cascaded_skip`).
+    #[serde(default)]
+    reconnect_capable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1071,6 +1084,7 @@ async fn collect_sample(
     sample.sampling.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     sample.sampling.rpc_timeouts = client.timeouts;
     sample.sampling.deadline_exceeded = client.deadline_exceeded;
+    sample.sampling.reconnect_capable = true;
     log.append(&sample)?;
     Ok(sample)
 }
@@ -2314,10 +2328,13 @@ fn check_coverage(checks: &mut BTreeMap<String, Check>, name: &str, status: &Cov
 }
 
 /// RPC methods `collect_sample` calls, in order, up to and including
-/// `ticket.list`. A `deadline exceeded; remaining reads skipped` timeout
-/// (see `SampleReader::timed_out`) on any earlier method in this list drops
-/// the connection and skips every read scheduled after it in the same
-/// sample, `ticket.list` included — see `collect_sample`'s fixed RPC order.
+/// `ticket.list`. A `... sample deadline exceeded; remaining reads skipped`
+/// timeout (see `SampleReader::timed_out`) on any earlier method in this list
+/// is always terminal for the rest of the sample — no budget remains to
+/// reopen a connection, `ticket.list` included. An `... RPC deadline
+/// exceeded` timeout on an earlier method is terminal only when the sample
+/// predates reconnect (see `cascaded_skip`) — see `collect_sample`'s fixed
+/// RPC order.
 const PRE_TICKET_RPCS: &[&str] = &[
     "connect",
     "status",
@@ -2337,14 +2354,29 @@ const PRE_EVENT_RPCS: &[&str] = &[
     "agent.list",
 ];
 
-/// Whether any of `rpcs` reported the specific cascading-skip timeout that
-/// `SampleReader::timed_out` emits, which drops the connection and skips
-/// every subsequent read in the same sample.
-fn cascaded_skip(errors: &[String], rpcs: &[&str]) -> bool {
-    errors.iter().any(|error| {
+/// Whether any of `rpcs` reported a timeout in `sample.errors` that this
+/// sample's own reader could not have recovered from — i.e. every read
+/// scheduled after it in the same sample genuinely never ran.
+///
+/// A "sample deadline exceeded" timeout is always terminal: no budget
+/// remains to reopen a connection, in any version of `SampleReader`. An "RPC
+/// deadline exceeded" timeout is only terminal when `sample.sampling
+/// .reconnect_capable` is false — i.e. this sample predates
+/// `SampleReader::ensure_connected`'s reconnect (TKT-hapar-migur-vujuv).
+/// After that fix, the identical wording means the reader opened a fresh
+/// connection and attempted whatever ran next, so a later source in `rpcs`
+/// must be judged on its own recorded evidence instead of being lumped in
+/// with the one RPC that actually timed out. Preserving the old, conservative
+/// reading for samples without that evidence (absent/false) matters because
+/// historical samples collected before the reconnect fix carry the exact
+/// same error text for a timeout that truly did skip everything after it.
+fn cascaded_skip(sample: &Sample, rpcs: &[&str]) -> bool {
+    sample.errors.iter().any(|error| {
         rpcs.iter()
             .any(|rpc| error.starts_with(&format!("{rpc}: ")))
-            && error.contains("deadline exceeded; remaining reads skipped")
+            && (error.contains("sample deadline exceeded; remaining reads skipped")
+                || (!sample.sampling.reconnect_capable
+                    && error.contains("RPC deadline exceeded; remaining reads skipped")))
     })
 }
 
@@ -2352,26 +2384,44 @@ fn cascaded_skip(errors: &[String], rpcs: &[&str]) -> bool {
 /// that actually ran, as opposed to being empty only because an earlier
 /// timeout in the same sample skipped it (see `PRE_TICKET_RPCS`) or the read
 /// itself failed.
+///
+/// A non-empty `tickets`/`lineage` is direct, self-evident proof the read
+/// completed — `select_tickets` only ever populates them from THIS sample's
+/// own `ticket.list` response, never carried over from a prior sample — so
+/// it overrides `cascaded_skip` even on a sample that predates
+/// `reconnect_capable` (an old sample cannot fabricate rows it never read).
+/// That leaves `cascaded_skip` to arbitrate only the genuinely ambiguous
+/// case: a completed read that legitimately found nothing.
 fn sample_tickets_fresh(sample: &Sample) -> bool {
-    !cascaded_skip(&sample.errors, PRE_TICKET_RPCS)
-        && !sample
-            .errors
-            .iter()
-            .any(|error| error.starts_with("ticket.list:"))
+    if sample
+        .errors
+        .iter()
+        .any(|error| error.starts_with("ticket.list:"))
+    {
+        return false;
+    }
+    !sample.tickets.is_empty()
+        || !sample.lineage.is_empty()
+        || !cascaded_skip(sample, PRE_TICKET_RPCS)
 }
 
 /// Whether this sample's event-page loop drained to the live tip: no
-/// upstream cascade skip, no `space.scan` failure — old-format unbounded-scan
-/// `frame_too_large` text and the newer bounded-retry/oversized-frame
-/// messages alike, since both are recorded with the same `"space.scan: "`
-/// prefix — and no held oversized-event frontier.
+/// `space.scan` failure — old-format unbounded-scan `frame_too_large` text
+/// and the newer bounded-retry/oversized-frame messages alike, since both
+/// are recorded with the same `"space.scan: "` prefix — no held
+/// oversized-event frontier, and (see `sample_tickets_fresh`) either direct
+/// evidence this sample's own page loop returned rows or no upstream cascade
+/// skip.
 fn sample_events_fresh(sample: &Sample) -> bool {
-    !cascaded_skip(&sample.errors, PRE_EVENT_RPCS)
-        && !sample
-            .errors
-            .iter()
-            .any(|error| error.starts_with("space.scan:"))
-        && sample.sampling.oversized_event_after.is_none()
+    if sample
+        .errors
+        .iter()
+        .any(|error| error.starts_with("space.scan:"))
+        || sample.sampling.oversized_event_after.is_some()
+    {
+        return false;
+    }
+    !sample.events.is_empty() || !cascaded_skip(sample, PRE_EVENT_RPCS)
 }
 
 /// Coverage for one merged-across-samples source. Conservative by
@@ -3789,6 +3839,173 @@ mod tests {
             collected.event_cursor,
             Some(RecordId::floor_at(manifest.started_at).to_string()),
             "space.scan ran too, bootstrapped from the run's own boundary"
+        );
+    }
+
+    /// TKT-hapar-migur-vujuv: the collection-side reconnect fixed by
+    /// `a_slow_source_does_not_starve_later_essential_reads` was not enough —
+    /// the REPORT evaluator still read an earlier RPC-level timeout as proof
+    /// that every later read in the same sample was skipped, even though
+    /// `ensure_connected` had already reopened a connection and served them.
+    /// Reproduces the September 12 evidence (rk-king-bbs-repeat sample 2):
+    /// `work.current` times out mid-sample while `deadline_exceeded` stays
+    /// false, and ticket/agent/event collection recovers on a fresh
+    /// connection with real rows and an advanced cursor. Each source must be
+    /// judged on its own recovered evidence: ticket/event coverage read
+    /// `Complete`, while the original timed-out source (`work.current`) and
+    /// the sample as a whole still carry their own partial evidence.
+    #[tokio::test]
+    async fn a_recovered_read_after_an_rpc_timeout_is_not_misread_as_skipped() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (dir, mut manifest) = fixture();
+        manifest.tickets = vec!["TKT-1".into(), "TKT-2".into()];
+        manifest.rpc_timeout_secs = 1;
+        manifest.sample_timeout_secs = 5;
+        write_json_atomic(&dir.path().join(MANIFEST), &manifest).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(layout.socket_path()).unwrap();
+        let event_at = manifest.started_at + chrono::Duration::seconds(5);
+        let event_id = RecordId::floor_at(event_at).to_string();
+        let events_response = json!({
+            "tuples": [{"id": event_id, "created_at": event_at.to_rfc3339()}],
+            "truncated": false,
+        });
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let events_response = events_response.clone();
+                tokio::spawn(async move {
+                    let mut stream = tokio::io::BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let method = request["method"].as_str().unwrap().to_string();
+                        if method == "work.current" {
+                            // Slower than the RPC timeout; the client gives up
+                            // on this connection before any reply is sent, but
+                            // the overall sample deadline is nowhere near hit.
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            break;
+                        }
+                        let value = match method.as_str() {
+                            "status" => {
+                                json!({"pid": 1, "build_version": "test", "landing_queue": []})
+                            }
+                            "king.status" => json!({"state": {}}),
+                            "reconcile.report" => json!({"violations": []}),
+                            "ticket.list" => json!({"tickets": [
+                                {"scope": "repo", "identity": "TKT-1", "alias": "TKT-1",
+                                 "payload": {"status": "open"}},
+                                {"scope": "repo", "identity": "TKT-2", "alias": "TKT-2",
+                                 "payload": {"status": "open"}},
+                            ]}),
+                            "agent.list" => json!({"agents": [
+                                {"spawn": "s1", "session_id": "sess1", "name": "Rat-1",
+                                 "repo_name": "repo", "task": "TKT-1", "state": "running"},
+                                {"spawn": "s2", "session_id": "sess2", "name": "Rat-2",
+                                 "repo_name": "repo", "task": "TKT-2", "state": "running"},
+                            ]}),
+                            "space.scan" => events_response.clone(),
+                            _ => panic!("unexpected observation RPC {method}"),
+                        };
+                        let response = json!({"id": request["id"], "result": value,
+                            "server_version": rk_core::version::BUILD_VERSION});
+                        if stream
+                            .get_mut()
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let collected =
+            tokio::time::timeout(Duration::from_secs(4), append_sample(&layout, dir.path()))
+                .await
+                .unwrap()
+                .unwrap();
+        server.abort();
+        assert_eq!(collected.sampling.rpc_timeouts, ["work.current"]);
+        assert!(
+            !collected.sampling.deadline_exceeded,
+            "only the one RPC timed out, not the overall sample budget"
+        );
+        assert!(
+            collected.work.is_none(),
+            "the source that actually timed out stays failed"
+        );
+        assert_eq!(
+            collected.tickets.len(),
+            2,
+            "ticket.list recovered on a fresh connection"
+        );
+        assert_eq!(
+            collected.agents.len(),
+            2,
+            "agent.list recovered on a fresh connection"
+        );
+        assert_eq!(collected.event_cursor, Some(event_id));
+        assert_eq!(
+            collected.events.len(),
+            1,
+            "space.scan recovered on a fresh connection"
+        );
+
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(
+            report.ticket_coverage.coverage,
+            Coverage::Complete,
+            "ticket.list's own recovered evidence must not be discarded because an \
+             earlier, unrelated RPC in the same sample timed out: {:?}",
+            report.ticket_coverage
+        );
+        assert_eq!(
+            report.event_coverage.coverage,
+            Coverage::Complete,
+            "space.scan's own recovered evidence must likewise stand on its own: {:?}",
+            report.event_coverage
+        );
+        assert!(report.checks["ticket-coverage"].passed);
+        assert!(report.checks["event-coverage"].passed);
+        assert_eq!(
+            report.partial_samples, 1,
+            "the sample as a whole, and the RPC that actually timed out, remain partial evidence"
+        );
+    }
+
+    /// TKT-hapar-migur-vujuv: a sample collected before `SampleReader`
+    /// gained reconnect (`sampling.reconnect_capable` absent/false) must keep
+    /// reading an "RPC deadline exceeded" timeout the old, conservative way —
+    /// that reader never reopened a connection, so a later source in the
+    /// same sample genuinely never ran even though the wording is identical
+    /// to a recovered timeout under the current reader.
+    #[test]
+    fn a_pre_reconnect_sample_still_reads_a_cascaded_skip_as_incomplete() {
+        let (dir, _) = fixture();
+        let first = sample(1, "2026-09-02T00:00:30Z");
+        let mut legacy = sample(2, "2026-09-02T00:01:00Z");
+        legacy.errors = vec!["work.current: RPC deadline exceeded; remaining reads skipped".into()];
+        legacy.tickets = vec![];
+        assert!(!legacy.sampling.reconnect_capable);
+        for value in [first, legacy] {
+            append_json_line(&dir.path().join(SAMPLES), &value).unwrap();
+        }
+        let report = derive_report(dir.path()).unwrap();
+        assert_eq!(
+            report.ticket_coverage.coverage,
+            Coverage::Incomplete,
+            "no reconnect evidence on this sample, so the old conservative reading must hold: {:?}",
+            report.ticket_coverage
         );
     }
 
