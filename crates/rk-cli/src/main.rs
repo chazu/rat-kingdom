@@ -15,6 +15,7 @@ mod observe;
 mod product_to_code_cmds;
 mod reconcile_cmds;
 mod reconcile_repair_cmds;
+mod release_cmds;
 mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
@@ -252,6 +253,11 @@ enum Command {
     Ticket {
         #[command(subcommand)]
         command: TicketCommand,
+    },
+    /// Prepare and inspect immutable paired rk/rk-mcp releases (P6.1).
+    Release {
+        #[command(subcommand)]
+        command: release_cmds::ReleaseCommand,
     },
     /// Ingest canonical SDLC feedback events and read current facts.
     Ingest {
@@ -1294,6 +1300,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Ingest { command } => ingest_cmds::run(&layout, command, cli.json).await?,
+        Command::Release { command } => release_cmds::run(&layout, command, cli.json).await?,
         Command::Workflow { command } => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             match command {
