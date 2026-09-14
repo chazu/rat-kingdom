@@ -12,6 +12,8 @@
 //! delivery and pricing snapshots) are reported as `unobserved` with
 //! `available=false`, never as zero failures.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -33,6 +35,19 @@ use rk_core::tuple::Tuple;
 
 /// Wire schema version of the read-only analytics envelopes.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Wire schema version of the additive `native_delivery` section — versioned
+/// independently of [`SCHEMA_VERSION`] because it reads a different producer
+/// (`landing::mark_processed`'s `landing_processed` markers, not the
+/// `OutcomeFact`/scorecard pipeline every other metric here goes through).
+pub const NATIVE_DELIVERY_SCHEMA_VERSION: u32 = 1;
+
+/// The exact `outcome` strings [`crate::landing::LandingPipeline::mark_processed`]
+/// writes into a `landing_processed` marker's payload, other than `"landed"`
+/// (handled separately as delivery). Any other value is malformed/unrecognized,
+/// not a silently-ignored new outcome.
+const NATIVE_NON_DELIVERY_OUTCOMES: &[&str] =
+    &["gate-held", "no-gate", "rework-filed", "escalated", "empty"];
 
 /// Source families that RK exposes as structured records today and can populate
 /// with observed facts. Everything else is reported as `unobserved`.
@@ -113,6 +128,33 @@ pub struct AnalyticsInputs {
     pub reviewer_verdicts: Vec<Tuple>,
     pub runtime_unavailable: Vec<OutcomeEvidenceKind>,
     pub read_warnings: Vec<String>,
+    pub native_delivery: NativeDeliveryInputs,
+}
+
+/// Bounded raw read of `landing_processed` markers plus the exact facts about
+/// that read the `native_delivery` coverage report needs — a bare `Vec<Tuple>`
+/// cannot say whether the storage query hit its cap or failed outright, and
+/// guessing either would let the section look complete when it is not.
+#[derive(Default)]
+pub struct NativeDeliveryInputs {
+    /// In-window markers, already capped at `limit` by the storage query
+    /// itself (`Space::scan_newest_limited`) before this payload was built.
+    pub events: Vec<Tuple>,
+    /// Raw count returned by the bounded query before the since/until window
+    /// filter was applied in Rust — i.e. `events.len()` plus anything the
+    /// window excluded, capped at `limit`.
+    pub scanned: usize,
+    /// The configured bound passed to the storage query.
+    pub limit: usize,
+    /// `true` when the query returned strictly more than `limit` rows,
+    /// meaning older `landing_processed` markers exist beyond this read and
+    /// coverage is a strict subset, not the full history.
+    pub truncated: bool,
+    /// `false` only on a runtime read failure (the pattern above never
+    /// reaches storage, or storage errors) — never on "zero markers found",
+    /// which is a legitimate empty-but-observed result.
+    pub available: bool,
+    pub read_warning: Option<String>,
 }
 
 #[cfg(test)]
@@ -652,6 +694,297 @@ fn availability_envelope(
     (source_counts, availability, warnings)
 }
 
+/// A `landing_processed` marker's typed fields, once its native provenance,
+/// work-key identity and outcome are all known to be present and recognized.
+/// Fields the reduction below needs are owned strings — the source set is
+/// already bounded by [`NativeDeliveryInputs::limit`], so cloning here is not
+/// an unbounded cost.
+struct NativeDeliveryRecord {
+    branch: String,
+    head_sha: String,
+    target: String,
+    outcome: String,
+    task: Option<String>,
+    /// The target's tip captured at write time (`landing::LandingPipeline::
+    /// mark_processed`), best-effort and `None` when unresolved — never
+    /// itself a conflict signal by omission, only when two *present* values
+    /// for one landed work key disagree (module doc on the producer: a
+    /// non-landed marker's `target_head` can legitimately go stale and get
+    /// superseded, but a landed marker's should not vary for the same key).
+    target_head: Option<String>,
+}
+
+/// `tuple` really is a native daemon-authored `landing_processed` marker, not
+/// merely a record whose payload happens to carry matching field names. The
+/// storage-side query already filters on category/identity/scope; this is
+/// the same defensive re-check this module applies to every other source
+/// family (`is_structured_revert_fact`, `is_structured_rework_artifact`) so
+/// the pure reducer never trusts an untyped `Vec<Tuple>` on faith alone.
+/// `instance == "daemon"` is the one check the storage-side pattern cannot
+/// express: only [`crate::landing::LandingPipeline::mark_processed`] ever
+/// writes this identity, always under that fixed producer instance.
+fn is_native_landing_processed_marker(tuple: &Tuple) -> bool {
+    tuple.category == rk_core::tuple::Category::Event
+        && tuple.identity == crate::landing::LANDING_PROCESSED_IDENTITY
+        && tuple.instance == "daemon"
+}
+
+fn parse_native_delivery_record(tuple: &Tuple) -> Option<NativeDeliveryRecord> {
+    if !is_native_landing_processed_marker(tuple) {
+        return None;
+    }
+    let get = |field: &str| -> Option<String> {
+        tuple
+            .payload
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let branch = get("branch")?;
+    let head_sha = get("head_sha")?;
+    let target = get("target")?;
+    let outcome = get("outcome")?;
+    if outcome != "landed" && !NATIVE_NON_DELIVERY_OUTCOMES.contains(&outcome.as_str()) {
+        return None;
+    }
+    Some(NativeDeliveryRecord {
+        branch,
+        head_sha,
+        target,
+        outcome,
+        task: get("task"),
+        target_head: get("target_head"),
+    })
+}
+
+/// One distinct `(branch, head_sha, target)` work key's reduced disposition.
+/// Kept as an enum (rather than folding straight into counters) so the
+/// per-group decision is made once, in one place, and is exhaustively
+/// testable independent of the JSON shape.
+enum NativeDeliveryDisposition<'a> {
+    /// A `"landed"` marker exists for this key and its task/target_head
+    /// bindings agree (or are absent) — a genuine, cleanly attributed
+    /// delivery edge. `task` is `None` for legitimate ad hoc delivery: a
+    /// native land with no ticket attached is not an error.
+    Delivered { task: Option<&'a str> },
+    /// A `"landed"` marker exists, but its own task or target_head bindings
+    /// disagree across records for this exact key — contradictory, not
+    /// silently attributed to either value and not folded into the plain
+    /// `Delivered` count.
+    DeliveredConflicting { conflict: &'static str },
+    /// Never landed; every record observed for this key agrees on the same
+    /// single non-delivery outcome.
+    NeverDelivered { outcome: &'a str },
+    /// Never landed, and the non-delivery outcomes recorded for this key
+    /// disagree — order-independent by construction (module doc), so this is
+    /// reported unknown rather than guessed via ULID or wall-clock order.
+    ConflictingOutcome,
+}
+
+fn reduce_native_delivery_group(records: &[(String, Option<String>, Option<String>)]) -> NativeDeliveryDisposition<'_> {
+    let outcomes: BTreeSet<&str> = records.iter().map(|(o, _, _)| o.as_str()).collect();
+    if outcomes.contains("landed") {
+        let landed = || records.iter().filter(|(outcome, _, _)| outcome == "landed");
+        let tasks: BTreeSet<&str> = landed().filter_map(|(_, t, _)| t.as_deref()).collect();
+        if tasks.len() > 1 {
+            return NativeDeliveryDisposition::DeliveredConflicting { conflict: "task" };
+        }
+        let target_heads: BTreeSet<&str> = landed().filter_map(|(_, _, h)| h.as_deref()).collect();
+        if target_heads.len() > 1 {
+            return NativeDeliveryDisposition::DeliveredConflicting {
+                conflict: "target_head",
+            };
+        }
+        NativeDeliveryDisposition::Delivered {
+            task: tasks.into_iter().next(),
+        }
+    } else if outcomes.len() == 1 {
+        NativeDeliveryDisposition::NeverDelivered {
+            outcome: outcomes.into_iter().next().expect("len==1"),
+        }
+    } else {
+        NativeDeliveryDisposition::ConflictingOutcome
+    }
+}
+
+/// Reduce raw `landing_processed` markers into the additive `native_delivery`
+/// section: bounded coverage, exact source ids, one delivery-edge count per
+/// distinct `(branch, head_sha, target)` work key, clearly named
+/// never-delivered work keys, and a separate raw incident tally that a later
+/// successful land cannot erase. See [`landing`](crate::landing) module doc
+/// for the producer contract this reads.
+///
+/// Two independent accounting axes, deliberately not merged:
+///   - Per-work-key summary (`delivered_edges`, `never_delivered`, and the
+///     `unknown` conflict buckets): one disposition per distinct key, from
+///     [`reduce_native_delivery_group`].
+///   - `observed_incidents`: a raw, non-deduplicated tally of every
+///     non-`"landed"` marker actually read. A key that failed gates twice
+///     before eventually landing still shows two recorded `gate_held`
+///     incidents — the eventual delivery does not retroactively erase the
+///     failure evidence.
+///
+/// Dedup within the per-key summary is a SET membership test on outcomes,
+/// not a comparison by `Tuple::id` (ULID mint order) or `created_at` (wall
+/// clock) — either would risk reordering a delayed writer's records. A
+/// `"landed"` marker anywhere in a key's group makes that key delivered
+/// regardless of how many other markers exist or in what order they were
+/// read, matching this producer's own invariant that a landed outcome is
+/// always current (`landing::LandingPipeline::admission_marker` doc). A key
+/// whose non-delivery markers disagree without ever landing has no
+/// order-independent way to prefer one verdict over another, so it is
+/// reported `conflicting_outcome` rather than guessed.
+fn native_delivery_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsRequest) -> Value {
+    let cov = &inputs.native_delivery;
+
+    let mut source_ids: Vec<String> = Vec::with_capacity(cov.events.len());
+    let mut malformed_ids: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<(String, String, String), Vec<(String, Option<String>, Option<String>)>> =
+        BTreeMap::new();
+    let mut observed_incidents: BTreeMap<&'static str, u64> = NATIVE_NON_DELIVERY_OUTCOMES
+        .iter()
+        .map(|outcome| (*outcome, 0u64))
+        .collect();
+
+    for tuple in &cov.events {
+        source_ids.push(tuple.id.to_string());
+        match parse_native_delivery_record(tuple) {
+            Some(record) => {
+                if record.outcome != "landed" {
+                    // Raw incident tally: independent of which work key this
+                    // belongs to and independent of that key's eventual
+                    // outcome (doc above) — never gated on `available` since
+                    // this loop only runs when the read itself succeeded.
+                    *observed_incidents
+                        .get_mut(record.outcome.as_str())
+                        .expect("checked by parse_native_delivery_record") += 1;
+                }
+                groups
+                    .entry((record.branch, record.head_sha, record.target))
+                    .or_default()
+                    .push((record.outcome, record.task, record.target_head));
+            }
+            None => malformed_ids.push(tuple.id.to_string()),
+        }
+    }
+    source_ids.sort();
+    malformed_ids.sort();
+
+    let mut delivered_edges: u64 = 0;
+    let mut delivered_edges_without_task: u64 = 0;
+    let mut delivered_tasks: BTreeSet<String> = BTreeSet::new();
+    let mut never_delivered: BTreeMap<&'static str, u64> = NATIVE_NON_DELIVERY_OUTCOMES
+        .iter()
+        .map(|outcome| (*outcome, 0u64))
+        .collect();
+    let mut conflicting_task: u64 = 0;
+    let mut conflicting_target_head: u64 = 0;
+    let mut conflicting_outcome: u64 = 0;
+
+    for records in groups.values() {
+        match reduce_native_delivery_group(records) {
+            NativeDeliveryDisposition::Delivered { task } => {
+                delivered_edges += 1;
+                match task {
+                    Some(task) => {
+                        delivered_tasks.insert(task.to_owned());
+                    }
+                    None => delivered_edges_without_task += 1,
+                }
+            }
+            NativeDeliveryDisposition::DeliveredConflicting { conflict: "task" } => {
+                conflicting_task += 1;
+            }
+            NativeDeliveryDisposition::DeliveredConflicting { .. } => {
+                conflicting_target_head += 1;
+            }
+            NativeDeliveryDisposition::NeverDelivered { outcome } => {
+                *never_delivered.get_mut(outcome).expect("known outcome") += 1;
+            }
+            NativeDeliveryDisposition::ConflictingOutcome => {
+                conflicting_outcome += 1;
+            }
+        }
+    }
+
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(warning) = &cov.read_warning {
+        warnings.push(warning.clone());
+    }
+    if cov.truncated {
+        warnings.push(format!(
+            "native_delivery_coverage_truncated: read capped at {} landing_processed markers ordered by descending tuple id; older-by-id markers beyond this bound are not reflected",
+            cov.limit
+        ));
+    }
+
+    // A failed read renders every derived count `null`, not `0` — a `0` here
+    // would read as "observed and confirmed empty," which is exactly the
+    // false-healthy-zero this module's own doc (top of file) exists to rule
+    // out for every other source family.
+    let count = |value: u64| -> Value {
+        if cov.available {
+            json!(value)
+        } else {
+            Value::Null
+        }
+    };
+    let opt_count = |value: usize| -> Value {
+        if cov.available {
+            json!(value)
+        } else {
+            Value::Null
+        }
+    };
+
+    json!({
+        "schema_version": NATIVE_DELIVERY_SCHEMA_VERSION,
+        "source": "landing_processed",
+        "available": cov.available,
+        "requested_window": {"since": req.since, "until": req.until},
+        "coverage": {
+            "scanned": opt_count(cov.scanned),
+            "in_window": opt_count(cov.events.len()),
+            "limit": cov.limit,
+            "truncated": if cov.available { json!(cov.truncated) } else { Value::Null },
+            // `Space::scan_newest_limited` orders by descending tuple id
+            // (ULID mint order), not by persistence/commit sequence or wall
+            // clock — naming it plainly rather than "newest_first" so a
+            // reader does not assume temporal completeness a delayed writer
+            // could violate. The reduction above never relies on this order.
+            "order": "id_desc",
+        },
+        "source_ids": if cov.available { json!(source_ids) } else { json!([]) },
+        "delivered_edges": count(delivered_edges),
+        "delivered_edges_without_task": count(delivered_edges_without_task),
+        "delivered_tasks": count(delivered_tasks.len() as u64),
+        "never_delivered": {
+            "gate_held": count(never_delivered["gate-held"]),
+            "no_gate": count(never_delivered["no-gate"]),
+            "rework_filed": count(never_delivered["rework-filed"]),
+            "escalated": count(never_delivered["escalated"]),
+            "empty": count(never_delivered["empty"]),
+        },
+        "observed_incidents": {
+            "gate_held": count(observed_incidents["gate-held"]),
+            "no_gate": count(observed_incidents["no-gate"]),
+            "rework_filed": count(observed_incidents["rework-filed"]),
+            "escalated": count(observed_incidents["escalated"]),
+            "empty": count(observed_incidents["empty"]),
+        },
+        "unknown": {
+            "malformed": opt_count(malformed_ids.len()),
+            "malformed_source_ids": if cov.available { json!(malformed_ids) } else { json!([]) },
+            "conflicting_task": count(conflicting_task),
+            "conflicting_target_head": count(conflicting_target_head),
+            "conflicting_outcome": count(conflicting_outcome),
+        },
+        "warnings": warnings,
+    })
+}
+
 /// Build the read-only `factory.scorecards` response envelope.
 pub fn scorecards_response(
     inputs: &AnalyticsInputs,
@@ -670,6 +1003,7 @@ pub fn scorecards_response(
         "source_counts": source_counts,
         "availability": availability,
         "scorecards": rows,
+        "native_delivery": native_delivery_section(inputs, req),
         "warnings": warnings,
     })
 }
@@ -837,6 +1171,10 @@ mod tests {
             reviewer_verdicts: Vec::new(),
             runtime_unavailable: Vec::new(),
             read_warnings: Vec::new(),
+            native_delivery: NativeDeliveryInputs {
+                available: true,
+                ..Default::default()
+            },
         }
     }
 

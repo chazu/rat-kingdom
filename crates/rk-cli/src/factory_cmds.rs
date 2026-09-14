@@ -1503,10 +1503,83 @@ fn render_warnings(out: &mut String, result: &Value) {
     }
 }
 
+/// Render the additive `native_delivery` section (`landing_processed`
+/// markers — see `factory_analytics::native_delivery_section`). Distinct from
+/// `## Scorecards` above: this reads the daemon-native landing pipeline
+/// directly, not the `OutcomeFact` aggregation, and every count renders `n/a`
+/// rather than `0` when the underlying read failed — a `0` here would read as
+/// "observed and confirmed empty" instead of "unknown".
+fn render_native_delivery(out: &mut String, result: &Value) {
+    out.push_str("## Native Delivery\n\n");
+    let section = &result["native_delivery"];
+    if section.is_null() {
+        out.push_str("(not reported)\n\n");
+        return;
+    }
+    let count = |value: &Value| -> String {
+        value
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "n/a".into())
+    };
+    let coverage = &section["coverage"];
+    out.push_str(&format!(
+        "- available={} scanned={} in_window={} limit={} truncated={} order={}\n",
+        section["available"].as_bool().unwrap_or(false),
+        count(&coverage["scanned"]),
+        count(&coverage["in_window"]),
+        coverage["limit"].as_u64().unwrap_or(0),
+        coverage["truncated"]
+            .as_bool()
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        coverage["order"].as_str().unwrap_or("?"),
+    ));
+    out.push_str(&format!(
+        "- delivered_edges={} (without_task={}) delivered_tasks={}\n",
+        count(&section["delivered_edges"]),
+        count(&section["delivered_edges_without_task"]),
+        count(&section["delivered_tasks"]),
+    ));
+    let never = &section["never_delivered"];
+    out.push_str(&format!(
+        "- never_delivered: gate_held={} no_gate={} rework_filed={} escalated={} empty={}\n",
+        count(&never["gate_held"]),
+        count(&never["no_gate"]),
+        count(&never["rework_filed"]),
+        count(&never["escalated"]),
+        count(&never["empty"]),
+    ));
+    let incidents = &section["observed_incidents"];
+    out.push_str(&format!(
+        "- observed_incidents (raw, not deduplicated by work key): gate_held={} no_gate={} rework_filed={} escalated={} empty={}\n",
+        count(&incidents["gate_held"]),
+        count(&incidents["no_gate"]),
+        count(&incidents["rework_filed"]),
+        count(&incidents["escalated"]),
+        count(&incidents["empty"]),
+    ));
+    let unknown = &section["unknown"];
+    out.push_str(&format!(
+        "- unknown: malformed={} conflicting_task={} conflicting_target_head={} conflicting_outcome={}\n",
+        count(&unknown["malformed"]),
+        count(&unknown["conflicting_task"]),
+        count(&unknown["conflicting_target_head"]),
+        count(&unknown["conflicting_outcome"]),
+    ));
+    if let Some(warnings) = section["warnings"].as_array() {
+        for warning in warnings {
+            out.push_str(&format!("- warning: {}\n", warning.as_str().unwrap_or("")));
+        }
+    }
+    out.push('\n');
+}
+
 fn render_scorecards_markdown(result: &Value) -> String {
     let mut out = String::from("# Factory Scorecards\n\n");
     render_source_counts(&mut out, result);
     render_scorecard_rows(&mut out, result);
+    render_native_delivery(&mut out, result);
     render_warnings(&mut out, result);
     out
 }
