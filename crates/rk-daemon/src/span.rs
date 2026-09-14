@@ -332,6 +332,17 @@ impl PhaseSpan {
     /// across a discontinuity (a host suspend, a delayed publish) between
     /// two of the boundaries — unlike [`Self::from_durations`], nothing here
     /// depends on when the caller happens to invoke this constructor.
+    ///
+    /// Also tagged [`PhaseSpan::duration_semantic`] `"additive"`: a
+    /// producer's own `queued_at`/`started_at`/`ended_at`, captured in the
+    /// order they actually happened, are non-overlapping by construction
+    /// (execution cannot start before it was queued, or end before it
+    /// started), so `queue_wait_ms + duration_ms` is exactly as sound a
+    /// total here as it is for [`Self::from_durations`]'s contract-checked
+    /// disjoint durations. A verification-phase reader
+    /// (`rk-cli`'s `bbs_report`) only totals spans carrying this tag; leaving
+    /// it unset here would silently drop every observed span into the
+    /// legacy/unknown bucket instead of the real total.
     pub fn from_observed(
         task: impl Into<String>,
         phase: Phase,
@@ -351,6 +362,7 @@ impl PhaseSpan {
         }
         if queued_at.is_some() || started_at.is_some() || ended_at.is_some() {
             span.timestamp_provenance = Some("observed");
+            span.duration_semantic = Some("additive");
         }
         span
     }

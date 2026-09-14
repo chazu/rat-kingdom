@@ -496,8 +496,19 @@ struct CheckVerificationSpan<'a> {
     attempt: u32,
     candidate: &'a str,
     full_check_required: bool,
-    queue_wait_ms: Option<u64>,
-    duration_ms: Option<u64>,
+    /// Real wall-clock boundaries `RunProgress` captured at the moment each
+    /// actually occurred (`None` when no execution happened at all — a
+    /// reused proof or a resume-from-durable-evidence path never observes
+    /// one). Never reconstructed from a duration and a later `now`
+    /// (span.rs's `PhaseSpan::from_observed` doc, TKT-hodij-lujak-kibon).
+    queued_at: Option<DateTime<Utc>>,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+    /// Monotonic (`Instant`-measured) admission wait/execution duration,
+    /// kept distinct from the wall-clock timestamps above — see
+    /// `PhaseSpan::queue_wait_ms_monotonic`'s doc.
+    queue_wait_ms_monotonic: Option<u64>,
+    duration_ms_monotonic: Option<u64>,
     /// Whether this check's pass came from a reused durable proof
     /// (TKT-01M0QRZ7QT8CQD74GHRN81XFT5) rather than actually executing the
     /// command in the gate worktree.
@@ -6781,8 +6792,11 @@ impl LandingPipeline {
                             attempt: check_attempt,
                             candidate: tested_sha,
                             full_check_required,
-                            queue_wait_ms: None,
-                            duration_ms: None,
+                            queued_at: None,
+                            started_at: None,
+                            ended_at: None,
+                            queue_wait_ms_monotonic: None,
+                            duration_ms_monotonic: None,
                             proof_reused: false,
                             occurrence_key: occurrence_key.clone(),
                         },
@@ -6829,20 +6843,23 @@ impl LandingPipeline {
                 {
                     return Ok(GateRunOutcome::InfraRetryExhausted);
                 }
-                // Execution-only duration, measured from when this check
-                // actually started running (after admission settled) rather
-                // than from before the admission wait — the two are recorded
-                // as distinct, non-overlapping fields (`queue_wait_ms` is
-                // admission wait, this is execution) so a consumer that adds
-                // them for a total never double-counts the wait the way a
-                // single elapsed-since-before-admission timer would.
-                let (check_queue_wait_ms, check_duration_ms) = {
+                // Real observed boundaries, frozen once by `run()` at the
+                // moment execution actually settled — read here, not
+                // re-derived, since `finish_infra_retry`'s `.await` above is
+                // exactly the kind of downstream delay that would otherwise
+                // shift a reconstructed `ended_at` away from when the check
+                // truly finished (span.rs's `from_durations` doc,
+                // TKT-hodij-lujak-kibon). `check_queue_wait_ms` (monotonic,
+                // `Instant`-measured) stays the admission-wait figure other
+                // consumers below already expect.
+                let (queued_at, started_at, ended_at, check_queue_wait_ms, check_duration_ms) = {
                     let p = progress.lock().unwrap();
                     (
+                        p.queued_at_wall,
+                        p.started_at_wall,
+                        p.settled.map(|s| s.ended_at_wall),
                         p.queue_wait_ms(),
-                        p.execution_started_at.map(|started| {
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-                        }),
+                        p.settled.map(|s| s.duration_ms),
                     )
                 };
                 self.record_check_verification_span(
@@ -6852,8 +6869,11 @@ impl LandingPipeline {
                         attempt: check_attempt,
                         candidate: tested_sha,
                         full_check_required,
-                        queue_wait_ms: check_queue_wait_ms,
-                        duration_ms: check_duration_ms,
+                        queued_at,
+                        started_at,
+                        ended_at,
+                        queue_wait_ms_monotonic: check_queue_wait_ms,
+                        duration_ms_monotonic: check_duration_ms,
                         proof_reused: false,
                         occurrence_key: occurrence_key.clone(),
                     },
@@ -6899,8 +6919,11 @@ impl LandingPipeline {
                             attempt: check_attempt,
                             candidate: tested_sha,
                             full_check_required,
-                            queue_wait_ms: None,
-                            duration_ms: None,
+                            queued_at: None,
+                            started_at: None,
+                            ended_at: None,
+                            queue_wait_ms_monotonic: None,
+                            duration_ms_monotonic: None,
                             proof_reused: true,
                             occurrence_key: occurrence_key.clone(),
                         },
@@ -7026,15 +7049,17 @@ impl LandingPipeline {
                     return Ok(GateRunOutcome::Fail);
                 }
             }
-            // See the infra-retry branch above for why this is measured from
-            // `execution_started_at`, not from before admission.
-            let (check_queue_wait_ms, check_duration_ms) = {
+            // See the infra-retry branch above for why these are the frozen
+            // observations `run()` recorded, not re-derived from
+            // `execution_started_at.elapsed()` here.
+            let (queued_at, started_at, ended_at, check_queue_wait_ms, check_duration_ms) = {
                 let p = progress.lock().unwrap();
                 (
+                    p.queued_at_wall,
+                    p.started_at_wall,
+                    p.settled.map(|s| s.ended_at_wall),
                     p.queue_wait_ms(),
-                    p.execution_started_at.map(|started| {
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-                    }),
+                    p.settled.map(|s| s.duration_ms),
                 )
             };
             self.record_check_verification_span(
@@ -7044,8 +7069,11 @@ impl LandingPipeline {
                     attempt: check_attempt,
                     candidate: tested_sha,
                     full_check_required,
-                    queue_wait_ms: check_queue_wait_ms,
-                    duration_ms: check_duration_ms,
+                    queued_at,
+                    started_at,
+                    ended_at,
+                    queue_wait_ms_monotonic: check_queue_wait_ms,
+                    duration_ms_monotonic: check_duration_ms,
                     proof_reused: false,
                     occurrence_key: occurrence_key.clone(),
                 },
@@ -7221,17 +7249,20 @@ impl LandingPipeline {
             attempt,
             candidate,
             full_check_required,
-            queue_wait_ms,
-            duration_ms,
+            queued_at,
+            started_at,
+            ended_at,
+            queue_wait_ms_monotonic,
+            duration_ms_monotonic,
             proof_reused,
             occurrence_key,
         } = occurrence;
-        let mut span = crate::span::PhaseSpan::from_durations(
+        let mut span = crate::span::PhaseSpan::from_observed(
             &entry.task,
             crate::span::Phase::VerificationQueued,
-            queue_wait_ms,
-            duration_ms,
-            Utc::now(),
+            queued_at,
+            started_at,
+            ended_at,
         )
         .attempt(attempt)
         .repo(&entry.repo_name)
@@ -7246,6 +7277,12 @@ impl LandingPipeline {
         .proof_reused(proof_reused);
         if let Some(key) = occurrence_key {
             span = span.occurrence_key(key);
+        }
+        if let Some(ms) = queue_wait_ms_monotonic {
+            span = span.queue_wait_ms_monotonic(ms);
+        }
+        if let Some(ms) = duration_ms_monotonic {
+            span = span.duration_ms_monotonic(ms);
         }
         let _ = crate::span::record_phase_span(&self.space, &entry.repo_name, "daemon", &span);
     }

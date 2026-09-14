@@ -3,7 +3,7 @@
 //! Workflow routing and landing policy compose this module without owning child
 //! process lifetimes or maintaining another verification queue.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
@@ -36,6 +36,38 @@ pub(crate) struct VerificationResources {
     pub(crate) test_exec_lock: TestExecLock,
     pub(crate) admission: VerificationAdmission,
     pub(crate) runs: ManagedVerificationRuns,
+    pub(crate) clock: SpanClock,
+}
+
+/// The single injectable wall-clock seam [`ManagedVerification::run`] reads
+/// to stamp `RunProgress`'s real `queued_at`/`started_at`/`ended_at`
+/// boundaries — production wiring is `Utc::now` ([`Default`]); a test
+/// substitutes a clock it controls to model a delayed publish or a host
+/// suspend deterministically, without actually sleeping the test host.
+/// Follows the same narrow-injectable-seam idiom as `landing.rs`'s
+/// `RetrySchedule`: nothing outside this one field reads through it, so a
+/// frozen/advancing test clock here cannot distort unrelated behavior.
+pub(crate) struct SpanClock {
+    now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+}
+
+impl SpanClock {
+    pub(crate) fn now(&self) -> DateTime<Utc> {
+        (self.now)()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_fn(now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
+        Self { now: Box::new(now) }
+    }
+}
+
+impl Default for SpanClock {
+    fn default() -> Self {
+        Self {
+            now: Box::new(Utc::now),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -151,8 +183,11 @@ impl<'a> ManagedVerification<'a> {
                         repo_name,
                         check_name,
                         candidate: sha,
-                        queue_wait_ms: None,
-                        duration_ms: None,
+                        queued_at: None,
+                        started_at: None,
+                        ended_at: None,
+                        queue_wait_ms_monotonic: None,
+                        duration_ms_monotonic: None,
                         proof_reused: true,
                         terminal_reason: "reused",
                     });
@@ -195,15 +230,22 @@ impl<'a> ManagedVerification<'a> {
         let result = match outcome {
             Ok(result) => result?,
             Err(reason) => {
-                let (queue_wait_ms, duration_ms) = {
+                // A cancellation is settled right here, at the moment it's
+                // observed — `ended_at` is real, not reconstructed later —
+                // but never `run()`'s own `Settled` (execution never finished
+                // normally, so there is nothing frozen to read).
+                let (queued_at, started_at, queue_wait_ms, duration_ms) = {
                     let p = progress.lock().unwrap();
                     (
+                        p.queued_at_wall,
+                        p.started_at_wall,
                         p.queue_wait_ms,
                         p.execution_started_at.map(|started| {
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
                         }),
                     )
                 };
+                let ended_at = started_at.map(|_| self.resources.clock.now());
                 self.record_verification_cancellation(
                     repo_name,
                     agent,
@@ -221,8 +263,11 @@ impl<'a> ManagedVerification<'a> {
                         repo_name,
                         check_name,
                         candidate: candidate_sha.as_deref().unwrap_or("dirty"),
-                        queue_wait_ms,
-                        duration_ms,
+                        queued_at,
+                        started_at,
+                        ended_at,
+                        queue_wait_ms_monotonic: queue_wait_ms,
+                        duration_ms_monotonic: duration_ms,
                         proof_reused: false,
                         terminal_reason: reason,
                     });
@@ -240,13 +285,14 @@ impl<'a> ManagedVerification<'a> {
         }
 
         if let Some(task) = task {
-            let (queue_wait_ms, duration_ms) = {
+            let (queued_at, started_at, ended_at, queue_wait_ms, duration_ms) = {
                 let p = progress.lock().unwrap();
                 (
+                    p.queued_at_wall,
+                    p.started_at_wall,
+                    p.settled.map(|s| s.ended_at_wall),
                     p.queue_wait_ms,
-                    p.execution_started_at.map(|started| {
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-                    }),
+                    p.settled.map(|s| s.duration_ms),
                 )
             };
             self.record_ad_hoc_verification_span(AdHocVerificationSpan {
@@ -254,8 +300,11 @@ impl<'a> ManagedVerification<'a> {
                 repo_name,
                 check_name,
                 candidate: candidate_sha.as_deref().unwrap_or("dirty"),
-                queue_wait_ms,
-                duration_ms,
+                queued_at,
+                started_at,
+                ended_at,
+                queue_wait_ms_monotonic: queue_wait_ms,
+                duration_ms_monotonic: duration_ms,
                 proof_reused: false,
                 terminal_reason: result
                     .get("verdict")
@@ -290,8 +339,11 @@ impl<'a> ManagedVerification<'a> {
             repo_name,
             check_name,
             candidate,
-            queue_wait_ms,
-            duration_ms,
+            queued_at,
+            started_at,
+            ended_at,
+            queue_wait_ms_monotonic,
+            duration_ms_monotonic,
             proof_reused,
             terminal_reason,
         } = occurrence;
@@ -305,25 +357,27 @@ impl<'a> ManagedVerification<'a> {
         )
         .unwrap_or(0);
         let attempt = AD_HOC_ATTEMPT_BASE.saturating_add(ad_hoc_occurrences);
-        let _ = crate::span::record_phase_span(
-            self.space,
-            repo_name,
-            "daemon",
-            &crate::span::PhaseSpan::from_durations(
-                task,
-                crate::span::Phase::VerificationQueued,
-                queue_wait_ms,
-                duration_ms,
-                Utc::now(),
-            )
-            .attempt(attempt)
-            .repo(repo_name)
-            .candidate(candidate)
-            .lane(check_name)
-            .proof_kind("ad-hoc")
-            .proof_reused(proof_reused)
-            .terminal_reason(terminal_reason),
-        );
+        let mut span = crate::span::PhaseSpan::from_observed(
+            task,
+            crate::span::Phase::VerificationQueued,
+            queued_at,
+            started_at,
+            ended_at,
+        )
+        .attempt(attempt)
+        .repo(repo_name)
+        .candidate(candidate)
+        .lane(check_name)
+        .proof_kind("ad-hoc")
+        .proof_reused(proof_reused)
+        .terminal_reason(terminal_reason);
+        if let Some(ms) = queue_wait_ms_monotonic {
+            span = span.queue_wait_ms_monotonic(ms);
+        }
+        if let Some(ms) = duration_ms_monotonic {
+            span = span.duration_ms_monotonic(ms);
+        }
+        let _ = crate::span::record_phase_span(self.space, repo_name, "daemon", &span);
     }
 
     /// Durable record of a managed verification run cancelled before it could
@@ -510,6 +564,10 @@ impl<'a> ManagedVerification<'a> {
         // its own timeout only after all admission resources are acquired.
         let admission_limit = self.resources.admission.limit_for(repo);
         let admission_started = Instant::now();
+        let admission_started_wall = self.resources.clock.now();
+        if let Some(p) = &progress {
+            p.lock().unwrap().queued_at_wall = Some(admission_started_wall);
+        }
         let wait_budget = admission_timeout.unwrap_or(timeout);
         let acquire = async {
             let test_guard = if resolved.shared_cargo_target && self.shared_cargo_target {
@@ -585,10 +643,12 @@ impl<'a> ManagedVerification<'a> {
             .then(|| u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX));
         let _admission_guard = admission.map(|(permit, _)| permit);
         let run_started = Instant::now();
+        let run_started_wall = self.resources.clock.now();
         if let Some(progress) = &progress {
             let mut p = progress.lock().unwrap();
             p.queue_wait_ms = admission_queue_wait_ms;
             p.execution_started_at = Some(run_started);
+            p.started_at_wall = Some(run_started_wall);
         }
 
         // Extra attempts on a non-"pass" verdict, for a check already
@@ -699,12 +759,19 @@ impl<'a> ManagedVerification<'a> {
                     stderr_truncated,
                     &history,
                 );
+                let duration = run_started.elapsed();
+                if let Some(p) = &progress {
+                    p.lock().unwrap().settled = Some(Settled {
+                        duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                        ended_at_wall: self.resources.clock.now(),
+                    });
+                }
                 self.record_verification_admission_event(VerificationAdmissionOutcome {
                     repo,
                     agent,
                     command,
                     queue_wait_ms: admission_queue_wait_ms,
-                    duration: run_started.elapsed(),
+                    duration,
                     exit,
                     verdict,
                 });
@@ -766,12 +833,19 @@ impl<'a> ManagedVerification<'a> {
             result["retries"] = json!(history);
         }
 
+        let settled_duration = run_started.elapsed();
+        if let Some(p) = &progress {
+            p.lock().unwrap().settled = Some(Settled {
+                duration_ms: u64::try_from(settled_duration.as_millis()).unwrap_or(u64::MAX),
+                ended_at_wall: self.resources.clock.now(),
+            });
+        }
         self.record_verification_admission_event(VerificationAdmissionOutcome {
             repo,
             agent,
             command,
             queue_wait_ms: admission_queue_wait_ms,
-            duration: run_started.elapsed(),
+            duration: settled_duration,
             exit,
             verdict,
         });
@@ -1216,10 +1290,35 @@ pub(crate) struct SettledAttempt {
 /// point sees both fields `None` ("still queued, never started"), and one
 /// landing after sees both set ("ran for at least this long before it was
 /// cancelled").
+///
+/// `queued_at_wall`/`started_at_wall` and [`Settled::ended_at_wall`] are the
+/// real wall-clock boundaries, each stamped from [`SpanClock`] at the exact
+/// statement that also takes the paired `Instant::now()` — never
+/// reconstructed later. A caller building a span from a settled run reads
+/// `settled` instead of calling `execution_started_at.elapsed()` itself: the
+/// latter re-measures elapsed time at whatever later moment the caller
+/// happens to get around to it (after a `.await` for further pipeline work),
+/// which is exactly the delayed-publish drift TKT-hodij-lujak-kibon reported
+/// (span.rs's `from_durations` doc). `settled` is written exactly once, at
+/// the moment execution genuinely finishes inside [`ManagedVerification::run`],
+/// so every later reader — however much real time has passed by the time it
+/// gets around to reading it — sees the same true boundary.
 #[derive(Default)]
 pub(crate) struct RunProgress {
     pub(crate) queue_wait_ms: Option<u64>,
     pub(crate) execution_started_at: Option<Instant>,
+    pub(crate) queued_at_wall: Option<DateTime<Utc>>,
+    pub(crate) started_at_wall: Option<DateTime<Utc>>,
+    pub(crate) settled: Option<Settled>,
+}
+
+/// The frozen outcome timing of a run that actually finished (as opposed to
+/// one raced away by cancellation before it settled) — see [`RunProgress`]'s
+/// doc for why this is captured once rather than re-derived per reader.
+#[derive(Clone, Copy)]
+pub(crate) struct Settled {
+    pub(crate) duration_ms: u64,
+    pub(crate) ended_at_wall: DateTime<Utc>,
 }
 
 impl RunProgress {
@@ -1258,8 +1357,11 @@ pub(crate) struct AdHocVerificationSpan<'a> {
     repo_name: &'a str,
     check_name: &'a str,
     candidate: &'a str,
-    queue_wait_ms: Option<u64>,
-    duration_ms: Option<u64>,
+    queued_at: Option<DateTime<Utc>>,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+    queue_wait_ms_monotonic: Option<u64>,
+    duration_ms_monotonic: Option<u64>,
     proof_reused: bool,
     terminal_reason: &'a str,
 }

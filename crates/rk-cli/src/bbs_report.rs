@@ -5330,6 +5330,86 @@ mod tests {
         );
     }
 
+    /// `rk_daemon::span::PhaseSpan::from_observed` (TKT-hodij-lujak-kibon)
+    /// tags real-timestamp spans `duration_semantic: "additive"` exactly
+    /// like `from_durations` — a span this producer emits must sum into
+    /// `verification_ms` the same way a legacy `from_durations` span always
+    /// has, not fall into the legacy/unknown bucket just because its
+    /// `timestamp_provenance` is "observed" rather than absent. Also proves
+    /// the new `queue_wait_ms_monotonic`/`duration_ms_monotonic` fields
+    /// (present alongside the wall-clock ones, informational only) do not
+    /// perturb the wall-clock total this report actually sums.
+    #[test]
+    fn observed_provenance_spans_sum_into_verification_ms_like_legacy_additive_spans() {
+        let m = task_manifest("TKT-verify-observed");
+        let observed_span = span_full(
+            "span-observed",
+            json!({
+                "task": "TKT-verify-observed", "phase": "verification", "attempt": 1,
+                "queued_at": T0,
+                "started_at": "2026-01-01T00:00:00.500Z",
+                "ended_at": "2026-01-01T00:00:00.550Z",
+                "queue_wait_ms": 500, "duration_ms": 50,
+                "duration_semantic": ADDITIVE_DURATION,
+                "timestamp_provenance": "observed",
+                "queue_wait_ms_monotonic": 501, "duration_ms_monotonic": 49,
+                "repo": "repo"
+            }),
+        );
+        let c = capture(vec![observed_span], Order::Unknown);
+        let report = compute(&m, &c, &[]).unwrap();
+        assert_eq!(report.deliveries.len(), 1);
+        let d = &report.deliveries[0];
+        assert_eq!(
+            d.phase_ms.verification_ms,
+            Some(550),
+            "an observed-provenance span sums exactly like a legacy additive one: {:?}",
+            d.phase_ms
+        );
+        assert_eq!(
+            d.phase_ms.verification_ms_legacy_spans, 0,
+            "an observed, additive-tagged span is never treated as a coverage gap"
+        );
+    }
+
+    /// A span recorded well after its real occurrence ended (a delayed
+    /// publish, or a producer whose `.await` chain spans a host suspend)
+    /// still totals on the same real `queued_at`/`started_at`/`ended_at` it
+    /// carries — the report has no separate "publish time" to be misled by,
+    /// it only ever reads the timestamps a producer actually wrote. This is
+    /// the consumer-side half of TKT-hodij-lujak-kibon's fix: the producer
+    /// change (freezing `ended_at` at the real settle point instead of
+    /// re-deriving it from a later `now`) is what keeps these timestamps
+    /// truthful in the first place; this only proves the report doesn't
+    /// itself reintroduce drift once they arrive correct.
+    #[test]
+    fn a_span_recorded_long_after_its_real_occurrence_still_totals_on_its_true_timestamps() {
+        let m = task_manifest("TKT-verify-delayed");
+        let true_started_at = "2026-01-01T00:00:00.500Z";
+        let true_ended_at = "2026-01-01T00:00:00.550Z";
+        let delayed_publish_span = span_full(
+            "span-delayed-publish",
+            json!({
+                "task": "TKT-verify-delayed", "phase": "verification", "attempt": 1,
+                "queued_at": T0,
+                "started_at": true_started_at,
+                "ended_at": true_ended_at,
+                "queue_wait_ms": 500, "duration_ms": 50,
+                "duration_semantic": ADDITIVE_DURATION,
+                "timestamp_provenance": "observed",
+                "repo": "repo"
+            }),
+        );
+        let c = capture(vec![delayed_publish_span], Order::Unknown);
+        let report = compute(&m, &c, &[]).unwrap();
+        let d = &report.deliveries[0];
+        assert_eq!(
+            d.phase_ms.verification_ms,
+            Some(550),
+            "totals on the span's own true timestamps regardless of when it was actually published"
+        );
+    }
+
     /// A manifest whose frozen scope is exactly one task in `repo`/`batch-1`.
     fn task_manifest(task: &str) -> Manifest {
         Manifest {
