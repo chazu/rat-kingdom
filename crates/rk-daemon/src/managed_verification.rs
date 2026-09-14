@@ -2720,4 +2720,158 @@ mod tests {
         );
         assert!(!home.path().join("should-not-execute").exists());
     }
+
+    /// End-to-end regression for TKT-hodij-lujak-kibon through the real
+    /// `verify_repo_check`/`run` producer path, driven by an injectable
+    /// [`SpanClock`] rather than an actual sleep. The fake clock only ever
+    /// hands out three timestamps — the true `queued_at`/`started_at`/
+    /// `ended_at` `run()` reads at its three real capture points — and
+    /// panics on a fourth read. The OLD code (`PhaseSpan::from_durations`
+    /// anchored on a `Utc::now()` called back in `verify_repo_check` after
+    /// `run()` already returned) would have consumed that fourth,
+    /// deliberately-corrupt value as `ended_at`; this proves the fixed
+    /// pipeline never reads the clock again downstream of `run()` settling,
+    /// so the recorded span carries the real settle-time boundaries no
+    /// matter how much further pipeline work (or a host suspend) happens
+    /// afterward.
+    #[tokio::test]
+    async fn a_span_recorded_after_further_pipeline_work_still_carries_the_real_settle_time() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "true", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+
+        let true_queued_at = Utc::now();
+        let true_started_at = true_queued_at + chrono::Duration::milliseconds(5);
+        let true_ended_at = true_started_at + chrono::Duration::milliseconds(50);
+        // Never legitimately read: proof that nothing downstream of `run()`
+        // settling calls the clock again to build the span.
+        let corrupt_if_reread = true_ended_at + chrono::Duration::minutes(40);
+        let remaining = Arc::new(Mutex::new(
+            vec![true_queued_at, true_started_at, true_ended_at, corrupt_if_reread].into_iter(),
+        ));
+        let mut resources = VerificationResources::default();
+        resources.clock = SpanClock::from_fn(move || {
+            remaining
+                .lock()
+                .unwrap()
+                .next()
+                .expect("span clock read more times than a settled run should need")
+        });
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+        verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-delayed-publish",
+                Some("TKT-delayed-publish"),
+            )
+            .await
+            .unwrap();
+
+        let spans = crate::span::spans_for_task(&space, "repo", "TKT-delayed-publish").unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["timestamp_provenance"], "observed");
+        assert_eq!(spans[0]["duration_semantic"], "additive");
+        assert_eq!(
+            spans[0]["queued_at"],
+            serde_json::to_value(true_queued_at).unwrap()
+        );
+        assert_eq!(
+            spans[0]["started_at"],
+            serde_json::to_value(true_started_at).unwrap()
+        );
+        assert_eq!(
+            spans[0]["ended_at"],
+            serde_json::to_value(true_ended_at).unwrap(),
+            "ended_at must be the real settle time, never a later clock read"
+        );
+    }
+
+    /// A check that genuinely waits behind another one at a repo's admission
+    /// bound gets real, observed `queued_at`/`started_at`/`ended_at` —
+    /// `started_at` lands meaningfully after `queued_at` (the true admission
+    /// wait), not folded into a single instantaneous "now" the way an
+    /// `ended_at`-only reconstruction would.
+    #[tokio::test]
+    async fn a_genuinely_queued_check_records_observed_boundaries_with_a_real_admission_wait() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "sleep 0.2", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        resources.admission.set_limits(1, HashMap::new());
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        // The first check occupies the repo's one admission slot; the second
+        // must genuinely queue behind it.
+        let first = verifier.verify_repo_check(
+            "operator",
+            dir.path(),
+            "repo",
+            "verify",
+            None,
+            "req-first",
+            Some("TKT-queued"),
+        );
+        let second = verifier.verify_repo_check(
+            "operator",
+            dir.path(),
+            "repo",
+            "verify",
+            None,
+            "req-second",
+            Some("TKT-queued"),
+        );
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let spans = crate::span::spans_for_task(&space, "repo", "TKT-queued").unwrap();
+        assert_eq!(spans.len(), 2);
+        // Whichever ran second (later `started_at`) must show a real
+        // admission wait, and every observed span's boundaries must be in
+        // true chronological order.
+        for span in &spans {
+            assert_eq!(span["timestamp_provenance"], "observed");
+            let queued_at = parse_span_time(&span["queued_at"]);
+            let started_at = parse_span_time(&span["started_at"]);
+            let ended_at = parse_span_time(&span["ended_at"]);
+            assert!(queued_at <= started_at, "{span}");
+            assert!(started_at <= ended_at, "{span}");
+        }
+        let waited_ms: Vec<i64> = spans
+            .iter()
+            .map(|s| s["queue_wait_ms"].as_i64().unwrap())
+            .collect();
+        assert!(
+            waited_ms.iter().any(|&ms| ms > 0),
+            "one of the two checks must have genuinely queued behind the other: {waited_ms:?}"
+        );
+    }
+
+    fn parse_span_time(v: &Value) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(v.as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc)
+    }
 }
