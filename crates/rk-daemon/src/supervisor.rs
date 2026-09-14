@@ -5677,8 +5677,7 @@ impl Supervisor {
         // Jcode onboarding runs one headless request with no Bash tool. Its
         // native `done` event is therefore the only safe positive completion
         // signal and, unlike an interactive turn boundary, ends the process.
-        let declared_done =
-            harness_terminal || self.declared_done(name, spawn, current_attempt);
+        let declared_done = harness_terminal || self.declared_done(name, spawn, current_attempt);
         let terminal = is_error || declared_done;
         let mut completions = self.lock_completions();
         let state = completions
@@ -5864,8 +5863,7 @@ impl Supervisor {
             if record.state == AgentState::Dismissed {
                 continue;
             }
-            let Some(task_done) = self.find_task_done(record.spawn, record.current_attempt)?
-            else {
+            let Some(task_done) = self.find_task_done(record.spawn, record.current_attempt)? else {
                 continue;
             };
 
@@ -9172,8 +9170,7 @@ mod respawn_tests {
                 .publish
         );
 
-        let ordinary =
-            supervisor.claim_completion("Whisker", generation, None, None, false, false);
+        let ordinary = supervisor.claim_completion("Whisker", generation, None, None, false, false);
         assert!(!ordinary.publish);
         assert!(!ordinary.declared_done);
     }
