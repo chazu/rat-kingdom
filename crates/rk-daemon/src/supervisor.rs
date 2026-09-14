@@ -6414,32 +6414,55 @@ impl Supervisor {
     /// channel send can suspend under backpressure, and everything validated
     /// before that suspend can go stale during it (the record can
     /// terminalize, or a respawn can supersede the session) with nothing on
-    /// either side positioned to notice, because [`SessionControl::steer_envelope`]
+    /// either side positioned to notice — [`SessionControl::steer_envelope`]
     /// awaits capacity with no way to abort once state changes underneath
-    /// it, and the receiving side's own fence
+    /// it, and the receiving side's ack fence
     /// ([`handle_event`](Self::handle_event)'s `ControlDelivered` arm,
-    /// gated on `self.own(name, session)`) checks session ownership, not
-    /// terminal state — it protects a respawn's successor from a stale
-    /// predecessor's belated ack, but does nothing at all for a same-session
-    /// message that was merely queued before `rk done` and lands after it.
+    /// gated on `self.own(name, session)`) only checks session ownership: it
+    /// stops a respawn's successor from being credited with a stale
+    /// predecessor's belated ack, but a same-session message that was
+    /// merely queued before `rk done` and lands after it keeps the SAME
+    /// session end to end, so `own` sees nothing wrong — the message is
+    /// genuinely delivered to, and read by, a process this fix meant to
+    /// have refused.
     ///
     /// The actual fix is to never suspend in the first place:
-    /// [`SessionControl::try_steer_envelope`] reserves a channel slot with
-    /// `try_reserve` — instant, never blocks — and only sends once a slot is
-    /// actually held. Doing that reservation-and-send HERE, before any lock
-    /// in this function is released, closes the window completely rather
-    /// than narrowing it: there is no suspend point between "admitted" and
-    /// "in the channel" for a concurrent terminalization or respawn to land
-    /// in, because the whole decision — session, state, capability, AND the
-    /// send itself — is one uninterrupted critical section under the same
-    /// `session_tokens`-first lock order [`own`](Self::own) and
-    /// [`publish_launch`](Self::publish_launch) already use for exactly this
-    /// reason (see their doc comments): holding `session_tokens` across the
-    /// whole thing blocks a concurrent takeover from interleaving with it at
-    /// all, rather than merely racing it. A channel that happens to be
-    /// saturated at that exact instant is refused outright, on the same
-    /// footing as any other admission failure, rather than queued behind
-    /// backpressure of unknown duration.
+    /// [`SessionControl::try_steer_envelope_with`] reserves a channel slot
+    /// with `try_reserve` — instant, never blocks — and only sends once a
+    /// slot is actually held. Doing that reservation-and-send HERE, before
+    /// any lock in this function is released, closes the window completely
+    /// rather than narrowing it: there is no suspend point between
+    /// "admitted" and "in the channel" for a concurrent terminalization or
+    /// respawn to land in, because the whole decision — session, state,
+    /// capability, AND the send itself — is one uninterrupted critical
+    /// section under the same `session_tokens`-first lock order
+    /// [`own`](Self::own) and [`publish_launch`](Self::publish_launch)
+    /// already use for exactly this reason (see their doc comments):
+    /// holding `session_tokens` across the whole thing blocks a concurrent
+    /// takeover from interleaving with it at all, rather than merely racing
+    /// it. A channel that happens to be saturated at that exact instant is
+    /// refused outright, on the same footing as any other admission
+    /// failure, rather than queued behind backpressure of unknown duration.
+    ///
+    /// `try_steer_envelope_with`'s `persist` callback (wired to
+    /// [`crate::steer::enqueue`] when `durable` is set below) runs between
+    /// the reservation and the send, not before it and not after: before,
+    /// a terminal/stale/saturated request would get durably journaled for
+    /// no reason it could ever be delivered from — exactly the "rejected
+    /// request replayed on a later `rk respawn`" bug this whole fix targets,
+    /// just moved into storage instead of the channel. After, a journal
+    /// failure would be discovered only once the message was already sent,
+    /// reporting a delivery whose durable record does not actually exist —
+    /// silently weakening the guarantee restart-replay depends on. Gating
+    /// the send on `persist`'s success keeps both invariants intact at
+    /// once: nothing refused is ever journaled, and everything journaled
+    /// was, at minimum, accepted and reserved a slot at that moment — not a
+    /// guarantee it was also physically sent. A crash in the gap between
+    /// `persist` returning and `permit.send` running is a real process
+    /// crash, not a fallible step in this code, and it is exactly the case
+    /// restart-replay already exists to cover: the journal entry survives,
+    /// the channel does not, and the next live session for this name
+    /// replays it as an ordinary unacknowledged pending message.
     ///
     /// `expected_generation`, when given, must match the session token this
     /// snapshot observes — the fence against a stale envelope (built against
@@ -6472,11 +6495,22 @@ impl Supervisor {
     /// initial-prompt delivery calls `SessionControl::steer` directly on its
     /// session handle and never goes through here, so it is unaffected by
     /// this gate.
+    /// `durable`, when true, journals the envelope via [`crate::steer::enqueue`]
+    /// between the channel reservation and the actual send —
+    /// [`SessionControl::try_steer_envelope_with`]'s `persist` callback —
+    /// so operator/RPC steering keeps the exact "journaled before it can
+    /// possibly be delivered" guarantee the pre-existing restart-replay
+    /// design depends on, while never journaling a request this function
+    /// is about to refuse outright (terminal state, stale generation, wrong
+    /// harness, or a saturated channel). `steer`'s internal daemon nudges
+    /// pass `false`: they were never journaled before this fix either, and
+    /// still don't need to be.
     fn admit_steer(
         &self,
         name: &str,
         expected_generation: Option<&str>,
         envelope: ControlEnvelope,
+        durable: bool,
     ) -> rk_core::Result<bool> {
         let tokens = self.lock_session_tokens();
         let controls = self.lock_controls();
@@ -6514,13 +6548,20 @@ impl Supervisor {
                 )));
             }
         }
-        control.try_steer_envelope(envelope)?;
+        if durable {
+            let repo_name = record.repo_name.clone();
+            control.try_steer_envelope_with(envelope, |envelope| {
+                crate::steer::enqueue(&self.space, &repo_name, envelope, &self.castle)
+            })?;
+        } else {
+            control.try_steer_envelope(envelope)?;
+        }
         Ok(true)
     }
 
     pub async fn steer(&self, name: &str, message: &str) -> rk_core::Result<()> {
         let envelope = ControlEnvelope::system("unknown", message);
-        if self.admit_steer(name, None, envelope)? {
+        if self.admit_steer(name, None, envelope, false)? {
             return Ok(());
         }
         // Attach-mode rats steer through their herdr pane.
@@ -6549,6 +6590,11 @@ impl Supervisor {
     /// Deliver a durable control envelope to a live harness. The old string
     /// method remains for daemon-internal nudges; operator/RPC steering must
     /// use this typed path so the adapter can acknowledge the exact message.
+    ///
+    /// Journals the envelope itself (`admit_steer(..., durable: true)`) —
+    /// callers (`handle_steer` in server.rs) must NOT also call
+    /// `crate::steer::enqueue` before or after this; that would either
+    /// journal a request this rejects, or double-journal an accepted one.
     pub async fn steer_envelope(
         &self,
         name: &str,
@@ -6558,6 +6604,7 @@ impl Supervisor {
             name,
             Some(envelope.delivery_generation.as_str()),
             envelope.clone(),
+            true,
         )? {
             return Ok(());
         }
@@ -8648,6 +8695,20 @@ impl Supervisor {
                     for envelope in pending {
                         let envelope = envelope.for_resume_generation(token.to_string());
                         let control = control.clone();
+                        // Deliberately still the `.await`-ing `steer_envelope`,
+                        // not the non-blocking `try_steer_envelope`: a
+                        // session can accumulate more than the channel's
+                        // capacity worth of genuinely unacknowledged pending
+                        // envelopes (a crash loop, or simply a busy agent),
+                        // and this replay must eventually deliver all of
+                        // them, not fail outright past the first
+                        // channel-full and strand the rest until yet
+                        // another restart. Each is already durably
+                        // persisted (that is what made it `pending`), so
+                        // waiting for capacity here is not the same
+                        // admission-then-await race `admit_steer` closes —
+                        // there is no live admission decision left to go
+                        // stale while this waits.
                         handle.spawn(async move {
                             if let Err(error) = control.steer_envelope(&envelope).await {
                                 warn!(

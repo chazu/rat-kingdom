@@ -270,8 +270,9 @@ impl SessionControl {
             .map_err(|_| rk_core::Error::other("session is no longer running"))
     }
 
-    /// Reserve a channel slot and hand the envelope over in one synchronous
-    /// step — no `.await`, so a caller can do this while still holding a
+    /// Reserve a channel slot, run `persist` while holding it, and only
+    /// then hand the envelope over — all in one synchronous step, no
+    /// `.await` anywhere, so a caller can do this while still holding a
     /// `std::sync::Mutex` admission guard instead of releasing it and
     /// racing an unbounded await against whatever that guard was protecting.
     ///
@@ -281,29 +282,57 @@ impl SessionControl {
     /// go stale during it (the record can terminalize, or a respawn can
     /// supersede the session) with no way for the now-stale send to notice.
     /// This instead reserves a slot with `try_reserve` — instant, never
-    /// blocks — and only proceeds to send once one is actually held, so
-    /// there is no window between "admitted" and "in the channel" for
-    /// anything to change underneath it. A momentarily saturated channel is
-    /// reported as refused outright, on the same footing as any other
-    /// admission failure, rather than queued behind unknown backpressure.
-    pub fn try_steer_envelope(&self, envelope: ControlEnvelope) -> rk_core::Result<()> {
+    /// blocks — before doing anything else observable, so there is no
+    /// window between "admitted" and "in the channel" for anything to
+    /// change underneath it. A momentarily saturated channel is reported as
+    /// refused outright, on the same footing as any other admission
+    /// failure, rather than queued behind unknown backpressure.
+    ///
+    /// `persist` is the caller's durable-journal write (e.g. the daemon's
+    /// steer replay log), run only once a slot is actually reserved — a
+    /// terminal, stale, or saturated request never reaches it — and its
+    /// result gates the send: a `persist` failure means this envelope is
+    /// reported as never-admitted, exactly like a saturated channel, and is
+    /// never placed on the channel. This is deliberately NOT "persist after
+    /// send": that ordering can report a message as delivered when its
+    /// durable record failed to write, leaving nothing to replay if the
+    /// process crashes before the harness actually reads it. Ordering it
+    /// the other way keeps the durable record as the reliable proof of
+    /// "this could still be in flight" that a restart's replay depends on —
+    /// once `persist` returns `Ok`, the reserved slot's `send` is
+    /// infallible, so the tiny gap between them is a real process crash,
+    /// not a fallible step.
+    pub fn try_steer_envelope_with(
+        &self,
+        envelope: ControlEnvelope,
+        persist: impl FnOnce(&ControlEnvelope) -> rk_core::Result<()>,
+    ) -> rk_core::Result<()> {
         let Some(tx) = &self.steer_tx else {
             return Err(rk_core::Error::other(
                 "this harness does not support steering",
             ));
         };
-        match tx.try_reserve() {
-            Ok(permit) => {
-                permit.send(envelope);
-                Ok(())
+        let permit = match tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(rk_core::Error::other(
+                    "the harness's control channel is saturated right now; steer not admitted",
+                ))
             }
-            Err(mpsc::error::TrySendError::Full(_)) => Err(rk_core::Error::other(
-                "the harness's control channel is saturated right now; steer not admitted",
-            )),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(rk_core::Error::other("session is no longer running"))
+                return Err(rk_core::Error::other("session is no longer running"))
             }
-        }
+        };
+        persist(&envelope)?;
+        permit.send(envelope);
+        Ok(())
+    }
+
+    /// [`try_steer_envelope_with`](Self::try_steer_envelope_with) with no
+    /// durable journal — for daemon-internal nudges that were never
+    /// journaled in the first place, not operator/RPC steering.
+    pub fn try_steer_envelope(&self, envelope: ControlEnvelope) -> rk_core::Result<()> {
+        self.try_steer_envelope_with(envelope, |_| Ok(()))
     }
 
     pub fn can_steer(&self) -> bool {
@@ -1092,5 +1121,83 @@ pub(crate) mod runner {
             },
             pid,
         })
+    }
+}
+
+#[cfg(test)]
+mod session_control_tests {
+    use super::*;
+
+    fn control_with_capacity(capacity: usize) -> (SessionControl, mpsc::Receiver<ControlEnvelope>) {
+        let (steer_tx, steer_rx) = mpsc::channel(capacity);
+        let (kill_tx, _kill_rx) = mpsc::channel(1);
+        (
+            SessionControl {
+                steer_tx: Some(steer_tx),
+                kill_tx,
+            },
+            steer_rx,
+        )
+    }
+
+    /// The core contract `Supervisor::admit_steer` (rk-daemon) depends on: a
+    /// `persist` failure is reported back to the caller and never places the
+    /// envelope on the channel — a rejected-for-storage-reasons request must
+    /// reach the harness no differently than a rejected-for-admission one.
+    #[test]
+    fn try_steer_envelope_with_never_sends_when_persist_fails() {
+        let (control, mut rx) = control_with_capacity(4);
+        let envelope = ControlEnvelope::system("Nibble", "guidance");
+        let error = control
+            .try_steer_envelope_with(envelope, |_| {
+                Err(rk_core::Error::other("journal write failed"))
+            })
+            .expect_err("a persist failure must be reported, not swallowed");
+        assert!(error.to_string().contains("journal write failed"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a persist failure must never place the envelope on the channel"
+        );
+    }
+
+    /// A failed `persist` must drop its reservation rather than leaking it —
+    /// otherwise a single storage failure would permanently steal a slot
+    /// from a channel that is never told to give it back.
+    #[test]
+    fn try_steer_envelope_with_releases_the_reservation_when_persist_fails() {
+        let (control, mut rx) = control_with_capacity(1);
+        let _ = control.try_steer_envelope_with(ControlEnvelope::system("Nibble", "first"), |_| {
+            Err(rk_core::Error::other("nope"))
+        });
+        control
+            .try_steer_envelope_with(ControlEnvelope::system("Nibble", "second"), |_| Ok(()))
+            .expect("the slot must be available again after the failed reservation was dropped");
+        let delivered = rx
+            .try_recv()
+            .expect("the second, successfully persisted envelope must be on the channel");
+        assert_eq!(delivered.text, "second");
+    }
+
+    /// `persist` sees the exact envelope about to be sent, and runs before
+    /// the send — the ordering `Supervisor::admit_steer`'s doc comment
+    /// depends on to keep "journaled" and "about to be delivered" in sync.
+    #[test]
+    fn try_steer_envelope_with_sends_only_after_persist_succeeds() {
+        let (control, mut rx) = control_with_capacity(4);
+        let envelope = ControlEnvelope::system("Nibble", "guidance");
+        let mut persisted = false;
+        control
+            .try_steer_envelope_with(envelope.clone(), |seen| {
+                assert_eq!(
+                    seen.text, "guidance",
+                    "persist must see the exact envelope being sent"
+                );
+                persisted = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(persisted, "persist must actually run for an admitted send");
+        let delivered = rx.try_recv().unwrap();
+        assert_eq!(delivered.message_id, envelope.message_id);
     }
 }

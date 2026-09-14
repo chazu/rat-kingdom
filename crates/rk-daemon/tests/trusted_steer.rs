@@ -6,6 +6,7 @@
 //! events, so generation provenance and the acknowledgement boundary are both
 //! exercised over RPC.
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -348,4 +349,143 @@ async fn unacknowledged_control_replays_once_after_restart_and_never_after_ack()
     if let Some(old_path) = old_path {
         std::env::set_var("PATH", old_path);
     }
+}
+
+/// TKT-jobib-zahaj-tilaj, the real integration gap a review pass on this fix
+/// found: `handle_steer` used to durably journal every `agent.steer` request
+/// (`crate::steer::enqueue`) BEFORE ever asking `Supervisor::steer_envelope`
+/// whether it was admissible. A steer rejected for a terminal generation
+/// still left an ordinary, permanently-unacknowledged pending `Message`
+/// tuple behind, and `publish_launch`/`track_session`'s restart-replay
+/// logic — which cannot distinguish "genuinely in flight when the daemon
+/// crashed" from "already, deliberately, permanently refused" — would
+/// silently replay it onto whatever session a later `rk respawn` of the SAME
+/// agent name launched. This drives the real daemon over its actual RPC and
+/// storage boundary (not `Supervisor` called directly) end to end: a clean
+/// `rk done`, a steer rejected against the now-`Completed` record, proof
+/// nothing was durably journaled for it, a respawn of the same name, and
+/// proof the rejected guidance never arrives at the new process either.
+#[tokio::test]
+async fn a_steer_rejected_after_done_never_becomes_replayable_pending_on_respawn() {
+    let _env_lock = env_lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+
+    // Declares done, then keeps the process running — exactly the
+    // `kill_lingering_after_done` grace-window shape: a clean `rk done`
+    // whose harness process has not exited yet, so the control handle stays
+    // retained.
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(
+            r#"
+read -r _prompt
+echo '{"type":"system","subtype":"init","session_id":"fake-done"}'
+rk_done "work done"
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"fake-done","total_cost_usd":0.001,"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+while :; do sleep 1; done
+"#,
+        ),
+    );
+
+    let layout = Layout::at(home.path());
+    let mut config = rk_core::config::Config::default();
+    // Wide enough that the grace-window sweep cannot SIGKILL the retained
+    // control handle out from under this test before it gets to steer it.
+    config.supervisor.done_kill_grace_secs = 30;
+    let daemon = Daemon::new(layout.clone(), &config).unwrap();
+    let _daemon = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
+
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo.path().to_string_lossy(),
+                "task": "trusted-steer-terminal-rejection",
+                "harness": "fake",
+            }),
+        )
+        .await
+        .unwrap();
+    let agent = spawned["agent"]["name"].as_str().unwrap().to_string();
+    let repo_name = spawned["agent"]["repo_name"].as_str().unwrap().to_string();
+
+    let mut completed = false;
+    for _ in 0..200 {
+        let status = client
+            .call("agent.status", json!({"name": agent}))
+            .await
+            .unwrap();
+        if status["agent"]["state"] == "completed" {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        completed,
+        "the fixture's rk_done must terminalize the record"
+    );
+
+    // The confirmed bug: an operator steer against a Completed record whose
+    // harness process is still running inside the post-done grace window.
+    let result = client
+        .call(
+            "agent.steer",
+            json!({"name": agent, "message": "REJECTED_STEER_PAYLOAD"}),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a steer against a Completed record must be refused over RPC: {result:?}"
+    );
+
+    // The core proof: nothing was durably journaled for the refused request.
+    // If it had been, this scan would find it sitting there forever
+    // unacknowledged (no `ControlDelivered` will ever arrive for it).
+    let messages = client
+        .call(
+            "space.scan",
+            json!({"category":"message", "scope":repo_name, "identity":agent}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        messages["tuples"].as_array().unwrap().is_empty(),
+        "a rejected steer must leave no durable pending message behind: {messages}"
+    );
+
+    // Respawn the SAME agent name onto a fresh process that durably marks
+    // receipt of anything past its own init line. If the rejected request
+    // had been journaled, `track_session`'s restart-replay would deliver it
+    // here.
+    let markers = tempfile::tempdir().unwrap();
+    let marker_path = markers.path().join("delivered");
+    let marker_arg = format!("\"{}\"", marker_path.display());
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        format!(
+            "echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fake-resumed\"}}'\n\
+             while IFS= read -r line; do\n\
+               case \"$line\" in\n\
+                 *REJECTED_STEER_PAYLOAD*) printf '%s' \"$line\" > {marker_arg} ;;\n\
+               esac\n\
+             done\n"
+        ),
+    );
+    client
+        .call("agent.respawn", json!({"name": agent}))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !marker_path.exists(),
+        "a rejected steer must never be replayed onto a later respawn's process"
+    );
+
+    let _ = client.call("stop", json!({})).await;
 }
