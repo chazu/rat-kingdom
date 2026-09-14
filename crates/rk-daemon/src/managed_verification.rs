@@ -2777,14 +2777,16 @@ mod tests {
             ]
             .into_iter(),
         ));
-        let mut resources = VerificationResources::default();
-        resources.clock = SpanClock::from_fn(move || {
-            remaining
-                .lock()
-                .unwrap()
-                .next()
-                .expect("span clock read more times than a settled run should need")
-        });
+        let resources = VerificationResources {
+            clock: SpanClock::from_fn(move || {
+                remaining
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .expect("span clock read more times than a settled run should need")
+            }),
+            ..Default::default()
+        };
         let verifier = ManagedVerification::new(&layout, &space, &resources, false);
         verifier
             .verify_repo_check(
