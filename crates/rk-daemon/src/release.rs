@@ -401,11 +401,8 @@ impl ReleaseRegistry {
     /// `rename` with no `sync_all` gives atomicity (no reader ever observes
     /// a torn file) but not durability against power loss — the OS can hold
     /// either write in its page cache indefinitely. `sync_all` on the temp
-    /// file before the rename, plus a best-effort sync of the containing
-    /// directory after it (some filesystems refuse to fsync a directory;
-    /// that failure is not fatal — the rename itself is still atomic either
-    /// way, this only affects how quickly its visibility survives a crash),
-    /// makes the write actually durable before this function returns,
+    /// file before the rename, plus `sync_directory` on the containing
+    /// directory after it, makes the write actually durable before this function returns,
     /// matching what the crash-recovery design claims rather than only
     /// approximating it.
     fn persist(&self) -> rk_core::Result<()> {
@@ -421,9 +418,7 @@ impl ReleaseRegistry {
             file.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        sync_directory(parent)?;
         Ok(())
     }
 }
@@ -562,6 +557,39 @@ fn tail(bytes: &[u8]) -> String {
         return text.into_owned();
     }
     text.chars().skip(total - FAILURE_EVIDENCE_CHARS).collect()
+}
+
+/// Sync `dir`'s own directory entry so a rename/hard-link/file-create within
+/// it durably survives a crash promptly, not just atomically — used by every
+/// write this module claims is durable-before-publication
+/// (`ReleaseRegistry::persist`, `write_manifest_new`, and the release
+/// binaries' containing directory in `run_recipe`).
+///
+/// A genuine failure here is propagated as an error rather than swallowed:
+/// silently ignoring it would leave those callers' doc comments claiming a
+/// durable commit-before-publication order that the code no longer actually
+/// enforces. The one exception is `ErrorKind::Unsupported` — some
+/// filesystems refuse to open or `fsync` a directory at all (their renames
+/// and hard-links stay atomic regardless, just not promptly durable against
+/// power loss), which is the documented, honest limitation this module
+/// already states rather than one this helper can fix. Every other error
+/// (permission denied, the directory having vanished, disk I/O failure, …)
+/// is a real fault a caller must not treat as "prepared"/"published".
+fn sync_directory(dir: &Path) -> rk_core::Result<()> {
+    let handle = std::fs::File::open(dir).map_err(|e| {
+        rk_core::Error::other(format!(
+            "failed to open directory {} to sync it durably: {e}",
+            dir.display()
+        ))
+    })?;
+    match handle.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        Err(e) => Err(rk_core::Error::other(format!(
+            "failed to durably sync directory {}: {e}",
+            dir.display()
+        ))),
+    }
 }
 
 fn upsert_entry(
@@ -1069,12 +1097,7 @@ async fn run_recipe(
         })?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
         let dest = release_dir.join(name);
-        std::fs::write(&dest, &bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
-        }
+        write_binary_durably(&dest, &bytes)?;
         binaries.insert(
             name.to_string(),
             BinaryArtifact {
@@ -1083,6 +1106,15 @@ async fn run_recipe(
             },
         );
     }
+    // Sync the release directory entry so the binaries' own fsyncs above are
+    // joined by a durable record of their names existing at all, matching
+    // `write_manifest_new`'s and `ReleaseRegistry::persist`'s same treatment
+    // of their containing directories. A genuine failure here is propagated
+    // (see `sync_directory`'s doc comment) rather than swallowed — this
+    // function's result feeds directly into `prepare`'s durable
+    // digest-before-publication commit, which must not proceed on the
+    // strength of an unconfirmed directory sync.
+    sync_directory(release_dir)?;
 
     let smoke_home = smoke_home_dir(layout, id);
     std::fs::create_dir_all(&smoke_home)?;
@@ -1246,6 +1278,30 @@ fn verify_mcp_initialize_response(stdout: &[u8]) -> rk_core::Result<()> {
     Ok(())
 }
 
+/// Write one release binary and `fsync` it before returning, so its bytes
+/// are actually durable on disk rather than merely sitting in the OS page
+/// cache — matching `ReleaseRegistry::persist`'s and `write_manifest_new`'s
+/// same discipline for the registry/manifest writes that come after it in
+/// `prepare`'s publication order. Without this, a crash between this write
+/// and the registry's durable digest commit (see `prepare`'s `Ok(manifest)`
+/// arm) could leave the digest durably recorded while the binary bytes it
+/// describes were still unflushed, which would make a later restart's
+/// `verify_content` re-hash a stale or truncated file — reported as
+/// "tampered or corrupted" rather than what it actually is, an incomplete
+/// publication.
+fn write_binary_durably(path: &Path, bytes: &[u8]) -> rk_core::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 /// Publish `manifest.json` atomically and with fully-written content: write
 /// the complete bytes to a temp file in the same directory first, then
 /// [`std::fs::hard_link`] it into place. `hard_link` fails if the destination
@@ -1279,14 +1335,13 @@ fn write_manifest_new(path: &Path, manifest: &ReleaseManifest) -> rk_core::Resul
     result.map_err(|e| {
         rk_core::Error::other(format!("failed to publish manifest at {}: {e}", path.display()))
     })?;
-    // Best-effort: sync the directory entry so the hard link's visibility
-    // itself survives a crash promptly, matching `ReleaseRegistry::persist`'s
-    // same treatment. Not fatal if the filesystem refuses to fsync a
-    // directory — the link is already atomic either way, this only affects
-    // how quickly it durably persists.
-    if let Ok(handle) = std::fs::File::open(dir) {
-        let _ = handle.sync_all();
-    }
+    // Sync the directory entry so the hard link's visibility itself survives
+    // a crash promptly, matching `ReleaseRegistry::persist`'s same
+    // treatment. A genuine failure here is propagated (see
+    // `sync_directory`'s doc comment) rather than swallowed: this function
+    // publishing "successfully" is exactly what a reader treats as proof the
+    // manifest is durably visible.
+    sync_directory(dir)?;
     Ok(())
 }
 
@@ -1540,5 +1595,38 @@ mod tests {
         assert!(verify_mcp_initialize_response(missing_field).is_err());
 
         assert!(verify_mcp_initialize_response(b"").is_err());
+    }
+
+    #[test]
+    fn write_binary_durably_writes_exact_bytes_and_marks_it_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rk");
+        write_binary_durably(&path, b"binary-content").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"binary-content");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn sync_directory_succeeds_on_an_ordinary_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(sync_directory(dir.path()).is_ok());
+    }
+
+    /// A publication/registry fault boundary (P6.1 correction, item 2): a
+    /// genuine directory-sync failure must be reported, not silently
+    /// swallowed the way `let _ = handle.sync_all();` used to. A nonexistent
+    /// path is a deterministic, host/uid-independent way to force `File::
+    /// open` itself to fail — no reliance on permission bits, which a
+    /// root-run suite would not even enforce.
+    #[test]
+    fn sync_directory_propagates_a_real_open_failure() {
+        let missing = Path::new("/nonexistent-rk-release-sync-directory-test-path");
+        let err = sync_directory(missing).unwrap_err();
+        assert!(err.to_string().contains("failed to open"), "{err}");
     }
 }

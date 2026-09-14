@@ -17,7 +17,6 @@ use rk_daemon::{Client, Daemon};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
 use support::{connect, register_repo};
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -389,121 +388,84 @@ async fn unsupported_manifest_schema_is_refused() {
     assert!(err.to_string().contains("schema_version"), "{err}");
 }
 
-/// A REAL Cargo build-script barrier: `rk-cli/build.rs` blocks (polling for a
-/// marker file's removal) before the actual crate compiles, giving a
-/// deterministic window in which to abort the daemon mid-build and prove the
-/// daemon-owned child survives the abort as an orphan (`ManagedChildMarker`),
-/// then gets reaped and the interrupted `Preparing` record is recoverable on
-/// restart — never silently rebuilt into a false "prepared" claim, and never
-/// stuck unrecoverable either.
-fn write_blocking_build_script(cli_dir: &Path, blocker: &Path, started: &Path) {
-    let build_rs = format!(
-        "fn main() {{\n    \
-             let blocker = std::path::Path::new(\"{}\");\n    \
-             if blocker.exists() {{\n        \
-                 std::fs::write(\"{}\", std::process::id().to_string()).unwrap();\n        \
-                 while blocker.exists() {{\n            \
-                     std::thread::sleep(std::time::Duration::from_millis(50));\n        \
-                 }}\n    \
-             }}\n}}\n",
-        blocker.display(),
-        started.display(),
-    );
-    std::fs::write(cli_dir.join("build.rs"), build_rs).unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interrupted_preparation_is_reported_and_recovers_on_retry_after_restart() {
+/// A publication/registry fault boundary (P6.1 correction, item 2): a
+/// `manifest.json` plus binaries that are perfectly self-consistent — the
+/// exact shape an attacker (or a bug) reusing a guessable, content-derived
+/// release-id path could plant — must never be trusted on its own say-so.
+/// Only a digest THIS daemon already durably committed to the registry
+/// counts as trust; deleting the registry's memory of a real prior
+/// preparation must make it fall back to quarantine-and-rebuild, not silent
+/// adoption.
+#[tokio::test]
+async fn self_consistent_manifest_without_a_registry_digest_is_quarantined_not_adopted() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_fixture_repo(repo_dir.path(), "v1");
     let repo_name = repo_name_of(repo_dir.path());
-    let scratch = tempfile::tempdir().unwrap();
-    let blocker = scratch.path().join("hold-build");
-    let started = scratch.path().join("build-started");
-    std::fs::write(&blocker, b"hold").unwrap();
-    write_blocking_build_script(&repo_dir.path().join("rk-cli"), &blocker, &started);
-    git(repo_dir.path(), &["add", "."]);
-    git(repo_dir.path(), &["commit", "-qm", "add blocking build script"]);
 
     let layout = Layout::at(home.path());
-    layout.ensure().unwrap();
-    let config = rk_core::config::Config::default();
-    let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
-    let handle_a = tokio::spawn(daemon_a.run());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
     register_repo(&mut client, repo_dir.path()).await;
+    let prepared = prepare(&mut client, &repo_name, "main").await.unwrap();
+    let id = prepared["release"]["id"].as_str().unwrap().to_string();
+    let original_binary =
+        std::fs::read(layout.home().join("releases").join(&id).join("rk")).unwrap();
 
-    // Fire prepare on a background task — it will block inside the real
-    // `cargo build` until `blocker` is removed.
-    let mut prepare_client = connect(&layout).await;
-    let repo_name_bg = repo_name.clone();
-    let prepare_task = tokio::spawn(async move {
-        prepare(&mut prepare_client, &repo_name_bg, "main").await
-    });
+    // Erase the registry's memory of this release entirely — the manifest
+    // and binaries on disk remain perfectly self-consistent with each other,
+    // but no digest this daemon committed backs them any more.
+    let registry_path = layout.home().join("releases.json");
+    let mut registry: Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    registry.as_object_mut().unwrap().remove(&id);
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
 
-    // Wait for the real build-script child to signal it's actually running.
-    let mut waited = Duration::ZERO;
-    while !started.exists() && waited < Duration::from_secs(30) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        waited += Duration::from_millis(50);
-    }
-    assert!(started.exists(), "the real owned build never reached the barrier");
+    // A fresh `prepare` for the same candidate resolves to the same
+    // content-derived id, finds a self-consistent-looking manifest with no
+    // registry-backed trust, and must NOT adopt it as-is.
+    let rebuilt = prepare(&mut client, &repo_name, "main").await.unwrap();
+    assert_eq!(rebuilt["release"]["id"], id, "{rebuilt}");
+    assert_eq!(rebuilt["release"]["status"], "prepared", "{rebuilt}");
+    // Rebuilt fresh (not merely re-adopted), and still content-verifies —
+    // the same deterministic fixture source produces byte-identical output.
+    let rebuilt_binary =
+        std::fs::read(layout.home().join("releases").join(&id).join("rk")).unwrap();
+    assert_eq!(rebuilt_binary, original_binary);
+    let shown = show(&mut client, &id).await;
+    assert_eq!(shown["content_verified"], true, "{shown}");
 
-    // Confirm the registry already shows durable intent before the crash.
-    let mut saw_preparing = false;
-    for _ in 0..50 {
-        let listed = client
-            .call("release.list", json!({"repo": &repo_name}))
-            .await
-            .unwrap();
-        if listed["releases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["status"] == "preparing")
-        {
-            saw_preparing = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(saw_preparing, "no durable Preparing intent was ever recorded");
-
-    // The kill: abort the daemon's task outright (see live_landing_restart.rs
-    // for why this — not a graceful stop — is what actually cuts an in-flight
-    // async future off mid-build). The real `sh -c cargo build ...` child
-    // (and the build.rs it's blocked in) is NOT killed by this — it has no
-    // `kill_on_drop` (see `managed_verification`/`release::run_smoke_check`'s
-    // doc comments) — so it survives as a genuine orphan, exactly the
-    // scenario `ManagedChildMarker`/`reap_stale_managed_children` exists for.
-    handle_a.abort();
-    let _ = handle_a.await;
-    let _ = prepare_task.await;
-    std::fs::remove_file(layout.pid_file()).ok();
-    std::fs::remove_file(layout.socket_path()).ok();
-
-    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
-    let _handle_b = tokio::spawn(daemon_b.run());
-    let mut client = connect(&layout).await;
-
-    let listed = client
-        .call("release.list", json!({"repo": &repo_name}))
-        .await
-        .unwrap();
-    let releases = listed["releases"].as_array().unwrap();
-    assert_eq!(releases.len(), 1, "{releases:?}");
-    // No live prepare is running in the new daemon for this stale intent —
-    // `effective_status` must downgrade it rather than claim an active build.
-    assert_eq!(releases[0]["status"], "unknown", "{releases:?}");
-
-    // Release the real orphaned build so the retry's OWN build (or the
-    // reaped orphan, if `reap_stale_managed_children` lets it finish instead
-    // of killing it) can actually complete.
-    std::fs::remove_file(&blocker).ok();
-
-    let resumed = prepare(&mut client, &repo_name, "main").await.unwrap();
-    assert_eq!(resumed["release"]["status"], "prepared", "{resumed}");
-    let id = resumed["release"]["id"].as_str().unwrap().to_string();
-    assert_eq!(show(&mut client, &id).await["content_verified"], true);
+    // The unattested manifest was preserved as inspectable quarantined
+    // evidence, not deleted, and not silently reused in place.
+    let quarantine_root = layout.home().join("releases-partial");
+    let quarantined = std::fs::read_dir(&quarantine_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with(&id));
+    assert!(
+        quarantined,
+        "the unattested manifest/binaries must be quarantined, not silently discarded"
+    );
 }
+
+// A real interruption-mid-build/restart/retry journey used to live here as
+// `interrupted_preparation_is_reported_and_recovers_on_retry_after_restart`,
+// driving the daemon in-process via `tokio::spawn(daemon.run())` and
+// "crashing" it with `JoinHandle::abort()`. That is unsound: `abort()` only
+// cancels the listener's own top-level task, while `Server::run`'s accept
+// loop spawns an INDEPENDENT task per connection — never a child of the
+// listener task — so the task actually running the in-flight
+// `release.prepare` call (and, through it, the real `cargo build` child it
+// owns) survives the abort untouched. Awaiting that same client's in-flight
+// `prepare` call after the "crash" then blocks behind the very build the
+// test means to interrupt, for up to `release::BUILD_TIMEOUT` (20 minutes) —
+// a fixture deadlock, not evidence of a slow compile.
+//
+// The corrected journey now lives in
+// `crates/rk-cli/tests/release_prepare_interruption.rs`, driving a real `rk`
+// subprocess daemon and interrupting it with a genuine `SIGKILL` — which
+// reaches every task the process was running, including the one holding the
+// in-flight build — then recovering through the ordinary
+// `Client::connect_or_spawn` stale-socket reclamation path a real restart
+// uses in the field.
