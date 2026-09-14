@@ -63,10 +63,33 @@ description = "Full workspace build, test, and lint — reserved for CI and prot
 # reviewers caught fmt/clippy issues verify had already reported clean.
 # See [tasks.test] above for why the `env -u` list must stay the full
 # strip_rk_spawn set, not just RK_AGENT.
+#
+# TKT-dagom-lajub-hijug: the test phase runs cargo-nextest (already pinned
+# above and already used by `verify`/verify-changed.sh) instead of
+# `cargo test --workspace`, because nextest runs test binaries concurrently
+# while `cargo test` runs them one at a time — that serialization is why the
+# old single-command test phase dominated protected-final's wall time.
+# `--test-threads 4` matches this repo's existing single-host concurrency
+# bound (.cargo/config.toml's `[build] jobs = 4`, chosen for the same
+# single-operator-castle disk/CPU-sharing reason) rather than nextest's
+# default of every logical core; it does not bound child-thread/test-internal
+# fan-out inside a test process, or any unrelated build sharing this host.
+# Nextest does not run doctests (https://nexte.st/docs/running/), so the
+# explicit `cargo test --workspace --doc` step below preserves that category.
+# It is a no-op today — this workspace has zero runnable doc-code-fences,
+# verified 2026-09-14 (crates/rk-git/src/lib.rs's only fence is ```text,
+# which rustdoc never executes) — but load-bearing the moment one is added.
+# Likewise, the workspace has no #[ignore] tests, [[bench]]/[[example]]
+# targets, or harness = false test targets (verified 2026-09-14), so
+# nextest's coverage of the existing test inventory is equivalent to
+# `cargo test --workspace`'s for every category actually present.
+# See crates/rk-core/tests/verify_full_recipe_regression.rs for command-level
+# proof that a broken fixture still fails each phase.
 run = """
 cargo fmt --all --check
 cargo build --workspace
-env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE -u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT cargo test --workspace --no-fail-fast
+env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE -u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT cargo nextest run --workspace --no-fail-fast --test-threads 4
+env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE -u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT cargo test --workspace --doc -- --test-threads 4
 cargo clippy --workspace --all-targets -- -D warnings
 """
 

@@ -10,7 +10,7 @@ checks: [
 		command:           "MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" mise run verify-full"
 		timeout:           "60m"
 		environmentPolicy: "strip_rk_spawn"
-		toolchain:         "mise rust@1.95.0"
+		toolchain:         "mise rust@1.95.0, cargo-nextest@0.9.143"
 		sharedCargoTarget: true
 	},
 	{
