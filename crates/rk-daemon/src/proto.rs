@@ -93,6 +93,11 @@ pub mod codes {
     pub const UNAUTHORIZED: &str = "unauthorized";
     pub const FORBIDDEN: &str = "forbidden";
     pub const FRAME_TOO_LARGE: &str = "frame_too_large";
+    /// Durable server-side state conflicts with what the request expects —
+    /// e.g. a stored release's content no longer matches its manifest, or a
+    /// manifest declares a schema this daemon does not support. Distinct from
+    /// `BAD_PARAMS`: the request shape was fine, the stored state was not.
+    pub const CONFLICT: &str = "conflict";
 }
 
 #[cfg(test)]

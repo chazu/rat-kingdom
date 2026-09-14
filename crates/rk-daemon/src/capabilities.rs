@@ -72,7 +72,8 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
         // handler refuses a foreign scope. It authors nothing.
         "bbs.brief" | "bbs.show" | "bbs.export" | "ping" | "status" | "space.scan" | "space.rd"
         | "repo.list"
-        | "repo.get" | "agent.status" | "agent.log" | "agent.progress" => ORDINARY_READ_ONLY,
+        | "repo.get" | "agent.status" | "agent.log" | "agent.progress" | "release.list"
+        | "release.show" => ORDINARY_READ_ONLY,
         "space.out" => ORDINARY_SELF_DONE,
         "repo.onboard.inspect" => ORDINARY_ONBOARDER,
         "repo.onboard.propose" => ONBOARDER_ONLY,
