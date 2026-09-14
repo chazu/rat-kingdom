@@ -792,6 +792,156 @@ async fn daemon_restart_never_blocks_progress_on_a_run_that_was_in_flight_when_i
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// P3.1 (TKT-vilug-hujok-bolis) variant of
+/// [`daemon_restart_never_blocks_progress_on_a_run_that_was_in_flight_when_it_died`]:
+/// the same crash-and-restart shape, but with the new aggregate host-wide
+/// cap (`[policy] verification_admission_aggregate_limit`) set to 1 on BOTH
+/// daemon A and daemon B, instead of relying on the pre-existing per-repo
+/// admission path. `HostVerificationAdmission` is in-memory only by design
+/// (like `VerificationAdmission` before it) — this proves that holds under a
+/// real crash, not just by inspection: daemon A's in-flight run holds the
+/// aggregate's one and only permit when it dies; daemon B's own semaphore
+/// must start genuinely fresh (full capacity), not somehow inherit a
+/// permanently-checked-out permit for a run that no longer exists, so its
+/// own first `verify.run` against the same repo is admitted immediately.
+/// Reuses the exact same real-process/real-crash mechanics as the test
+/// above; only the admission configuration differs.
+#[tokio::test]
+async fn daemon_restart_cleans_owned_verification_work_before_admitting_replacements_under_the_aggregate_cap(
+) {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    install_verify_check(repo_dir.path());
+
+    let rk = rk_bin();
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&hold_for_verify_script(&rk)),
+    );
+
+    let config = rk_core::config::Config::default();
+
+    // Daemon A: genuinely on-disk (`Daemon::new`), aggregate cap = 1.
+    let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
+    daemon_a.set_verification_admission_aggregate_limit(1);
+    let handle_a = tokio::spawn(daemon_a.run());
+    let mut client = connect(&layout).await;
+
+    let repo_name = repo_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    let (agent, worktree) =
+        spawn_verify_holder(&mut client, repo_dir.path(), "restart-in-flight-aggregate").await;
+    let pid_path = worktree.join("verify.pid");
+    let child_pid = wait_for_pid(&pid_path).await;
+    assert!(
+        process_alive(child_pid),
+        "the agent's own verify run must have a real child alive before the restart"
+    );
+
+    let status = client.call("status", json!({})).await.unwrap();
+    assert_eq!(
+        status["verification_host"]["executing"].as_u64(),
+        Some(1),
+        "the aggregate cap's one permit must be checked out by the in-flight run before the \
+         crash: {status}"
+    );
+
+    // The kill: abort the daemon's task outright (same technique the sibling
+    // test above uses), then clear the stale pid/socket a real crash would
+    // also leave with no live holder.
+    handle_a.abort();
+    let _ = handle_a.await;
+    std::fs::remove_file(layout.pid_file()).ok();
+    std::fs::remove_file(layout.socket_path()).ok();
+
+    // Daemon B: a fresh `Daemon::new` over the SAME on-disk home, with the
+    // SAME aggregate cap re-applied (config is not itself durable — every
+    // admission limit in this file is startup-config-only, re-read from
+    // `config.toml`-equivalent input on every boot). Its own startup sweeps
+    // and kills whatever daemon A left running before this test's client can
+    // issue a single RPC.
+    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
+    daemon_b.set_verification_admission_aggregate_limit(1);
+    let handle_b = tokio::spawn(daemon_b.run());
+    let mut client = connect(&layout).await;
+
+    // The real child daemon A left running is genuinely dead, not merely
+    // presumed dead — the same regression proof as the sibling test.
+    wait_for_death(child_pid).await;
+
+    let agent_status = client
+        .call("agent.status", json!({"name": &agent}))
+        .await
+        .unwrap();
+    assert_eq!(
+        agent_status["agent"]["state"].as_str(),
+        Some("orphaned"),
+        "the dead generation's agent record must not still claim to be live: {agent_status}"
+    );
+
+    let status = client.call("status", json!({})).await.unwrap();
+    assert_eq!(
+        status["verification_host"]["executing"].as_u64(),
+        Some(0),
+        "daemon B's own aggregate semaphore must start genuinely empty, not somehow inherit a \
+         permit checked out by a run that no longer exists: {status}"
+    );
+
+    // The forward-progress guarantee under the NEW cap: daemon B can
+    // immediately admit its own fresh `verify.run` against the very same
+    // repo under the same aggregate limit=1 — unblocked by any trace of the
+    // dead run daemon A left behind.
+    let (second_agent, worktree_2) = spawn_verify_holder(
+        &mut client,
+        repo_dir.path(),
+        "restart-in-flight-aggregate-2",
+    )
+    .await;
+    let child_pid_2 = wait_for_pid(&worktree_2.join("verify.pid")).await;
+    assert!(
+        process_alive(child_pid_2),
+        "daemon B must admit its own fresh verify.run under the same aggregate cap, unblocked \
+         by any trace of the dead run daemon A left behind"
+    );
+    let status = client.call("status", json!({})).await.unwrap();
+    assert_eq!(
+        status["verification_host"]["executing"].as_u64(),
+        Some(1),
+        "daemon B's replacement run must genuinely hold the aggregate cap's one permit: {status}"
+    );
+
+    // Clean up daemon B's own still-running check through the daemon's OWN
+    // owned-cancellation path (`agent.dismiss` -> `Supervisor::dismiss` ->
+    // `cancel_managed_verification_for_agent`, the same real mechanism
+    // `dismissing_a_live_agent_kills_its_own_in_flight_verify_run` proves
+    // end to end) rather than a raw external `kill -9` outside the
+    // daemon's own bookkeeping.
+    client
+        .call("agent.dismiss", json!({"name": second_agent}))
+        .await
+        .unwrap();
+    wait_for_death(child_pid_2).await;
+
+    handle_b.abort();
+    let _ = handle_b.await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
 /// Sets up two independently registered repos and two SEPARATE operator
 /// connections, each issuing its own FIRST `verify.run` call — so both
 /// genuinely mint `req.id == "1"` (`Client::next_id` starts at 0 and is

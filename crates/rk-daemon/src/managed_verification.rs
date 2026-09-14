@@ -35,6 +35,7 @@ pub(crate) struct CheckExecution<'a> {
 pub(crate) struct VerificationResources {
     pub(crate) test_exec_lock: TestExecLock,
     pub(crate) admission: VerificationAdmission,
+    pub(crate) host_admission: HostVerificationAdmission,
     pub(crate) runs: ManagedVerificationRuns,
     pub(crate) clock: SpanClock,
 }
@@ -92,8 +93,22 @@ pub(crate) struct ManagedVerification<'a> {
 }
 
 impl<'a> ManagedVerification<'a> {
+    /// Whether a check for `repo` goes through ANY bounded admission at all —
+    /// the shared-`CARGO_TARGET_DIR` lock, this repo's own per-repo WIP
+    /// limit, OR the aggregate host-wide cap (P3.1, TKT-vilug-hujok-bolis).
+    /// `landing.rs`'s combined-candidate batching (`process_batch`) reads
+    /// this to decide whether a repo is safe to batch multiple tickets'
+    /// checks into one combined run: batching assumes the repo has no
+    /// capacity contention to protect against. Before the aggregate cap
+    /// existed, a repo with no per-repo override and no shared-target flag
+    /// correctly read as "unbounded, safe to batch" — but a positive
+    /// aggregate limit bounds this repo's checks too even with no per-repo
+    /// override configured, so omitting it here would have silently kept
+    /// batching a repo that is, in fact, now under host-wide admission.
     pub(crate) fn uses_capacity_admission(&self, repo: &str) -> bool {
-        self.shared_cargo_target || self.resources.admission.limit_for(repo) > 0
+        self.shared_cargo_target
+            || self.resources.admission.limit_for(repo) > 0
+            || self.resources.host_admission.limit() > 0
     }
 
     pub(crate) fn new(
@@ -576,6 +591,10 @@ impl<'a> ManagedVerification<'a> {
         // One capacity budget spans both locks. Named check execution gets
         // its own timeout only after all admission resources are acquired.
         let admission_limit = self.resources.admission.limit_for(repo);
+        // Read once per call, same convention as `admission_limit` — the
+        // aggregate cap is startup-config-only (TKT-vilug-hujok-bolis), never
+        // live-reloaded mid-flight outside a test.
+        let host_limit = self.resources.host_admission.limit();
         let admission_started = Instant::now();
         let admission_started_wall = self.resources.clock.now();
         if let Some(p) = &progress {
@@ -596,9 +615,19 @@ impl<'a> ManagedVerification<'a> {
             } else {
                 None
             };
-            (test_guard, admission)
+            // Aggregate host permit, acquired LAST — strictly after the
+            // shared-target lock and the per-repo permit above. A request
+            // still queued behind either of those has not yet entered this
+            // semaphore's own wait queue, so a saturated repo (or a held
+            // shared-target lock) can never occupy a host slot, or block
+            // ahead of, an eligible request from a different repo
+            // (TKT-vilug-hujok-bolis: preventing cross-repo head-of-line
+            // blocking). This does not implement check sharing — it is a
+            // pure ordering property of two independent semaphores.
+            let host_guard = self.resources.host_admission.acquire().await;
+            (test_guard, admission, host_guard)
         };
-        let (_test_exec_guard, admission) = match if wait_budget.is_zero() {
+        let (_test_exec_guard, admission, _host_guard) = match if wait_budget.is_zero() {
             None
         } else {
             tokio::time::timeout(wait_budget, acquire).await.ok()
@@ -606,7 +635,7 @@ impl<'a> ManagedVerification<'a> {
             Some(guards) => guards,
             None => {
                 let stderr = format!(
-                    "run step: `{command}` did not acquire verification capacity for repo `{repo}` within {wait_budget:?} (shared CARGO_TARGET_DIR lock / verification admission; WIP limit {admission_limit})"
+                    "run step: `{command}` did not acquire verification capacity for repo `{repo}` within {wait_budget:?} (shared CARGO_TARGET_DIR lock / verification admission; WIP limit {admission_limit}; host limit {host_limit})"
                 );
                 let queue_wait_ms =
                     u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -652,7 +681,9 @@ impl<'a> ManagedVerification<'a> {
                 }));
             }
         };
-        let admission_queue_wait_ms = (admission_limit > 0 || _test_exec_guard.is_some())
+        let admission_queue_wait_ms = (admission_limit > 0
+            || _test_exec_guard.is_some()
+            || host_limit > 0)
             .then(|| u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX));
         let _admission_guard = admission.map(|(permit, _)| permit);
         let run_started = Instant::now();
@@ -2439,6 +2470,115 @@ impl VerificationAdmission {
             .await
             .expect("verification admission semaphore is never closed");
         Some((permit, started.elapsed()))
+    }
+}
+
+/// Optional aggregate concurrency ceiling for daemon-managed verification
+/// runs ACROSS EVERY REPOSITORY this daemon serves (P3.1,
+/// TKT-vilug-hujok-bolis) — layered ABOVE, never instead of, each
+/// repository's own [`VerificationAdmission`] bound. `0` (the default)
+/// disables it entirely: no semaphore is ever created, so a daemon that
+/// hasn't opted in pays nothing beyond one mutex lock per managed run, and
+/// behaves exactly as it did before this existed.
+///
+/// Backed by a single `tokio::sync::Semaphore` sized to the configured
+/// limit — no per-repo dimension, unlike [`VerificationAdmission`]. Like
+/// that struct, this is IN-MEMORY ONLY: a daemon restart drops it along with
+/// every outstanding permit, and the next daemon starts fresh, full of
+/// permits — there is no durable lease to recover or strand across a
+/// restart. The real OS child processes a restart must still clean up are
+/// reached the same way they always were: [`ManagedChildMarker`] /
+/// `reap_stale_managed_children`, unaffected by this struct's own lifetime.
+///
+/// [`ManagedVerification::run`] acquires this STRICTLY AFTER the per-repo
+/// admission (and the shared-`CARGO_TARGET_DIR` lock, when applicable): a
+/// request still queued behind its own saturated repo has not yet entered
+/// this semaphore's wait queue, and so can never occupy — or queue ahead
+/// of — a host slot an eligible request from a DIFFERENT repo could
+/// otherwise use immediately. Ordinary acquire-order is what prevents the
+/// cross-repo head-of-line blocking the ticket requires be prevented; no
+/// separate coordination or check-sharing is needed for it.
+#[derive(Default)]
+pub(crate) struct HostVerificationAdmission {
+    semaphore: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    limit: AtomicU64,
+    /// Requests currently blocked in [`acquire`](Self::acquire)'s own
+    /// await — SPECIFICALLY waiting for the aggregate host permit, never a
+    /// broader "waiting for any managed admission" count. A request still
+    /// queued behind its own per-repo `VerificationAdmission` semaphore, or
+    /// behind the shared-`CARGO_TARGET_DIR` `TestExecLock`, has not called
+    /// [`acquire`](Self::acquire) yet (see [`ManagedVerification::run`]'s
+    /// acquire order) and so is not counted here at all — it shows up only
+    /// implicitly, as elapsed queue-wait time once it settles. Distinct from
+    /// `executing` (checked-out permits): a request that already holds its
+    /// own repo's permit but is still queued here for the host-wide one is
+    /// "waiting", not yet "executing".
+    waiting: AtomicU64,
+}
+
+impl HostVerificationAdmission {
+    /// Set `[policy] verification_admission_aggregate_limit`. Applied once by
+    /// `Daemon::new` from config — same pattern, and same
+    /// restart-required-to-change contract, as
+    /// [`VerificationAdmission::set_limits`]. Replaces any existing
+    /// semaphore outright: safe in production (called exactly once, before
+    /// the daemon serves its first request) and otherwise only ever called
+    /// again by a test.
+    pub(crate) fn set_limit(&self, limit: u32) {
+        self.limit.store(u64::from(limit), Ordering::Relaxed);
+        *self.semaphore.lock().unwrap() =
+            (limit > 0).then(|| Arc::new(tokio::sync::Semaphore::new(limit as usize)));
+    }
+
+    /// The configured aggregate ceiling. `0` means disabled.
+    pub(crate) fn limit(&self) -> u32 {
+        self.limit.load(Ordering::Relaxed) as u32
+    }
+
+    /// Host permits currently checked out, for reporting only
+    /// (`Supervisor::host_verification_capacity_summary`) — never consulted
+    /// for admission itself. `0` whenever the limit is `0` (disabled).
+    pub(crate) fn executing(&self) -> u32 {
+        let limit = self.limit();
+        if limit == 0 {
+            return 0;
+        }
+        match self.semaphore.lock().unwrap().as_ref() {
+            Some(sem) => limit.saturating_sub(sem.available_permits() as u32),
+            None => 0,
+        }
+    }
+
+    /// Requests currently waiting for a host permit, for reporting only.
+    pub(crate) fn waiting(&self) -> u32 {
+        self.waiting.load(Ordering::Relaxed) as u32
+    }
+
+    /// Acquire one host-wide permit, or `None` immediately when the
+    /// aggregate cap is disabled (limit `0`) — every caller must treat that
+    /// as "proceed unbounded", matching [`VerificationAdmission::acquire`]'s
+    /// own convention. The `waiting` counter is incremented only around the
+    /// actual await and decremented by a drop guard rather than inline code
+    /// after it, so a caller that cancels this future mid-wait (the overall
+    /// admission `tokio::time::timeout`, or `verify_repo_check`'s own
+    /// cancellation race) can never leak the count.
+    pub(crate) async fn acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let sem = self.semaphore.lock().unwrap().clone()?;
+        struct WaitGuard<'a>(&'a AtomicU64);
+        impl Drop for WaitGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let _wait_guard = WaitGuard(&self.waiting);
+        // A semaphore is only ever closed by `close()`, which nothing here
+        // calls — this can never actually return `Err`.
+        Some(
+            sem.acquire_owned()
+                .await
+                .expect("host verification admission semaphore is never closed"),
+        )
     }
 }
 
