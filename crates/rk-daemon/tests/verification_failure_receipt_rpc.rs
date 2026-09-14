@@ -11,7 +11,7 @@ mod support;
 
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Pattern};
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use rk_ledger::Budget;
 use rk_space::Space;
 use serde_json::json;
