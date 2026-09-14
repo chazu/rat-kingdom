@@ -1508,7 +1508,9 @@ fn render_warnings(out: &mut String, result: &Value) {
 /// `## Scorecards` above: this reads the daemon-native landing pipeline
 /// directly, not the `OutcomeFact` aggregation, and every count renders `n/a`
 /// rather than `0` when the underlying read failed — a `0` here would read as
-/// "observed and confirmed empty" instead of "unknown".
+/// "observed and confirmed empty" instead of "unknown". This is also the
+/// only bounded read in this response: every other scorecard source above
+/// remains an unbounded scan within its own repo scope.
 fn render_native_delivery(out: &mut String, result: &Value) {
     out.push_str("## Native Delivery\n\n");
     let section = &result["native_delivery"];
@@ -1516,12 +1518,27 @@ fn render_native_delivery(out: &mut String, result: &Value) {
         out.push_str("(not reported)\n\n");
         return;
     }
+    out.push_str(
+        "(bounded read: only this section is capped/windowed; other scorecard sources above are unbounded scans within this repo)\n",
+    );
     let count = |value: &Value| -> String {
         value
             .as_u64()
             .map(|n| n.to_string())
             .unwrap_or_else(|| "n/a".into())
     };
+    let window = &section["requested_window"];
+    out.push_str(&format!(
+        "- requested_window: since={} until={}\n",
+        window["since"]
+            .as_i64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".into()),
+        window["until"]
+            .as_i64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".into()),
+    ));
     let coverage = &section["coverage"];
     out.push_str(&format!(
         "- available={} scanned={} in_window={} limit={} truncated={} order={}\n",
@@ -1541,14 +1558,18 @@ fn render_native_delivery(out: &mut String, result: &Value) {
         count(&section["delivered_edges_without_task"]),
         count(&section["delivered_tasks"]),
     ));
-    let never = &section["never_delivered"];
+    let no_delivery = &section["no_delivery_observed"];
     out.push_str(&format!(
-        "- never_delivered: gate_held={} no_gate={} rework_filed={} escalated={} empty={}\n",
-        count(&never["gate_held"]),
-        count(&never["no_gate"]),
-        count(&never["rework_filed"]),
-        count(&never["escalated"]),
-        count(&never["empty"]),
+        "- no_delivery_observed (within the coverage above, not an absolute claim -- may_hide_delivery={}): gate_held={} no_gate={} rework_filed={} escalated={} empty={}\n",
+        coverage["may_hide_delivery"]
+            .as_bool()
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        count(&no_delivery["gate_held"]),
+        count(&no_delivery["no_gate"]),
+        count(&no_delivery["rework_filed"]),
+        count(&no_delivery["escalated"]),
+        count(&no_delivery["empty"]),
     ));
     let incidents = &section["observed_incidents"];
     out.push_str(&format!(

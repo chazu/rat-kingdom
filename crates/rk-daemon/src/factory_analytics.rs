@@ -774,16 +774,32 @@ enum NativeDeliveryDisposition<'a> {
     /// silently attributed to either value and not folded into the plain
     /// `Delivered` count.
     DeliveredConflicting { conflict: &'static str },
-    /// Never landed; every record observed for this key agrees on the same
-    /// single non-delivery outcome.
-    NeverDelivered { outcome: &'a str },
-    /// Never landed, and the non-delivery outcomes recorded for this key
-    /// disagree — order-independent by construction (module doc), so this is
-    /// reported unknown rather than guessed via ULID or wall-clock order.
+    /// No `"landed"` marker for this key inside the returned coverage: every
+    /// record observed within `coverage.scanned`/`requested_window` agrees on
+    /// the same single non-delivery outcome. This is a claim about the
+    /// bounded/windowed read, NOT that the key was never delivered — a
+    /// narrower `requested_window` or the storage-side row limit can exclude
+    /// an actual later (or earlier) `"landed"` marker for this exact key
+    /// (module doc on [`native_delivery_section`]'s `may_hide_delivery`).
+    NoDeliveryObserved { outcome: &'a str },
+    /// No `"landed"` marker observed, and the non-delivery outcomes recorded
+    /// for this key disagree — order-independent by construction (module
+    /// doc), so this is reported unknown rather than guessed via ULID or
+    /// wall-clock order.
     ConflictingOutcome,
 }
 
-fn reduce_native_delivery_group(records: &[(String, Option<String>, Option<String>)]) -> NativeDeliveryDisposition<'_> {
+/// `(branch, head_sha, target)` — the exact identity fields
+/// `landing::LandingPipeline::mark_processed` records, used as the dedup key.
+type NativeDeliveryWorkKey = (String, String, String);
+
+/// One parsed marker's `(outcome, task, target_head)`, grouped per
+/// [`NativeDeliveryWorkKey`] for [`reduce_native_delivery_group`].
+type NativeDeliveryOutcomeRecord = (String, Option<String>, Option<String>);
+
+fn reduce_native_delivery_group(
+    records: &[NativeDeliveryOutcomeRecord],
+) -> NativeDeliveryDisposition<'_> {
     let outcomes: BTreeSet<&str> = records.iter().map(|(o, _, _)| o.as_str()).collect();
     if outcomes.contains("landed") {
         let landed = || records.iter().filter(|(outcome, _, _)| outcome == "landed");
@@ -801,7 +817,7 @@ fn reduce_native_delivery_group(records: &[(String, Option<String>, Option<Strin
             task: tasks.into_iter().next(),
         }
     } else if outcomes.len() == 1 {
-        NativeDeliveryDisposition::NeverDelivered {
+        NativeDeliveryDisposition::NoDeliveryObserved {
             outcome: outcomes.into_iter().next().expect("len==1"),
         }
     } else {
@@ -811,15 +827,22 @@ fn reduce_native_delivery_group(records: &[(String, Option<String>, Option<Strin
 
 /// Reduce raw `landing_processed` markers into the additive `native_delivery`
 /// section: bounded coverage, exact source ids, one delivery-edge count per
-/// distinct `(branch, head_sha, target)` work key, clearly named
-/// never-delivered work keys, and a separate raw incident tally that a later
-/// successful land cannot erase. See [`landing`](crate::landing) module doc
-/// for the producer contract this reads.
+/// distinct `(branch, head_sha, target)` work key, a clearly-scoped
+/// `no_delivery_observed` bucket, and a separate raw incident tally that a
+/// later successful land cannot erase. See [`landing`](crate::landing) module
+/// doc for the producer contract this reads.
+///
+/// Scope: this is the ONLY source family in [`AnalyticsInputs`] read through
+/// a bounded, storage-capped query (`Server::factory_analytics_inputs`'s
+/// `scan_newest_limited` call). Every other field on [`AnalyticsInputs`]
+/// (agents, instances, tickets, revert facts, reviewer verdicts, CI facts) is
+/// still an unbounded scan within its repo scope; this slice does not make
+/// the rest of `factory.scorecards` bounded, only this new section.
 ///
 /// Two independent accounting axes, deliberately not merged:
-///   - Per-work-key summary (`delivered_edges`, `never_delivered`, and the
-///     `unknown` conflict buckets): one disposition per distinct key, from
-///     [`reduce_native_delivery_group`].
+///   - Per-work-key summary (`delivered_edges`, `no_delivery_observed`, and
+///     the `unknown` conflict buckets): one disposition per distinct key,
+///     from [`reduce_native_delivery_group`].
 ///   - `observed_incidents`: a raw, non-deduplicated tally of every
 ///     non-`"landed"` marker actually read. A key that failed gates twice
 ///     before eventually landing still shows two recorded `gate_held`
@@ -836,12 +859,25 @@ fn reduce_native_delivery_group(records: &[(String, Option<String>, Option<Strin
 /// whose non-delivery markers disagree without ever landing has no
 /// order-independent way to prefer one verdict over another, so it is
 /// reported `conflicting_outcome` rather than guessed.
+///
+/// `no_delivery_observed` is relative to `coverage`, not absolute: a
+/// requested `since`/`until` window, or the storage-side row limit, can
+/// exclude the one `"landed"` marker for a key while still including an
+/// earlier `"gate-held"`/etc. marker for that SAME key — e.g. a candidate
+/// gated-held inside the window, then landed after an operator fix, with
+/// that later land's timestamp outside `until`. That key would show up here
+/// as `no_delivery_observed.gate_held`, which is correct FOR THIS COVERAGE
+/// but is not a claim the key was never delivered. `coverage.may_hide_delivery`
+/// flags exactly this condition (a window was requested, or the read was
+/// truncated) rather than silently resolving it — resolving it would require
+/// reading unbounded history, which this bounded slice deliberately does not
+/// do (deferred cursor/checkpoint work, ticket "Deferred, still required").
 fn native_delivery_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsRequest) -> Value {
     let cov = &inputs.native_delivery;
 
     let mut source_ids: Vec<String> = Vec::with_capacity(cov.events.len());
     let mut malformed_ids: Vec<String> = Vec::new();
-    let mut groups: BTreeMap<(String, String, String), Vec<(String, Option<String>, Option<String>)>> =
+    let mut groups: BTreeMap<NativeDeliveryWorkKey, Vec<NativeDeliveryOutcomeRecord>> =
         BTreeMap::new();
     let mut observed_incidents: BTreeMap<&'static str, u64> = NATIVE_NON_DELIVERY_OUTCOMES
         .iter()
@@ -875,7 +911,7 @@ fn native_delivery_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsReque
     let mut delivered_edges: u64 = 0;
     let mut delivered_edges_without_task: u64 = 0;
     let mut delivered_tasks: BTreeSet<String> = BTreeSet::new();
-    let mut never_delivered: BTreeMap<&'static str, u64> = NATIVE_NON_DELIVERY_OUTCOMES
+    let mut no_delivery_observed: BTreeMap<&'static str, u64> = NATIVE_NON_DELIVERY_OUTCOMES
         .iter()
         .map(|outcome| (*outcome, 0u64))
         .collect();
@@ -900,14 +936,23 @@ fn native_delivery_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsReque
             NativeDeliveryDisposition::DeliveredConflicting { .. } => {
                 conflicting_target_head += 1;
             }
-            NativeDeliveryDisposition::NeverDelivered { outcome } => {
-                *never_delivered.get_mut(outcome).expect("known outcome") += 1;
+            NativeDeliveryDisposition::NoDeliveryObserved { outcome } => {
+                *no_delivery_observed
+                    .get_mut(outcome)
+                    .expect("known outcome") += 1;
             }
             NativeDeliveryDisposition::ConflictingOutcome => {
                 conflicting_outcome += 1;
             }
         }
     }
+
+    // A requested window or a truncated read can each exclude the one
+    // `"landed"` marker for a key while leaving an earlier/later non-delivery
+    // marker for that same key inside coverage (function doc above) — flag
+    // that condition explicitly rather than let `no_delivery_observed` read
+    // as an absolute claim.
+    let may_hide_delivery = req.since.is_some() || req.until.is_some() || cov.truncated;
 
     let mut warnings: Vec<String> = Vec::new();
     if let Some(warning) = &cov.read_warning {
@@ -918,6 +963,15 @@ fn native_delivery_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsReque
             "native_delivery_coverage_truncated: read capped at {} landing_processed markers ordered by descending tuple id; older-by-id markers beyond this bound are not reflected",
             cov.limit
         ));
+    }
+    if may_hide_delivery {
+        warnings.push(
+            "native_delivery_no_delivery_observed_is_coverage_relative: no_delivery_observed \
+             counts work keys with no landed marker inside coverage (bounded by the requested \
+             since/until window and/or the row limit above) — a work key's landing outside this \
+             coverage is not reflected and this is not a claim delivery never happened"
+                .to_string(),
+        );
     }
 
     // A failed read renders every derived count `null`, not `0` — a `0` here
@@ -955,17 +1009,23 @@ fn native_delivery_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsReque
             // reader does not assume temporal completeness a delayed writer
             // could violate. The reduction above never relies on this order.
             "order": "id_desc",
+            // True when a `since`/`until` window was requested, or the read
+            // hit its row limit — either can exclude a real `"landed"`
+            // marker for a key while `no_delivery_observed` still counts it
+            // (function doc). `false` means this coverage is a complete view
+            // of every `landing_processed` marker for this repo.
+            "may_hide_delivery": if cov.available { json!(may_hide_delivery) } else { Value::Null },
         },
         "source_ids": if cov.available { json!(source_ids) } else { json!([]) },
         "delivered_edges": count(delivered_edges),
         "delivered_edges_without_task": count(delivered_edges_without_task),
         "delivered_tasks": count(delivered_tasks.len() as u64),
-        "never_delivered": {
-            "gate_held": count(never_delivered["gate-held"]),
-            "no_gate": count(never_delivered["no-gate"]),
-            "rework_filed": count(never_delivered["rework-filed"]),
-            "escalated": count(never_delivered["escalated"]),
-            "empty": count(never_delivered["empty"]),
+        "no_delivery_observed": {
+            "gate_held": count(no_delivery_observed["gate-held"]),
+            "no_gate": count(no_delivery_observed["no-gate"]),
+            "rework_filed": count(no_delivery_observed["rework-filed"]),
+            "escalated": count(no_delivery_observed["escalated"]),
+            "empty": count(no_delivery_observed["empty"]),
         },
         "observed_incidents": {
             "gate_held": count(observed_incidents["gate-held"]),
@@ -1611,5 +1671,536 @@ mod tests {
                 == 0,
             "in-flight agents contribute no terminal agent facts"
         );
+    }
+
+    // -- native_delivery (landing_processed) -------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn landing_processed_event(
+        branch: &str,
+        head_sha: &str,
+        target: &str,
+        task: &str,
+        outcome: &str,
+        target_head: Option<&str>,
+        at_secs: i64,
+    ) -> Tuple {
+        let mut payload = json!({
+            "branch": branch,
+            "target": target,
+            "head_sha": head_sha,
+            "task": task,
+            "outcome": outcome,
+            "admission_hold": false,
+            "admission_recovery": Value::Null,
+        });
+        payload["target_head"] = match target_head {
+            Some(head) => json!(head),
+            None => Value::Null,
+        };
+        let mut tuple = Tuple::new(
+            rk_core::tuple::Category::Event,
+            "rat-kingdom",
+            crate::landing::LANDING_PROCESSED_IDENTITY,
+            "daemon",
+            payload,
+        );
+        tuple.created_at = Utc.timestamp_opt(at_secs, 0).unwrap();
+        tuple
+    }
+
+    fn native_inputs(events: Vec<Tuple>, coverage: NativeDeliveryInputs) -> AnalyticsInputs {
+        let mut base = inputs();
+        base.native_delivery = NativeDeliveryInputs { events, ..coverage };
+        base
+    }
+
+    fn observed(scanned: usize, limit: usize, truncated: bool) -> NativeDeliveryInputs {
+        NativeDeliveryInputs {
+            events: Vec::new(),
+            scanned,
+            limit,
+            truncated,
+            available: true,
+            read_warning: None,
+        }
+    }
+
+    #[test]
+    fn native_delivery_counts_one_edge_per_work_key_and_attributes_its_task() {
+        let events = vec![landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-abc"),
+            1_000,
+        )];
+        let coverage = observed(1, 10_000, false);
+        let resp = scorecards_response(
+            &native_inputs(events, coverage),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["available"], json!(true));
+        assert_eq!(nd["delivered_edges"], json!(1));
+        assert_eq!(nd["delivered_edges_without_task"], json!(0));
+        assert_eq!(nd["delivered_tasks"], json!(1));
+        assert_eq!(nd["coverage"]["order"], json!("id_desc"));
+        assert_eq!(nd["coverage"]["truncated"], json!(false));
+    }
+
+    #[test]
+    fn native_delivery_ad_hoc_land_with_no_task_is_legitimate_not_unknown() {
+        let events = vec![landing_processed_event(
+            "feature", "abc123", "main", "", "landed", None, 1_000,
+        )];
+        let resp = scorecards_response(
+            &native_inputs(events, observed(1, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["delivered_edges"], json!(1));
+        assert_eq!(nd["delivered_edges_without_task"], json!(1));
+        assert_eq!(nd["delivered_tasks"], json!(0));
+        assert_eq!(nd["unknown"]["conflicting_task"], json!(0));
+    }
+
+    #[test]
+    fn native_delivery_recovered_key_preserves_prior_gate_held_as_an_incident() {
+        // Same work key: one prior gate-held marker, later a landed marker
+        // (an operator resubmit after a fix). The key is delivered exactly
+        // once, but the earlier gate-failure evidence must not disappear.
+        let events = vec![
+            landing_processed_event(
+                "feature",
+                "abc123",
+                "main",
+                "TKT-1",
+                "gate-held",
+                None,
+                1_000,
+            ),
+            landing_processed_event(
+                "feature",
+                "abc123",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-abc"),
+                2_000,
+            ),
+        ];
+        let resp = scorecards_response(
+            &native_inputs(events, observed(2, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(3_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["delivered_edges"], json!(1));
+        assert_eq!(nd["no_delivery_observed"]["gate_held"], json!(0));
+        assert_eq!(
+            nd["observed_incidents"]["gate_held"],
+            json!(1),
+            "the earlier gate-held attempt must remain visible even though this key later landed"
+        );
+    }
+
+    #[test]
+    fn native_delivery_never_landed_key_with_single_agreed_outcome_is_counted_once() {
+        let events = vec![landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "rework-filed",
+            None,
+            1_000,
+        )];
+        let resp = scorecards_response(
+            &native_inputs(events, observed(1, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["delivered_edges"], json!(0));
+        assert_eq!(nd["no_delivery_observed"]["rework_filed"], json!(1));
+        assert_eq!(nd["observed_incidents"]["rework_filed"], json!(1));
+    }
+
+    #[test]
+    fn native_delivery_conflicting_task_on_a_landed_key_is_unknown_not_delivered() {
+        // Two "landed" markers for the exact same work key disagreeing on
+        // task is a data anomaly (the admission dedup is supposed to
+        // prevent it) — must not be silently attributed to either ticket.
+        let events = vec![
+            landing_processed_event(
+                "feature",
+                "abc123",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-abc"),
+                1_000,
+            ),
+            landing_processed_event(
+                "feature",
+                "abc123",
+                "main",
+                "TKT-2",
+                "landed",
+                Some("merge-abc"),
+                1_100,
+            ),
+        ];
+        let resp = scorecards_response(
+            &native_inputs(events, observed(2, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(
+            nd["delivered_edges"],
+            json!(0),
+            "a task conflict must not be folded into a clean delivered edge"
+        );
+        assert_eq!(nd["unknown"]["conflicting_task"], json!(1));
+    }
+
+    #[test]
+    fn native_delivery_conflicting_target_head_on_a_landed_key_is_unknown() {
+        let events = vec![
+            landing_processed_event(
+                "feature",
+                "abc123",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-abc"),
+                1_000,
+            ),
+            landing_processed_event(
+                "feature",
+                "abc123",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-def"),
+                1_100,
+            ),
+        ];
+        let resp = scorecards_response(
+            &native_inputs(events, observed(2, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["delivered_edges"], json!(0));
+        assert_eq!(nd["unknown"]["conflicting_target_head"], json!(1));
+    }
+
+    #[test]
+    fn native_delivery_never_landed_key_with_disagreeing_outcomes_is_unknown() {
+        let events = vec![
+            landing_processed_event(
+                "feature",
+                "abc123",
+                "main",
+                "TKT-1",
+                "gate-held",
+                None,
+                1_000,
+            ),
+            landing_processed_event(
+                "feature",
+                "abc123",
+                "main",
+                "TKT-1",
+                "escalated",
+                None,
+                1_100,
+            ),
+        ];
+        let resp = scorecards_response(
+            &native_inputs(events, observed(2, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["delivered_edges"], json!(0));
+        assert_eq!(nd["no_delivery_observed"]["gate_held"], json!(0));
+        assert_eq!(nd["no_delivery_observed"]["escalated"], json!(0));
+        assert_eq!(nd["unknown"]["conflicting_outcome"], json!(1));
+    }
+
+    #[test]
+    fn native_delivery_rejects_a_record_not_authored_by_the_daemon_producer() {
+        let mut forged = landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-abc"),
+            1_000,
+        );
+        forged.instance = "some-rat".into();
+        let resp = scorecards_response(
+            &native_inputs(vec![forged], observed(1, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["delivered_edges"], json!(0));
+        assert_eq!(nd["unknown"]["malformed"], json!(1));
+    }
+
+    #[test]
+    fn native_delivery_rejects_wrong_category_and_wrong_identity() {
+        let mut wrong_category = landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-abc"),
+            1_000,
+        );
+        wrong_category.category = rk_core::tuple::Category::Fact;
+        let mut wrong_identity = landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-abc"),
+            1_100,
+        );
+        wrong_identity.identity = "not_landing_processed".into();
+        let resp = scorecards_response(
+            &native_inputs(
+                vec![wrong_category, wrong_identity],
+                observed(2, 10_000, false),
+            ),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["delivered_edges"], json!(0));
+        assert_eq!(nd["unknown"]["malformed"], json!(2));
+    }
+
+    #[test]
+    fn native_delivery_missing_identity_fields_are_malformed_not_dropped_silently() {
+        let mut missing_branch = landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-abc"),
+            1_000,
+        );
+        missing_branch.payload["branch"] = Value::Null;
+        let resp = scorecards_response(
+            &native_inputs(vec![missing_branch], observed(1, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["unknown"]["malformed"], json!(1));
+        assert_eq!(
+            nd["unknown"]["malformed_source_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_delivery_empty_but_observed_dataset_reports_real_zeros_not_null() {
+        let resp = scorecards_response(
+            &native_inputs(Vec::new(), observed(0, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["available"], json!(true));
+        assert_eq!(nd["delivered_edges"], json!(0));
+        assert_eq!(nd["coverage"]["scanned"], json!(0));
+        assert_eq!(nd["coverage"]["in_window"], json!(0));
+    }
+
+    #[test]
+    fn native_delivery_truncated_read_is_reported_explicitly() {
+        let events = vec![landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-abc"),
+            1_000,
+        )];
+        let resp = scorecards_response(
+            &native_inputs(events, observed(10_000, 10_000, true)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["coverage"]["truncated"], json!(true));
+        assert_eq!(
+            nd["coverage"]["may_hide_delivery"],
+            json!(true),
+            "a truncated read can hide a real delivery beyond the row limit"
+        );
+        assert!(nd["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("native_delivery_coverage_truncated")));
+    }
+
+    #[test]
+    fn native_delivery_window_excludes_a_later_landed_marker_reports_no_delivery_observed_not_never(
+    ) {
+        // Simulates the pre-filter `Server::factory_analytics_inputs` applies
+        // before this pure function ever sees the data: a requested `until`
+        // keeps this key's earlier gate-held marker in coverage but excludes
+        // its later landed marker (an operator fix that landed after the
+        // window's cutoff). Within THIS coverage the key never shows
+        // "landed" — that must render as `no_delivery_observed`, explicitly
+        // flagged as coverage-relative, never as an absolute "never landed"
+        // claim, and without reading anything beyond this bounded window.
+        let events = vec![landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "gate-held",
+            None,
+            1_000,
+        )];
+        let req = FactoryAnalyticsRequest {
+            repo: Some("rat-kingdom".into()),
+            until: Some(1_500_000),
+            ..Default::default()
+        };
+        let resp = scorecards_response(
+            &native_inputs(events, observed(1, 10_000, false)),
+            &req,
+            Utc.timestamp_opt(6_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["delivered_edges"], json!(0));
+        assert_eq!(
+            nd["no_delivery_observed"]["gate_held"],
+            json!(1),
+            "within this bounded window the key shows no landed marker"
+        );
+        assert_eq!(nd["requested_window"]["until"], json!(1_500_000));
+        assert_eq!(
+            nd["coverage"]["may_hide_delivery"],
+            json!(true),
+            "a requested window can exclude a real later delivery for this same key"
+        );
+        assert!(nd["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("no_delivery_observed_is_coverage_relative")));
+    }
+
+    #[test]
+    fn native_delivery_complete_unwindowed_untruncated_read_does_not_hide_delivery() {
+        let events = vec![landing_processed_event(
+            "feature",
+            "abc123",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-abc"),
+            1_000,
+        )];
+        let resp = scorecards_response(
+            &native_inputs(events, observed(1, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        assert_eq!(
+            resp["native_delivery"]["coverage"]["may_hide_delivery"],
+            json!(false),
+            "no requested window and no truncation means this coverage is complete"
+        );
+    }
+
+    #[test]
+    fn native_delivery_failed_read_renders_null_counts_not_a_healthy_zero() {
+        let failed = NativeDeliveryInputs {
+            events: Vec::new(),
+            scanned: 0,
+            limit: 10_000,
+            truncated: false,
+            available: false,
+            read_warning: Some(
+                "source_family_read_failed: NativeLandingDelivery unavailable: boom".into(),
+            ),
+        };
+        let resp = scorecards_response(
+            &native_inputs(Vec::new(), failed),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nd = &resp["native_delivery"];
+        assert_eq!(nd["available"], json!(false));
+        assert!(nd["delivered_edges"].is_null());
+        assert!(nd["coverage"]["scanned"].is_null());
+        assert!(nd["no_delivery_observed"]["gate_held"].is_null());
+        assert!(nd["observed_incidents"]["gate_held"].is_null());
+        assert!(nd["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("NativeLandingDelivery")));
+    }
+
+    #[test]
+    fn native_delivery_deterministic_across_input_order() {
+        let events = vec![
+            landing_processed_event(
+                "feature-a",
+                "sha-a",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-a"),
+                1_000,
+            ),
+            landing_processed_event(
+                "feature-b",
+                "sha-b",
+                "main",
+                "TKT-2",
+                "gate-held",
+                None,
+                1_100,
+            ),
+        ];
+        let mut reversed = events.clone();
+        reversed.reverse();
+        let at = Utc.timestamp_opt(2_000, 0).unwrap();
+        let a = scorecards_response(
+            &native_inputs(events, observed(2, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            at,
+        );
+        let b = scorecards_response(
+            &native_inputs(reversed, observed(2, 10_000, false)),
+            &FactoryAnalyticsRequest::default(),
+            at,
+        );
+        assert_eq!(a["native_delivery"], b["native_delivery"]);
     }
 }
