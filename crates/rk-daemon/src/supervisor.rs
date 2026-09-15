@@ -557,7 +557,7 @@ pub struct SpawnParams {
     pub instance_max_usd: Option<f64>,
 }
 
-fn default_role() -> String {
+pub(crate) fn default_role() -> String {
     "rat".into()
 }
 
@@ -1823,40 +1823,12 @@ impl Supervisor {
             params.instance_max_usd,
         )?;
         self.check_disk_floor(&repo_name)?;
-        let target_branch = match &params.base {
-            Some(b) => b.clone(),
-            None => repo_policy
-                .as_ref()
-                .ok_or_else(|| {
-                    rk_core::Error::other("onboarder spawn requires an explicit base branch")
-                })?
-                .delivery_target(&repo.current_branch()?),
-        };
-        // `target_branch` is persisted as this spawn's landing target — for
-        // every role alike, an explicit `--base` (CLI dispatch, reviewer or
-        // rework spawns) and the policy-derived default alike, since
-        // `record.target_branch` and the landing pipeline's later merge
-        // both read it without distinguishing why it was set. It must name
-        // a real branch: `rev_parse` a few lines below resolves a bare
-        // commit SHA just fine, silently accepting one as a "branch" the
-        // landing pipeline can never merge into — caught instead here,
-        // before any worktree or provider generation exists, rather than
-        // the landing queue hot-looping on it forever later.
-        match repo.branch_exists_checked(&target_branch) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(rk_core::Error::other(format!(
-                    "landing target {target_branch:?} is not an existing branch; a landing \
-                     target must be a real branch, not a bare commit"
-                )));
-            }
-            // A transient read failure is not proof of absence, but it is
-            // also not permission to launch a generation against a target
-            // that was never actually verified: propagate it and let the
-            // caller retry the spawn, rather than silently proceeding or
-            // manufacturing a permanent refusal from an inconclusive check.
-            Err(error) => return Err(error),
-        }
+        // Shared with the `repo.resolve_landing_target` RPC (the CLI's
+        // pre-ticket-transition check) so the two boundaries can never
+        // silently diverge on what "the effective target" means or on how
+        // a bad one is reported.
+        let target_branch =
+            self.resolve_landing_target(&repo, params.base.as_deref(), repo_policy.as_ref())?;
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
         // Capture before creating the branch. Unlike a later merge-base read,
         // this remains the original fork even after a forge fast-forwards the
@@ -6704,6 +6676,47 @@ impl Supervisor {
         resolve_repository_policy(self.layout.home(), repo)
     }
 
+    /// Resolve the landing target a spawn would use — an explicit `--base`
+    /// or, absent one, the policy-derived delivery default — and confirm it
+    /// names a real local branch before returning it. `repo_policy` is
+    /// `None` exactly when the caller's role has no activated policy to
+    /// fall back on (onboarding); threading it in rather than re-resolving
+    /// lets [`Self::spawn`] (which already has one) skip a second lookup,
+    /// while the `repo.resolve_landing_target` RPC resolves its own the same
+    /// way — so the CLI's pre-ticket-transition check and this native
+    /// boundary can never silently diverge on what "the effective target"
+    /// means or on how a bad one is reported.
+    ///
+    /// `Ok(false)` from `branch_exists_checked` is a definitive verdict —
+    /// refused outright. `Err` is not proof of absence, but it is also not
+    /// permission to launch a generation against a target that was never
+    /// actually verified, so it propagates rather than silently letting the
+    /// caller through or manufacturing a permanent refusal from an
+    /// inconclusive check.
+    pub(crate) fn resolve_landing_target(
+        &self,
+        repo: &Repo,
+        base: Option<&str>,
+        repo_policy: Option<&rk_workflow::RepositoryPolicy>,
+    ) -> rk_core::Result<String> {
+        let target_branch = match base {
+            Some(b) => b.to_string(),
+            None => repo_policy
+                .ok_or_else(|| {
+                    rk_core::Error::other("onboarder spawn requires an explicit base branch")
+                })?
+                .delivery_target(&repo.current_branch()?),
+        };
+        match repo.branch_exists_checked(&target_branch) {
+            Ok(true) => Ok(target_branch),
+            Ok(false) => Err(rk_core::Error::other(format!(
+                "landing target {target_branch:?} is not an existing branch; a landing target \
+                 must be a real branch, not a bare commit"
+            ))),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Use the same registered identity as policy resolution. A directory's
     /// basename is only a fallback for unregistered diagnostic/test repos.
     pub(crate) fn repository_name(&self, repo: &Repo) -> rk_core::Result<String> {
@@ -8094,6 +8107,47 @@ impl Supervisor {
         Ok(())
     }
 
+    /// The repo/branch boundary a foreman-delegated child spawn must satisfy,
+    /// factored out of [`Self::prepare_foreman_spawn`] so a read-only
+    /// preflight (`repo.resolve_landing_target`) can answer for a foreman
+    /// without duplicating — or drifting from — the same check: the caller
+    /// must be a live `foreman` with an integration branch, `repo` must
+    /// resolve to exactly that foreman's own repository (never a foreign or
+    /// unregistered one a role-spoofed caller might name), and any explicit
+    /// `base` must name exactly that branch. Returns the foreman's own
+    /// branch — the only value `base` may ever effectively be for a child
+    /// spawn, so a caller cannot merge directly into the repository target
+    /// or escape its supervision subtree.
+    pub(crate) fn foreman_child_target_branch(
+        &self,
+        foreman: &str,
+        repo: &Repo,
+        base: Option<&str>,
+    ) -> rk_core::Result<String> {
+        let record = self
+            .status(foreman)
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {foreman}")))?;
+        if record.role != "foreman" {
+            return Err(rk_core::Error::other(
+                "only a foreman may spawn worker agents",
+            ));
+        }
+        let branch = record.branch.clone().ok_or_else(|| {
+            rk_core::Error::other("foreman has no integration branch for a worker spawn")
+        })?;
+        if repo.root().canonicalize()? != record.repo_root.canonicalize()? {
+            return Err(rk_core::Error::other(
+                "a foreman may only act within its own repository",
+            ));
+        }
+        if base.is_some_and(|b| Some(b) != Some(branch.as_str())) {
+            return Err(rk_core::Error::other(
+                "a foreman child must target the foreman's integration branch",
+            ));
+        }
+        Ok(branch)
+    }
+
     /// Normalize a foreman's child spawn. The caller is the source of truth
     /// for parentage, workflow ownership, and the shared integration branch;
     /// accepting any of those fields from an agent would let it escape its
@@ -8103,19 +8157,11 @@ impl Supervisor {
         foreman: &str,
         mut params: SpawnParams,
     ) -> rk_core::Result<SpawnParams> {
+        let repo = Repo::discover(std::path::Path::new(&params.repo))?;
+        let branch = self.foreman_child_target_branch(foreman, &repo, params.base.as_deref())?;
         let record = self
             .status(foreman)
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {foreman}")))?;
-        if record.role != "foreman" {
-            return Err(rk_core::Error::other(
-                "only a foreman may spawn worker agents",
-            ));
-        }
-        if record.branch.is_none() {
-            return Err(rk_core::Error::other(
-                "foreman has no integration branch for a worker spawn",
-            ));
-        }
         if params
             .parent
             .as_deref()
@@ -8134,18 +8180,9 @@ impl Supervisor {
                 "a foreman child must remain in its parent's workflow instance",
             ));
         }
-        if params
-            .base
-            .as_deref()
-            .is_some_and(|base| Some(base) != record.branch.as_deref())
-        {
-            return Err(rk_core::Error::other(
-                "a foreman child must target the foreman's integration branch",
-            ));
-        }
         params.parent = Some(foreman.to_string());
         params.workflow_instance = record.workflow_instance.clone();
-        params.base = record.branch.clone();
+        params.base = Some(branch);
         Ok(params)
     }
 

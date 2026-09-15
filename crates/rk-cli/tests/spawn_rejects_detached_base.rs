@@ -205,3 +205,106 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
         .unwrap();
     assert_eq!(after_valid["ticket"]["payload"]["status"], "in_progress");
 }
+
+/// `rk spawn --ticket <id>` with NO `--base` at all still resolves a landing
+/// target: the repo's activated policy. If that policy's fixed `delivery.target`
+/// names a branch that does not exist, the same refusal must fire — the CLI's
+/// preflight cannot only inspect `args.base`, since the ticket-status write
+/// happens unconditionally on the way to `agent.spawn` regardless of whether
+/// an explicit `--base` was ever given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_refuses_a_policy_default_target_that_does_not_exist() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::create_dir_all(repo_dir.path().join(".rk")).unwrap();
+    // A fixed delivery target that was never created as a branch — the
+    // policy-config counterpart of an operator's mistaken `--base <sha>`.
+    std::fs::write(
+        repo_dir.path().join(".rk/repo.cue"),
+        r#"
+repo: {
+    delivery: {
+        target: "release-line"
+        mode: "merge-push"
+        remote: "origin"
+        remoteBranch: "{{branch}}"
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let added = client
+        .call(
+            "repo.add",
+            json!({"name": "myrepo", "path": repo_dir.path()}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        added["repo"]["activated_policy"]["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64),
+        "registration must bind the exact policy: {added}"
+    );
+
+    let ticket = client
+        .call(
+            "ticket.new",
+            json!({"title": "ordinary work", "scope": "myrepo"}),
+        )
+        .await
+        .unwrap();
+    let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rk"))
+        .args([
+            "--json",
+            "spawn",
+            "--ticket",
+            &ticket_id,
+            "--harness",
+            "fake",
+        ])
+        .env("RK_HOME", home.path())
+        .env_remove("RK_AGENT")
+        .env_remove("RK_AUTH_TOKEN")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a nonexistent policy-derived default target must be refused, got: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not an existing branch"),
+        "expected a clear refusal reason, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = client
+        .call("ticket.get", json!({"id": ticket_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        after["ticket"]["payload"]["status"], "open",
+        "a refused dispatch must leave the ticket untouched even with no --base at all: {after}"
+    );
+    let agents = client.call("agent.list", json!({})).await.unwrap();
+    assert!(
+        agents["agents"].as_array().unwrap().is_empty(),
+        "no agent/worktree/generation may exist for a refused spawn: {agents}"
+    );
+}
