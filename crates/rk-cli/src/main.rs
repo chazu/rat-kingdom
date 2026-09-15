@@ -763,6 +763,12 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
         .await
         .map_err(|_| anyhow::anyhow!("daemon is not running — nothing to roll over"))?;
 
+    // Capture the outgoing instance's identity before we ask it to stop —
+    // this is the only way to later tell a genuine replacement apart from a
+    // reconnect to the same retiring process (see the post-stop check below).
+    let old_status = client.call("status", json!({})).await?;
+    let old_pid = old_status["pid"].as_u64();
+
     let mut live = match rollover_drain(&mut client, wait_secs, as_json).await {
         Ok(live) => live,
         Err(e) => {
@@ -781,11 +787,29 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
     }
 
     client.call("stop", json!({})).await?;
+    let mut old_exited = false;
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         if Client::connect(layout).await.is_err() {
+            old_exited = true;
             break;
         }
+    }
+    if !old_exited {
+        // The outgoing daemon never released the socket within the bounded
+        // wait. Proceeding here is exactly the bug this guards against:
+        // `connect_or_spawn` would just reconnect to the still-live retiring
+        // instance and we would report a restart that never happened.
+        // Resume dispatch on it — it is still the only daemon running — and
+        // fail loudly instead.
+        let _ = client.call("daemon.resume_dispatch", json!({})).await;
+        anyhow::bail!(
+            "rollover timed out waiting for the outgoing daemon (pid {}) to exit — \
+             dispatch resumed on it, nothing was replaced",
+            old_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
     }
 
     // Bring the new daemon up onto whatever binary `rk` now resolves to.
@@ -793,6 +817,31 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
     // (RK_AGENT set) — this command is operator-only (see `authorize_reasoned`)
     // so that refusal, if hit, is itself the right answer.
     let mut client = Client::connect_or_spawn(layout).await?;
+
+    // A successful connect here is not yet proof of a replacement: confirm a
+    // genuinely different, live process running the build this `rk` binary
+    // was itself just installed with. Absent or unreadable identity is never
+    // treated as success — only an explicit match is.
+    let new_status = client.call("status", json!({})).await?;
+    let new_pid = new_status["pid"].as_u64();
+    let new_build = new_status["build_version"].as_str();
+    let expected_build = rk_core::version::BUILD_VERSION;
+    let replaced = matches!(
+        (new_pid, old_pid, new_build),
+        (Some(new_pid), Some(old_pid), Some(new_build))
+            if new_pid != old_pid && new_build == expected_build
+    );
+    if !replaced {
+        anyhow::bail!(
+            "rollover did not produce a verified replacement daemon: reconnected to pid {} \
+             build {} (expected a new pid running {expected_build}) — the outgoing daemon may \
+             still be retiring",
+            new_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            new_build.unwrap_or("unknown"),
+        );
+    }
 
     // Reconcile: respawn only the rats parked above, and only the ones the
     // restart actually orphaned.

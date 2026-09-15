@@ -3272,7 +3272,23 @@ impl Daemon {
             "status" => reply(Response::ok(id, self.status())),
             "stop" => {
                 let resp = Response::ok(id, json!({"stopping": true}));
-                let _ = self.shutdown_tx.send(true);
+                // Test-only fault injection (TKT-nusod-lizuk-jomun): hold this
+                // instance fully live — still accepting connections — for the
+                // given number of milliseconds past acknowledging `stop`,
+                // so a test can prove `rk daemon rollover` does not mistake
+                // a reconnect to a slow-exiting outgoing daemon for a
+                // replacement. Never set outside a test harness; unset, the
+                // shutdown fires on the next tick exactly as before.
+                let shutdown_tx = self.shutdown_tx.clone();
+                let delay_ms = std::env::var("RK_TEST_SHUTDOWN_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok());
+                tokio::spawn(async move {
+                    if let Some(ms) = delay_ms {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                    let _ = shutdown_tx.send(true);
+                });
                 reply(resp)
             }
             // `rk daemon rollover`'s drain step: stop admitting new dispatch
