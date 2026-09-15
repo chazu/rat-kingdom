@@ -268,7 +268,10 @@ fn rollover_succeeds_once_old_daemon_exits_within_the_reasonable_bound() {
     )["pid"]
         .as_u64()
         .unwrap();
-    assert_ne!(pid1, pid2, "rollover did not actually replace the daemon process");
+    assert_ne!(
+        pid1, pid2,
+        "rollover did not actually replace the daemon process"
+    );
 
     let spawn_out = rk(home.path())
         .args([
@@ -384,7 +387,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"resumed a
     )["pid"]
         .as_u64()
         .unwrap();
-    assert_ne!(pid1, pid2, "rollover did not actually replace the daemon process");
+    assert_ne!(
+        pid1, pid2,
+        "rollover did not actually replace the daemon process"
+    );
 
     let mut completed = false;
     for _ in 0..100 {
@@ -467,7 +473,10 @@ fn rollover_fails_without_resuming_dispatch_past_the_reasonable_bound() {
     )["pid"]
         .as_u64()
         .unwrap();
-    assert_eq!(pid1, pid2, "no daemon was actually replaced by the failed attempt");
+    assert_eq!(
+        pid1, pid2,
+        "no daemon was actually replaced by the failed attempt"
+    );
 
     // The corrected contract: dispatch must stay paused, because this
     // daemon's stop is already committed and irrevocable — resuming it
