@@ -15892,7 +15892,10 @@ checks: [
             .expect("the waiter must resolve once member-b actually lands, not hang forever")
             .unwrap()
             .unwrap();
-        assert_eq!(waiter_result["merged"], true, "waiter_result: {waiter_result}");
+        assert_eq!(
+            waiter_result["merged"], true,
+            "waiter_result: {waiter_result}"
+        );
         assert_eq!(
             waiter_result["delivered"], true,
             "waiter_result: {waiter_result}"
@@ -15912,6 +15915,228 @@ checks: [
             .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
             .unwrap()
             .is_empty());
+    }
+
+    /// TKT-vaful-sabuh-rajon: the deferred half's durability must survive a
+    /// real restart, not just an in-process return. `Space::open_in_memory`
+    /// (used by the sibling test above) cannot prove this — it never
+    /// touches disk at all. Here a real on-disk `Space` and the SAME
+    /// [`Layout`] home back TWO successive `LandingPipeline` instances, with
+    /// the first dropped entirely (simulating a daemon restart) while
+    /// `member-b` is deferred behind a live fence. Proves: `member-b`'s
+    /// durable row (and its `seq`) survives into the fresh instance
+    /// unchanged; the fence record itself — a separate on-disk store under
+    /// the same home — survives too, so the fresh instance still refuses to
+    /// admit `member-b` on its own `drain_key` call; and releasing the
+    /// SAME `fence_id` against the fresh instance resumes and lands
+    /// `member-b` exactly once.
+    #[tokio::test]
+    async fn a_fence_deferred_member_survives_a_restart_and_resumes_on_the_new_instance() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("reached");
+        let release = barrier_dir.path().join("release");
+        let count_file = barrier_dir.path().join("count");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'; if [ \"$n\" = \"1\" ]; then exit 1; fi; if [ -f docs/member-a.md ] && [ ! -f docs/member-b.md ]; then touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done; fi; exit 0", timeout: "30s"}},
+]
+"#,
+            count = count_file.display(),
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut heads = Vec::new();
+        for branch in ["member-a", "member-b"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("{branch}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+            heads.push(rev_parse(repo_dir.path(), branch));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+        let (a_head, b_head) = (heads[0].clone(), heads[1].clone());
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
+
+        let fence_id;
+        let member_b_before_restart;
+        // "Before restart": a real on-disk Space, member-b durably deferred
+        // behind a live fence when this whole pipeline instance is dropped.
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: repo_name.clone(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: "member-a".into(),
+                    target: "main".into(),
+                    head_sha: a_head,
+                    diff_class: "doc-only".into(),
+                    task: "member-a-task".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: repo_name.clone(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: "member-b".into(),
+                    target: "main".into(),
+                    head_sha: b_head,
+                    diff_class: "doc-only".into(),
+                    task: "member-b-task".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let drain_pipeline = Arc::clone(&pipeline);
+            let drain_repo = repo_name.clone();
+            let drain_task =
+                tokio::spawn(async move { drain_pipeline.drain_key(&drain_repo, "main").await });
+
+            let mut member_a_reached = false;
+            for _ in 0..300 {
+                if reached.exists() {
+                    member_a_reached = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                member_a_reached,
+                "member-a's solo gate never started running"
+            );
+
+            let requested = pipeline
+                .fence_request(
+                    &repo_name,
+                    "operator-test",
+                    600,
+                    &ManagedWorkSnapshot::default,
+                )
+                .await
+                .unwrap();
+            assert_eq!(requested["state"], "draining", "requested: {requested}");
+            fence_id = requested["fence_id"].as_str().unwrap().to_string();
+
+            std::fs::write(&release, b"go").unwrap();
+            let drain_outcomes = tokio::time::timeout(Duration::from_secs(10), drain_task)
+                .await
+                .expect("the drain must return once member-a settles")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                drain_outcomes.len(),
+                1,
+                "drain_outcomes: {drain_outcomes:?}"
+            );
+            assert!(matches!(drain_outcomes[0], LandingOutcome::Landed(_)));
+
+            member_b_before_restart = space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .into_iter()
+                .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b"))
+                .expect("member-b must be durably deferred before the restart")
+                .payload;
+
+            // Pipeline, its background-drain continuation and its Space
+            // handle all go out of scope here — the simulated crash.
+        }
+
+        // "After restart": fresh Space handle and fresh pipeline over the
+        // SAME on-disk store/home.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+
+        let member_b_after_restart = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b"))
+            .expect("member-b must survive the restart durably queued")
+            .payload;
+        assert_eq!(
+            member_b_after_restart["seq"], member_b_before_restart["seq"],
+            "member-b must be the SAME durable row across the restart, not re-created"
+        );
+        assert_eq!(
+            member_b_after_restart["enqueued_at"],
+            member_b_before_restart["enqueued_at"]
+        );
+
+        let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
+        assert_eq!(
+            status["fenced"], true,
+            "the fence record must survive the restart too: {status}"
+        );
+        assert_eq!(status["fence_id"], fence_id, "status: {status}");
+
+        // The fresh instance must still refuse to admit member-b on its own
+        // — the existing coarse `claim_batch`-boundary fence check, now
+        // proven to apply across a restart of the whole process, not just
+        // within one still-live instance.
+        let still_fenced_outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert!(
+            still_fenced_outcomes.is_empty(),
+            "the fresh instance must not admit member-b while the restored fence is live: \
+             {still_fenced_outcomes:?}"
+        );
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b")),
+            "member-b must remain queued on the fresh instance while fenced"
+        );
+
+        // Release the SAME fence (its identity crossed the restart too) —
+        // member-b may now resume, exactly once, on the fresh instance.
+        pipeline
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                &fence_id,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        let outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "member-b must resume exactly once on the fresh instance: {outcomes:?}"
+        );
+        assert!(matches!(outcomes[0], LandingOutcome::Landed(_)));
+
+        let listing = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["ls-tree", "-r", "--name-only", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("docs/member-a.md"));
+        assert!(listing.contains("docs/member-b.md"));
     }
 
     /// TKT-dobas-lujom-lipog rework (native verdict `01M2HVGV7KC9X36MMEC7D3NZXS`,
