@@ -159,7 +159,13 @@ fn init_repo(dir: &Path) {
 /// (`crates/rk-daemon/src/landing.rs`): the exact commit-keyed identity a
 /// review verdict artifact must carry (`review_attempt`) to be read as the
 /// live attempt's answer instead of triggering a fresh reviewer spawn.
-fn review_instance_id(repo_name: &str, branch: &str, head_sha: &str, target: &str, task: &str) -> String {
+fn review_instance_id(
+    repo_name: &str,
+    branch: &str,
+    head_sha: &str,
+    target: &str,
+    task: &str,
+) -> String {
     use sha2::Digest;
     let digest =
         sha2::Sha256::digest(format!("{repo_name}@{branch}@{head_sha}@{target}@{task}").as_bytes());
