@@ -988,6 +988,9 @@ pub struct Daemon {
     ticket_graph_apply_lock: tokio::sync::Mutex<()>,
     /// Serialize the shared release staging worktree; also expose in-flight preparation to reads.
     release_prepare_lock: tokio::sync::Mutex<()>,
+    /// P4.1 (TKT-nibuv-gokun-sibin): `[policy] release_build_admission_enabled`.
+    /// See that config field's doc comment for the full contract.
+    release_build_admission_enabled: bool,
     action_approvals: crate::action_approval::ActionApprovalStore,
     /// TKT-01M0E8PN9C41BWECGNW0990R3J: the durable orchestrator lease store
     /// (one lease per repo scope) an `attention.decide` orchestrator-authority
@@ -1214,6 +1217,7 @@ impl Daemon {
         daemon.king_config = config.king.clone();
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
+        daemon.release_build_admission_enabled = config.policy.release_build_admission_enabled;
         daemon.authority_policy = crate::authority::AuthorityPolicy::from_config(&config.policy)?;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
@@ -1290,6 +1294,15 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_require_named_checks(&mut self, v: bool) {
         self.require_named_checks = v;
+    }
+
+    /// Test-only hook, same rationale as [`set_require_named_checks`](Self::set_require_named_checks):
+    /// `Daemon::with_space_for_tests`/`new_in_memory` bypass `Daemon::new`'s
+    /// `config.policy.release_build_admission_enabled` wiring, so a test
+    /// exercising P4.1's release-build admission route sets it directly.
+    #[doc(hidden)]
+    pub fn set_release_build_admission_enabled(&mut self, v: bool) {
+        self.release_build_admission_enabled = v;
     }
 
     /// Test-only equivalent of `Daemon::new`'s
@@ -1573,6 +1586,7 @@ impl Daemon {
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
             ticket_graph_apply_lock: tokio::sync::Mutex::new(()),
             release_prepare_lock: tokio::sync::Mutex::new(()),
+            release_build_admission_enabled: false,
             action_approvals,
             orchestrator_lease,
             king,
@@ -2484,7 +2498,7 @@ impl Daemon {
                     codes::FORBIDDEN,
                     format!("{} is not authorized for {}", req.caller, req.method),
                 )),
-                Ok(req) if req.method == "verify.run" => {
+                Ok(req) if req.method == "verify.run" || req.method == "release.prepare" => {
                     self.dispatch_watching_disconnect(req, &mut read, conn_id)
                         .await
                 }
@@ -2531,13 +2545,20 @@ impl Daemon {
         }
     }
 
-    /// Race `verify.run`'s dispatch against this connection dying — the
+    /// Race `verify.run`'s (and, since P4.1/TKT-nibuv-gokun-sibin,
+    /// `release.prepare`'s) dispatch against this connection dying — the
     /// RPC-disconnect half of TKT-01M0PA6C5WYRWS757R1SS2F2GR's cancellation
-    /// binding: if the caller (an agent's own `rk verify`, or an operator's)
-    /// is killed mid-call, its managed child process must not keep running
-    /// under the daemon alone. Scoped to `verify.run` only, by the one call
-    /// site above — every other method already completes fast enough that a
-    /// lost caller costs nothing but an unread reply.
+    /// binding: if the caller (an agent's own `rk verify`, an operator's, or
+    /// an operator's `rk release prepare`) is killed mid-call, its managed
+    /// child process must not keep running under the daemon alone. Scoped to
+    /// these two methods only, by the match arm above — every other method
+    /// already completes fast enough that a lost caller costs nothing but an
+    /// unread reply; both of these can run for minutes and both register a
+    /// [`crate::managed_verification::ManagedVerificationRuns`] entry keyed
+    /// on the exact same [`verify_request_key`] this function computes, so
+    /// [`Supervisor::cancel_managed_verification_request`](crate::supervisor::Supervisor::cancel_managed_verification_request)
+    /// below is generic across both callers already — no `release`-specific
+    /// cancellation registry was added.
     ///
     /// The wire protocol is strictly one in-flight request per connection: a
     /// caller always awaits its response before sending again. So any byte
@@ -3322,7 +3343,23 @@ impl Daemon {
             "status" => reply(Response::ok(id, self.status())),
             "stop" => {
                 let resp = Response::ok(id, json!({"stopping": true}));
-                let _ = self.shutdown_tx.send(true);
+                // Test-only fault injection (TKT-nusod-lizuk-jomun): hold this
+                // instance fully live — still accepting connections — for the
+                // given number of milliseconds past acknowledging `stop`,
+                // so a test can prove `rk daemon rollover` does not mistake
+                // a reconnect to a slow-exiting outgoing daemon for a
+                // replacement. Never set outside a test harness; unset, the
+                // shutdown fires on the next tick exactly as before.
+                let shutdown_tx = self.shutdown_tx.clone();
+                let delay_ms = std::env::var("RK_TEST_SHUTDOWN_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok());
+                tokio::spawn(async move {
+                    if let Some(ms) = delay_ms {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                    let _ = shutdown_tx.send(true);
+                });
                 reply(resp)
             }
             // `rk daemon rollover`'s drain step: stop admitting new dispatch
@@ -3370,13 +3407,24 @@ impl Daemon {
                 )
             }
             "bbs.brief" => {
-                let result =
-                    parse_params::<crate::bbs::BriefParams>(&req.params).and_then(|params| {
+                let result = match parse_params::<crate::bbs::BriefParams>(&req.params) {
+                    Ok(params) => {
+                        // Reconcile before reading: an ordinary `bbs.brief`
+                        // read is this feature's trigger point (its config is
+                        // resolved fresh, and this call is a no-op instantly
+                        // when the repo's `landing-need-retirement` flag is
+                        // off). A reconciliation failure never fails the
+                        // read itself.
+                        if let Err(error) = self.retire_resolved_landing_needs(&params.repo).await {
+                            warn!(%error, repo = %params.repo, "landing-need-retirement: reconciliation pass failed; brief unaffected");
+                        }
                         let discovery =
                             crate::bbs_discovery::resolve_for_brief(&self.layout, &params.repo);
                         crate::bbs::brief(&self.space, &self.tickets, &params, discovery)
                             .map_err(|e| e.to_string())
-                    });
+                    }
+                    Err(error) => Err(error),
+                };
                 reply(match result {
                     Ok(mut briefing) => {
                         // The selection is captured only AFTER it was computed
@@ -3416,6 +3464,35 @@ impl Daemon {
                             .map_err(|e| e.to_string())
                     },
                 );
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.retirement.show" => {
+                let result =
+                    parse_params::<crate::landing_need_resolution::ShowParams>(&req.params)
+                        .and_then(|params| {
+                            crate::landing_need_resolution::show(&self.layout, &params)
+                                .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.retirement.set" => {
+                let result = parse_params::<crate::landing_need_resolution::SetParams>(&req.params)
+                    .and_then(|params| {
+                        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                        crate::landing_need_resolution::set(
+                            &self.layout,
+                            &repos,
+                            &req.caller,
+                            &params,
+                        )
+                        .map_err(|e| e.to_string())
+                    });
                 reply(match result {
                     Ok(value) => Response::ok(id, value),
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
@@ -4048,7 +4125,7 @@ impl Daemon {
                     ),
                 })
             }
-            "release.prepare" => reply(self.handle_release_prepare(req).await),
+            "release.prepare" => reply(self.handle_release_prepare(req, conn_id).await),
             "release.list" => reply(self.handle_release_list(req)),
             "release.show" => reply(self.handle_release_show(req)),
             "ticket.new" => reply(self.handle_ticket_new(req).await),
@@ -4839,6 +4916,56 @@ impl Daemon {
         })
         .await
         .map_err(|e| rk_core::Error::other(format!("git ancestry check panicked: {e}")))
+    }
+
+    /// Defensive second trigger for the shared `run_retirement_pass` core —
+    /// see `crate::landing_need_resolution`'s module doc for the full
+    /// two-trigger design (the primary one is the automatic post-landing
+    /// hook in `landing.rs`, right after an accepted delivery is durably
+    /// recorded). This one fires on every `bbs.brief` RPC for `repo` and
+    /// catches what the post-landing hook could not: a Need whose delivery
+    /// already landed before the flag was ever turned on, or whose own
+    /// post-landing pass failed. Gated by the same repo-scoped
+    /// `landing-need-retirement` flag (default off, independent of the
+    /// unrelated BBS discovery-ranking flag); returns a zeroed outcome
+    /// instantly when the flag is off or the repo is unconfigured. A
+    /// reconciliation failure here never fails the `bbs.brief` read itself.
+    async fn retire_resolved_landing_needs(
+        &self,
+        repo: &str,
+    ) -> rk_core::Result<crate::landing_need_resolution::RetirementOutcome> {
+        let config = crate::landing_need_resolution::resolve_for_repo(&self.layout, repo);
+        if !config.enabled {
+            return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+        }
+        let path = {
+            let reg = self
+                .repos
+                .lock()
+                .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+            reg.get(repo).map(|r| r.path.clone())
+        };
+        let Some(path) = path else {
+            return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+        };
+        let space = self.space.clone();
+        let tickets = Arc::clone(&self.tickets);
+        let repo = repo.to_string();
+        // A blocking git subprocess call must not stall the async dispatch
+        // loop other connections share — `spawn_blocking` is this RPC path's
+        // half of the split; the post-landing hook in `landing.rs` calls
+        // `run_retirement_pass` directly instead, consistent with that file's
+        // existing inline blocking git calls.
+        tokio::task::spawn_blocking(move || {
+            let Ok(git_repo) = rk_git::Repo::discover(&path) else {
+                return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+            };
+            crate::landing_need_resolution::run_retirement_pass(
+                &space, &tickets, &repo, &git_repo, "daemon", &config,
+            )
+        })
+        .await
+        .map_err(|e| rk_core::Error::other(format!("landing-need-retirement pass panicked: {e}")))?
     }
 
     async fn handle_inbox(&self, req: Request) -> Response {
@@ -7972,7 +8099,7 @@ impl Daemon {
         }
     }
 
-    async fn handle_release_prepare(&self, req: Request) -> Response {
+    async fn handle_release_prepare(&self, req: Request, conn_id: u64) -> Response {
         let params: ReleasePrepareParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
@@ -8055,7 +8182,31 @@ impl Daemon {
                 "proof": proof,
             }))
         });
-        match crate::release::prepare(
+        // P4.1 (TKT-nibuv-gokun-sibin): route the build through the SAME
+        // aggregate host-wide admission semaphore every managed named check
+        // already shares, only when the operator has explicitly opted in.
+        let release_admission = self
+            .release_build_admission_enabled
+            .then(|| &self.supervisor.verification_resources().host_admission);
+        // P4.1 cancellation: register with the SAME `ManagedVerificationRuns`
+        // registry `verify.run` uses, keyed by the identical `request_key`
+        // `dispatch_watching_disconnect` computes for this connection/request
+        // — no release-specific cancellation registry. `generation` follows
+        // `handle_verify_run`'s own convention: `None` for the operator (no
+        // live agent record to fence a namesake against), the caller's
+        // current spawn id otherwise.
+        let generation = if req.caller.is_empty() || req.caller == crate::client::OPERATOR {
+            None
+        } else {
+            self.supervisor.status(&req.caller).map(|r| r.spawn_id())
+        };
+        let request_key = verify_request_key(conn_id, &req.id);
+        let (managed_id, mut cancel_rx) = self.supervisor.verification_resources().runs.register(
+            &req.caller,
+            generation,
+            &request_key,
+        );
+        let prepare_fut = crate::release::prepare(
             &self.layout,
             crate::release::PrepareParams {
                 repo_name: params.repo,
@@ -8066,9 +8217,34 @@ impl Daemon {
                 recipe: params.recipe,
                 known_verification,
             },
-        )
-        .await
-        {
+            release_admission,
+        );
+        tokio::pin!(prepare_fut);
+        // Dropping `prepare_fut` on the cancel branch — never polling it
+        // again — is what actually tears the build down: its `ProcessGroupGuard`
+        // (owned deep inside `run_recipe`'s `collect_child_output` call, same
+        // guard `verify.run`'s own cancellation relies on) and its
+        // `HostVerificationAdmission` permit are both plain locals in the
+        // future being abandoned here, so both release via ordinary Rust
+        // drop the instant this function returns below. The `release_prepare_lock`
+        // guard (`_guard` above) drops the same way, so a cancelled build's
+        // release entry is exposed by `effective_status` as `Unknown` (lock
+        // free, still `Preparing`) rather than lying about it forever.
+        let outcome = tokio::select! {
+            result = &mut prepare_fut => result,
+            _ = cancel_rx.changed() => {
+                let reason: Option<&'static str> = *cancel_rx.borrow();
+                Err(rk_core::Error::other(format!(
+                    "release.prepare cancelled ({})",
+                    reason.unwrap_or("cancelled")
+                )))
+            }
+        };
+        self.supervisor
+            .verification_resources()
+            .runs
+            .unregister(managed_id);
+        match outcome {
             Ok(outcome) => Response::ok(
                 req.id,
                 json!({

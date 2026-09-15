@@ -75,7 +75,8 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
         // ticket state) — every role, including the read-only ones, needs it
         // to check a claimed steer, exactly like the read-only surfaces
         // beside it.
-        "bbs.brief" | "bbs.show" | "bbs.export" | "bbs.discovery.show" | "ping" | "status"
+        "bbs.brief" | "bbs.show" | "bbs.export" | "bbs.discovery.show"
+        | "bbs.retirement.show" | "ping" | "status"
         | "space.scan" | "space.rd"
         | "repo.list"
         | "repo.get" | "agent.status" | "agent.log" | "agent.progress" | "release.list"
@@ -189,6 +190,7 @@ mod tests {
             "ticket.deliver",
             "bbs.assess",
             "bbs.discovery.set",
+            "bbs.retirement.set",
         ] {
             assert!(method_policy(method).is_none(), "{method}");
         }
@@ -240,6 +242,7 @@ mod tests {
             "bbs.reuse",
             "control.verify",
             "bbs.discovery.show",
+            "bbs.retirement.show",
             "release.list",
             "release.show",
         ] {

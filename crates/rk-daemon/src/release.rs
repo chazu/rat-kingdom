@@ -6,14 +6,16 @@
 //! The recorded toolchain describes the original build; idempotent reuse does not re-probe the
 //! host.
 
-use crate::managed_verification::{collect_child_output, ManagedChildMarker, RunOutcome};
+use crate::managed_verification::{
+    collect_child_output, HostVerificationAdmission, ManagedChildMarker, RunOutcome,
+};
 use chrono::{DateTime, Utc};
 use rk_core::paths::Layout;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Bumped whenever [`ReleaseManifest`]'s shape changes incompatibly. A stored
 /// manifest declaring any other value is refused outright rather than guessed
@@ -30,6 +32,31 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CARGO_BUILD_JOBS: u32 = 2;
 const NICE_LEVEL: i32 = 10;
+/// P4.1 (TKT-nibuv-gokun-sibin): bound on how long the build subprocess may
+/// wait for a [`HostVerificationAdmission`] permit before `run_recipe` gives
+/// up and reports the whole `prepare` call `Failed` — distinct from
+/// [`BUILD_TIMEOUT`], which bounds the build itself only once admitted.
+/// Generous relative to ordinary named-check admission waits: a release
+/// build is an infrequent, operator-initiated action, not a per-commit gate,
+/// so queuing behind checks/other builds for a while is an acceptable
+/// tradeoff for a hard host-wide capacity ceiling.
+const ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// The fixed admission identity for every `paired-rk-mcp` build, used only
+/// for telemetry today (P3.1 has no weight/class lookup). Never derived
+/// from a repository's own `.rk/checks.cue` — a repo cannot relabel its own
+/// release build as cheap, and a future weighted-class admission mode
+/// (P3.2, `TKT-nasif-danob-sirok`, not yet on `main`) can key an explicit
+/// heavier config weight off this exact string once it lands.
+const RELEASE_ADMISSION_IDENTITY: &str = "release-build:paired-rk-mcp";
+/// Documented conservative reservation for legacy static (P3.1-only)
+/// admission: this build always costs exactly one aggregate unit, the same
+/// as every unclassified named check. A heavier weight is deliberately NOT
+/// approximated by acquiring more than one permit here — `HostVerificationAdmission::acquire`
+/// grants exactly one permit per call, and calling it more than once per
+/// build would require holding a partial reservation while awaiting the
+/// rest, which is exactly the recursive/partial-hold pattern that can
+/// deadlock two heavy builds contending for the same tight aggregate cap.
+const RELEASE_ADMISSION_WEIGHT: u32 = 1;
 /// Maximum retained failure-tail characters; truncation respects character boundaries.
 const FAILURE_EVIDENCE_CHARS: usize = 4000;
 
@@ -98,6 +125,32 @@ pub struct RecipeBounds {
     pub timeout_secs: u64,
     /// Describes process-local enforcement; no host-wide CPU or immutable-execution guarantee.
     pub enforcement_note: String,
+    /// P4.1 (TKT-nibuv-gokun-sibin): host-wide admission bounds actually
+    /// observed for this build. `None` means `[policy]
+    /// release_build_admission_enabled` was off — the legacy unmanaged path,
+    /// identical to every release prepared before this field existed.
+    #[serde(default)]
+    pub host_admission: Option<HostAdmissionBounds>,
+}
+
+/// P4.1 telemetry: this build's own aggregate host-verification-admission
+/// wait/run bounds, distinct from [`RecipeBounds::timeout_secs`] (the build
+/// execution bound alone). Recorded only when admission was enabled for this
+/// prepare call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostAdmissionBounds {
+    /// Fixed, never repo-supplied — see [`RELEASE_ADMISSION_IDENTITY`].
+    pub recipe_identity: String,
+    /// Aggregate units this build consumed. Always [`RELEASE_ADMISSION_WEIGHT`]
+    /// under legacy static (P3.1-only) admission today; see that constant's
+    /// doc comment for why a heavier cost is not approximated by acquiring
+    /// more than one permit.
+    pub weight: u32,
+    /// How long the build waited for a permit before it was granted.
+    pub admission_wait_ms: u64,
+    /// How long the build subprocess itself ran once admitted (spawn to
+    /// exit), `None` if it never reached that point.
+    pub build_run_ms: Option<u64>,
 }
 
 /// Keep confirmed absence distinct from an unavailable observation.
@@ -507,7 +560,17 @@ fn publish_prepared_release(
 }
 
 /// Prepare or reuse a release. The caller must serialize access to its shared staging worktree.
-pub async fn prepare(layout: &Layout, params: PrepareParams) -> rk_core::Result<PrepareOutcome> {
+///
+/// `admission`: `Some` when `[policy] release_build_admission_enabled` is on
+/// — the build subprocess acquires one [`HostVerificationAdmission`] permit,
+/// participating in the same aggregate host-wide cap every managed named
+/// check already shares, before it spawns. `None` (the default) preserves
+/// the unmanaged legacy path exactly.
+pub(crate) async fn prepare(
+    layout: &Layout,
+    params: PrepareParams,
+    admission: Option<&HostVerificationAdmission>,
+) -> rk_core::Result<PrepareOutcome> {
     if params.recipe != RECIPE_PAIRED_RK_MCP {
         return Err(rk_core::Error::other(format!(
             "unsupported recipe '{}': only '{RECIPE_PAIRED_RK_MCP}' is available",
@@ -619,6 +682,7 @@ pub async fn prepare(layout: &Layout, params: PrepareParams) -> rk_core::Result<
         &id,
         &release_dir,
         config_provenance,
+        admission,
     )
     .await
     {
@@ -781,6 +845,7 @@ async fn run_recipe(
     id: &str,
     release_dir: &Path,
     config_provenance: ConfigProvenance,
+    admission: Option<&HostVerificationAdmission>,
 ) -> rk_core::Result<ReleaseManifest> {
     let staging = staging_dir(layout, repo_name);
     {
@@ -803,6 +868,37 @@ async fn run_recipe(
     // Mise selection was already frozen from the selected source tree.
     let script = build_script(config_provenance.used_mise, &target_dir);
 
+    // P4.1 (TKT-nibuv-gokun-sibin): acquire one bounded host-wide admission
+    // permit, participating in the SAME aggregate cap every managed named
+    // check already shares, before spawning the build subprocess. The
+    // immutable selected source (`resolved_commit`/`tree_sha`, already
+    // frozen in `PrepareParams` before `prepare` ever called this function)
+    // is untouched while waiting — nothing here re-resolves or mutates it.
+    // Held across the entire build execution below and released, via plain
+    // RAII drop, on every exit path from this function (success, build
+    // failure, timeout, or this future itself being dropped) — no explicit
+    // release call, same convention `ManagedVerification::run` uses for its
+    // own `_host_guard`.
+    let admission_wait_started = Instant::now();
+    let host_permit = match admission {
+        Some(host_admission) => {
+            match tokio::time::timeout(ADMISSION_WAIT_TIMEOUT, host_admission.acquire()).await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Err(rk_core::Error::other(format!(
+                        "release build did not acquire host verification admission capacity \
+                         within {}s (aggregate cap saturated); the selected source \
+                         {resolved_commit} was never built, not partially built",
+                        ADMISSION_WAIT_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
+    let admission_wait_ms =
+        u64::try_from(admission_wait_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
     let mut command = tokio::process::Command::new("sh");
     command
         .arg("-c")
@@ -817,6 +913,7 @@ async fn run_recipe(
         .process_group(0);
     // Guard concurrent captured-pipe inheritance; see rk_core::exec::close_extra_fds.
     rk_core::exec::close_extra_fds(command.as_std_mut());
+    let build_started = Instant::now();
     let child = command.spawn().map_err(|e| {
         rk_core::Error::other(format!("release build: failed to spawn recipe: {e}"))
     })?;
@@ -824,6 +921,12 @@ async fn run_recipe(
         .id()
         .map(|pid| ManagedChildMarker::create(layout, pid));
     let outcome = collect_child_output(child, BUILD_TIMEOUT, "release build").await?;
+    let build_run_ms = u64::try_from(build_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // The build itself has fully exited (or was killed on timeout, below) —
+    // this permit's job is done; drop it before the (comparatively slow)
+    // binary-copy/smoke-check steps that follow so a saturated aggregate
+    // cap never waits on those too.
+    drop(host_permit);
     match outcome {
         RunOutcome::TimedOut => {
             return Err(rk_core::Error::other(format!(
@@ -917,10 +1020,24 @@ async fn run_recipe(
             cargo_build_jobs: CARGO_BUILD_JOBS,
             nice: NICE_LEVEL,
             timeout_secs: BUILD_TIMEOUT.as_secs(),
-            enforcement_note: "process-wide single-flight lock on release.prepare; not a \
-                host-wide CPU quota, not the P3.1 HostVerificationAdmission cap, and not an \
-                immutable-execution guarantee"
-                .to_string(),
+            enforcement_note: if admission.is_some() {
+                "process-wide single-flight lock on release.prepare; participates in the P3.1 \
+                    HostVerificationAdmission aggregate cap (see host_admission below) as one \
+                    weight-1 unit; still not a host-wide CPU quota and not an \
+                    immutable-execution guarantee — nice/jobs bounds remain process-local only"
+                    .to_string()
+            } else {
+                "process-wide single-flight lock on release.prepare; not a \
+                    host-wide CPU quota, not the P3.1 HostVerificationAdmission cap, and not an \
+                    immutable-execution guarantee"
+                    .to_string()
+            },
+            host_admission: admission.is_some().then(|| HostAdmissionBounds {
+                recipe_identity: RELEASE_ADMISSION_IDENTITY.to_string(),
+                weight: RELEASE_ADMISSION_WEIGHT,
+                admission_wait_ms,
+                build_run_ms: Some(build_run_ms),
+            }),
         },
         config_provenance,
         checks,
@@ -1258,6 +1375,7 @@ mod tests {
                 nice: NICE_LEVEL,
                 timeout_secs: BUILD_TIMEOUT.as_secs(),
                 enforcement_note: "note".into(),
+                host_admission: None,
             },
             config_provenance: ConfigProvenance {
                 cargo_build_jobs_env: "2".into(),
