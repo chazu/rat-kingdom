@@ -5440,6 +5440,19 @@ impl LandingPipeline {
                         .into(),
                 };
                 self.withhold_rework(entry, &ctx, attempt, round, &withheld)?;
+                // This dispatch is now terminal (a withheld AttentionHold, not
+                // auto-retried) — relinquish its own exact lane-wait reservation
+                // so it stops parking the FIFO head for other repos/lanes'
+                // waiters until LANE_WAIT_STALE_SECS (TKT-minak-mogiz-lizun).
+                // Matches the SpawnParams this attempt used: role "rat", no
+                // workflow_instance. A no-op if this refusal never reached
+                // lane-capacity queuing (e.g. a fleet-WIP or budget refusal).
+                self.supervisor.abandon_lane_wait(
+                    &entry.repo_name,
+                    "rat",
+                    &ctx.rework_ticket,
+                    None,
+                );
                 warn!(
                     repo = %entry.repo_name, branch = %entry.branch, error = %e,
                     "landing pipeline: bounded rework dispatch refused"
@@ -6284,6 +6297,19 @@ impl LandingPipeline {
                         .into(),
                 };
                 self.withhold_conflict(&entry, &ctx, attempt, round, &withheld)?;
+                // This dispatch is now terminal (a withheld AttentionHold, not
+                // auto-retried) — relinquish its own exact lane-wait reservation
+                // so it stops parking the FIFO head for other repos/lanes'
+                // waiters until LANE_WAIT_STALE_SECS (TKT-minak-mogiz-lizun).
+                // Matches the SpawnParams this attempt used: role "rat", no
+                // workflow_instance. A no-op if this refusal never reached
+                // lane-capacity queuing (e.g. a fleet-WIP or budget refusal).
+                self.supervisor.abandon_lane_wait(
+                    &entry.repo_name,
+                    "rat",
+                    &ctx.rework_ticket,
+                    None,
+                );
                 warn!(
                     repo = %ctx.repo, branch = %ctx.branch, error = %e,
                     "landing pipeline: orchestrator-authorized conflict-correction dispatch refused"
