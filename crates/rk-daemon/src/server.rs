@@ -4084,6 +4084,7 @@ impl Daemon {
             }
             "release.prepare" => reply(self.handle_release_prepare(req, conn_id).await),
             "release.select" => reply(self.handle_release_select(req, conn_id).await),
+            "release.status" => reply(self.handle_release_status(req).await),
             "release.list" => reply(self.handle_release_list(req)),
             "release.show" => reply(self.handle_release_show(req)),
             "ticket.new" => reply(self.handle_ticket_new(req).await),
@@ -8081,44 +8082,137 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
-        let policy = {
-            let reg = match self.repos.lock() {
-                Ok(r) => r,
-                Err(_) => {
-                    return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned")
-                }
+        // `run_release_prepare` re-resolves the repo path from the registry
+        // itself (the same shape `release.prepare` always used); only the
+        // resolved integration branch name is needed from here.
+        let (_repo_path, integration_branch, _release_target) =
+            match self.resolve_release_role(&params.repo) {
+                Ok(v) => v,
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
             };
-            match reg.get(&params.repo) {
-                Some(record) => match record.effective_policy() {
-                    Ok(policy) => policy,
-                    Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
-                },
-                None => {
+        self.run_release_prepare(req, conn_id, params.repo, integration_branch, params.recipe)
+            .await
+    }
+
+    /// Look up `repo`'s activated release role
+    /// (`RepositoryPolicy::release.{integration_branch,release_target}`),
+    /// requiring both to be configured — shared by `release.select` and
+    /// `release.status` so the exact same "not activated at all" vs
+    /// "activated but the release role is unset" error text (and the
+    /// distinction between them) is not duplicated or allowed to drift.
+    fn resolve_release_role(
+        &self,
+        repo: &str,
+    ) -> Result<(std::path::PathBuf, String, String), String> {
+        let (repo_path, policy) = {
+            let reg = self
+                .repos
+                .lock()
+                .map_err(|_| "repo registry lock poisoned".to_string())?;
+            match reg.get(repo) {
+                Some(record) => {
+                    let policy = record.effective_policy().map_err(|e| e.to_string())?;
+                    (record.path.clone(), policy)
+                }
+                None => return Err(format!("unknown repository: {repo}")),
+            }
+        };
+        let integration_branch = policy.release.integration_branch.trim().to_string();
+        let release_target = policy.release.release_target.trim().to_string();
+        if integration_branch.is_empty() || release_target.is_empty() {
+            return Err(format!(
+                "repository '{repo}' has no activated release role (repo.release.integrationBranch \
+                 and repo.release.releaseTarget); configure both and activate via `rk repo \
+                 onboard`, or use release.prepare with an explicit --candidate"
+            ));
+        }
+        Ok((repo_path, integration_branch, release_target))
+    }
+
+    /// P5.1: read-only view tying the activated release role together —
+    /// the integration branch's current head, the release target's current
+    /// head (when resolvable), and whether the integration head already has
+    /// a recorded, content-verified `Prepared` release inventory entry
+    /// (`integration_head_prepared`). PRECISE MEANING, corrected after a
+    /// verified operator review: this reports only `ReleaseStatus::Prepared`
+    /// — an immutable artifact inventory entry exists for this exact commit,
+    /// nothing more. It is NOT "accepted" (no review/gate has run over it as
+    /// a release), NOT "deployed" (nothing was installed or activated
+    /// anywhere), and NOT "enabled" (no feature-exposure state changed) —
+    /// those are distinct states from other subsystems (`rk feature
+    /// show/set`, a future release-activation slice) that this field must
+    /// never be read as implying. Never advances or authorizes anything on
+    /// `release_target`; landing onto that branch is unchanged, governed
+    /// entirely by its own existing protected-path/review gates. This only
+    /// makes `releaseTarget` observable, closing the gap where it was
+    /// previously validated at activation time but never read at runtime.
+    async fn handle_release_status(&self, req: Request) -> Response {
+        let params: ReleaseSelectParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let (repo_path, integration_branch, release_target) =
+            match self.resolve_release_role(&params.repo) {
+                Ok(v) => v,
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+            };
+        let integration_head = {
+            let repo_path = repo_path.clone();
+            let branch = integration_branch.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::release::resolve_candidate(&repo_path, &branch)
+            })
+            .await
+            {
+                Ok(Ok((commit, _tree))) => commit,
+                Ok(Err(e)) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+                Err(e) => {
                     return Response::err(
                         req.id,
-                        codes::BAD_PARAMS,
-                        format!("unknown repository: {}", params.repo),
+                        codes::INTERNAL,
+                        format!("integration branch resolution task failed: {e}"),
                     )
                 }
             }
         };
-        let integration_branch = policy.release.integration_branch.trim();
-        let release_target = policy.release.release_target.trim();
-        if integration_branch.is_empty() || release_target.is_empty() {
-            return Response::err(
-                req.id,
-                codes::BAD_PARAMS,
-                format!(
-                    "repository '{}' has no activated release role (repo.release.integrationBranch \
-                     and repo.release.releaseTarget); configure both and activate via `rk repo \
-                     onboard`, or use release.prepare with an explicit --candidate",
-                    params.repo
-                ),
-            );
-        }
-        let candidate = integration_branch.to_string();
-        self.run_release_prepare(req, conn_id, params.repo, candidate, params.recipe)
+        // The release target may not resolve locally (e.g. an unusual
+        // fetch/mirror state) — that is reported as `null`, not a hard
+        // error, since it never blocks the read-only status view itself.
+        let release_target_head = {
+            let repo_path = repo_path.clone();
+            let branch = release_target.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::release::resolve_candidate(&repo_path, &branch)
+            })
             .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|(commit, _tree)| commit)
+        };
+        let id = crate::release::id_for(&params.repo, &integration_head, &params.recipe);
+        let lock_is_free = self.release_prepare_lock.try_lock().is_ok();
+        let selected = crate::release::show(&self.layout, &id).ok().flatten();
+        // Reports ONLY `ReleaseStatus::Prepared` — see this handler's doc
+        // comment for the accepted/deployed/enabled distinctions this field
+        // must never be read as implying.
+        let integration_head_prepared = selected.as_ref().is_some_and(|s| {
+            crate::release::effective_status(&s.entry, lock_is_free)
+                == crate::release::ReleaseStatus::Prepared
+        });
+        Response::ok(
+            req.id,
+            json!({
+                "repo": params.repo,
+                "integration_branch": integration_branch,
+                "integration_head": integration_head,
+                "release_target": release_target,
+                "release_target_head": release_target_head,
+                "selected_release": selected.map(|s| {
+                    release_json(&s.entry, s.manifest.as_ref(), Some(lock_is_free))
+                }),
+                "integration_head_prepared": integration_head_prepared,
+            }),
+        )
     }
 
     async fn run_release_prepare(

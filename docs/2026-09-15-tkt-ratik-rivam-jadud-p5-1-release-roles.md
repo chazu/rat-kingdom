@@ -102,21 +102,63 @@ always required an operator-supplied `--candidate` (branch/tag/sha), and
   supersession evidence" (a concurrent second call queues on the mutex FIFO
   rather than coalescing to a single pending marker). See "Scope explicitly
   NOT covered here."
-- **Observation**: no new status RPC was added. `release.select`'s own
-  response, plus the existing unchanged `release.list`/`release.show` (`rk
-  release list`/`rk release show`), are the observation surface for a
-  selected candidate — the ticket's "one real operator journey selecting and
-  observing" is satisfied by composing existing, unmodified surfaces rather
-  than building a new one. `repo.get`/`rk repo get` also surfaces the
-  activated `release.integrationBranch`/`releaseTarget` roles for free,
-  since `RepoRecord`'s full `activated_policy` already serializes on that
-  RPC and required no handler change.
+- **`release.status` RPC + `rk release status --repo R`** (`server.rs`,
+  `release.rs::id_for`, `rk-cli`): a genuinely new, read-only surface tying
+  the activated role together — `integration_branch`/`integration_head`
+  (resolved live, same code path `select` uses), `release_target`/
+  `release_target_head` (resolved live; `null` rather than an error if it
+  does not resolve), the selected `Prepared` release for the CURRENT
+  integration head if one exists (via the new `release::id_for`, a
+  read-only deterministic id computation added specifically so this never
+  has to call `prepare`/`select` to check), and
+  `integration_head_prepared: bool`. **Precise meaning, named and documented
+  exactly per a verified operator correction**: this reports only
+  `ReleaseStatus::Prepared` — an immutable artifact inventory entry exists
+  for this exact commit. It does NOT mean accepted, deployed, or enabled;
+  those are distinct states other subsystems own (`rk feature show/set`, a
+  future release-activation slice) and this field must never be read as
+  implying any of them. This makes `release_target` actually READ at
+  runtime, not only validated once at policy-activation time — closing the
+  gap where it was previously write-only. It still never advances, lands,
+  or authorizes anything on `release_target`; that branch's own
+  protected-path/review gates are completely unaffected, proved directly
+  in `status_reports_integration_and_release_target_heads`
+  (`release_target_head` is asserted unchanged after a `select` call).
+- **What the admission-sharing evidence actually proves, precisely scoped**
+  (corrected after two rounds of verified operator review — the first found
+  the original evidence only proved sequential, not concurrent, behavior;
+  the second found the replacement concurrency claim itself overstated).
+  `select_shares_the_aggregate_admission_permit_with_a_concurrent_named_check`
+  configures the daemon exactly as this ticket's own stated production base
+  state (`release_build_admission_enabled: true`,
+  `verification_admission_aggregate_limit: 1`) and proves: `release.select`'s
+  build genuinely queues behind, and is admitted alongside, an ordinary
+  named check (`verify.run`) on a SEPARATE repo through the SAME shared
+  aggregate semaphore — the exact property
+  `release_prepare.rs::host_admission::enabled_shares_the_aggregate_cap_with_a_concurrent_named_check`
+  already proves for `release.prepare`, now confirmed preserved unchanged
+  through `select`'s new integration-branch candidate resolution. **This is
+  NOT** a proof that integration continues unblocked while a release
+  validates — under this real, currently-deployed configuration, a release
+  build DOES consume shared capacity a concurrent named check would need,
+  and vice versa; they contend, they are not isolated. An earlier version of
+  this evidence, built only against the admission-DISABLED default with a
+  real (and, under host contention, unreliably slow) `cargo build` barrier,
+  claimed the opposite ("never blocked behind a held release build") — that
+  claim was true only for the untested-in-production default configuration
+  and has been removed. Whether integration should be isolated from release
+  build admission under production's actual settings is exactly the kind of
+  question retained on the follow-up, not resolved here.
 - **Integration continues through existing gates, unchanged**: this slice
   does not touch `landing.rs`, `LandingPolicy`, or focused-check routing at
   all. Ordinary deliveries onto the configured integration branch use
   whatever landing policy that repo already has — the ticket's "later work
-  integrates through existing gates" is satisfied by NOT changing that path,
-  not by adding a new one.
+  integrates through existing gates" is satisfied by NOT changing that
+  path, not by adding a new one. This is a narrower claim than "integration
+  is never slowed by a release build" (see above): the landing PATH is
+  unchanged; whether it contends for shared admission capacity with an
+  in-flight release build depends on the aggregate admission configuration,
+  proved precisely above, not assumed.
 
 ## Evidence
 
@@ -126,7 +168,7 @@ always required an operator-supplied `--candidate` (branch/tag/sha), and
   export; half-configured, identical-branch, and release-target-outside-
   protected-targets are each rejected with an actionable message. Full
   existing `rk-workflow` suite (69+ tests) passes unchanged.
-- `crates/rk-daemon/tests/release_select.rs` (4 new, real daemon + the same
+- `crates/rk-daemon/tests/release_select.rs` (6 new, real daemon + the same
   tiny dependency-free paired Cargo fixture `release_prepare.rs` already
   uses):
   - `select_without_any_activated_policy_reports_the_existing_inactive_repo_error`
@@ -149,6 +191,20 @@ always required an operator-supplied `--candidate` (branch/tag/sha), and
     still report `prepared`/`content_verified: true` with its ORIGINAL
     frozen commit — the actual immutability property under real content
     drift risk, not just "the code path is unchanged."
+  - `select_shares_the_aggregate_admission_permit_with_a_concurrent_named_check`
+    — the precisely-scoped admission evidence described above, configured
+    exactly as production's actual base state (admission enabled, aggregate
+    cap 1): a barrier-held `verify.run` on a separate repo, `release.select`
+    proven to genuinely queue behind it on the shared permit
+    (`host_executing == 1 && host_waiting == 1`, via the real `status` RPC),
+    then admitted and completing with nonzero recorded
+    `admission_wait_ms`. Uses the same cheap shell-command barrier
+    `release_prepare.rs::host_admission` already relies on, not a real
+    `cargo build` — faster and not contention-prone under host load.
+  - `status_reports_integration_and_release_target_heads` — `release.status`
+    before and after a `select` call: `integration_head_prepared` flips
+    from `false` to `true`, `release_target_head` is asserted unchanged
+    across the call.
   - Regression: the full pre-existing `release_prepare.rs` suite (15 tests,
     including the P4.1 `host_admission` module) and `repository_policy.rs`
     (3 tests) pass unchanged after the `handle_release_prepare` refactor.
@@ -170,15 +226,29 @@ always required an operator-supplied `--candidate` (branch/tag/sha), and
   overflow for a later snapshot, or give an individually-oversized
   constituent a visible disposition. Needs its own bounded slice against the
   existing diff-scope check machinery.
+- **Whether integration should be isolated from release-build admission
+  contention.** Proved precisely above: under production's actual
+  configuration (admission enabled, aggregate cap 1), a `release.select`
+  build and an ordinary named check genuinely contend for the same shared
+  permit — a held release build can delay a concurrent check, and vice
+  versa. Whether that is acceptable, or whether `release.select` should
+  reserve separate capacity or a distinct admission class from ordinary
+  landing checks, is an open design question this slice deliberately does
+  not resolve; it only makes the actual current behavior observable and
+  correctly documented instead of assumed.
 - **Protected-path authority reuse for the release edge** (the parent's
   "prior integration approval alone cannot authorize the release edge; use
   existing authority checks and explicitly surface a missing/stale
-  approval"). `release.prepare`/`release.select` do not land anything onto
-  `release_target` themselves — they only build an immutable artifact
-  inventory entry, exactly as `release.prepare` always has — so this
-  slice has no release-edge landing action to authorize yet. Applies once a
-  later slice adds an actual advancement of `release_target` to the
-  selected candidate.
+  approval"). `release_target` is now READ and reported live
+  (`release.status`), but `release.prepare`/`release.select` still do not
+  LAND anything onto it themselves — they only build an immutable artifact
+  inventory entry, exactly as `release.prepare` always has — so this slice
+  has no release-edge landing action to authorize yet. Applies once a later
+  slice adds an actual advancement of `release_target` to the selected
+  candidate; that advancement is release ACTIVATION, a distinct capability
+  from artifact preparation in the design doc's own track table (P7:
+  "Explicitly activate and roll back a compatible bundle"), not something
+  `release.prepare` has ever done.
 - **The full native two-branch barrier fixture** (parent acceptance point
   5): a full release check held at a deterministic barrier while a second
   candidate integrates through its focused check, proving frozen

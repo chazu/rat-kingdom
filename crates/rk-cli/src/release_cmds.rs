@@ -21,6 +21,9 @@ pub enum ReleaseCommand {
     /// release; a call after new commits land produces a separate,
     /// independently immutable release rather than mutating the prior one.
     Select(SelectArgs),
+    /// Show the activated release role's integration/target branch heads and
+    /// whether the current integration head already has a recorded release.
+    Status(StatusArgs),
     /// List prepared/failed/in-progress releases.
     List(ListArgs),
     /// Inspect one release: source, config provenance, binary hashes, checks.
@@ -54,6 +57,16 @@ pub struct SelectArgs {
 }
 
 #[derive(Args)]
+pub struct StatusArgs {
+    /// Registered repository name with an activated release role.
+    #[arg(long)]
+    pub repo: String,
+    /// Build recipe. Only `paired-rk-mcp` exists today.
+    #[arg(long)]
+    pub recipe: Option<String>,
+}
+
+#[derive(Args)]
 pub struct ListArgs {
     /// Only releases for this repo.
     #[arg(long)]
@@ -64,6 +77,7 @@ pub async fn run(layout: &Layout, command: ReleaseCommand, as_json: bool) -> Res
     match command {
         ReleaseCommand::Prepare(args) => prepare(layout, args, as_json).await,
         ReleaseCommand::Select(args) => select(layout, args, as_json).await,
+        ReleaseCommand::Status(args) => status(layout, args, as_json).await,
         ReleaseCommand::List(args) => list(layout, args, as_json).await,
         ReleaseCommand::Show { id } => show(layout, id, as_json).await,
     }
@@ -133,6 +147,47 @@ async fn select(layout: &Layout, args: SelectArgs, as_json: bool) -> Result<()> 
     );
     if let Some(manifest) = release.get("manifest").filter(|m| !m.is_null()) {
         print_manifest_summary(manifest);
+    }
+    Ok(())
+}
+
+async fn status(layout: &Layout, args: StatusArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let mut params = json!({
+        "repo": args.repo,
+    });
+    if let Some(recipe) = args.recipe {
+        params["recipe"] = json!(recipe);
+    }
+    let result = client.call("release.status", params).await?;
+    if as_json {
+        println!("{result}");
+        return Ok(());
+    }
+    println!(
+        "repo {}: integration {} @ {} — release target {} @ {}",
+        result["repo"].as_str().unwrap_or("?"),
+        result["integration_branch"].as_str().unwrap_or("?"),
+        result["integration_head"].as_str().unwrap_or("?"),
+        result["release_target"].as_str().unwrap_or("?"),
+        result["release_target_head"]
+            .as_str()
+            .unwrap_or("(unresolved)"),
+    );
+    // "prepared" only: an immutable artifact inventory entry exists for
+    // this exact commit — NOT accepted, deployed, or enabled anywhere.
+    println!(
+        "  integration head prepared: {}",
+        result["integration_head_prepared"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    if let Some(release) = result.get("selected_release").filter(|r| !r.is_null()) {
+        println!(
+            "  selected release {} — {}",
+            release["id"].as_str().unwrap_or("?"),
+            release["status"].as_str().unwrap_or("?"),
+        );
     }
     Ok(())
 }
