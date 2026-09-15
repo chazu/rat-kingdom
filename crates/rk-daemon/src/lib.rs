@@ -43,6 +43,7 @@ pub mod read_only_roles;
 pub mod reconcile;
 pub mod reconcile_repair;
 pub mod recovery;
+pub mod release;
 pub mod repos;
 pub mod scheduler;
 pub mod server;

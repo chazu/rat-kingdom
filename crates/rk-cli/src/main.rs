@@ -15,6 +15,7 @@ mod observe;
 mod product_to_code_cmds;
 mod reconcile_cmds;
 mod reconcile_repair_cmds;
+mod release_cmds;
 mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
@@ -256,6 +257,11 @@ enum Command {
     Ticket {
         #[command(subcommand)]
         command: TicketCommand,
+    },
+    /// Prepare and inspect immutable paired rk/rk-mcp releases (P6.1).
+    Release {
+        #[command(subcommand)]
+        command: release_cmds::ReleaseCommand,
     },
     /// Ingest canonical SDLC feedback events and read current facts.
     Ingest {
@@ -1012,6 +1018,12 @@ fn init_tracing(config: &Config) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Must run before anything below reads `rk_core::version::build_version()`
+    // / `build_sha()` — including inside `rk-daemon`, which this process runs
+    // in-process as `rk daemon run`. `RK_BUILD_SHA` is this crate's own
+    // compile-time env var, stamped by `crates/rk-cli/build.rs`.
+    rk_core::version::init_build_sha(env!("RK_BUILD_SHA"));
+
     let cli = Cli::parse();
     let layout = Layout::discover()?;
     let config = Config::load(&layout.config_file())?;
@@ -1299,6 +1311,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Ingest { command } => ingest_cmds::run(&layout, command, cli.json).await?,
+        Command::Release { command } => release_cmds::run(&layout, command, cli.json).await?,
         Command::Workflow { command } => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             match command {

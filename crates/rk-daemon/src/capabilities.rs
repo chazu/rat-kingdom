@@ -79,9 +79,8 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
         | "bbs.retirement.show" | "ping" | "status"
         | "space.scan" | "space.rd"
         | "repo.list"
-        | "repo.get" | "agent.status" | "agent.log" | "agent.progress" | "control.verify" => {
-            ORDINARY_READ_ONLY
-        }
+        | "repo.get" | "agent.status" | "agent.log" | "agent.progress" | "release.list"
+        | "release.show" | "control.verify" => ORDINARY_READ_ONLY,
         "space.out" => ORDINARY_SELF_DONE,
         "repo.onboard.inspect" => ORDINARY_ONBOARDER,
         "repo.onboard.propose" => ONBOARDER_ONLY,
@@ -244,6 +243,8 @@ mod tests {
             "control.verify",
             "bbs.discovery.show",
             "bbs.retirement.show",
+            "release.list",
+            "release.show",
         ] {
             assert!(
                 method_policy(method).is_some_and(|policy| policy.ordinary),

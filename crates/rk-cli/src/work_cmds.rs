@@ -19,9 +19,10 @@ pub async fn run(layout: &Layout, args: WorkArgs, as_json: bool) -> Result<()> {
     let mut result = client
         .call("work.current", json!({"repo": args.repo}))
         .await?;
-    result["installed_build"] = json!(rk_core::version::BUILD_VERSION);
-    result["build_in_sync"] =
-        json!(result["daemon"]["build_version"].as_str() == Some(rk_core::version::BUILD_VERSION));
+    result["installed_build"] = json!(rk_core::version::build_version());
+    result["build_in_sync"] = json!(
+        result["daemon"]["build_version"].as_str() == Some(rk_core::version::build_version())
+    );
     if as_json {
         println!("{result}");
         return Ok(());
@@ -38,7 +39,7 @@ fn print_current(work: &Value) -> std::io::Result<()> {
 fn write_current(out: &mut impl Write, work: &Value) -> std::io::Result<()> {
     let local_build = work["installed_build"]
         .as_str()
-        .unwrap_or(rk_core::version::BUILD_VERSION);
+        .unwrap_or(rk_core::version::build_version());
     let daemon_build = work["daemon"]["build_version"].as_str().unwrap_or("?");
     let parity = if daemon_build == local_build {
         "in sync"
@@ -176,7 +177,7 @@ mod tests {
     fn current_work_empty_state_names_history_and_wake_distinction() {
         let value = json!({
             "repo": "rat-kingdom",
-            "daemon": {"build_version": rk_core::version::BUILD_VERSION},
+            "daemon": {"build_version": rk_core::version::build_version()},
             "counts": {"live_agents": 0, "ready_tickets": 0, "actionable": 0, "attention": 0, "decision_required": 0, "stalled": 0},
             "live_agents": [],
             "ready_tickets": [],
@@ -187,7 +188,7 @@ mod tests {
             "no_current_work": true,
             "history_command": "rk digest --since 1d",
             "diagnostics_command": "rk top",
-            "installed_build": rk_core::version::BUILD_VERSION,
+            "installed_build": rk_core::version::build_version(),
             "build_in_sync": true,
         });
         // Smoke the renderer's required fields and no-panic empty contract.
@@ -198,7 +199,7 @@ mod tests {
     fn current_work_renders_action_decision_and_stall_without_inventing_commands() {
         let value = json!({
             "repo": "rat-kingdom",
-            "daemon": {"build_version": rk_core::version::BUILD_VERSION},
+            "daemon": {"build_version": rk_core::version::build_version()},
             "counts": {"live_agents": 0, "ready_tickets": 0, "actionable": 1, "attention": 1, "decision_required": 1, "stalled": 1},
             "live_agents": [],
             "ready_tickets": [],
@@ -207,7 +208,7 @@ mod tests {
             "decision_required": [{"kind": "workflow-gate", "scope": "rat-kingdom", "detail": "approval required", "commands": ["rk approve wf-1", "rk reject wf-1"]}],
             "stalled": [{"kind": "workflow-failed", "scope": "rat-kingdom", "text": "check failed", "action": "rk workflow status wf-2"}],
             "no_current_work": false,
-            "installed_build": rk_core::version::BUILD_VERSION,
+            "installed_build": rk_core::version::build_version(),
         });
         let mut rendered = Vec::new();
         write_current(&mut rendered, &value).unwrap();
