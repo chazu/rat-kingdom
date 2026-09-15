@@ -168,7 +168,8 @@ fn candidate_repo() -> tempfile::TempDir {
         dir.path().join(".rk/checks.cue"),
         "checks: [\n    {name: \"landing-protected-paths\", command: \"true\", timeout: \"30s\"},\n    \
          {name: \"landing-diff-scope\", command: \"true\", timeout: \"30s\"},\n    \
-         {name: \"verify\", command: \"true\", timeout: \"30s\"},\n]\n",
+         {name: \"verify\", command: \"true\", timeout: \"30s\"},\n    \
+         {name: \"smoke\", command: \"true\", timeout: \"30s\"},\n]\n",
     )
     .unwrap();
     std::fs::write(dir.path().join(".rk/repo.cue"), "repo: {}\n").unwrap();
@@ -286,17 +287,11 @@ impl Drop for DaemonGuard {
     }
 }
 
-
 /// Read `rk fence-status` over the real CLI, as JSON.
 fn fence_status(home: &Path, repo: &Path) -> Value {
     json_stdout(
         &rk(home)
-            .args([
-                "--json",
-                "fence-status",
-                "--repo",
-                repo.to_str().unwrap(),
-            ])
+            .args(["--json", "fence-status", "--repo", repo.to_str().unwrap()])
             .output()
             .unwrap(),
     )
@@ -438,9 +433,10 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
 
     // (4) A settles NORMALLY — the fence never cancelled or forced it.
     std::fs::write(home_path.join("release-reviewer"), "").unwrap();
-    until("candidate-a to land normally through its own live RPCs", || {
-        ref_contains(&repo_path, "main", "src_gen.rs").then_some(())
-    });
+    until(
+        "candidate-a to land normally through its own live RPCs",
+        || ref_contains(&repo_path, "main", "src_gen.rs").then_some(()),
+    );
 
     // (5) THE readiness claim: ready WITH B still durably queued. This is
     // the whole point of a handoff window — readiness never requires the
@@ -475,19 +471,16 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
 
     // (5b) THE RACE THE SNAPSHOT ALONE COULD NOT CLOSE. `ready` was just
     // answered. An independent managed check now ARRIVES — after acceptance,
-    // after readiness. If it were merely observed rather than fenced, it
+    // after readiness. If it were merely OBSERVED rather than fenced, it
     // would start silently and the operator would roll over on top of live
-    // owned work. It must be REFUSED instead, and readiness must still hold
-    // afterwards.
+    // owned work.
+    //
+    // `smoke` is used deliberately: it is declared in this repo's
+    // `.rk/checks.cue` but is NOT one of the checks the landing gate ran, so
+    // no cached proof exists for it and this call genuinely reaches the
+    // registration path the fence guards.
     let intruder = rk(&home_path)
-        .args([
-            "--json",
-            "verify",
-            "--repo",
-            &repo_name,
-            "--check",
-            "verify",
-        ])
+        .args(["--json", "verify", "--repo", &repo_name, "--check", "smoke"])
         .output()
         .unwrap();
     assert!(
@@ -495,12 +488,20 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
         "a managed verify.run arriving after `ready` must be refused, not admitted: {}",
         String::from_utf8_lossy(&intruder.stdout)
     );
-    let refusal = String::from_utf8_lossy(&intruder.stderr).to_lowercase();
+    let refusal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&intruder.stdout),
+        String::from_utf8_lossy(&intruder.stderr)
+    )
+    .to_lowercase();
     assert!(
         refusal.contains("handoff fence"),
-        "the refusal must name the handoff fence so the caller can retry after release: \
-         {refusal}"
+        "the refusal must name the handoff fence so the caller knows to retry after \
+         release, rather than reading as an ordinary check failure: {refusal}"
     );
+
+    // ...and the refusal must be the ONLY effect: readiness still holds, and
+    // the refused run never registered as owned work.
     let still_ready = fence_status(&home_path, &repo_path);
     assert_eq!(
         still_ready["ready"], true,
@@ -511,6 +512,30 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
         still_ready["managed_blockers"].as_array().unwrap().len(),
         0,
         "the refused run must never have registered as owned work: {still_ready}"
+    );
+
+    // The deliberate other half of that boundary, asserted rather than left
+    // implicit: a check whose proof is ALREADY CACHED is still served while
+    // fenced. It spawns no process, takes no admission permit and returns
+    // immediately, so it cannot hang a daemon stop — refusing it would break
+    // callers during the handoff window for no safety gain. `verify` is
+    // exactly this case here: the landing gate already proved it for this
+    // candidate.
+    let cached = rk(&home_path)
+        .args([
+            "--json", "verify", "--repo", &repo_name, "--check", "verify",
+        ])
+        .output()
+        .unwrap();
+    let cached_json = json_stdout(&cached);
+    assert_eq!(
+        cached_json["reused"], true,
+        "this arm is only meaningful if the proof genuinely came from cache: {cached_json}"
+    );
+    assert_eq!(
+        fence_status(&home_path, &repo_path)["ready"],
+        true,
+        "serving a cached proof owns nothing, so readiness must be unchanged"
     );
 
     // (6) The actual rollover: a real `rk daemon stop`, and a real pid exit.

@@ -15180,7 +15180,12 @@ checks: [
 
         // Request the fence while A is genuinely mid-check.
         let requested = pipeline
-            .fence_request(&repo_name, "operator-test", 60, &ManagedWorkSnapshot::default())
+            .fence_request(
+                &repo_name,
+                "operator-test",
+                60,
+                &ManagedWorkSnapshot::default(),
+            )
             .await
             .unwrap();
         let generation = requested["generation"].as_u64().unwrap();
@@ -15298,7 +15303,12 @@ checks: [
 
         // Release the fence — B may now advance, exactly once.
         pipeline
-            .fence_release(&repo_name, "operator-test", generation, &ManagedWorkSnapshot::default())
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                generation,
+                &ManagedWorkSnapshot::default(),
+            )
             .await
             .unwrap();
         assert_eq!(

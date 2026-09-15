@@ -335,7 +335,10 @@ pub async fn fence_status(layout: &Layout, args: FenceStatusArgs, as_json: bool)
         // `state`, so an operator reading this line is reading the actual
         // safety claim the daemon made.
         let ready = result["ready"].as_bool().unwrap_or(false);
-        let keys = result["blocking_keys"].as_array().cloned().unwrap_or_default();
+        let keys = result["blocking_keys"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let managed = result["managed_blockers"]
             .as_array()
             .cloned()

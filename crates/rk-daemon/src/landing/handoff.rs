@@ -45,6 +45,25 @@
 //!    outside it for ADMISSION purposes, since the fence gates only this
 //!    repo's landing claims.
 //!
+//! # What the fence REFUSES while engaged
+//!
+//! Readiness would be a fiction if new owned work could start right after it
+//! is answered, so the fence does not merely observe dimensions 2 and 3 — it
+//! refuses NEW managed runs for the fenced repo at
+//! [`crate::managed_verification::ManagedVerificationRuns::try_register`],
+//! whose fence check happens under the very mutex the readiness snapshot
+//! takes. See that method's doc for the two-outcomes-never-both argument.
+//!
+//! One deliberate exception, because it is not work at all: a check whose
+//! verification proof is ALREADY CACHED is still served while fenced. That
+//! path returns before any registration — it spawns no process, takes no
+//! admission permit and completes immediately — so it cannot hang a stop.
+//! Refusing it would break callers during the window for no safety gain.
+//!
+//! Already-registered runs are likewise untouched and settle through their
+//! own contracts. The fence stops work STARTING; it never stops work
+//! FINISHING, which is what makes the window usable at all.
+//!
 //! These are REPORTED, never cancelled: the ticket requires reusing the
 //! existing managed-run and release status/cancellation contracts rather
 //! than silently killing an operator's own jobs. A bounded deadline reports
@@ -343,8 +362,7 @@ impl ManagedWorkSnapshot {
         all_runs: Vec<crate::managed_verification::ManagedRunBlocker>,
         release_prepare_in_flight: bool,
     ) -> Self {
-        let (repo_runs, other_repo_runs) =
-            all_runs.into_iter().partition(|run| run.repo == repo);
+        let (repo_runs, other_repo_runs) = all_runs.into_iter().partition(|run| run.repo == repo);
         Self {
             repo_runs,
             other_repo_runs,
@@ -792,6 +810,40 @@ mod tests {
             .release("repo", "operator-a", renewed.generation, at(12))
             .unwrap();
         assert!(!store.current("repo").unwrap().blocks_admission(at(13)));
+    }
+
+    /// The fence covers ONE repository. A run on another repo must be
+    /// refused-nothing (it is outside the fence) yet still visible, because
+    /// a rollover stops the daemon they share.
+    #[test]
+    fn another_repos_run_blocks_rollover_without_being_covered_by_this_fence() {
+        let snapshot = ManagedWorkSnapshot::new(
+            "fenced",
+            vec![crate::managed_verification::ManagedRunBlocker {
+                repo: "elsewhere".into(),
+                kind: "verify",
+                agent: "Peer-9".into(),
+            }],
+            false,
+        );
+
+        assert!(
+            snapshot.repo_clear(),
+            "the fenced repo's own covered boundary is genuinely clear"
+        );
+        assert!(
+            !snapshot.daemon_clear(),
+            "but the daemon is shared, so a rollover is not safe"
+        );
+
+        let rows = snapshot.blocker_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["repo"], "elsewhere");
+        assert_eq!(rows[0]["scope"], "daemon");
+        assert_eq!(
+            rows[0]["fenced"], false,
+            "an operator must be told this one can restart on its own at any moment"
+        );
     }
 
     /// Readiness is multi-dimensional. A managed run that holds NO landing

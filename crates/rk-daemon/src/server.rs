@@ -4182,12 +4182,7 @@ impl Daemon {
                 reply(
                     match self
                         .landing()
-                        .fence_release(
-                            &repo,
-                            &params.holder,
-                            params.generation,
-                            &managed,
-                        )
+                        .fence_release(&repo, &params.holder, params.generation, &managed)
                         .await
                     {
                         Ok(value) => Response::ok(id, value),
@@ -8544,15 +8539,17 @@ impl Daemon {
         // release prepare started after `ready` would silently invalidate the
         // handoff the operator is mid-way through. Already-running prepares
         // are untouched.
-        let (managed_id, mut cancel_rx) = match self
-            .supervisor
-            .verification_resources()
-            .runs
-            .try_register(&req.caller, generation, &request_key, &repo, "release-prepare")
-        {
-            Ok(registered) => registered,
-            Err(error) => return Response::err(req.id, codes::FORBIDDEN, error.to_string()),
-        };
+        let (managed_id, mut cancel_rx) =
+            match self.supervisor.verification_resources().runs.try_register(
+                &req.caller,
+                generation,
+                &request_key,
+                &repo,
+                "release-prepare",
+            ) {
+                Ok(registered) => registered,
+                Err(error) => return Response::err(req.id, codes::FORBIDDEN, error.to_string()),
+            };
         let prepare_fut = crate::release::prepare(
             &self.layout,
             crate::release::PrepareParams {

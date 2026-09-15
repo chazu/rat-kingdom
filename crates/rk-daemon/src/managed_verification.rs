@@ -253,10 +253,13 @@ impl<'a> ManagedVerification<'a> {
         // Refused outright while a P7.1 handoff fence is engaged for this
         // repo — the fence stops NEW managed work from starting behind an
         // already-answered `ready`. See `try_register`'s doc.
-        let (managed_id, mut cancel_rx) =
-            self.resources
-                .runs
-                .try_register(agent, generation, request_key, repo_name, "verify")?;
+        let (managed_id, mut cancel_rx) = self.resources.runs.try_register(
+            agent,
+            generation,
+            request_key,
+            repo_name,
+            "verify",
+        )?;
         let registration = ManagedRegistration {
             runs: &self.resources.runs,
             id: managed_id,
