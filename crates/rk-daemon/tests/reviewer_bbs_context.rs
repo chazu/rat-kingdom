@@ -53,6 +53,21 @@ fn scratch_repo(dir: &Path) {
     git(dir, &["commit", "-m", "init"]);
 }
 
+/// A real `feature` branch with one commit, returning its resolvable sha.
+/// The reviewer spawns below drive a genuine `agent.spawn` RPC, so their
+/// `ReviewContext.headSha` must be an actual commit — the daemon now forks
+/// the reviewer's worktree from it (TKT-zajob-japos-dalot) rather than
+/// tolerating a placeholder like `"d".repeat(40)`.
+fn create_feature_branch(dir: &Path) -> String {
+    git(dir, &["checkout", "-b", "feature"]);
+    std::fs::write(dir.join("feature.txt"), "feature work\n").unwrap();
+    git(dir, &["add", "feature.txt"]);
+    git(dir, &["commit", "-m", "feature work"]);
+    let sha = git_out(dir, &["rev-parse", "HEAD"]).trim().to_string();
+    git(dir, &["checkout", "main"]);
+    sha
+}
+
 /// Same shape as `install_default_repository_policy`, but with
 /// `landing.reviewedTicketBbsContext: true` — written and committed BEFORE
 /// `repo.add` so this fresh, previously-unregistered repo activates it
@@ -158,6 +173,7 @@ async fn policy_off_by_default_reviewer_briefing_misses_reviewed_ticket_evidence
     let repo = tempfile::tempdir().unwrap();
     scratch_repo(repo.path());
     support::install_default_repository_policy(repo.path());
+    let feature_head = create_feature_branch(repo.path());
     std::env::set_var("RK_FAKE_HARNESS_CMD", capture_prime());
 
     let layout = Layout::at(home.path());
@@ -198,7 +214,7 @@ async fn policy_off_by_default_reviewer_briefing_misses_reviewed_ticket_evidence
         &synthetic_task,
         "reviewer",
         Some(json!({
-            "branch": "feature", "headSha": "d".repeat(40), "target": "main",
+            "branch": "feature", "headSha": feature_head, "target": "main",
             "task": original_ticket, "attempt": "attempt-policy-off",
         })),
     )
@@ -231,6 +247,7 @@ async fn policy_on_exposes_reviewed_ticket_evidence_without_leaking_foreign_scop
     let repo = tempfile::tempdir().unwrap();
     scratch_repo(repo.path());
     install_reviewed_ticket_bbs_context_policy(repo.path());
+    let feature_head = create_feature_branch(repo.path());
     let other_repo = tempfile::tempdir().unwrap();
     scratch_repo(other_repo.path());
     support::install_default_repository_policy(other_repo.path());
@@ -305,7 +322,7 @@ async fn policy_on_exposes_reviewed_ticket_evidence_without_leaking_foreign_scop
         &synthetic_task,
         "reviewer",
         Some(json!({
-            "branch": "feature", "headSha": "d".repeat(40), "target": "main",
+            "branch": "feature", "headSha": feature_head.clone(), "target": "main",
             "task": original_ticket, "attempt": "attempt-policy-on",
         })),
     )
@@ -347,7 +364,7 @@ async fn policy_on_exposes_reviewed_ticket_evidence_without_leaking_foreign_scop
         &mismatched_synthetic_task,
         "reviewer",
         Some(json!({
-            "branch": "feature", "headSha": "e".repeat(40), "target": "main",
+            "branch": "feature", "headSha": feature_head, "target": "main",
             "task": foreign_ticket, "attempt": "attempt-policy-on-foreign",
         })),
     )
