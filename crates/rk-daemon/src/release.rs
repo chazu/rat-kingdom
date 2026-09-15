@@ -41,22 +41,13 @@ const NICE_LEVEL: i32 = 10;
 /// so queuing behind checks/other builds for a while is an acceptable
 /// tradeoff for a hard host-wide capacity ceiling.
 const ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// The fixed admission identity for every `paired-rk-mcp` build, used only
-/// for telemetry today (P3.1 has no weight/class lookup). Never derived
-/// from a repository's own `.rk/checks.cue` — a repo cannot relabel its own
-/// release build as cheap, and a future weighted-class admission mode
-/// (P3.2, `TKT-nasif-danob-sirok`, not yet on `main`) can key an explicit
-/// heavier config weight off this exact string once it lands.
+/// The fixed admission identity for every `paired-rk-mcp` build. Never
+/// derived from a repository's own `.rk/checks.cue` — a repo cannot relabel
+/// its own release build as cheap. Now (P3.2, `TKT-nasif-danob-sirok`, on
+/// `main`) a real `config.toml`-keyable weight/class lookup: an operator
+/// sets `[policy] verification_admission_check_weight."release-build:paired-rk-mcp"]`
+/// to give this build a heavier reservation than the default `1`.
 const RELEASE_ADMISSION_IDENTITY: &str = "release-build:paired-rk-mcp";
-/// Documented conservative reservation for legacy static (P3.1-only)
-/// admission: this build always costs exactly one aggregate unit, the same
-/// as every unclassified named check. A heavier weight is deliberately NOT
-/// approximated by acquiring more than one permit here — `HostVerificationAdmission::acquire`
-/// grants exactly one permit per call, and calling it more than once per
-/// build would require holding a partial reservation while awaiting the
-/// rest, which is exactly the recursive/partial-hold pattern that can
-/// deadlock two heavy builds contending for the same tight aggregate cap.
-const RELEASE_ADMISSION_WEIGHT: u32 = 1;
 /// Maximum retained failure-tail characters; truncation respects character boundaries.
 const FAILURE_EVIDENCE_CHARS: usize = 4000;
 
@@ -141,10 +132,15 @@ pub struct RecipeBounds {
 pub struct HostAdmissionBounds {
     /// Fixed, never repo-supplied — see [`RELEASE_ADMISSION_IDENTITY`].
     pub recipe_identity: String,
-    /// Aggregate units this build consumed. Always [`RELEASE_ADMISSION_WEIGHT`]
-    /// under legacy static (P3.1-only) admission today; see that constant's
-    /// doc comment for why a heavier cost is not approximated by acquiring
-    /// more than one permit.
+    /// Aggregate units this build actually consumed — the EFFECTIVE
+    /// configured weight for [`RELEASE_ADMISSION_IDENTITY`]
+    /// (`HostVerificationAdmission::weight_for`, P3.2), default `1` when
+    /// unconfigured. Acquired atomically in one `acquire()` call (P3.2's
+    /// `acquire_many_owned` internally, never several sequential single-unit
+    /// calls) — a heavier weight is never approximated by holding a partial
+    /// reservation while awaiting the rest, which would be exactly the
+    /// recursive/partial-hold pattern that can deadlock two heavy builds
+    /// contending for the same tight aggregate cap.
     pub weight: u32,
     /// How long the build waited for a permit before it was granted.
     pub admission_wait_ms: u64,
@@ -882,7 +878,12 @@ async fn run_recipe(
     let admission_wait_started = Instant::now();
     let host_permit = match admission {
         Some(host_admission) => {
-            match tokio::time::timeout(ADMISSION_WAIT_TIMEOUT, host_admission.acquire()).await {
+            match tokio::time::timeout(
+                ADMISSION_WAIT_TIMEOUT,
+                host_admission.acquire(RELEASE_ADMISSION_IDENTITY),
+            )
+            .await
+            {
                 Ok(permit) => permit,
                 Err(_) => {
                     return Err(rk_core::Error::other(format!(
@@ -1021,20 +1022,20 @@ async fn run_recipe(
             nice: NICE_LEVEL,
             timeout_secs: BUILD_TIMEOUT.as_secs(),
             enforcement_note: if admission.is_some() {
-                "process-wide single-flight lock on release.prepare; participates in the P3.1 \
-                    HostVerificationAdmission aggregate cap (see host_admission below) as one \
-                    weight-1 unit; still not a host-wide CPU quota and not an \
+                "process-wide single-flight lock on release.prepare; participates in the \
+                    HostVerificationAdmission aggregate cap (see host_admission below) at its \
+                    own configured weight; still not a host-wide CPU quota and not an \
                     immutable-execution guarantee — nice/jobs bounds remain process-local only"
                     .to_string()
             } else {
                 "process-wide single-flight lock on release.prepare; not a \
-                    host-wide CPU quota, not the P3.1 HostVerificationAdmission cap, and not an \
+                    host-wide CPU quota, not the HostVerificationAdmission cap, and not an \
                     immutable-execution guarantee"
                     .to_string()
             },
-            host_admission: admission.is_some().then(|| HostAdmissionBounds {
+            host_admission: admission.map(|host_admission| HostAdmissionBounds {
                 recipe_identity: RELEASE_ADMISSION_IDENTITY.to_string(),
-                weight: RELEASE_ADMISSION_WEIGHT,
+                weight: host_admission.weight_for(RELEASE_ADMISSION_IDENTITY),
                 admission_wait_ms,
                 build_run_ms: Some(build_run_ms),
             }),

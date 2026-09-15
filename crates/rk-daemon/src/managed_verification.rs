@@ -3019,7 +3019,14 @@ impl HostVerificationAdmission {
         self.limit.load(Ordering::Relaxed) as u32
     }
 
-    fn weight_for(&self, check_name: &str) -> u32 {
+    /// The configured aggregate cost for `check_name` — its own weight if
+    /// set, else the default `1`. `pub(crate)`, not private: P4.1's
+    /// `release.rs` reads this directly to report the EFFECTIVE configured
+    /// weight in its build telemetry (`HostAdmissionBounds::weight`)
+    /// instead of a hardcoded constant, so that field stays accurate once
+    /// an operator actually configures `[policy]
+    /// verification_admission_check_weight."release-build:paired-rk-mcp"]`.
+    pub(crate) fn weight_for(&self, check_name: &str) -> u32 {
         self.check_weight
             .lock()
             .unwrap()
