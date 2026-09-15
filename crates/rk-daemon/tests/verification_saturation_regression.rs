@@ -349,6 +349,41 @@ fn process_alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// Best-effort test-hygiene safety net for the exact real check subprocess
+/// a restart test observes, armed for the window between confirming a
+/// daemon's physical death and confirming the replacement daemon's own
+/// recovery reclaimed the orphan it left behind — an early panic in that
+/// window (e.g. a failed assertion) must not leak a live background
+/// process. This is NOT part of, and never races, the actual recovery
+/// mechanism under test (`workflow_exec::reap_stale_managed_children`'s
+/// pid+signature check) — on the successful path that mechanism already
+/// kills the process well before this guard ever drops, so `process_alive`
+/// is false and `drop` is a no-op. Only signals if the pid is both still
+/// alive AND still running the exact command this test spawned (checked via
+/// `ps`), bounding — the ticket's own caution about a bare, reused-pid
+/// signal applies to an unconditional kill, not to one gated on confirming
+/// the target is still the process this test started.
+struct OwnedCheckCleanup(i32);
+
+impl Drop for OwnedCheckCleanup {
+    fn drop(&mut self) {
+        if !process_alive(self.0) {
+            return;
+        }
+        let is_ours = Command::new("ps")
+            .args(["-o", "command=", "-p", &self.0.to_string()])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("verify.pid"))
+            .unwrap_or(false);
+        if is_ours {
+            let _ = Command::new("kill")
+                .args(["-9", &self.0.to_string()])
+                .status();
+        }
+    }
+}
+
 async fn wait_for_pid(path: &Path) -> i32 {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -722,21 +757,26 @@ triggers: [
 ]
 "#;
 
-/// Two policy gates pass instantly; `verify` sleeps just long enough to give
-/// the "kill while candidate 1 is mid-gate, candidate 2 sits queued behind
-/// it" step below a real window — same shape as `live_landing_restart.rs`'s
-/// `CHECKS`. `sharedCargoTarget: true` routes it through the per-repo
-/// verification admission lane (WIP_LIMIT below), so the post-restart fresh
-/// `verify.run` at the end genuinely exercises lease non-leak, not a
-/// bypassed check.
+/// Two policy gates pass instantly; `verify`'s FIRST attempt holds itself
+/// open (bounded to 10s as an absolute safety cap) rather than sleeping a
+/// fixed duration — a fixed sleep cannot GUARANTEE the check is still alive
+/// at the exact moment the restart test below kills daemon A, since
+/// candidate 2's own spawn/complete/queue steps in between have no fixed
+/// duration of their own; if they ever took longer than the sleep, the
+/// check would exit as an ordinary natural completion, and the restart
+/// test's kill would prove nothing about it. Once `held` exists, EVERY
+/// later attempt — including daemon B's own recovery re-run of this same
+/// interrupted gate — completes immediately, so restart-recovery marches
+/// through the once-real hold with no lingering timing dependency.
 ///
-/// The check also drops its own real shell pid (`$$`) into `shared` before
-/// sleeping — `.process_group(0)` (`managed_verification.rs::spawn_check_child`)
-/// makes this pid its own process group leader, the exact pid
-/// `ProcessGroupGuard` targets on cancellation. The restart test below reads
-/// it back to build a genuine gate-start/release barrier around the real OS
-/// process, rather than trusting `handle_a.abort()` alone to mean the check's
-/// child is actually dead by the time it returns.
+/// The first attempt also drops its own real shell pid (`$$`) into `shared`
+/// before holding — `.process_group(0)`
+/// (`managed_verification.rs::spawn_check_child`) makes this pid its own
+/// process group leader, the exact pid `ProcessGroupGuard` targets on
+/// cancellation. The restart test below reads it back to build a genuine
+/// gate-start/release barrier around the real OS process, rather than
+/// trusting a same-process task abort (or a naturally-timed sleep) alone to
+/// mean the check's child is actually dead by the time daemon B starts.
 fn restart_checks(shared: &Path) -> String {
     format!(
         r#"
@@ -747,8 +787,8 @@ checks: [
 ]
 "#,
         cue_command(&format!(
-            r#"echo $$ > "{}/verify.pid"; sleep 0.6 && true"#,
-            shared.display()
+            r#"if [ -f "{shared}/held" ]; then exit 0; fi; echo $$ > "{shared}/verify.pid"; touch "{shared}/held"; sleep 10"#,
+            shared = shared.display()
         ))
     )
 }
@@ -995,6 +1035,9 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
         process_alive(verify_pid),
         "the verify check's real child must be running before the mid-gate kill below"
     );
+    // Panic-safety net (see `OwnedCheckCleanup` doc comment) for the
+    // remainder of this test — a no-op on the successful path.
+    let _owned_check_cleanup = OwnedCheckCleanup(verify_pid);
 
     // Candidate 2: spawned and completed WHILE candidate 1's gate run is
     // still in flight, so its own landing completion enqueues behind
@@ -1039,14 +1082,28 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
          still mid-gate"
     );
 
+    // Prove the exact owned check is STILL alive at the moment of the kill
+    // below, not merely that it once was: `restart_checks`'s first attempt
+    // holds itself open (bounded to a generous 10s) rather than sleeping a
+    // fixed duration precisely so this is a guaranteed fact, not a race
+    // against however long candidate 2's own spawn/complete/queue steps
+    // above happened to take.
+    assert!(
+        process_alive(verify_pid),
+        "the verify check's real child must still be alive at the moment of the kill below — \
+         its process_alive-eventually-false later would not prove daemon B recovered an \
+         orphan if this process could have exited naturally in between"
+    );
+
     // The kill: a genuine SIGKILL against daemon A's own OS process,
     // observed to completion — `Child::kill` sends the signal AND reaps the
     // process (tokio's own doc: "equivalent to SIGKILL followed by wait"),
     // so this line does not return until daemon A's physical exit is a
     // recorded fact, not an assumption. A real crash runs none of daemon
     // A's own Drop/cascade impls — unlike an in-process task abort, the
-    // mid-gate `verify` check's real child (captured above as `verify_pid`)
-    // is left genuinely orphaned, exactly the situation
+    // mid-gate `verify` check's real child (captured above as `verify_pid`,
+    // still genuinely blocked per the assertion just above) is left
+    // genuinely orphaned, exactly the situation
     // `workflow_exec::reap_stale_managed_children` exists to reclaim.
     let pid_a = child_a
         .id()
