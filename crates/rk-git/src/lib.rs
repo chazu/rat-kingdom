@@ -287,11 +287,11 @@ impl Repo {
     /// successful verification proves presence, while absence stays unknown.
     pub fn branch_exists_checked(&self, branch: &str) -> rk_core::Result<bool> {
         let reference = format!("refs/heads/{branch}");
-        let output = Command::new("git")
-            .arg("-C")
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
             .arg(&self.root)
-            .args(["show-ref", "--exists", &reference])
-            .output()
+            .args(["show-ref", "--exists", &reference]);
+        let output = spawn_output(&mut cmd)
             .map_err(|e| rk_core::Error::other(format!("git not runnable: {e}")))?;
         match output.status.code() {
             Some(0) => Ok(true),
@@ -323,11 +323,11 @@ impl Repo {
     /// other result as an inability to answer (bad/missing revision, corrupt
     /// repository, or an unavailable git executable).
     pub fn ancestry(&self, commit: &str, of: &str) -> Ancestry {
-        let output = Command::new("git")
-            .arg("-C")
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
             .arg(&self.root)
-            .args(["merge-base", "--is-ancestor", commit, of])
-            .output();
+            .args(["merge-base", "--is-ancestor", commit, of]);
+        let output = spawn_output(&mut cmd);
         match output.ok().and_then(|out| out.status.code()) {
             Some(0) => Ancestry::Present,
             Some(1) => Ancestry::Absent,
@@ -1214,12 +1214,20 @@ impl Repo {
     }
 }
 
+/// Run `cmd` and capture its output, closing every fd the child would
+/// otherwise inherit beyond the pipes/stdio this call wires up itself — see
+/// [`rk_core::exec::close_extra_fds`] for why: an inherited descriptor left
+/// over from an unrelated, concurrently-racing process launch elsewhere in
+/// the daemon can otherwise keep this pipe's read side from ever seeing EOF.
+fn spawn_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    rk_core::exec::close_extra_fds(cmd);
+    cmd.output()
+}
+
 fn git_in(dir: &Path, args: &[&str]) -> rk_core::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    let out = spawn_output(&mut cmd)
         .map_err(|e| rk_core::Error::other(format!("git not runnable: {e}")))?;
     if !out.status.success() {
         return Err(rk_core::Error::other(format!(
@@ -1282,11 +1290,9 @@ const REASON_LINES: usize = 3;
 /// writes progress and remote messages (PR/MR URLs) to stderr, so the plain
 /// stdout-only capture would drop exactly the output we need.
 fn git_output(dir: &Path, args: &[&str]) -> rk_core::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    let out = spawn_output(&mut cmd)
         .map_err(|e| rk_core::Error::other(format!("git not runnable: {e}")))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
@@ -1314,14 +1320,16 @@ fn git_output(dir: &Path, args: &[&str]) -> rk_core::Result<String> {
 const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> rk_core::Result<String> {
-    let mut child = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| rk_core::Error::other(format!("git not runnable: {e}")))?;
     let start = Instant::now();

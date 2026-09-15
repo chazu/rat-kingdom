@@ -40,11 +40,10 @@ pub struct AgentState {
 impl HerdrMux {
     /// Is a herdr server reachable?
     pub fn available() -> bool {
-        Command::new("herdr")
-            .args(["status", "server"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        let mut cmd = Command::new("herdr");
+        cmd.args(["status", "server"]);
+        rk_core::exec::close_extra_fds(&mut cmd);
+        cmd.output().map(|o| o.status.success()).unwrap_or(false)
     }
 
     /// Start `argv` as a named agent in a new herdr pane. The name doubles as
@@ -280,10 +279,10 @@ impl HerdrMux {
     }
 
     fn snapshot() -> Option<Value> {
-        let out = Command::new("herdr")
-            .args(["api", "snapshot"])
-            .output()
-            .ok()?;
+        let mut cmd = Command::new("herdr");
+        cmd.args(["api", "snapshot"]);
+        rk_core::exec::close_extra_fds(&mut cmd);
+        let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -425,8 +424,10 @@ fn retry_while_pane_busy<T>(
 }
 
 fn run_herdr(args: &[&str]) -> rk_core::Result<String> {
-    let out = Command::new("herdr")
-        .args(args)
+    let mut cmd = Command::new("herdr");
+    cmd.args(args);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let out = cmd
         .output()
         .map_err(|e| rk_core::Error::other(format!("herdr not runnable: {e}")))?;
     if !out.status.success() {
