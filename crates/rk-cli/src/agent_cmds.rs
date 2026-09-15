@@ -256,6 +256,115 @@ pub struct CancelReviewArgs {
 }
 
 #[derive(Args)]
+pub struct FenceRequestArgs {
+    /// Repository path or registered name.
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+    /// Identity recorded as the fence's holder (defaults to "operator").
+    /// Requesting again with the SAME holder while its fence is still live
+    /// renews the deadline rather than erroring.
+    #[arg(long)]
+    pub holder: Option<String>,
+    /// Bounded seconds before an un-released fence auto-expires and
+    /// admission resumes on its own (clamped to [1, 3600]).
+    #[arg(long, default_value_t = 600)]
+    pub ttl_secs: i64,
+}
+
+#[derive(Args)]
+pub struct FenceStatusArgs {
+    /// Repository path or registered name.
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+}
+
+#[derive(Args)]
+pub struct FenceReleaseArgs {
+    /// Repository path or registered name.
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+    /// Holder that requested the fence (must match to release it).
+    #[arg(long)]
+    pub holder: String,
+    /// Generation returned by `fence request` (CAS-fences a stale caller).
+    #[arg(long)]
+    pub generation: u64,
+}
+
+/// `rk fence-request` — P7.1: engage the operator-only handoff-window
+/// fence for `repo`. New landing admission stops there; anything already
+/// queued or actively checking/reviewing is untouched and continues via its
+/// existing live RPCs. Poll `rk fence-status` for `ready`.
+pub async fn fence_request(layout: &Layout, args: FenceRequestArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
+    let result = client
+        .call(
+            "repo.land.fence_request",
+            json!({"repo": repo, "holder": args.holder, "ttl_secs": args.ttl_secs}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "handoff fence requested for {repo}: state={} generation={} holder={}",
+            result["state"].as_str().unwrap_or("?"),
+            result["generation"].as_u64().unwrap_or(0),
+            result["holder"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+/// `rk fence-status` — read-only: state (`released`/`draining`/
+/// `ready`/`expired`), the exact `(repo, target)` keys still blocking
+/// readiness, and the fence's holder/generation/deadline.
+pub async fn fence_status(layout: &Layout, args: FenceStatusArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
+    let result = client
+        .call("repo.land.fence_status", json!({"repo": repo}))
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        let blocking = result["blocking_keys"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        println!(
+            "{repo}: state={} blocking_keys={blocking}",
+            result["state"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+/// `rk fence-release` — end the fence early; idempotent. Admission for
+/// `repo` resumes on the very next claim attempt; nothing queued is
+/// force-cancelled or re-run.
+pub async fn fence_release(layout: &Layout, args: FenceReleaseArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
+    let result = client
+        .call(
+            "repo.land.fence_release",
+            json!({"repo": repo, "holder": args.holder, "generation": args.generation}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "handoff fence released for {repo}: state={}",
+            result["state"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Args)]
 pub struct RevertArgs {
     /// Dismissed agent whose landed merge to undo.
     pub name: String,

@@ -4073,6 +4073,57 @@ impl Daemon {
                     Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
                 })
             }
+            "repo.land.fence_request" => {
+                let params: RepoLandFenceRequestParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                let holder = params.holder.unwrap_or_else(|| {
+                    if req.caller.is_empty() {
+                        "operator".to_string()
+                    } else {
+                        req.caller.clone()
+                    }
+                });
+                reply(
+                    match self
+                        .landing()
+                        .fence_request(&params.repo, &holder, params.ttl_secs)
+                    {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                    },
+                )
+            }
+            "repo.land.fence_status" => {
+                let params: RepoLandFenceStatusParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                reply(Response::ok(id, self.landing().fence_status(&params.repo)))
+            }
+            "repo.land.fence_release" => {
+                let params: RepoLandFenceReleaseParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                reply(
+                    match self.landing().fence_release(
+                        &params.repo,
+                        &params.holder,
+                        params.generation,
+                    ) {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                    },
+                )
+            }
             "repo.list" => reply(match self.repos.lock() {
                 Ok(reg) => Response::ok(id, json!({"repos": reg.list()})),
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
@@ -13000,6 +13051,40 @@ struct RepoLandCancelReviewParams {
     #[serde(default = "default_main_branch")]
     target: String,
     task: String,
+}
+
+fn default_handoff_fence_ttl_secs() -> i64 {
+    600
+}
+
+/// `repo.land.fence_request` — P7.1 (TKT-rufik-lafit-pisah): engage the
+/// operator-only handoff-window fence for `repo`, blocking new landing
+/// admission there without draining or cancelling anything already queued
+/// or in flight. See [`crate::landing::handoff`]'s module doc.
+#[derive(Deserialize)]
+struct RepoLandFenceRequestParams {
+    repo: String,
+    #[serde(default)]
+    holder: Option<String>,
+    #[serde(default = "default_handoff_fence_ttl_secs")]
+    ttl_secs: i64,
+}
+
+/// `repo.land.fence_status` — read-only: state, blockers, whether it is
+/// safe to proceed with a rollover for `repo`.
+#[derive(Deserialize)]
+struct RepoLandFenceStatusParams {
+    repo: String,
+}
+
+/// `repo.land.fence_release` — end a fence early; idempotent, CAS-fenced on
+/// `(holder, generation)` so a stale/foreign caller cannot release someone
+/// else's active fence.
+#[derive(Deserialize)]
+struct RepoLandFenceReleaseParams {
+    repo: String,
+    holder: String,
+    generation: u64,
 }
 
 #[derive(Deserialize)]
