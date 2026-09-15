@@ -555,6 +555,7 @@ use admission::{AdmissionWindow, ADMISSION_HOLD_IDENTITY};
 
 mod handoff;
 use handoff::HandoffFenceStore;
+pub(crate) use handoff::ManagedWorkSnapshot;
 
 /// One landing candidate: a completed rat's branch, prepared into an exact
 /// merge object, gated, then either advanced or routed through review. Mirrors the
@@ -1552,6 +1553,12 @@ pub(crate) struct LandingPipeline {
     /// — see `handoff.rs`'s module doc. One record per repo, file-backed
     /// under the daemon home so a request survives a restart.
     handoff: HandoffFenceStore,
+    /// Per-repo read/write gate that linearizes the fence check against the
+    /// claim it guards — see [`Self::admission_gate`]. Claim sites hold it
+    /// shared; `fence_request`/`fence_release` hold it exclusively. Entries
+    /// are created lazily per repo and are tiny, so this never grows beyond
+    /// one gate per repository this daemon has ever drained.
+    admission_gates: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
     /// The daemon's own shutdown signal (`Server::shutdown_tx`), wired in
     /// once by [`LandingPipeline::with_shutdown`] — production only
     /// (`Server::landing`); a pipeline built directly by a test leaves this
@@ -1606,6 +1613,7 @@ impl LandingPipeline {
             terminal_notify: Mutex::new(HashMap::new()),
             retry_schedule: RetrySchedule::default(),
             handoff,
+            admission_gates: Mutex::new(HashMap::new()),
             shutdown: None,
         }
     }
@@ -1920,7 +1928,12 @@ impl LandingPipeline {
                 // durably queued (already recorded above by
                 // `enqueue_disposition`) for a later cycle once the fence
                 // is released or expires.
-                if self.admission_fenced(&repo_name) {
+                let fenced = {
+                    let gate = self.admission_gate(&repo_name);
+                    let _admit = gate.read().await;
+                    self.admission_fenced(&repo_name)
+                };
+                if fenced {
                     drop(guard);
                     return Ok(json!({
                         "branch": branch,
@@ -1970,18 +1983,27 @@ impl LandingPipeline {
             // once on entry) so a fence engaged partway through a multi-entry
             // drain still stops before claiming whatever comes after the
             // entry currently in flight. See `drain_key`'s identical check.
-            if self.admission_fenced(&repo_name) {
-                return Ok(json!({
-                    "branch": entry.branch,
-                    "target": target,
-                    "queued": true,
-                    "deferred_by_handoff_fence": true,
-                    "detail": "landing admission is currently fenced for an operator \
-                               handoff window; this submission is durably queued and \
-                               will be considered once the fence is released or expires",
-                }));
-            }
-            let Some(claimed) = self.queue.claim_next(&repo_name, &target)? else {
+            // Held SHARED across both the check and the claim it gates, so
+            // an acknowledged `fence_request` (which takes the same gate
+            // exclusively) can never land between the two. See
+            // `handoff.rs`'s linearization note.
+            let claimed = {
+                let gate = self.admission_gate(&repo_name);
+                let _admit = gate.read().await;
+                if self.admission_fenced(&repo_name) {
+                    return Ok(json!({
+                        "branch": entry.branch,
+                        "target": target,
+                        "queued": true,
+                        "deferred_by_handoff_fence": true,
+                        "detail": "landing admission is currently fenced for an operator \
+                                   handoff window; this submission is durably queued and \
+                                   will be considered once the fence is released or expires",
+                    }));
+                }
+                self.queue.claim_next(&repo_name, &target)?
+            };
+            let Some(claimed) = claimed else {
                 if let Some(result) = self.settled_terminal_json(&entry)? {
                     return Ok(result);
                 }
@@ -2039,10 +2061,15 @@ impl LandingPipeline {
                 // P7.1 handoff fence: same re-check as `drain_key` and
                 // `drive_key_as_owner` — stop claiming further entries once
                 // engaged, leaving the rest durably queued under this key.
-                if pipeline.admission_fenced(&repo_name) {
-                    break;
-                }
-                let claimed = match pipeline.queue.claim_next(&repo_name, &target) {
+                let claimed = {
+                    let gate = pipeline.admission_gate(&repo_name);
+                    let _admit = gate.read().await;
+                    if pipeline.admission_fenced(&repo_name) {
+                        break;
+                    }
+                    pipeline.queue.claim_next(&repo_name, &target)
+                };
+                let claimed = match claimed {
                     Ok(Some(claimed)) => claimed,
                     Ok(None) => break,
                     Err(error) => {
@@ -6949,10 +6976,14 @@ impl LandingPipeline {
             // gates — never a separate status-then-claim race — and only
             // stops the NEXT, not-yet-claimed batch. Whatever this loop has
             // already claimed and is mid-processing is unaffected.
-            if self.admission_fenced(repo_name) {
-                break;
-            }
-            let entries = self.queue.claim_batch(repo_name, target, 8)?;
+            let entries = {
+                let gate = self.admission_gate(repo_name);
+                let _admit = gate.read().await;
+                if self.admission_fenced(repo_name) {
+                    break;
+                }
+                self.queue.claim_batch(repo_name, target, 8)?
+            };
             if entries.is_empty() {
                 break;
             }
@@ -15149,11 +15180,12 @@ checks: [
 
         // Request the fence while A is genuinely mid-check.
         let requested = pipeline
-            .fence_request(&repo_name, "operator-test", 60)
+            .fence_request(&repo_name, "operator-test", 60, &ManagedWorkSnapshot::default())
+            .await
             .unwrap();
         let generation = requested["generation"].as_u64().unwrap();
         assert_eq!(requested["state"], "draining", "requested: {requested}");
-        let status = pipeline.fence_status(&repo_name);
+        let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
         assert_eq!(status["state"], "draining", "status: {status}");
         assert!(
             status["blocking_keys"]
@@ -15178,7 +15210,7 @@ checks: [
         // itself see the fence and stop before claiming `second`.
         let mut ready = None;
         for _ in 0..300 {
-            let status = pipeline.fence_status(&repo_name);
+            let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
             if status["state"] == "ready" {
                 ready = Some(status);
                 break;
@@ -15214,14 +15246,24 @@ checks: [
         // A stale/foreign release attempt is refused rather than silently
         // lifting someone else's fence.
         assert!(pipeline
-            .fence_release(&repo_name, "operator-test", generation.wrapping_sub(1))
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                generation.wrapping_sub(1),
+                &ManagedWorkSnapshot::default(),
+            )
+            .await
             .is_err());
 
         // Release the fence — B may now advance, exactly once.
         pipeline
-            .fence_release(&repo_name, "operator-test", generation)
+            .fence_release(&repo_name, "operator-test", generation, &ManagedWorkSnapshot::default())
+            .await
             .unwrap();
-        assert_eq!(pipeline.fence_status(&repo_name)["state"], "released");
+        assert_eq!(
+            pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default())["state"],
+            "released"
+        );
         pipeline.run_cycle().await.unwrap();
 
         let processed = space

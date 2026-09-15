@@ -251,7 +251,9 @@ impl<'a> ManagedVerification<'a> {
         let occurrence_id = rk_core::id::RecordId::new();
         let progress = Arc::new(Mutex::new(RunProgress::default()));
         let (managed_id, mut cancel_rx) =
-            self.resources.runs.register(agent, generation, request_key);
+            self.resources
+                .runs
+                .register(agent, generation, request_key, repo_name, "verify");
         let registration = ManagedRegistration {
             runs: &self.resources.runs,
             id: managed_id,
@@ -3229,8 +3231,31 @@ impl HostVerificationAdmission {
 struct ManagedVerificationRun {
     generation: Option<rk_core::id::SpawnId>,
     agent: String,
+    /// Which repository this run is bound to — the dimension
+    /// `active_for_repo` reports on. Recorded at `register` time, which
+    /// happens BEFORE the admission acquire inside `run()`, so an entry
+    /// covers a run that is still WAITING for its permit exactly as much as
+    /// one that is already EXECUTING. That is deliberate: P7.1's handoff
+    /// fence must treat both as owned managed work (see
+    /// [`ManagedVerificationRuns::active_for_repo`]).
+    repo: String,
+    /// `"verify"` or `"release-prepare"` — reported verbatim as a blocker's
+    /// `kind` so an operator reading `fence_status` can tell which managed
+    /// contract still owns the repo.
+    kind: &'static str,
     request_key: String,
     cancel: tokio::sync::watch::Sender<Option<&'static str>>,
+}
+
+/// One managed run still owning `repo` when the P7.1 handoff fence was
+/// asked whether a rollover is safe. Reported, never cancelled: the ticket
+/// requires reusing the existing managed-run status/cancellation contracts
+/// rather than silently killing an operator's own jobs.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct ManagedRunBlocker {
+    pub(crate) repo: String,
+    pub(crate) kind: &'static str,
+    pub(crate) agent: String,
 }
 
 /// Registry of in-flight [`ManagedVerificationRun`]s, keyed by an opaque
@@ -3268,6 +3293,8 @@ impl ManagedVerificationRuns {
         agent: &str,
         generation: Option<rk_core::id::SpawnId>,
         request_key: &str,
+        repo: &str,
+        kind: &'static str,
     ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
         let (cancel, rx) = tokio::sync::watch::channel(None);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -3276,11 +3303,38 @@ impl ManagedVerificationRuns {
             ManagedVerificationRun {
                 generation,
                 agent: agent.to_string(),
+                repo: repo.to_string(),
+                kind,
                 request_key: request_key.to_string(),
                 cancel,
             },
         );
         (id, rx)
+    }
+
+    /// Every managed run currently bound to `repo`, whether it is executing
+    /// or still queued behind an admission permit (see the `repo` field
+    /// doc). This is the "owned managed work that would make ordinary
+    /// shutdown hang" P7.1's readiness condition must account for — a
+    /// landing-key snapshot alone cannot see it, because a `verify.run` or
+    /// `release.prepare` holds no landing drain lane at all.
+    ///
+    /// Sorted for a stable operator-facing report.
+    pub(crate) fn active_for_repo(&self, repo: &str) -> Vec<ManagedRunBlocker> {
+        let mut blockers: Vec<ManagedRunBlocker> = self
+            .runs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|run| run.repo == repo)
+            .map(|run| ManagedRunBlocker {
+                repo: run.repo.clone(),
+                kind: run.kind,
+                agent: run.agent.clone(),
+            })
+            .collect();
+        blockers.sort_by(|a, b| (a.kind, &a.agent).cmp(&(b.kind, &b.agent)));
+        blockers
     }
 
     pub(crate) fn unregister(&self, id: u64) {

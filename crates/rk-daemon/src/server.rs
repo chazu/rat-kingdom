@@ -4098,10 +4098,12 @@ impl Daemon {
                         req.caller.clone()
                     }
                 });
+                let managed = self.managed_work_snapshot(&params.repo);
                 reply(
                     match self
                         .landing()
-                        .fence_request(&params.repo, &holder, params.ttl_secs)
+                        .fence_request(&params.repo, &holder, params.ttl_secs, &managed)
+                        .await
                     {
                         Ok(value) => Response::ok(id, value),
                         Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
@@ -4115,7 +4117,11 @@ impl Daemon {
                         return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
                     }
                 };
-                reply(Response::ok(id, self.landing().fence_status(&params.repo)))
+                let managed = self.managed_work_snapshot(&params.repo);
+                reply(Response::ok(
+                    id,
+                    self.landing().fence_status(&params.repo, &managed),
+                ))
             }
             "repo.land.fence_release" => {
                 let params: RepoLandFenceReleaseParams = match parse_params(&req.params) {
@@ -4124,12 +4130,18 @@ impl Daemon {
                         return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
                     }
                 };
+                let managed = self.managed_work_snapshot(&params.repo);
                 reply(
-                    match self.landing().fence_release(
-                        &params.repo,
-                        &params.holder,
-                        params.generation,
-                    ) {
+                    match self
+                        .landing()
+                        .fence_release(
+                            &params.repo,
+                            &params.holder,
+                            params.generation,
+                            &managed,
+                        )
+                        .await
+                    {
                         Ok(value) => Response::ok(id, value),
                         Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
                     },
@@ -8251,6 +8263,28 @@ impl Daemon {
     /// entirely by its own existing protected-path/review gates. This only
     /// makes `releaseTarget` observable, closing the gap where it was
     /// previously validated at activation time but never read at runtime.
+    /// Everything outside the landing queue that can still own `repo` when
+    /// P7.1's handoff fence is asked whether a rollover is safe. Built here
+    /// because `Server` is the only place that can observe all three
+    /// dimensions at once — the landing pipeline cannot reach back for the
+    /// managed-run registry or the release-prepare lock without a cycle.
+    ///
+    /// Read-only and non-blocking: `try_lock` never waits on, and never
+    /// itself becomes, the release-prepare owner, and the run registry is a
+    /// plain snapshot. Nothing here cancels anything — see
+    /// `landing::handoff`'s module doc on reusing rather than pre-empting
+    /// the existing managed-run and release contracts.
+    fn managed_work_snapshot(&self, repo: &str) -> crate::landing::ManagedWorkSnapshot {
+        crate::landing::ManagedWorkSnapshot {
+            runs: self
+                .supervisor
+                .verification_resources()
+                .runs
+                .active_for_repo(repo),
+            release_prepare_in_flight: self.release_prepare_lock.try_lock().is_err(),
+        }
+    }
+
     async fn handle_release_status(&self, req: Request) -> Response {
         let params: ReleaseSelectParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -8429,6 +8463,8 @@ impl Daemon {
             &req.caller,
             generation,
             &request_key,
+            &repo,
+            "release-prepare",
         );
         let prepare_fut = crate::release::prepare(
             &self.layout,
