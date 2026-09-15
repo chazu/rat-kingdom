@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-use support::{connect, connect_or_report};
+use support::connect;
 
 // `RK_FAKE_HARNESS_CMD` is a process-global env var and `#[tokio::test]`
 // bodies in one binary run concurrently by default — without this lock, a
@@ -729,15 +729,31 @@ triggers: [
 /// verification admission lane (WIP_LIMIT below), so the post-restart fresh
 /// `verify.run` at the end genuinely exercises lease non-leak, not a
 /// bypassed check.
-const RESTART_CHECKS: &str = r#"
+///
+/// The check also drops its own real shell pid (`$$`) into `shared` before
+/// sleeping — `.process_group(0)` (`managed_verification.rs::spawn_check_child`)
+/// makes this pid its own process group leader, the exact pid
+/// `ProcessGroupGuard` targets on cancellation. The restart test below reads
+/// it back to build a genuine gate-start/release barrier around the real OS
+/// process, rather than trusting `handle_a.abort()` alone to mean the check's
+/// child is actually dead by the time it returns.
+fn restart_checks(shared: &Path) -> String {
+    format!(
+        r#"
 checks: [
-    {name: "landing-protected-paths", command: "true", timeout: "30s"},
-    {name: "landing-diff-scope", command: "true", timeout: "30s"},
-    {name: "verify", command: "sleep 0.6 && true", timeout: "30s", sharedCargoTarget: true},
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{}", timeout: "30s", sharedCargoTarget: true}},
 ]
-"#;
+"#,
+        cue_command(&format!(
+            r#"echo $$ > "{}/verify.pid"; sleep 0.6 && true"#,
+            shared.display()
+        ))
+    )
+}
 
-fn init_repo_restart(dir: &Path) -> String {
+fn init_repo_restart(dir: &Path, shared: &Path) -> String {
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.email", "r@x"]);
     git(dir, &["config", "user.name", "R"]);
@@ -747,7 +763,7 @@ fn init_repo_restart(dir: &Path) -> String {
     support::install_default_repository_policy(dir);
     let rk_dir = dir.join(".rk");
     std::fs::create_dir_all(&rk_dir).unwrap();
-    std::fs::write(rk_dir.join("checks.cue"), RESTART_CHECKS).unwrap();
+    std::fs::write(rk_dir.join("checks.cue"), restart_checks(shared)).unwrap();
     git(dir, &["add", ".rk/checks.cue"]);
     git(dir, &["commit", "-m", "add checks registry"]);
     dir.file_name().unwrap().to_string_lossy().to_string()
@@ -756,11 +772,11 @@ fn init_repo_restart(dir: &Path) -> String {
 /// A doc-only change under a distinct filename/cost per candidate — routes
 /// straight to `Supervisor::land` on a gate pass (`classify_diff`), no
 /// reviewer needed, keeping this test's only variable the restart+order, not
-/// review tiering.
-fn candidate_script(note: &str, cost: f64) -> String {
+/// review tiering. Excludes the `read -r _prompt` line: the combined script
+/// below reads the prompt exactly once, before branching.
+fn candidate_body(note: &str, cost: f64) -> String {
     format!(
         r#"
-read -r _prompt
 mkdir -p docs
 echo "note" > docs/{note}.md
 git add docs/{note}.md >/dev/null 2>&1
@@ -772,14 +788,69 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"done","se
     )
 }
 
-fn restart_config(repo_name: &str) -> rk_core::config::Config {
-    let mut config = rk_core::config::Config::default();
-    config.harness.default = "fake".into();
-    config
-        .policy
-        .verification_admission_limit_by_repo
-        .insert(repo_name.to_string(), WIP_LIMIT);
-    config
+/// One static fake-harness script, baked once into daemon A's own OS
+/// process environment when it is spawned. A genuinely separate daemon
+/// process cannot see this test process's later `std::env::set_var` calls —
+/// environment is captured at fork/exec, not shared across processes — so
+/// unlike the same-process daemons this file's other tests use, the two
+/// candidates below must be told apart by something that genuinely crosses
+/// the RPC boundary instead: the `agent.spawn` request's own `prompt`
+/// field, echoed back to the script as `$RK_FAKE_PROMPT` — the same
+/// technique this file's own `liveness_fake` already uses to vary behavior
+/// per spawn against one static script.
+fn restart_candidates_fake() -> String {
+    format!(
+        r#"
+read -r _prompt
+case "$RK_FAKE_PROMPT" in
+  *note-1*)
+{body1}
+    ;;
+  *note-2*)
+{body2}
+    ;;
+esac
+"#,
+        body1 = candidate_body("note-1", 0.01),
+        body2 = candidate_body("note-2", 0.02),
+    )
+}
+
+/// A real `rk daemon run` process reads its config from disk
+/// (`Config::load`), unlike the other tests in this file which hand a
+/// `Config` value straight to `Daemon::new` in-process — there is no
+/// in-process value to hand a genuinely separate OS process.
+fn write_restart_daemon_config(layout: &Layout, repo_name: &str) {
+    std::fs::write(
+        layout.config_file(),
+        format!(
+            "[harness]\ndefault = \"fake\"\n\n\
+             [policy.verification_admission_limit_by_repo]\n\
+             {repo_name:?} = {WIP_LIMIT}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Launch `rk daemon run` as a genuinely independent OS process against
+/// `layout` — not `tokio::spawn(daemon.run())` in this test's own process.
+/// `harness_cmd` becomes this process's OWN `RK_FAKE_HARNESS_CMD` — the
+/// only way to give a separate daemon process a fake-harness script, since
+/// it cannot see this test process's own environment.
+/// `kill_on_drop` is this test's own cleanup safety net (an early panic
+/// must not leak a live daemon process pointed at a tempdir this function
+/// is about to delete); it has nothing to do with the production
+/// `ProcessGroupGuard`/`kill_on_drop` tradeoff inside the daemon itself.
+fn spawn_daemon_process(layout: &Layout, harness_cmd: &str) -> tokio::process::Child {
+    tokio::process::Command::new(rk_bin())
+        .args(["daemon", "run"])
+        .env("RK_HOME", layout.home())
+        .env("RK_FAKE_HARNESS_CMD", harness_cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("rk daemon run must spawn as a real OS process")
 }
 
 async fn wait_agent_completed(client: &mut Client, name: &str) {
@@ -822,10 +893,15 @@ async fn processed_markers(client: &mut Client, repo_name: &str) -> Vec<Value> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_without_duplication() {
-    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    // No `HARNESS_ENV_LOCK` needed here: daemon A/B are genuinely separate OS
+    // processes below, each given its own `RK_FAKE_HARNESS_CMD` via `.env(..)`
+    // at spawn time — never this test process's own (process-global, racy)
+    // environment, which is what that lock guards for the other tests in
+    // this file.
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
-    let repo_name = init_repo_restart(repo_dir.path());
+    let shared = tempfile::tempdir().unwrap();
+    let repo_name = init_repo_restart(repo_dir.path(), shared.path());
     let main_before = git(repo_dir.path(), &["rev-parse", "main"]);
 
     let layout = Layout::at(home.path());
@@ -836,13 +912,16 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
         RESTART_LANDING_TRIGGER,
     )
     .unwrap();
-    let config = restart_config(&repo_name);
+    write_restart_daemon_config(&layout, &repo_name);
 
-    // Daemon A: genuinely on-disk (`Daemon::new`), so daemon B below
-    // actually inherits its durable state rather than starting empty.
-    let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
-    let mut handle_a = tokio::spawn(daemon_a.run());
-    let mut client = connect_or_report(&layout, &mut handle_a).await;
+    // Daemon A: a genuinely independent OS process (`rk daemon run`), not
+    // `tokio::spawn(daemon.run())` in this test's own process — so the kill
+    // below is a real crash (no Drop/cascade of any kind runs), and daemon
+    // B's startup below exercises the SAME on-disk recovery path a real
+    // restart does, rather than a same-process approximation of one.
+    let mut child_a =
+        spawn_daemon_process(&layout, &fixture::with_rk_done(&restart_candidates_fake()));
+    let mut client = connect(&layout).await;
 
     client
         .call(
@@ -864,14 +943,18 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
         .unwrap();
     let ticket1_id = ticket1["ticket"]["identity"].as_str().unwrap().to_string();
 
-    std::env::set_var(
-        "RK_FAKE_HARNESS_CMD",
-        fixture::with_rk_done(&candidate_script("note-1", 0.01)),
-    );
     let agent1 = client
         .call(
             "agent.spawn",
-            json!({"repo": repo_dir.path().to_string_lossy(), "task": &ticket1_id, "harness": "fake"}),
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": &ticket1_id,
+                "harness": "fake",
+                // Tells daemon A's one static combined script (baked in at
+                // spawn time) which candidate body to run — see
+                // `restart_candidates_fake`'s doc comment.
+                "prompt": "restart candidate note-1",
+            }),
         )
         .await
         .unwrap();
@@ -898,6 +981,21 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
         "candidate 1 never reached running_gates before candidate 2 was queued behind it"
     );
 
+    // Explicit gate-start barrier: `running_gates` is a `Space`-level status
+    // flag on the queue entry, set by the landing loop before it actually
+    // spawns the `verify` check's real child. Confirm the REAL OS process
+    // backing it has genuinely started — not just that the flag flipped —
+    // by reading back the pid it drops into `shared` (same pid-file
+    // technique as this file's `live_verifier_descendant_survives...`
+    // test above). This is also the pid the mid-gate kill below must prove
+    // is actually dead, not merely detached from, before daemon B starts.
+    let verify_pid_path = shared.path().join("verify.pid");
+    let verify_pid = wait_for_pid(&verify_pid_path).await;
+    assert!(
+        process_alive(verify_pid),
+        "the verify check's real child must be running before the mid-gate kill below"
+    );
+
     // Candidate 2: spawned and completed WHILE candidate 1's gate run is
     // still in flight, so its own landing completion enqueues behind
     // candidate 1 on the same `(repo, "main")` FIFO key — `queued`, not
@@ -911,14 +1009,15 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
         .unwrap();
     let ticket2_id = ticket2["ticket"]["identity"].as_str().unwrap().to_string();
 
-    std::env::set_var(
-        "RK_FAKE_HARNESS_CMD",
-        fixture::with_rk_done(&candidate_script("note-2", 0.02)),
-    );
     let agent2 = client
         .call(
             "agent.spawn",
-            json!({"repo": repo_dir.path().to_string_lossy(), "task": &ticket2_id, "harness": "fake"}),
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": &ticket2_id,
+                "harness": "fake",
+                "prompt": "restart candidate note-2",
+            }),
         )
         .await
         .unwrap();
@@ -940,13 +1039,31 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
          still mid-gate"
     );
 
-    // The kill: abort the daemon's task outright (same technique
-    // `live_landing_restart.rs` uses), so candidate 1's in-flight gate run
-    // is genuinely cut off with candidate 2 still durably queued behind it.
-    handle_a.abort();
-    let _ = handle_a.await;
-    std::fs::remove_file(layout.pid_file()).ok();
-    std::fs::remove_file(layout.socket_path()).ok();
+    // The kill: a genuine SIGKILL against daemon A's own OS process,
+    // observed to completion — `Child::kill` sends the signal AND reaps the
+    // process (tokio's own doc: "equivalent to SIGKILL followed by wait"),
+    // so this line does not return until daemon A's physical exit is a
+    // recorded fact, not an assumption. A real crash runs none of daemon
+    // A's own Drop/cascade impls — unlike an in-process task abort, the
+    // mid-gate `verify` check's real child (captured above as `verify_pid`)
+    // is left genuinely orphaned, exactly the situation
+    // `workflow_exec::reap_stale_managed_children` exists to reclaim.
+    let pid_a = child_a
+        .id()
+        .expect("daemon A must have a pid before the kill");
+    child_a.kill().await.expect("SIGKILL daemon A");
+    let status = child_a
+        .wait()
+        .await
+        .expect("daemon A's exit status must be observable after the kill");
+    assert!(
+        !status.success(),
+        "a SIGKILLed daemon must not report a successful exit: {status:?}"
+    );
+    assert!(
+        !process_alive(pid_a as i32),
+        "daemon A's own OS process must be genuinely dead once reaped"
+    );
 
     // Both candidates survived the kill, durably queued in FIFO order —
     // proof the kill landed genuinely mid-queue, not after the pipeline had
@@ -962,10 +1079,40 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
         assert_eq!(pending.len(), 2, "both candidates must survive the kill");
     }
 
-    // Daemon B: a fresh `Daemon::new` over the SAME on-disk home.
-    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
-    let mut handle_b = tokio::spawn(daemon_b.run());
-    let mut client = connect_or_report(&layout, &mut handle_b).await;
+    // Daemon B: a fresh, genuinely independent `rk daemon run` process over
+    // the SAME on-disk home — normal startup/recovery, not a test-side
+    // shortcut: `Server::run` (server.rs) reclaims the stale pid/socket
+    // itself (checking the recorded pid is actually dead, which the
+    // assertion above already proved), and
+    // `workflow_exec::reap_stale_managed_children` runs before this daemon
+    // can serve a single request, verifying its pid+start-time signature
+    // before killing anything — never a bare/reused-pid signal.
+    // No new agent is ever spawned on daemon B in this test (both
+    // candidates already completed before the kill; this restart only
+    // replays the durable landing queue), but the same static script is
+    // supplied for consistency with daemon A's environment.
+    let mut child_b =
+        spawn_daemon_process(&layout, &fixture::with_rk_done(&restart_candidates_fake()));
+    let mut client = connect(&layout).await;
+
+    // Release barrier: confirm daemon B's own real recovery — not this
+    // test — reclaimed the mid-gate check's orphaned real process. By the
+    // time `connect` above got a working client, `reap_stale_managed_children`
+    // has already run to completion (server.rs calls it, synchronously in
+    // program order, before the accept loop that serves any RPC), so this
+    // is a short bounded confirmation, not a race against daemon B's own
+    // startup.
+    let release_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process_alive(verify_pid) {
+        assert!(
+            std::time::Instant::now() < release_deadline,
+            "the mid-gate verify check's real process {verify_pid} outlived daemon A's crash \
+             by more than 5s after daemon B started — its own startup-time \
+             reap_stale_managed_children must reclaim daemon-owned background work a real \
+             crash orphans"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let mut drained = false;
     for _ in 0..300 {
@@ -1063,7 +1210,5 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
     .expect("a fresh verify.run must not be blocked by any leaked lease from daemon A");
     assert_eq!(post_restart["exit"], json!(0), "{post_restart:#?}");
 
-    handle_b.abort();
-    let _ = handle_b.await;
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+    let _ = child_b.kill().await;
 }
