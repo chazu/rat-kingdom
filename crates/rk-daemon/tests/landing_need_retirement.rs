@@ -5,9 +5,13 @@
 //!   hook in `LandingPipeline::record_delivery`, not the RPC path);
 //! - a genuinely mismatched Need is never touched;
 //! - the retirement (a `Resolution` provenance trail, then the Need's
-//!   deletion) survives a REAL daemon restart — a fresh process reconnecting
-//!   to the same persisted store, not a second call against the same
-//!   in-process daemon;
+//!   deletion) survives a fresh daemon INSTANCE reopening the same persisted
+//!   store — the first instance is dropped and a second `Daemon` is built
+//!   over the same on-disk layout, so the assertions below read a new
+//!   `Space` off disk rather than the first instance's memory. This is an
+//!   in-process instance restart, NOT a process-level one: it proves the
+//!   durability of what was written, not the crash-recovery behaviour of a
+//!   freshly exec'd daemon binary;
 //! - the default-off/on/off config lifecycle is independently observable.
 
 mod support;
@@ -71,7 +75,7 @@ fn init_repo_with_marker_gate(dir: &Path) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn accepted_delivery_automatically_retires_the_matching_need_and_survives_a_real_restart() {
+async fn accepted_delivery_automatically_retires_the_matching_need_and_survives_a_store_reopen() {
     let home = tempfile::tempdir().unwrap();
     Layout::at(home.path()).ensure().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
@@ -254,9 +258,14 @@ async fn accepted_delivery_automatically_retires_the_matching_need_and_survives_
         .unwrap_or_default()
         .is_empty());
 
-    // A REAL daemon restart — kill this process, start a fresh one from the
-    // SAME persisted layout — not merely a second call into the same
-    // in-process daemon.
+    // Drop this daemon INSTANCE and build a fresh one over the SAME persisted
+    // layout, so every read below comes from a new `Space` reopened off the
+    // on-disk store rather than from the retired instance's memory. Scoped
+    // claim, stated exactly: this is an in-process instance restart — the
+    // tokio task is aborted and a second `Daemon` is constructed inside this
+    // same OS process — NOT a process-level restart. It proves the store
+    // reload (durability of what was written), not crash-recovery behaviour
+    // of a freshly exec'd daemon binary.
     handle_a.abort();
     let _ = handle_a.await;
     std::fs::remove_file(layout.pid_file()).ok();
@@ -266,25 +275,25 @@ async fn accepted_delivery_automatically_retires_the_matching_need_and_survives_
     let handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
 
-    let needs_after_restart = client
+    let needs_after_reopen = client
         .call(
             "space.scan",
             json!({"category": "need", "scope": repo_name}),
         )
         .await
         .unwrap();
-    let remaining_after_restart: Vec<_> = needs_after_restart["tuples"]
+    let remaining_after_reopen: Vec<_> = needs_after_reopen["tuples"]
         .as_array()
         .unwrap()
         .iter()
         .map(|t| t["id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(
-        remaining_after_restart,
+        remaining_after_reopen,
         vec![mismatch_need.clone()],
-        "the retirement must be durable across a real restart, not just this process's memory"
+        "the retirement must be durable in the persisted store, not just the retired daemon instance's memory"
     );
-    let trails_after_restart = client
+    let trails_after_reopen = client
         .call(
             "space.scan",
             json!({"category": "resolution", "scope": repo_name}),
@@ -292,13 +301,13 @@ async fn accepted_delivery_automatically_retires_the_matching_need_and_survives_
         .await
         .unwrap();
     assert_eq!(
-        trails_after_restart["tuples"].as_array().unwrap().len(),
+        trails_after_reopen["tuples"].as_array().unwrap().len(),
         1,
-        "the provenance trail must also survive the restart"
+        "the provenance trail must also survive the reopen"
     );
 
     // The `bbs.brief` RPC path is still a valid (defensive) second trigger
-    // for the same idempotent pass: calling it post-restart must not error,
+    // for the same idempotent pass: calling it on the reopened store must not error,
     // must not duplicate the trail, and must not touch the mismatch.
     client
         .call("bbs.brief", json!({"repo": repo_name, "task": task}))

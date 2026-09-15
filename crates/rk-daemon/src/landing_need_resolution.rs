@@ -883,4 +883,149 @@ mod tests {
             .unwrap();
         assert_eq!(trails.len(), 1, "reinforce must not duplicate: {trails:?}");
     }
+    /// The exact interruption state the trail-before-delete ordering in
+    /// [`run_retirement_pass`] exists to survive, constructed DIRECTLY rather
+    /// than inferred from two full concurrent passes: a `Resolution` trail
+    /// already durably written while its matching `Need` is STILL PRESENT —
+    /// i.e. a crash landing precisely between the two writes.
+    ///
+    /// This is the one property the module doc comment claims outright
+    /// ("an interruption between the two leaves the Need standing, so the
+    /// next pass regenerates the same candidate, proves the same ancestry
+    /// again, and reinforces (never duplicates) the same trail before
+    /// retrying the delete") that no other test isolates:
+    /// `concurrent_settlement_never_double_counts_a_resolved_need` only
+    /// proves two COMPLETE passes do not double-count each other, and never
+    /// exercises trail-written-but-Need-still-standing on its own.
+    ///
+    /// The pre-written trail is the real one — produced by `resolution_trail`
+    /// from the same candidate `resolution_candidates` hands the pass, under
+    /// the same castle instance — so it collides on the exact
+    /// `(category, scope, identity, instance)` key `Space::reinforce` dedups
+    /// on. A trail merely shaped like it would prove nothing.
+    ///
+    /// The boundary is PERSISTED, not just in-memory: the store is a real
+    /// on-disk `Space`, and the interrupted `Space` handle is dropped and
+    /// reopened from that same file before the recovery pass runs. So the
+    /// recovery pass reads the half-finished state back off disk — exactly
+    /// what a later daemon generation does — rather than inheriting it from
+    /// the same live handle that wrote it.
+    #[tokio::test]
+    async fn a_persisted_trail_written_without_its_delete_is_finished_by_the_next_pass() {
+        let (repo_dir, head) = one_commit_repo();
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_path = store_dir.path().join("space.db");
+        let space = rk_space::Space::open(&store_path).unwrap();
+        let repo = "fixture-repo";
+        let branch = "rat/x/tkt-fix";
+        let task = create_ticket(&space, repo).await;
+        let tickets = crate::tickets::Tickets::new(space.clone(), "test-castle".into());
+
+        let need = Tuple::new(
+            Category::Need,
+            repo,
+            "landing",
+            "daemon",
+            serde_json::json!({
+                "agent": "landing", "task": task,
+                "landing_incident": {"branch": branch, "target": "main", "head_sha": head, "source_spawn": null},
+            }),
+        );
+        let need_id = need.id;
+        space.out(need).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        deliver(&space, &task, branch, &head).await;
+
+        // Replay only the FIRST half of a pass, then "crash": write the trail
+        // the pass would have written, and stop before the delete.
+        let needs = space
+            .scan(&Pattern::category(Category::Need).scope(repo))
+            .unwrap();
+        let candidates =
+            crate::current_needs::resolution_candidates(&needs, &[], &tickets, true).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let incident: LandingIncident =
+            serde_json::from_value(needs[0].payload.get("landing_incident").unwrap().clone())
+                .unwrap();
+        let interrupted_trail_id = space
+            .reinforce(resolution_trail(
+                &needs[0],
+                &candidates[0],
+                &incident,
+                "test",
+            ))
+            .unwrap()
+            .id;
+
+        // The "crash": drop every handle on the interrupted store and reopen
+        // it from the same file, so nothing below is inherited from the
+        // generation that wrote the trail.
+        drop(tickets);
+        drop(needs);
+        drop(space);
+        let space = rk_space::Space::open(&store_path).unwrap();
+        let tickets = crate::tickets::Tickets::new(space.clone(), "test-castle".into());
+
+        // Precondition — the interruption state itself, read back off disk and
+        // asserted so this test cannot silently degrade into the
+        // already-settled case: provenance is durable, and the Need it
+        // describes has NOT been consumed.
+        let standing = space
+            .scan(&Pattern::category(Category::Need).scope(repo))
+            .unwrap();
+        assert_eq!(
+            standing.len(),
+            1,
+            "the persisted crash state must be trail-written-but-Need-still-standing: {standing:?}"
+        );
+        assert_eq!(standing[0].id, need_id);
+        let trails_before = space
+            .scan(&Pattern::category(Category::Resolution).scope(repo))
+            .unwrap();
+        assert_eq!(trails_before.len(), 1, "{trails_before:?}");
+
+        let config = RetirementConfig {
+            enabled: true,
+            revision: 1,
+            status: ConfigStatus::Explicit,
+        };
+        let outcome =
+            run_retirement_pass(&space, &tickets, repo, &git_repo, "test", &config).unwrap();
+
+        // The recovery pass completes the transition the crash left half-done:
+        // it re-derives the same candidate, re-proves ancestry, reinforces the
+        // SAME trail, and performs the delete this time — so the delete really
+        // did happen here and counts as one fresh resolution.
+        assert_eq!(outcome.attempted, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.resolved, 1,
+            "the recovery pass must complete the delete the crash never reached: {outcome:?}"
+        );
+        assert_eq!(outcome.skipped, 0, "{outcome:?}");
+        assert_eq!(outcome.failed, 0, "{outcome:?}");
+
+        let remaining = space
+            .scan(&Pattern::category(Category::Need).scope(repo))
+            .unwrap();
+        assert!(remaining.is_empty(), "{remaining:?}");
+
+        // Reinforce, not append: one trail, and the SAME record — the crash's
+        // provenance was refreshed in place, never destroyed and never
+        // duplicated into a second audit row for one retirement.
+        let trails_after = space
+            .scan(&Pattern::category(Category::Resolution).scope(repo))
+            .unwrap();
+        assert_eq!(
+            trails_after.len(),
+            1,
+            "reinforce must not duplicate the pre-existing trail: {trails_after:?}"
+        );
+        assert_eq!(
+            trails_after[0].id, interrupted_trail_id,
+            "the recovery pass must reinforce the crashed pass's own trail record"
+        );
+        assert_eq!(trails_after[0].payload["need_id"], need_id.to_string());
+        assert_eq!(trails_after[0].payload["head_sha"], head);
+    }
 }
