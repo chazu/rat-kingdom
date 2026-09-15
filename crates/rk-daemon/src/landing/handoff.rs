@@ -90,6 +90,20 @@
 //! uninterrupted; only the transition to a member that has not yet started
 //! can be refused.
 //!
+//! [`LandingPipeline::process_batch`]'s two ordinary sequential paths — the
+//! mixed prepared-cohort/new-singleton split, and the plain per-entry loop
+//! taken for a capacity-admission or otherwise non-trivial independent
+//! cohort — claim their members together the same way and then hand each one
+//! to [`LandingPipeline::process_entry`] in turn without ever revisiting a
+//! claim site either (TKT-sisoj-difar-mazul). They reuse this exact
+//! checkpoint at the same granularity: before every not-yet-started member,
+//! including the boundary right before recursing into an untouched `legacy`
+//! remainder in the mixed-cohort path. A member already inside
+//! `process_entry` is never interrupted; only the next one still durably
+//! queued can be refused, and it is left exactly as `claim_batch` persisted
+//! it — this does not, by itself, cover every claimed member of a batch, only
+//! the two sequential paths named here plus the existing bisected-split path.
+//!
 //! The fence record itself is a small file-backed store — modeled directly
 //! on [`crate::orchestrator_lease::LeaseStore`] — so a request survives a
 //! daemon restart, is idempotent for its own holder, is fenced against a
