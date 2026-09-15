@@ -553,6 +553,10 @@ const REVIEW_POLL_SLICE: Duration = Duration::from_millis(150);
 mod admission;
 use admission::{AdmissionWindow, ADMISSION_HOLD_IDENTITY};
 
+mod handoff;
+use handoff::HandoffFenceStore;
+pub(crate) use handoff::ManagedWorkSnapshot;
+
 /// One landing candidate: a completed rat's branch, prepared into an exact
 /// merge object, gated, then either advanced or routed through review. Mirrors the
 /// reactor's queued-fire tuple shape (`repo_name`/`repo_path` as two
@@ -1545,6 +1549,16 @@ pub(crate) struct LandingPipeline {
     /// [`RetrySchedule`]. Real in production; a test overrides it with
     /// [`LandingPipeline::with_retry_schedule`].
     retry_schedule: RetrySchedule,
+    /// P7.1 (TKT-rufik-lafit-pisah): the operator-only handoff-window fence
+    /// — see `handoff.rs`'s module doc. One record per repo, file-backed
+    /// under the daemon home so a request survives a restart.
+    handoff: HandoffFenceStore,
+    /// Per-repo read/write gate that linearizes the fence check against the
+    /// claim it guards — see [`Self::admission_gate`]. Claim sites hold it
+    /// shared; `fence_request`/`fence_release` hold it exclusively. Entries
+    /// are created lazily per repo and are tiny, so this never grows beyond
+    /// one gate per repository this daemon has ever drained.
+    admission_gates: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
     /// The daemon's own shutdown signal (`Server::shutdown_tx`), wired in
     /// once by [`LandingPipeline::with_shutdown`] — production only
     /// (`Server::landing`); a pipeline built directly by a test leaves this
@@ -1586,6 +1600,7 @@ impl LandingPipeline {
         layout: Layout,
     ) -> Self {
         let queue = LandingQueue::new(space.clone(), &layout);
+        let handoff = HandoffFenceStore::load(layout.home().join("landing-handoff.json"));
         Self {
             supervisor,
             engine,
@@ -1597,6 +1612,8 @@ impl LandingPipeline {
             key_locks: Mutex::new(HashMap::new()),
             terminal_notify: Mutex::new(HashMap::new()),
             retry_schedule: RetrySchedule::default(),
+            handoff,
+            admission_gates: Mutex::new(HashMap::new()),
             shutdown: None,
         }
     }
@@ -1903,6 +1920,31 @@ impl LandingPipeline {
         let lock = self.key_lock(&repo_name, target);
         match Arc::clone(&lock).try_lock_owned() {
             Ok(guard) => {
+                // P7.1 handoff fence: this branch only runs when the key was
+                // free (uncontended) — i.e. this call would be starting
+                // genuinely NEW work, not continuing an existing owner. If a
+                // fence is engaged for this repo, release the lane
+                // immediately without claiming anything; `entry` stays
+                // durably queued (already recorded above by
+                // `enqueue_disposition`) for a later cycle once the fence
+                // is released or expires.
+                let fenced = {
+                    let gate = self.admission_gate(&repo_name);
+                    let _admit = gate.read().await;
+                    self.admission_fenced(&repo_name)
+                };
+                if fenced {
+                    drop(guard);
+                    return Ok(json!({
+                        "branch": branch,
+                        "target": target,
+                        "queued": true,
+                        "deferred_by_handoff_fence": true,
+                        "detail": "landing admission is currently fenced for an operator \
+                                   handoff window; this submission is durably queued and \
+                                   will be considered once the fence is released or expires",
+                    }));
+                }
                 self.drive_key_as_owner(guard, repo_name, target.to_string(), entry)
                     .await
             }
@@ -1937,7 +1979,31 @@ impl LandingPipeline {
         entry: LandingQueueEntry,
     ) -> rk_core::Result<Value> {
         loop {
-            let Some(claimed) = self.queue.claim_next(&repo_name, &target)? else {
+            // P7.1 handoff fence: re-checked on every iteration (not just
+            // once on entry) so a fence engaged partway through a multi-entry
+            // drain still stops before claiming whatever comes after the
+            // entry currently in flight. See `drain_key`'s identical check.
+            // Held SHARED across both the check and the claim it gates, so
+            // an acknowledged `fence_request` (which takes the same gate
+            // exclusively) can never land between the two. See
+            // `handoff.rs`'s linearization note.
+            let claimed = {
+                let gate = self.admission_gate(&repo_name);
+                let _admit = gate.read().await;
+                if self.admission_fenced(&repo_name) {
+                    return Ok(json!({
+                        "branch": entry.branch,
+                        "target": target,
+                        "queued": true,
+                        "deferred_by_handoff_fence": true,
+                        "detail": "landing admission is currently fenced for an operator \
+                                   handoff window; this submission is durably queued and \
+                                   will be considered once the fence is released or expires",
+                    }));
+                }
+                self.queue.claim_next(&repo_name, &target)?
+            };
+            let Some(claimed) = claimed else {
                 if let Some(result) = self.settled_terminal_json(&entry)? {
                     return Ok(result);
                 }
@@ -1992,7 +2058,18 @@ impl LandingPipeline {
         tokio::spawn(async move {
             let _guard = guard;
             loop {
-                let claimed = match pipeline.queue.claim_next(&repo_name, &target) {
+                // P7.1 handoff fence: same re-check as `drain_key` and
+                // `drive_key_as_owner` — stop claiming further entries once
+                // engaged, leaving the rest durably queued under this key.
+                let claimed = {
+                    let gate = pipeline.admission_gate(&repo_name);
+                    let _admit = gate.read().await;
+                    if pipeline.admission_fenced(&repo_name) {
+                        break;
+                    }
+                    pipeline.queue.claim_next(&repo_name, &target)
+                };
+                let claimed = match claimed {
                     Ok(Some(claimed)) => claimed,
                     Ok(None) => break,
                     Err(error) => {
@@ -6920,7 +6997,19 @@ impl LandingPipeline {
         let _guard = lock.lock().await;
         let mut outcomes = Vec::new();
         loop {
-            let entries = self.queue.claim_batch(repo_name, target, 8)?;
+            // P7.1 handoff fence: checked strictly AFTER acquiring this
+            // key's exclusive lock, so it is atomic with the claim it
+            // gates — never a separate status-then-claim race — and only
+            // stops the NEXT, not-yet-claimed batch. Whatever this loop has
+            // already claimed and is mid-processing is unaffected.
+            let entries = {
+                let gate = self.admission_gate(repo_name);
+                let _admit = gate.read().await;
+                if self.admission_fenced(repo_name) {
+                    break;
+                }
+                self.queue.claim_batch(repo_name, target, 8)?
+            };
             if entries.is_empty() {
                 break;
             }
@@ -8401,7 +8490,7 @@ checks: [
         ))
     }
 
-    fn test_pipeline(home: &Path, space: Space) -> LandingPipeline {
+    pub(super) fn test_pipeline(home: &Path, space: Space) -> LandingPipeline {
         test_pipeline_routed(home, space, HashMap::new(), TierRouting::default())
     }
 
@@ -15183,6 +15272,272 @@ checks: [
                 .is_empty(),
             "both candidates must be retired from the active queue once the drain completes"
         );
+    }
+
+    /// P7.1 (TKT-rufik-lafit-pisah): a native handoff-window fixture. `first`
+    /// (A) is actively mid-`verify` at a barrier when the fence is
+    /// requested; `second` (B) is already durably queued behind it on the
+    /// SAME key. Proves: A can still report/settle via the normal live path
+    /// while fenced; `fence_status` accurately reports `draining` while A's
+    /// key lock is held and `ready` once it is not; B is never claimed while
+    /// the fence blocks admission — not even by the background-drain
+    /// handoff A's own completion triggers; B advances exactly once, only
+    /// after an explicit release.
+    #[tokio::test]
+    async fn handoff_fence_blocks_new_admission_without_draining_the_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("reached");
+        let release = barrier_dir.path().join("release");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done", timeout: "30s"}},
+]
+"#,
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut heads = Vec::new();
+        for branch in ["first", "second"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("{branch}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+            heads.push(rev_parse(repo_dir.path(), branch));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+        let (first_head, second_head) = (heads[0].clone(), heads[1].clone());
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "first".into(),
+                target: "main".into(),
+                head_sha: first_head.clone(),
+                diff_class: "doc-only".into(),
+                task: "first-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "second".into(),
+                target: "main".into(),
+                head_sha: second_head.clone(),
+                diff_class: "doc-only".into(),
+                task: "second-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // A: drive `first` in the background — it will sit inside `verify`'s
+        // barrier until we release it below.
+        let first_pipeline = Arc::clone(&pipeline);
+        let repo_dir_path = repo_dir.path().to_path_buf();
+        let first_task = tokio::spawn(async move {
+            first_pipeline
+                .submit_manual(
+                    &repo_dir_path,
+                    "first",
+                    "main",
+                    false,
+                    Some("first-task".into()),
+                    None,
+                )
+                .await
+        });
+
+        let mut first_reached = false;
+        for _ in 0..300 {
+            if reached.exists() {
+                first_reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(first_reached, "first's gate never started running");
+
+        // Request the fence while A is genuinely mid-check.
+        let requested = pipeline
+            .fence_request(
+                &repo_name,
+                "operator-test",
+                60,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        let fence_id = requested["fence_id"].as_str().unwrap().to_string();
+        assert_eq!(requested["state"], "draining", "requested: {requested}");
+        let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
+        assert_eq!(status["state"], "draining", "status: {status}");
+        assert!(
+            status["blocking_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k == "main"),
+            "status: {status}"
+        );
+
+        // Let A finish — a live, normal completion, unaffected by the fence.
+        std::fs::write(&release, b"go").unwrap();
+        let first_result = first_task.await.unwrap().unwrap();
+        assert_eq!(first_result["merged"], true, "first_result: {first_result}");
+        assert_eq!(
+            first_result["delivered"], true,
+            "first_result: {first_result}"
+        );
+
+        // `ready` once A's key lock is no longer held — including by the
+        // background-drain handoff A's own completion spawns, which must
+        // itself see the fence and stop before claiming `second`.
+        let mut ready = None;
+        for _ in 0..300 {
+            let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
+            if status["state"] == "ready" {
+                ready = Some(status);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ready = ready.expect("fence never reached ready");
+        assert_eq!(
+            ready["blocking_keys"].as_array().unwrap().len(),
+            0,
+            "ready: {ready}"
+        );
+        assert_eq!(ready["ready"], true, "ready: {ready}");
+
+        // THE gap-1 regression, asserted against a REAL pipeline at the
+        // exact instant it would otherwise report ready: every landing drain
+        // lane is genuinely free, so a key-lock snapshot alone says "safe to
+        // roll over". A managed `verify.run` bound to this repo holds no
+        // landing lane at all, yet it would hang an ordinary stop — so it
+        // must flip the very same call to `draining`.
+        let with_managed = pipeline.fence_status(
+            &repo_name,
+            &ManagedWorkSnapshot::new(
+                &repo_name,
+                vec![crate::managed_verification::ManagedRunBlocker {
+                    repo: repo_name.clone(),
+                    kind: "verify",
+                    agent: "Peer-1".into(),
+                }],
+                false,
+            ),
+        );
+        assert_eq!(
+            with_managed["state"], "draining",
+            "a managed verify run must deny readiness even with every landing lane free: \
+             {with_managed}"
+        );
+        assert_eq!(with_managed["ready"], false, "{with_managed}");
+        assert_eq!(
+            with_managed["blocking_keys"].as_array().unwrap().len(),
+            0,
+            "the denial must come from managed work, not a landing lane: {with_managed}"
+        );
+        assert_eq!(with_managed["managed_blockers"][0]["kind"], "verify");
+
+        // The daemon-wide release-prepare lock denies it too, and says so at
+        // daemon scope rather than pretending to be a repo-bound blocker.
+        let with_release = pipeline.fence_status(
+            &repo_name,
+            &ManagedWorkSnapshot::new(&repo_name, Vec::new(), true),
+        );
+        assert_eq!(with_release["ready"], false, "{with_release}");
+        assert_eq!(with_release["managed_blockers"][0]["scope"], "daemon");
+
+        // B is durably queued and untouched: not claimed, not processed.
+        let queued = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap();
+        assert!(
+            queued
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("second")),
+            "second must remain durably queued while fenced: {queued:?}"
+        );
+        assert!(
+            !space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+                .unwrap()
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("second")),
+            "second must not have been processed while fenced"
+        );
+
+        // A stale/foreign release attempt is refused rather than silently
+        // lifting someone else's fence.
+        assert!(pipeline
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                "01JZZZZZZZZZZZZZZZZZZZZZZZ",
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .is_err());
+
+        // Release the fence — B may now advance, exactly once.
+        pipeline
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                &fence_id,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default())["state"],
+            "released"
+        );
+        pipeline.run_cycle().await.unwrap();
+
+        let processed = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+            .unwrap();
+        let second_landed: Vec<_> = processed
+            .iter()
+            .filter(|t| {
+                t.payload.get("branch").and_then(Value::as_str) == Some("second")
+                    && t.payload.get("outcome").and_then(Value::as_str) == Some("landed")
+            })
+            .collect();
+        assert_eq!(
+            second_landed.len(),
+            1,
+            "second must advance exactly once: {processed:?}"
+        );
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .is_empty());
     }
 
     /// TKT-dobas-lujom-lipog rework (native verdict `01M2HVGV7KC9X36MMEC7D3NZXS`,

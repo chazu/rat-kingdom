@@ -256,6 +256,166 @@ pub struct CancelReviewArgs {
 }
 
 #[derive(Args)]
+pub struct FenceRequestArgs {
+    /// Repository path or registered name.
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+    /// Identity recorded as the fence's holder (defaults to "operator").
+    /// Requesting again with the SAME holder while its fence is still live
+    /// renews the deadline rather than erroring.
+    #[arg(long)]
+    pub holder: Option<String>,
+    /// Bounded seconds before an un-released fence auto-expires and
+    /// admission resumes on its own (clamped to [1, 3600]).
+    #[arg(long, default_value_t = 600)]
+    pub ttl_secs: i64,
+}
+
+#[derive(Args)]
+pub struct FenceStatusArgs {
+    /// Repository path or registered name.
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+}
+
+#[derive(Args)]
+pub struct FenceReleaseArgs {
+    /// Repository path or registered name.
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+    /// Holder that requested the fence (must match to release it).
+    #[arg(long)]
+    pub holder: String,
+    /// Opaque `fence_id` returned by `rk fence-request` (fences a stale
+    /// caller). This replaces the old `--generation`: a generation counter
+    /// restarts at 1 if the durable store has to be recovered, so a replayed
+    /// release could match a NEWER fence it never owned.
+    #[arg(long)]
+    pub fence_id: String,
+}
+
+/// `rk fence-request` — P7.1: engage the operator-only handoff-window
+/// fence for `repo`. New landing admission stops there; anything already
+/// queued or actively checking/reviewing is untouched and continues via its
+/// existing live RPCs. Poll `rk fence-status` for `ready`.
+pub async fn fence_request(layout: &Layout, args: FenceRequestArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
+    let result = client
+        .call(
+            "repo.land.fence_request",
+            json!({"repo": repo, "holder": args.holder, "ttl_secs": args.ttl_secs}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "handoff fence requested for {repo}: state={} holder={} fence_id={}",
+            result["state"].as_str().unwrap_or("?"),
+            result["holder"].as_str().unwrap_or("?"),
+            // Printed because it is now REQUIRED to release the fence.
+            result["fence_id"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+/// `rk fence-status` — read-only: state (`released`/`draining`/`ready`/
+/// `expired`/`unavailable`), the explicit `ready` safety boolean, every
+/// blocker still holding the repo (landing drain lanes AND managed
+/// verify/release work), and the fence's holder/generation/deadline.
+pub async fn fence_status(layout: &Layout, args: FenceStatusArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
+    let result = client
+        .call("repo.land.fence_status", json!({"repo": repo}))
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        let state = result["state"].as_str().unwrap_or("?");
+        // `ready` is printed from its own boolean, never inferred from
+        // `state`, so an operator reading this line is reading the actual
+        // safety claim the daemon made.
+        let ready = result["ready"].as_bool().unwrap_or(false);
+        let keys = result["blocking_keys"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let managed = result["managed_blockers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        // Both boundaries printed, never collapsed: `ready` is the
+        // whole-daemon rollover claim, `repo_drain_ready` the narrower
+        // fenced-repo one. An operator deciding to roll over reads `ready`.
+        println!(
+            "{repo}: state={state} ready={ready} repo_drain_ready={} \
+             blocking_keys={} managed_blockers={}",
+            result["repo_drain_ready"].as_bool().unwrap_or(false),
+            keys.len(),
+            managed.len(),
+        );
+        if let Some(guarantee) = result["guarantee"].as_str() {
+            println!("  guarantee: {guarantee}");
+        }
+        for key in &keys {
+            println!("  landing lane: {}", key.as_str().unwrap_or("?"));
+        }
+        // Printed individually rather than only counted: a managed
+        // verify/release run is invisible in `blocking_keys` (it holds no
+        // landing lane), so a bare count would leave an operator unable to
+        // tell WHAT is still holding the repo.
+        for blocker in &managed {
+            println!(
+                "  managed {} [{}{}]: {}",
+                blocker["kind"].as_str().unwrap_or("?"),
+                blocker["scope"].as_str().unwrap_or("?"),
+                // Uncovered blockers are marked, because they can reappear
+                // on their own no matter how long the operator waits.
+                if blocker["fenced"].as_bool().unwrap_or(false) {
+                    ""
+                } else {
+                    ", not covered by this fence"
+                },
+                blocker["agent"]
+                    .as_str()
+                    .or_else(|| blocker["detail"].as_str())
+                    .unwrap_or("?"),
+            );
+        }
+        if let Some(recovery) = result["recovery"].as_str() {
+            println!("  recovery: {recovery}");
+        }
+    }
+    Ok(())
+}
+
+/// `rk fence-release` — end the fence early; idempotent. Admission for
+/// `repo` resumes on the very next claim attempt; nothing queued is
+/// force-cancelled or re-run.
+pub async fn fence_release(layout: &Layout, args: FenceReleaseArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
+    let result = client
+        .call(
+            "repo.land.fence_release",
+            json!({"repo": repo, "holder": args.holder, "fence_id": args.fence_id}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "handoff fence released for {repo}: state={}",
+            result["state"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Args)]
 pub struct RevertArgs {
     /// Dismissed agent whose landed merge to undo.
     pub name: String,
