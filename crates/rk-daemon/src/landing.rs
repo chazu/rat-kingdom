@@ -16610,6 +16610,530 @@ checks: [
         assert!(listing.contains("docs/member-b.md"));
     }
 
+    /// TKT-sisoj-difar-mazul: the handoff fence must also be honored inside
+    /// `process_batch`'s ORDINARY sequential per-entry loop — the path a
+    /// capacity-admission repo takes for a multi-entry claim that never
+    /// shares one prepared candidate, distinct from `bisect_batch`. `first`
+    /// and `second` are claimed TOGETHER in one `claim_batch` call (same
+    /// `(repo, target)` key) and, because this repo's capacity-admission
+    /// limit is set, land through the independent per-entry loop rather than
+    /// a combined batch. `first`'s own solo gate sits at a deterministic
+    /// barrier when the fence is requested. Proves: `first`'s already-
+    /// executing check finishes uninterrupted and lands normally while
+    /// fenced; `second` — the next, not-yet-started member — never starts
+    /// its own gate while the fence is live; `second`'s durable row (`seq`,
+    /// `enqueued_at`) is preserved exactly, not re-created or re-budgeted;
+    /// fence readiness flips to `true` once `first`'s key lock is released,
+    /// even with `second` still queued; and releasing the fence resumes and
+    /// lands `second` exactly once.
+    #[tokio::test]
+    async fn handoff_fence_blocks_the_next_member_of_an_ordinary_capacity_admission_batch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("reached");
+        let release = barrier_dir.path().join("release");
+        let count_file = barrier_dir.path().join("count");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'; if [ -f docs/first.md ] && [ ! -f docs/second.md ]; then touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done; fi; exit 0", timeout: "30s"}},
+]
+"#,
+            count = count_file.display(),
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut heads = Vec::new();
+        for branch in ["first", "second"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("{branch}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+            heads.push(rev_parse(repo_dir.path(), branch));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+        let (first_head, second_head) = (heads[0].clone(), heads[1].clone());
+
+        let space = Space::open_in_memory().unwrap();
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // Every entry below keeps empty `batch_branches` (a fresh, never-
+        // batched arrival) — with the repo's capacity-admission limit set,
+        // that is exactly the condition that routes a multi-entry claim
+        // through the independent per-entry loop rather than a combined
+        // shared-candidate batch (`process_batch`'s second branch).
+        pipeline
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "first".into(),
+                target: "main".into(),
+                head_sha: first_head,
+                diff_class: "doc-only".into(),
+                task: "first-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "second".into(),
+                target: "main".into(),
+                head_sha: second_head,
+                diff_class: "doc-only".into(),
+                task: "second-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let drain_pipeline = Arc::clone(&pipeline);
+        let drain_repo = repo_name.clone();
+        let drain_task =
+            tokio::spawn(async move { drain_pipeline.drain_key(&drain_repo, "main").await });
+
+        let mut first_reached = false;
+        for _ in 0..300 {
+            if reached.exists() {
+                first_reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(first_reached, "first's solo gate never started running");
+        assert_eq!(
+            std::fs::read_to_string(&count_file).unwrap().trim(),
+            "1",
+            "only first's solo check must have run so far"
+        );
+
+        // second's durable row right now — already claimed together with
+        // `first` by the single `claim_batch` call this drain made (rewritten
+        // to `RunningGates` by that claim, never touched again while this
+        // loop has not yet reached it). Captured so the post-deferral
+        // snapshot below can prove `seq`/`enqueued_at` survive untouched.
+        let second_before = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("second"))
+            .expect("second must already be durably present before the fence is requested")
+            .payload;
+
+        // Request the fence while `first` is genuinely mid-check.
+        let requested = pipeline
+            .fence_request(
+                &repo_name,
+                "operator-test",
+                60,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(requested["state"], "draining", "requested: {requested}");
+        let fence_id = requested["fence_id"].as_str().unwrap().to_string();
+
+        // Let `first` finish — a live, normal completion, unaffected by the
+        // fence.
+        std::fs::write(&release, b"go").unwrap();
+        let drain_outcomes = tokio::time::timeout(Duration::from_secs(10), drain_task)
+            .await
+            .expect("the drain must return once first settles, not wait on second")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            drain_outcomes.len(),
+            1,
+            "only first's outcome must come back from this drain: {drain_outcomes:?}"
+        );
+        assert!(matches!(drain_outcomes[0], LandingOutcome::Landed(_)));
+
+        // second never started its own gate.
+        assert_eq!(
+            std::fs::read_to_string(&count_file).unwrap().trim(),
+            "1",
+            "second's gate must not have started while the fence is engaged"
+        );
+
+        let queued = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap();
+        assert!(
+            queued
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("second")),
+            "second must remain durably queued while fenced: {queued:?}"
+        );
+        assert!(
+            !space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+                .unwrap()
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("second")),
+            "second must not have been processed while fenced"
+        );
+
+        // The deferral itself must not mutate second's durable identity.
+        let second_deferred = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("second"))
+            .expect("second must still be durably present while deferred")
+            .payload;
+        assert_eq!(second_deferred["seq"], second_before["seq"]);
+        assert_eq!(second_deferred["enqueued_at"], second_before["enqueued_at"]);
+
+        // `ready` once first's key lock is no longer held, even with second
+        // still queued behind the fence — queued-but-unclaimed work is never
+        // a blocker (module doc).
+        let mut ready = None;
+        for _ in 0..300 {
+            let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
+            if status["state"] == "ready" {
+                ready = Some(status);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ready = ready.expect("fence never reached ready");
+        assert_eq!(ready["ready"], true, "ready: {ready}");
+
+        // Release the fence — second may now advance, exactly once.
+        pipeline
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                &fence_id,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        let outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "second must resume exactly once: {outcomes:?}"
+        );
+        assert!(matches!(outcomes[0], LandingOutcome::Landed(_)));
+        assert_eq!(
+            std::fs::read_to_string(&count_file).unwrap().trim(),
+            "2",
+            "second's gate must have run exactly once after the release"
+        );
+
+        let listing = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["ls-tree", "-r", "--name-only", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("docs/first.md"));
+        assert!(listing.contains("docs/second.md"));
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// TKT-sisoj-difar-mazul: the same checkpoint at the mixed prepared-
+    /// cohort/new-singleton boundary — `process_batch`'s FIRST branch, taken
+    /// when a fresh singleton arrival is claimed together with a legacy
+    /// cohort member that already carries non-empty `batch_branches` from an
+    /// earlier, interrupted batch attempt. `singleton`'s own solo gate sits
+    /// at a deterministic barrier when the fence is requested. Proves:
+    /// `singleton` finishes and lands uninterrupted; the fence is re-checked
+    /// again right before recursing into the untouched `legacy` remainder,
+    /// so `legacy` never starts its own gate while fenced and its durable
+    /// row (`seq`, `enqueued_at`) is untouched; and — since this path is also
+    /// where a mixed cohort's restart/replay matters — the deferral survives
+    /// a full daemon restart (a fresh `LandingPipeline` over the same on-disk
+    /// home still refuses to admit `legacy` under the restored fence, and
+    /// releasing the SAME fence on the fresh instance resumes and lands it
+    /// exactly once).
+    #[tokio::test]
+    async fn handoff_fence_blocks_the_legacy_remainder_of_a_mixed_cohort_and_survives_a_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("reached");
+        let release = barrier_dir.path().join("release");
+        let count_file = barrier_dir.path().join("count");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'; if [ -f docs/singleton.md ] && [ ! -f docs/legacy.md ]; then touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done; fi; exit 0", timeout: "30s"}},
+]
+"#,
+            count = count_file.display(),
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut heads = Vec::new();
+        for branch in ["singleton", "legacy"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("{branch}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+            heads.push(rev_parse(repo_dir.path(), branch));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+        let (singleton_head, legacy_head) = (heads[0].clone(), heads[1].clone());
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
+
+        let fence_id;
+        let legacy_before_restart;
+        // "Before restart": a real on-disk Space, `legacy` durably deferred
+        // behind a live fence when this whole pipeline instance is dropped.
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+            pipeline
+                .supervisor
+                .set_verification_admission_limits(1, HashMap::new());
+
+            // `legacy` carries non-empty `batch_branches` (its own branch
+            // name) with no candidate bound yet — exactly the durable shape
+            // a batch attempt interrupted before `prepare_merge_batch` ever
+            // ran would leave behind, without needing a real combined
+            // candidate to reconstruct. `singleton` keeps the default empty
+            // `batch_branches` of a fresh arrival. Both claimed together
+            // (same repo/target key) is what routes this claim through the
+            // mixed-cohort branch rather than the ordinary independent loop.
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: repo_name.clone(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: "legacy".into(),
+                    target: "main".into(),
+                    head_sha: legacy_head,
+                    diff_class: "doc-only".into(),
+                    task: "legacy-task".into(),
+                    batch_branches: vec!["legacy".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: repo_name.clone(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: "singleton".into(),
+                    target: "main".into(),
+                    head_sha: singleton_head,
+                    diff_class: "doc-only".into(),
+                    task: "singleton-task".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let drain_pipeline = Arc::clone(&pipeline);
+            let drain_repo = repo_name.clone();
+            let drain_task =
+                tokio::spawn(async move { drain_pipeline.drain_key(&drain_repo, "main").await });
+
+            let mut singleton_reached = false;
+            for _ in 0..300 {
+                if reached.exists() {
+                    singleton_reached = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                singleton_reached,
+                "singleton's solo gate never started running"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&count_file).unwrap().trim(),
+                "1",
+                "only singleton's solo check must have run so far"
+            );
+
+            legacy_before_restart = space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .into_iter()
+                .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("legacy"))
+                .expect("legacy must already be durably present before the fence is requested")
+                .payload;
+
+            let requested = pipeline
+                .fence_request(
+                    &repo_name,
+                    "operator-test",
+                    600,
+                    &ManagedWorkSnapshot::default,
+                )
+                .await
+                .unwrap();
+            assert_eq!(requested["state"], "draining", "requested: {requested}");
+            fence_id = requested["fence_id"].as_str().unwrap().to_string();
+
+            std::fs::write(&release, b"go").unwrap();
+            let drain_outcomes = tokio::time::timeout(Duration::from_secs(10), drain_task)
+                .await
+                .expect("the drain must return once singleton settles, not wait on legacy")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                drain_outcomes.len(),
+                1,
+                "only singleton's outcome must come back from this drain: {drain_outcomes:?}"
+            );
+            assert!(matches!(drain_outcomes[0], LandingOutcome::Landed(_)));
+
+            // legacy never started its own gate — the check ran exactly
+            // once, for singleton alone.
+            assert_eq!(
+                std::fs::read_to_string(&count_file).unwrap().trim(),
+                "1",
+                "legacy's gate must not have started while the fence is engaged"
+            );
+
+            let queued = space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap();
+            assert!(
+                queued
+                    .iter()
+                    .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("legacy")),
+                "legacy must remain durably queued while fenced: {queued:?}"
+            );
+            assert!(
+                !space
+                    .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+                    .unwrap()
+                    .iter()
+                    .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("legacy")),
+                "legacy must not have been processed while fenced"
+            );
+
+            let mut ready = None;
+            for _ in 0..300 {
+                let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
+                if status["state"] == "ready" {
+                    ready = Some(status);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let ready = ready.expect("fence never reached ready");
+            assert_eq!(ready["ready"], true, "ready: {ready}");
+
+            // Pipeline, its background-drain continuation and its Space
+            // handle all go out of scope here — the simulated crash.
+        }
+
+        // "After restart": fresh Space handle and fresh pipeline over the
+        // SAME on-disk store/home.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        pipeline
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+
+        let legacy_after_restart = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("legacy"))
+            .expect("legacy must survive the restart durably queued")
+            .payload;
+        assert_eq!(
+            legacy_after_restart["seq"], legacy_before_restart["seq"],
+            "legacy must be the SAME durable row across the restart, not re-created"
+        );
+        assert_eq!(
+            legacy_after_restart["enqueued_at"],
+            legacy_before_restart["enqueued_at"]
+        );
+
+        let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
+        assert_eq!(
+            status["fenced"], true,
+            "the fence record must survive the restart too: {status}"
+        );
+        assert_eq!(status["fence_id"], fence_id, "status: {status}");
+
+        let still_fenced_outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert!(
+            still_fenced_outcomes.is_empty(),
+            "the fresh instance must not admit legacy while the restored fence is live: \
+             {still_fenced_outcomes:?}"
+        );
+
+        pipeline
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                &fence_id,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        let outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "legacy must resume exactly once on the fresh instance: {outcomes:?}"
+        );
+        assert!(matches!(outcomes[0], LandingOutcome::Landed(_)));
+        assert_eq!(
+            std::fs::read_to_string(&count_file).unwrap().trim(),
+            "2",
+            "legacy's gate must have run exactly once after the release"
+        );
+
+        let listing = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["ls-tree", "-r", "--name-only", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("docs/singleton.md"));
+        assert!(listing.contains("docs/legacy.md"));
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .is_empty());
+    }
+
     /// TKT-dobas-lujom-lipog rework (native verdict `01M2HVGV7KC9X36MMEC7D3NZXS`,
     /// finding (4)): the original diff's sole new test only ever drove
     /// `submit_manual`'s WINNING path (it becomes the drainer itself via
