@@ -988,6 +988,9 @@ pub struct Daemon {
     ticket_graph_apply_lock: tokio::sync::Mutex<()>,
     /// Serialize the shared release staging worktree; also expose in-flight preparation to reads.
     release_prepare_lock: tokio::sync::Mutex<()>,
+    /// P4.1 (TKT-nibuv-gokun-sibin): `[policy] release_build_admission_enabled`.
+    /// See that config field's doc comment for the full contract.
+    release_build_admission_enabled: bool,
     action_approvals: crate::action_approval::ActionApprovalStore,
     /// TKT-01M0E8PN9C41BWECGNW0990R3J: the durable orchestrator lease store
     /// (one lease per repo scope) an `attention.decide` orchestrator-authority
@@ -1187,6 +1190,7 @@ impl Daemon {
         daemon.king_config = config.king.clone();
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
+        daemon.release_build_admission_enabled = config.policy.release_build_admission_enabled;
         daemon.authority_policy = crate::authority::AuthorityPolicy::from_config(&config.policy)?;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
@@ -1263,6 +1267,15 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_require_named_checks(&mut self, v: bool) {
         self.require_named_checks = v;
+    }
+
+    /// Test-only hook, same rationale as [`set_require_named_checks`](Self::set_require_named_checks):
+    /// `Daemon::with_space_for_tests`/`new_in_memory` bypass `Daemon::new`'s
+    /// `config.policy.release_build_admission_enabled` wiring, so a test
+    /// exercising P4.1's release-build admission route sets it directly.
+    #[doc(hidden)]
+    pub fn set_release_build_admission_enabled(&mut self, v: bool) {
+        self.release_build_admission_enabled = v;
     }
 
     /// Test-only equivalent of `Daemon::new`'s
@@ -1526,6 +1539,7 @@ impl Daemon {
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
             ticket_graph_apply_lock: tokio::sync::Mutex::new(()),
             release_prepare_lock: tokio::sync::Mutex::new(()),
+            release_build_admission_enabled: false,
             action_approvals,
             orchestrator_lease,
             king,
@@ -8024,6 +8038,12 @@ impl Daemon {
                 "proof": proof,
             }))
         });
+        // P4.1 (TKT-nibuv-gokun-sibin): route the build through the SAME
+        // aggregate host-wide admission semaphore every managed named check
+        // already shares, only when the operator has explicitly opted in.
+        let release_admission = self
+            .release_build_admission_enabled
+            .then(|| &self.supervisor.verification_resources().host_admission);
         match crate::release::prepare(
             &self.layout,
             crate::release::PrepareParams {
@@ -8035,6 +8055,7 @@ impl Daemon {
                 recipe: params.recipe,
                 known_verification,
             },
+            release_admission,
         )
         .await
         {

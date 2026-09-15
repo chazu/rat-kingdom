@@ -452,3 +452,305 @@ async fn self_consistent_manifest_without_a_registry_digest_is_quarantined_not_a
 }
 
 // Real process-death/restart/retry coverage lives in rk-cli/tests/release_prepare_interruption.rs.
+
+/// P4.1 (TKT-nibuv-gokun-sibin): `[policy] release_build_admission_enabled`
+/// routes the `paired-rk-mcp` build subprocess through the SAME P3.1
+/// aggregate `HostVerificationAdmission` semaphore every managed named check
+/// already shares. These tests reuse `host_verification_aggregate_cap.rs`'s
+/// barrier-check-plus-status-poll technique (a controlled named check on a
+/// SECOND fixture repo, never a fixed sleep as the success criterion) rather
+/// than rebuilding a whole project per scenario — the release build itself
+/// is the existing tiny two-package Cargo fixture above.
+mod host_admission {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// One barrier-controlled named check: writes its own pid to
+    /// `<shared>/<marker>.pid` the instant it starts, then blocks — polling a
+    /// short fixed interval, never sleeping past a bounded budget — until the
+    /// test deposits `<shared>/<marker>.release`. Same technique as
+    /// `host_verification_aggregate_cap.rs::barrier_check_body`.
+    fn barrier_check_body(shared: &Path, marker: &str) -> String {
+        let shared = shared.display();
+        format!(
+            r#"echo $$ > "{shared}/{marker}.pid"; for i in $(seq 1 600); do [ -f "{shared}/{marker}.release" ] && exit 0; sleep 0.05; done; echo "barrier {marker} never released" 1>&2; exit 9"#
+        )
+    }
+
+    fn write_barrier_check(repo: &Path, shared: &Path, name: &str, marker: &str) {
+        let body = barrier_check_body(shared, marker)
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let cue = format!(
+            "checks: [{{name: \"{name}\", command: \"{body}\", timeout: \"30s\", environmentPolicy: \"strip_rk_spawn\"}}]\n"
+        );
+        let rk_dir = repo.join(".rk");
+        std::fs::create_dir_all(&rk_dir).unwrap();
+        std::fs::write(rk_dir.join("checks.cue"), cue).unwrap();
+    }
+
+    /// A committed, policy-registered checker repo carrying one barrier
+    /// check under `marker` — matches
+    /// `host_verification_aggregate_cap.rs::init_repo` +
+    /// `prepare_repo`'s exact sequencing (repository policy committed
+    /// first, the check written uncommitted afterward).
+    fn init_checker_repo(dir: &Path, shared: &Path, marker: &str) -> String {
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "r@x"]);
+        git(dir, &["config", "user.name", "R"]);
+        std::fs::write(dir.join("README.md"), "# checker\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "init"]);
+        support::install_default_repository_policy(dir);
+        write_barrier_check(dir, shared, "go", marker);
+        repo_name_of(dir)
+    }
+
+    fn release_marker(shared: &Path, marker: &str) {
+        std::fs::write(shared.join(format!("{marker}.release")), b"go").unwrap();
+    }
+
+    fn pid_path(shared: &Path, marker: &str) -> std::path::PathBuf {
+        shared.join(format!("{marker}.pid"))
+    }
+
+    const POLL_DEADLINE: Duration = Duration::from_secs(15);
+    const POLL_INTERVAL: Duration = Duration::from_millis(30);
+
+    async fn wait_for_start(path: &Path) {
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            if path.exists() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "check never started (no pid file at {}) within {POLL_DEADLINE:?}",
+                path.display()
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn status(client: &mut Client) -> Value {
+        client.call("status", json!({})).await.unwrap()
+    }
+
+    fn host_executing(s: &Value) -> u64 {
+        s["verification_host"]["executing"].as_u64().unwrap_or(0)
+    }
+
+    fn host_waiting(s: &Value) -> u64 {
+        s["verification_host"]["waiting"].as_u64().unwrap_or(0)
+    }
+
+    async fn poll_status_until(
+        client: &mut Client,
+        description: &str,
+        mut pred: impl FnMut(&Value) -> bool,
+    ) -> Value {
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            let s = status(client).await;
+            if pred(&s) {
+                return s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "condition never became true within {POLL_DEADLINE:?}: {description}; last status: {s}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Spawn `release.prepare` for `(repo, candidate)` over its own fresh
+    /// connection — genuine concurrency with a status-polling connection
+    /// needs a separate one, same reasoning as
+    /// `host_verification_aggregate_cap.rs::spawn_verify`.
+    fn spawn_prepare(
+        layout: Layout,
+        repo: String,
+        candidate: String,
+    ) -> tokio::task::JoinHandle<Value> {
+        tokio::spawn(async move {
+            let mut client = Client::connect_as_operator(&layout).await.unwrap();
+            client
+                .call(
+                    "release.prepare",
+                    json!({"repo": repo, "candidate": candidate}),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("release.prepare({repo}) failed: {e}"))
+        })
+    }
+
+    /// Disabled (the default): a release build must ignore a fully saturated
+    /// aggregate cap entirely — it neither waits on, nor is counted by,
+    /// `verification_host`. Proven by completing the build while a barrier
+    /// check on a SEPARATE repo holds the aggregate cap's one and only
+    /// permit open for the whole test, never released until after.
+    #[tokio::test]
+    async fn disabled_by_default_ignores_a_saturated_aggregate_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let checker_dir = tempfile::tempdir().unwrap();
+        let checker_name = init_checker_repo(checker_dir.path(), shared.path(), "chk");
+        let release_dir = tempfile::tempdir().unwrap();
+        init_fixture_repo(release_dir.path(), "v1");
+        let release_name = repo_name_of(release_dir.path());
+
+        let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        daemon.set_verification_admission_aggregate_limit(1);
+        // Admission left disabled (default `false`) — the switch under test.
+        let _handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        register_repo(&mut client, checker_dir.path()).await;
+        register_repo(&mut client, release_dir.path()).await;
+
+        let checker_layout = layout.clone();
+        let checker_repo = checker_name.clone();
+        let checker_call = tokio::spawn(async move {
+            let mut c = Client::connect_as_operator(&checker_layout).await.unwrap();
+            c.call("verify.run", json!({"repo": checker_repo, "check": "go"}))
+                .await
+        });
+        wait_for_start(&pid_path(shared.path(), "chk")).await;
+        poll_status_until(
+            &mut client,
+            "checker occupies the one aggregate permit",
+            |s| host_executing(s) == 1,
+        )
+        .await;
+
+        // The release build must complete WITHOUT ever waiting on the
+        // saturated aggregate cap — bounded well under the checker's own 30s
+        // barrier budget, which is never released during this await.
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            prepare(&mut client, &release_name, "main"),
+        )
+        .await
+        .expect("a disabled release build must not block on the saturated aggregate cap")
+        .unwrap();
+        assert_eq!(result["release"]["status"], "prepared", "{result}");
+        assert_eq!(
+            result["release"]["manifest"]["recipe_bounds"]["host_admission"],
+            Value::Null,
+            "disabled admission must record no host_admission telemetry: {result}"
+        );
+
+        release_marker(shared.path(), "chk");
+        checker_call.await.unwrap().unwrap();
+    }
+
+    /// Enabled: a release build genuinely queues behind, and is admitted
+    /// alongside, an ordinary named check on a DIFFERENT repo through the
+    /// SAME aggregate semaphore — real cross-repo, cross-request-type
+    /// sharing, not a separate release-only capacity pool.
+    #[tokio::test]
+    async fn enabled_shares_the_aggregate_cap_with_a_concurrent_named_check() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let checker_dir = tempfile::tempdir().unwrap();
+        let checker_name = init_checker_repo(checker_dir.path(), shared.path(), "chk");
+        let release_dir = tempfile::tempdir().unwrap();
+        init_fixture_repo(release_dir.path(), "v1");
+        let release_name = repo_name_of(release_dir.path());
+
+        let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        daemon.set_verification_admission_aggregate_limit(1);
+        daemon.set_release_build_admission_enabled(true);
+        let _handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        register_repo(&mut client, checker_dir.path()).await;
+        register_repo(&mut client, release_dir.path()).await;
+
+        let checker_layout = layout.clone();
+        let checker_repo = checker_name.clone();
+        let checker_call = tokio::spawn(async move {
+            let mut c = Client::connect_as_operator(&checker_layout).await.unwrap();
+            c.call("verify.run", json!({"repo": checker_repo, "check": "go"}))
+                .await
+        });
+        wait_for_start(&pid_path(shared.path(), "chk")).await;
+        poll_status_until(
+            &mut client,
+            "checker occupies the one aggregate permit",
+            |s| host_executing(s) == 1,
+        )
+        .await;
+
+        // The release build must now genuinely queue behind the checker on
+        // the SAME host-wide semaphore — proven via the real status RPC, not
+        // inferred from elapsed time.
+        let prepare_call = spawn_prepare(layout.clone(), release_name.clone(), "main".into());
+        poll_status_until(
+            &mut client,
+            "release build is genuinely queued behind the saturated aggregate cap",
+            |s| host_executing(s) == 1 && host_waiting(s) == 1,
+        )
+        .await;
+
+        release_marker(shared.path(), "chk");
+        checker_call.await.unwrap().unwrap();
+
+        let result = prepare_call.await.unwrap();
+        assert_eq!(result["release"]["status"], "prepared", "{result}");
+        let host_admission = &result["release"]["manifest"]["recipe_bounds"]["host_admission"];
+        assert_eq!(
+            host_admission["recipe_identity"],
+            json!("release-build:paired-rk-mcp"),
+            "{result}"
+        );
+        assert_eq!(host_admission["weight"], json!(1), "{result}");
+        assert!(
+            host_admission["admission_wait_ms"].as_u64().unwrap() > 0,
+            "the build genuinely waited for the checker's permit, so its recorded wait must be \
+             nonzero: {result}"
+        );
+
+        poll_status_until(&mut client, "capacity fully drains, no leak", |s| {
+            host_executing(s) == 0 && host_waiting(s) == 0
+        })
+        .await;
+    }
+
+    /// Enabled with the aggregate cap itself still disabled (`0`, the
+    /// default) is a documented no-op: `HostVerificationAdmission::acquire`
+    /// returns immediately, so the build never actually waits, matching
+    /// every named check's own behavior under a disabled aggregate cap.
+    #[tokio::test]
+    async fn enabled_with_aggregate_cap_disabled_never_waits() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_fixture_repo(repo_dir.path(), "v1");
+        let repo_name = repo_name_of(repo_dir.path());
+
+        let layout = Layout::at(home.path());
+        let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        daemon.set_release_build_admission_enabled(true);
+        // Aggregate limit left at its default (0 = disabled).
+        let _handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        register_repo(&mut client, repo_dir.path()).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            prepare(&mut client, &repo_name, "main"),
+        )
+        .await
+        .expect("an enabled build must never wait when the aggregate cap itself is disabled")
+        .unwrap();
+        assert_eq!(result["release"]["status"], "prepared", "{result}");
+        let host_admission = &result["release"]["manifest"]["recipe_bounds"]["host_admission"];
+        assert_eq!(host_admission["weight"], json!(1), "{result}");
+        assert!(
+            host_admission["admission_wait_ms"].as_u64().unwrap() < 50,
+            "a disabled aggregate cap must never make the build genuinely wait: {result}"
+        );
+    }
+}
