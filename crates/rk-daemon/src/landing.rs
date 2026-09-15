@@ -1528,6 +1528,19 @@ pub(crate) struct LandingPipeline {
     space: Space,
     enqueue_lock: Mutex<()>,
     key_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One-shot wake hint per exact work key (`repo\0branch\0head_sha\0target`),
+    /// fired by [`Self::notify_terminal`] the moment [`Self::mark_processed`]
+    /// durably records that key's outcome. Lets [`Self::submit_manual`]
+    /// observe its OWN terminal result without contending for `key_locks`'
+    /// per-`(repo,target)` exclusive drain lane — see
+    /// [`Self::wait_for_terminal_outcome`]. A hint only: the durable
+    /// `landing_processed` marker ([`Self::processed_outcome`]) is the sole
+    /// authority, so a missed or spuriously-repeated notification (map
+    /// eviction races, a restart) settles correctly either way, it just
+    /// costs the bounded poll fallback instead of an instant wake. Entries
+    /// are removed as soon as they fire (see `notify_terminal`) so this
+    /// never accumulates one entry per landing ever processed.
+    terminal_notify: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
     /// Clock/jitter/sleep seam for review-death retry backoff — see
     /// [`RetrySchedule`]. Real in production; a test overrides it with
     /// [`LandingPipeline::with_retry_schedule`].
@@ -1570,6 +1583,7 @@ impl LandingPipeline {
             space,
             enqueue_lock: Mutex::new(()),
             key_locks: Mutex::new(HashMap::new()),
+            terminal_notify: Mutex::new(HashMap::new()),
             retry_schedule: RetrySchedule::default(),
         }
     }
@@ -1777,7 +1791,7 @@ impl LandingPipeline {
     /// enqueueing with `task: ""` — that used to mean no ticket/spec for the
     /// reviewer, no delivery record, and nothing ever closed.
     pub(crate) async fn submit_manual(
-        &self,
+        self: &Arc<Self>,
         repo_root: &Path,
         branch: &str,
         target: &str,
@@ -1840,25 +1854,60 @@ impl LandingPipeline {
             }
         }
 
+        // Become the exclusive drainer for this key only if it is free right
+        // now (`try_lock_owned`, never the blocking `.lock().await` the old
+        // implementation used) — contending for it would mean waiting on
+        // whatever unrelated candidates the CURRENT owner is draining before
+        // ever getting a turn to check on our own, exactly the bug this
+        // fixes (module doc, TKT-dobas-lujom-lipog).
         let lock = self.key_lock(&repo_name, target);
-        let _guard = lock.lock().await;
+        match Arc::clone(&lock).try_lock_owned() {
+            Ok(guard) => {
+                self.drive_key_as_owner(guard, repo_name, target.to_string(), entry)
+                    .await
+            }
+            Err(_) => {
+                // Someone else already owns this key's single exclusive
+                // drain lane (`run_cycle`'s `drain_key`, or a concurrent
+                // `submit_manual` that got there first). Never contend for
+                // it ourselves — a second consumer racing to claim entries
+                // would break the single-consumer-per-key invariant. Just
+                // watch our own durable terminal outcome; the active
+                // drainer will reach `entry` in FIFO order and write it.
+                let outcome = self.wait_for_terminal_outcome(&entry).await?;
+                Ok(Self::already_settled_json(branch, target, &outcome))
+            }
+        }
+    }
+
+    /// `submit_manual`'s drain loop once this caller has won the exclusive
+    /// `(repo, target)` lane: identical claim/process/remove sequence as
+    /// before, but returns to the caller the instant `entry`'s OWN work key
+    /// reaches a terminal outcome, handing any remaining queued work for
+    /// this key off to a detached background continuation
+    /// ([`Self::spawn_background_drain`]) instead of making the caller wait
+    /// on unrelated later candidates to drain too. Still exactly one active
+    /// drainer at a time — the handoff moves the SAME lock guard into the
+    /// spawned task rather than releasing it, so no second consumer is ever
+    /// admitted for this key.
+    async fn drive_key_as_owner(
+        self: &Arc<Self>,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        repo_name: String,
+        target: String,
+        entry: LandingQueueEntry,
+    ) -> rk_core::Result<Value> {
         loop {
-            let Some(claimed) = self.queue.claim_next(&repo_name, target)? else {
+            let Some(claimed) = self.queue.claim_next(&repo_name, &target)? else {
                 if let Some(prior) = self.processed_outcome(&entry)? {
-                    return Ok(json!({
-                        "branch": branch,
-                        "target": target,
-                        "merged": prior == "landed",
-                        "delivered": prior == "landed",
-                        "status": prior,
-                        "detail": "landing was completed while this same-key submitter waited",
-                    }));
+                    return Ok(Self::already_settled_json(&entry.branch, &target, &prior));
                 }
                 return Err(rk_core::Error::other(format!(
-                    "landing queue lost operator submission {branch}@{head_sha}"
+                    "landing queue lost operator submission {}@{}",
+                    entry.branch, entry.head_sha
                 )));
             };
-            let ours = claimed.branch == branch && claimed.head_sha == head_sha;
+            let ours = claimed.branch == entry.branch && claimed.head_sha == entry.head_sha;
             let outcome = self.process_entry(&claimed).await;
             if outcome.is_ok() {
                 self.queue.remove(&claimed)?;
@@ -1867,34 +1916,116 @@ impl LandingPipeline {
             if !ours || matches!(outcome, LandingOutcome::Requeued { .. }) {
                 continue;
             }
-            return Ok(match outcome {
-                LandingOutcome::Landed(result) => result.to_json(),
-                LandingOutcome::Empty(result) => result,
-                LandingOutcome::GateHeld => json!({
-                    "branch": branch, "target": target, "merged": false,
-                    "delivered": false, "status": "gate-held",
-                }),
-                LandingOutcome::NoGate(need) => json!({
-                    "branch": branch, "target": target, "merged": false,
-                    "delivered": false, "status": "no-gate", "need": need.id.to_string(),
-                }),
-                LandingOutcome::ReworkFiled(ticket) => json!({
-                    "branch": branch, "target": target, "merged": false,
-                    "delivered": false, "status": "rework-filed", "ticket": ticket.id.to_string(),
-                }),
-                LandingOutcome::Escalated(need) => json!({
-                    "branch": branch, "target": target, "merged": false,
-                    "delivered": false, "status": "escalated", "need": need.id.to_string(),
-                }),
-                LandingOutcome::Reconciled(prior) => json!({
-                    "branch": branch, "target": target, "merged": prior == "landed",
-                    "delivered": prior == "landed", "status": prior,
-                }),
-                LandingOutcome::Quarantined(evidence) => {
-                    json!({"status": "quarantined", "evidence": evidence.id.to_string(), "merged": false, "delivered": false})
+            let result = Self::manual_result_json(&entry.branch, &target, outcome);
+            self.spawn_background_drain(guard, repo_name, target);
+            return Ok(result);
+        }
+    }
+
+    /// Keep this key's single exclusive lane alive past `submit_manual`'s
+    /// own return, draining whatever remains (already queued, or still
+    /// arriving) exactly as [`Self::drive_key_as_owner`] would have —
+    /// same `claim_next`/`process_entry`/`remove` sequence, same lock held
+    /// throughout via `guard`, just detached from any caller awaiting it.
+    /// One infra error (an `Err` from `process_entry` itself, not a verdict
+    /// on a branch) stops this pass rather than looping forever; the next
+    /// `run_cycle` poll retries the entry left in place, same as
+    /// `process_next`'s documented restart-safety.
+    fn spawn_background_drain(
+        self: &Arc<Self>,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        repo_name: String,
+        target: String,
+    ) {
+        let pipeline = Arc::clone(self);
+        tokio::spawn(async move {
+            let _guard = guard;
+            loop {
+                let claimed = match pipeline.queue.claim_next(&repo_name, &target) {
+                    Ok(Some(claimed)) => claimed,
+                    Ok(None) => break,
+                    Err(error) => {
+                        warn!(
+                            repo = %repo_name, target = %target, error = %error,
+                            "landing pipeline: background drain handoff failed to claim, \
+                             will retry next cycle"
+                        );
+                        break;
+                    }
+                };
+                match pipeline.process_entry(&claimed).await {
+                    Ok(_) => {
+                        if let Err(error) = pipeline.queue.remove(&claimed) {
+                            warn!(
+                                repo = %repo_name, target = %target, error = %error,
+                                "landing pipeline: background drain handoff failed to \
+                                 retire a processed entry"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            repo = %repo_name, target = %target, error = %error,
+                            "landing pipeline: background drain handoff failed to process, \
+                             will retry next cycle"
+                        );
+                        break;
+                    }
                 }
-                LandingOutcome::Requeued { .. } => unreachable!(),
-            });
+            }
+        });
+    }
+
+    /// Shared result shape for a caller learning its own work key's outcome
+    /// after the fact — either `submit_manual` itself found the durable
+    /// marker with nothing left to claim, or a non-owning caller's
+    /// [`Self::wait_for_terminal_outcome`] resolved. Distinct detail text
+    /// from [`Self::manual_result_json`]'s fresh-outcome shapes: this
+    /// caller's own candidate was actually processed by a DIFFERENT
+    /// drainer instance, not by the code path returning this value.
+    fn already_settled_json(branch: &str, target: &str, prior: &str) -> Value {
+        json!({
+            "branch": branch,
+            "target": target,
+            "merged": prior == "landed",
+            "delivered": prior == "landed",
+            "status": prior,
+            "detail": "landing was completed while this same-key submitter waited",
+        })
+    }
+
+    /// [`LandingOutcome`] to `submit_manual`'s public JSON result shape —
+    /// unchanged from the shapes `rk land` has always returned; factored out
+    /// so both [`Self::drive_key_as_owner`]'s in-line result and a future
+    /// caller can build it without duplicating the match.
+    fn manual_result_json(branch: &str, target: &str, outcome: LandingOutcome) -> Value {
+        match outcome {
+            LandingOutcome::Landed(result) => result.to_json(),
+            LandingOutcome::Empty(result) => result,
+            LandingOutcome::GateHeld => json!({
+                "branch": branch, "target": target, "merged": false,
+                "delivered": false, "status": "gate-held",
+            }),
+            LandingOutcome::NoGate(need) => json!({
+                "branch": branch, "target": target, "merged": false,
+                "delivered": false, "status": "no-gate", "need": need.id.to_string(),
+            }),
+            LandingOutcome::ReworkFiled(ticket) => json!({
+                "branch": branch, "target": target, "merged": false,
+                "delivered": false, "status": "rework-filed", "ticket": ticket.id.to_string(),
+            }),
+            LandingOutcome::Escalated(need) => json!({
+                "branch": branch, "target": target, "merged": false,
+                "delivered": false, "status": "escalated", "need": need.id.to_string(),
+            }),
+            LandingOutcome::Reconciled(prior) => json!({
+                "branch": branch, "target": target, "merged": prior == "landed",
+                "delivered": prior == "landed", "status": prior,
+            }),
+            LandingOutcome::Quarantined(evidence) => {
+                json!({"status": "quarantined", "evidence": evidence.id.to_string(), "merged": false, "delivered": false})
+            }
+            LandingOutcome::Requeued { .. } => unreachable!(),
         }
     }
 
@@ -2158,7 +2289,79 @@ impl LandingPipeline {
             }),
         )
         .with_lifecycle(Lifecycle::Furniture);
-        self.space.out(tuple)
+        self.space.out(tuple)?;
+        self.notify_terminal(entry);
+        Ok(())
+    }
+
+    /// The exact work-key string [`Self::terminal_notify`] is keyed on —
+    /// distinct from [`Self::key_lock`]'s coarser `(repo, target)` key, since
+    /// a caller watching its own submission needs to be woken for THAT
+    /// branch/head, not for every candidate sharing its target.
+    fn entry_work_key(entry: &LandingQueueEntry) -> String {
+        format!(
+            "{}\0{}\0{}\0{}",
+            entry.repo_name, entry.branch, entry.head_sha, entry.target
+        )
+    }
+
+    /// Wake any [`Self::wait_for_terminal_outcome`] caller registered for
+    /// `entry`'s exact work key, then drop the registration — a fired
+    /// [`tokio::sync::Notify`] is one-shot evidence for one terminal
+    /// transition, never reused for a later resubmission of the same key.
+    /// Called from [`Self::mark_processed`] only: that is the sole point
+    /// every terminal outcome (bar `Reconciled`, whose marker already exists
+    /// from the run that actually wrote it — see `mark_processed`'s own
+    /// doc) durably lands.
+    fn notify_terminal(&self, entry: &LandingQueueEntry) {
+        let key = Self::entry_work_key(entry);
+        let notify = self
+            .terminal_notify
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Await `entry`'s own durable terminal outcome without ever taking
+    /// [`Self::key_lock`] — the fix for the wait a submitter used to owe an
+    /// exclusive per-`(repo,target)` drain lane even after its own candidate
+    /// had already landed (module doc, TKT-dobas-lujom-lipog): unrelated
+    /// later arrivals on the same key keep draining under that lock while
+    /// this caller only ever watches its own work key.
+    ///
+    /// The durable [`Self::processed_outcome`] marker is checked before AND
+    /// after registering for the wake hint, closing the race where
+    /// [`Self::mark_processed`] runs between the two — and the wait itself
+    /// is bounded by a short poll fallback rather than the bare notify, so a
+    /// missed or coalesced wakeup (map eviction, a restart) still settles
+    /// correctly instead of hanging: "a notification is a wake hint; durable
+    /// state remains authority."
+    async fn wait_for_terminal_outcome(&self, entry: &LandingQueueEntry) -> rk_core::Result<String> {
+        const POLL_FALLBACK: Duration = Duration::from_millis(200);
+        loop {
+            if let Some(outcome) = self.processed_outcome(entry)? {
+                return Ok(outcome);
+            }
+            let notify = {
+                let key = Self::entry_work_key(entry);
+                let mut map = self
+                    .terminal_notify
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                Arc::clone(
+                    map.entry(key)
+                        .or_insert_with(|| Arc::new(tokio::sync::Notify::new())),
+                )
+            };
+            let notified = notify.notified();
+            if let Some(outcome) = self.processed_outcome(entry)? {
+                return Ok(outcome);
+            }
+            let _ = tokio::time::timeout(POLL_FALLBACK, notified).await;
+        }
     }
 
     /// Process exactly one candidate for `(repo_name, target)`, or `None` if
@@ -14331,7 +14534,7 @@ checks: [
         let main_before = rev_parse(repo_dir.path(), "main");
 
         let space = Space::open_in_memory().unwrap();
-        let pipeline = test_pipeline(home.path(), space.clone());
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
 
         let result = pipeline
             .submit_manual(
@@ -14380,6 +14583,187 @@ checks: [
             "the replay must dedup, not write a second empty event"
         );
         assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+    }
+
+    /// TKT-dobas-lujom-lipog: `submit_manual` ("the original `rk land`
+    /// caller") must observe its OWN work key's terminal outcome and return
+    /// without waiting for an unrelated later candidate on the same
+    /// `(repo, target)` key to finish draining. Two same-key candidates are
+    /// pre-admitted (FIFO: `first` then `second`); the shared `verify` check
+    /// passes instantly on its first invocation but blocks the SECOND
+    /// invocation inside a barrier until released. Since admission stays
+    /// strictly single-consumer per key (`burst_of_completions_on_one_key_
+    /// never_runs_gates_concurrently`, unchanged by this fix), `first`'s
+    /// gate is necessarily the fast one and `second`'s is necessarily the
+    /// one that blocks — proving `submit_manual("first", ...)` returns
+    /// landed/closed/off-the-active-queue while `second` is still verifiably
+    /// mid-gate (its barrier "reached" marker exists, no release yet).
+    #[tokio::test]
+    async fn submit_manual_returns_its_own_outcome_without_waiting_for_a_later_same_key_candidate()
+    {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("second-reached");
+        let release = barrier_dir.path().join("release");
+        let count_file = barrier_dir.path().join("count");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'; if [ \"$n\" = \"1\" ]; then exit 0; fi; touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done", timeout: "30s"}},
+]
+"#,
+            count = count_file.display(),
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut heads = Vec::new();
+        for branch in ["first", "second"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("{branch}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(repo_dir.path(), &["commit", "-m", &format!("docs: {branch}")]);
+            heads.push(rev_parse(repo_dir.path(), branch));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+        let (first_head, second_head) = (heads[0].clone(), heads[1].clone());
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+
+        // Pre-admit BOTH candidates before draining a single one, oldest
+        // first — mirrors `burst_of_completions_on_one_key_never_runs_
+        // gates_concurrently`'s admission style, so FIFO order (not who
+        // happens to call `submit_manual`) decides which gate is the fast
+        // one and which one blocks.
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "first".into(),
+                target: "main".into(),
+                head_sha: first_head.clone(),
+                diff_class: "doc-only".into(),
+                task: "first-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "second".into(),
+                target: "main".into(),
+                head_sha: second_head.clone(),
+                diff_class: "doc-only".into(),
+                task: "second-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // The "original rk land caller": both candidates are already
+        // queued, so this hits `EnqueueDisposition::Pending` and proceeds
+        // straight to draining — the lock is free, so this call becomes the
+        // exclusive drainer, claims `first` (oldest), and must return the
+        // instant `first`'s own outcome is terminal.
+        let result = pipeline
+            .submit_manual(
+                repo_dir.path(),
+                "first",
+                "main",
+                false,
+                Some("first-task".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "landed", "result: {result}");
+        assert_eq!(result["merged"], true);
+        assert_eq!(result["delivered"], true);
+
+        // `first` is durably closed and off the active queue RIGHT NOW —
+        // not eventually, not after `second` also finishes.
+        let processed = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+            .unwrap();
+        assert!(
+            processed.iter().any(|t| t.payload.get("branch").and_then(Value::as_str)
+                == Some("first")
+                && t.payload.get("outcome").and_then(Value::as_str) == Some("landed")),
+            "first must have a durable landed marker: {processed:?}"
+        );
+        let queued = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap();
+        assert!(
+            queued
+                .iter()
+                .all(|t| t.payload.get("branch").and_then(Value::as_str) != Some("first")),
+            "first must be retired from the active queue: {queued:?}"
+        );
+
+        // `second` is provably STILL mid-gate at this exact moment: its
+        // barrier was reached but not yet released. If `submit_manual`
+        // above had instead waited on the old blocking `key_lock` (the
+        // bug), it could not have returned until AFTER this file existed
+        // and the barrier below was released — so finding it not-yet-
+        // released here, immediately after `first`'s prompt return, is the
+        // proof.
+        let mut second_reached = false;
+        for _ in 0..300 {
+            if reached.exists() {
+                second_reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(second_reached, "second's gate never started running");
+        assert!(
+            !space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+                .unwrap()
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("second")),
+            "second must not have a terminal outcome yet — it is still inside its gate"
+        );
+
+        // Release the barrier and let the handed-off background drain
+        // finish `second` too — nothing is lost or force-landed, it just
+        // wasn't on `first`'s caller's critical path.
+        std::fs::write(&release, b"go").unwrap();
+        let mut second_landed = false;
+        for _ in 0..300 {
+            let processed = space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+                .unwrap();
+            if processed.iter().any(|t| {
+                t.payload.get("branch").and_then(Value::as_str) == Some("second")
+                    && t.payload.get("outcome").and_then(Value::as_str) == Some("landed")
+            }) {
+                second_landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(second_landed, "second must eventually land via the handed-off background drain");
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "both candidates must be retired from the active queue once the drain completes"
+        );
     }
 
     /// An entry already sitting `Queued` — as it would after a restart, or
