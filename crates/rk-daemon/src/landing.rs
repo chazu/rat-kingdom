@@ -1930,6 +1930,18 @@ impl LandingPipeline {
     /// on a branch) stops this pass rather than looping forever; the next
     /// `run_cycle` poll retries the entry left in place, same as
     /// `process_next`'s documented restart-safety.
+    ///
+    /// Known, assessed residual gap (Munch-16 finding `01M2HTJ67JK3XCMX89KFQWG5A7`
+    /// on TKT-karut-jaraf-hivur, reviewed against this exact shape): this
+    /// bare `tokio::spawn` is not registered in `Server::run`'s
+    /// `background_tasks` `JoinSet`, so a graceful daemon stop does not
+    /// explicitly join it — it stops only because process exit tears the
+    /// runtime down, or (once TKT-karut-jaraf-hivur's `LandingPipeline`
+    /// shutdown field lands) because its own `process_entry` review waits
+    /// bail on that signal. No correctness risk on its own — restart-safety
+    /// already covers an aborted mid-`process_entry` state — but whoever
+    /// lands both branches together should decide whether this needs an
+    /// explicit `JoinSet` handle instead of accepting process-exit-abort.
     fn spawn_background_drain(
         self: &Arc<Self>,
         guard: tokio::sync::OwnedMutexGuard<()>,
