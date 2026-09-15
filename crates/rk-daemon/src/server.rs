@@ -13913,15 +13913,32 @@ const LANDING_BACKGROUND_DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// nothing here weakens that guarantee, it only makes the ordinary case
 /// deliberate instead of incidental.
 ///
-/// No separate recovery path is built here: a reviewer signalled this way
-/// exits without ever publishing a `Completed` event, which
-/// `Supervisor::handle_event`'s existing `Exited` arm already treats as an
-/// ordinary crash/kill (state -> `Failed`, `pid` cleared, managed
-/// verification for it cancelled). The landing pipeline's own review-death
-/// detection and bounded replacement dispatch — proven end to end by
-/// `bounded_daemon_stop_with_active_review.rs` — does not key off
-/// `state == "orphaned"`, so this reuses that existing recovery path exactly
-/// as it would for any other reviewer crash.
+/// TKT-ravig-kumob-timuh acceptance correction: a genuine same-generation
+/// recovery path IS built here, and it is exercised BEFORE any process is
+/// signalled — `Supervisor::orphan_for_owned_shutdown` transitions each
+/// owned reviewer's still-live record straight to `Orphaned` first, so
+/// `Supervisor::handle_event`'s `Exited` arm — which observes the exit this
+/// function is about to cause, since this daemon's own event-consumer task
+/// is still alive and listening — finds `state.is_live()` already false and
+/// never runs its crash arm (`state -> Failed`, `crashed = true`, a
+/// synthesized "process exited" result). The record instead carries exactly
+/// the disposition `on_daemon_started`'s `orphan_live_agents` sweep gives a
+/// rat whose process died while the daemon was down, so it resumes through
+/// that SAME already-tested contract: `respawn_sweep`'s self-healing tick
+/// (or `rk daemon rollover`'s own explicit `agent.respawn` reconciliation,
+/// which already treats a reviewer no differently from a rat once its
+/// record reads `Orphaned`) relaunches the identical `SpawnId`/review
+/// binding/branch/worktree, and `cost_usd`/`usage` — never reset by a
+/// respawn — keep accumulating on that one record. The review workflow's own
+/// `wait` step survives the gap for free: `abandoned()`
+/// (`workflow_exec.rs`) never treats a record still `Orphaned` (or `Failed`
+/// while respawn is enabled and not yet exhausted) as gone for good, so it
+/// stays parked on the SAME workflow instance polling for that generation's
+/// own `harness_result` rather than timing out. The landing pipeline's own
+/// review-death detection / bounded-replacement dispatch — proven end to end
+/// by `bounded_daemon_stop_with_active_review.rs` — is therefore never
+/// reached for a deliberately-stopped reviewer at all; it remains exactly as
+/// it was for a reviewer that genuinely crashes outside a shutdown.
 async fn shut_down_owned_reviewer_processes(supervisor: &crate::supervisor::Supervisor) {
     let owned = supervisor.live_reviewer_session_controls();
     if owned.is_empty() {
@@ -13931,6 +13948,9 @@ async fn shut_down_owned_reviewer_processes(supervisor: &crate::supervisor::Supe
         count = owned.len(),
         "signalling owned agent/check processes for graceful stop"
     );
+    for (name, _) in &owned {
+        supervisor.orphan_for_owned_shutdown(name);
+    }
     for (_, control) in &owned {
         let _ = control.kill().await;
     }
