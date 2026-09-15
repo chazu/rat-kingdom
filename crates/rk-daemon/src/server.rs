@@ -986,6 +986,8 @@ pub struct Daemon {
     /// checkpoints and idempotent ticket coalesce keys provide restart safety;
     /// this lock prevents concurrent operator retries racing those checkpoints.
     ticket_graph_apply_lock: tokio::sync::Mutex<()>,
+    /// Serialize the shared release staging worktree; also expose in-flight preparation to reads.
+    release_prepare_lock: tokio::sync::Mutex<()>,
     action_approvals: crate::action_approval::ActionApprovalStore,
     /// TKT-01M0E8PN9C41BWECGNW0990R3J: the durable orchestrator lease store
     /// (one lease per repo scope) an `attention.decide` orchestrator-authority
@@ -1523,6 +1525,7 @@ impl Daemon {
             onboarding_sessions,
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
             ticket_graph_apply_lock: tokio::sync::Mutex::new(()),
+            release_prepare_lock: tokio::sync::Mutex::new(()),
             action_approvals,
             orchestrator_lease,
             king,
@@ -3997,6 +4000,9 @@ impl Daemon {
                     ),
                 })
             }
+            "release.prepare" => reply(self.handle_release_prepare(req).await),
+            "release.list" => reply(self.handle_release_list(req)),
+            "release.show" => reply(self.handle_release_show(req)),
             "ticket.new" => reply(self.handle_ticket_new(req).await),
             "ticket.list" => reply(self.handle_ticket_list(req)),
             "ticket.get" => reply(self.handle_ticket_get(req)),
@@ -7915,6 +7921,155 @@ impl Daemon {
         match reg.get(&params.name) {
             Some(record) => Response::ok(req.id, json!({"repo": record})),
             None => Response::ok(req.id, json!({"repo": null})),
+        }
+    }
+
+    async fn handle_release_prepare(&self, req: Request) -> Response {
+        let params: ReleasePrepareParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let repo_path = {
+            let reg = match self.repos.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned")
+                }
+            };
+            match reg.get(&params.repo) {
+                Some(record) => record.path.clone(),
+                None => {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!("unknown repository: {}", params.repo),
+                    )
+                }
+            }
+        };
+        // Serialize staging access and expose preparation liveness to list/show.
+        let _guard = self.release_prepare_lock.lock().await;
+        // Freeze the mutable ref once under the lock for both proof lookup and building.
+        let (resolved_commit, tree_sha) = {
+            let repo_path = repo_path.clone();
+            let candidate = params.candidate.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::release::resolve_candidate(&repo_path, &candidate)
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+                Err(e) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("candidate resolution task failed: {e}"),
+                    )
+                }
+            }
+        };
+        // Look up existing exact-key proof only; a cache miss must never execute verification.
+        let check = {
+            let repo_path = repo_path.clone();
+            let resolved_commit = resolved_commit.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::release::load_named_check(&repo_path, &resolved_commit, "verify")
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let known_verification = check.and_then(|check| {
+            let proof = crate::managed_verification::ManagedVerification::new(
+                &self.layout,
+                &self.space,
+                self.supervisor.verification_resources(),
+                check.shared_cargo_target,
+            )
+            .lookup_verification_proof(&params.repo, &resolved_commit, &check)?;
+            // Retain the exact lookup key so consumers can independently trace the durable proof.
+            let key = crate::managed_verification::verification_proof_key(
+                &params.repo,
+                &resolved_commit,
+                &check,
+            );
+            // Include the check context with its proof reference.
+            Some(json!({
+                "check": {
+                    "name": check.name,
+                    "command": check.command,
+                    "toolchain": check.toolchain,
+                    "environment_policy": check.environment_policy.to_string(),
+                },
+                "resolved_commit": resolved_commit,
+                "key": key,
+                "proof": proof,
+            }))
+        });
+        match crate::release::prepare(
+            &self.layout,
+            crate::release::PrepareParams {
+                repo_name: params.repo,
+                repo_path,
+                requested: params.candidate,
+                resolved_commit,
+                tree_sha,
+                recipe: params.recipe,
+                known_verification,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => Response::ok(
+                req.id,
+                json!({
+                    "release": release_json(&outcome.entry, Some(&outcome.manifest), None),
+                    "already_prepared": outcome.already_prepared,
+                }),
+            ),
+            Err(e) => Response::err(req.id, codes::CONFLICT, e.to_string()),
+        }
+    }
+
+    fn handle_release_list(&self, req: Request) -> Response {
+        let params: ReleaseListParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let lock_is_free = self.release_prepare_lock.try_lock().is_ok();
+        match crate::release::list(&self.layout, params.repo.as_deref()) {
+            Ok(entries) => {
+                let releases: Vec<Value> = entries
+                    .iter()
+                    .map(|entry| release_json(entry, None, Some(lock_is_free)))
+                    .collect();
+                Response::ok(req.id, json!({"releases": releases}))
+            }
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_release_show(&self, req: Request) -> Response {
+        let params: ReleaseShowParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let lock_is_free = self.release_prepare_lock.try_lock().is_ok();
+        match crate::release::show(&self.layout, &params.id) {
+            Ok(Some(result)) => Response::ok(
+                req.id,
+                json!({
+                    "release": release_json(
+                        &result.entry,
+                        result.manifest.as_ref(),
+                        Some(lock_is_free),
+                    ),
+                    "content_verified": result.content_verified,
+                }),
+            ),
+            Ok(None) => Response::ok(req.id, json!({"release": null})),
+            Err(e) => Response::err(req.id, codes::CONFLICT, e.to_string()),
         }
     }
 
@@ -12688,6 +12843,59 @@ fn repo_remote_url(path: &std::path::Path, remote: &str) -> Option<String> {
 struct RepoAddParams {
     name: String,
     path: String,
+}
+
+#[derive(Deserialize)]
+struct ReleasePrepareParams {
+    repo: String,
+    candidate: String,
+    #[serde(default = "default_release_recipe")]
+    recipe: String,
+}
+
+fn default_release_recipe() -> String {
+    crate::release::RECIPE_PAIRED_RK_MCP.to_string()
+}
+
+#[derive(Deserialize)]
+struct ReleaseListParams {
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReleaseShowParams {
+    id: String,
+}
+
+/// Flatten a release's index entry (with its `Preparing`-staleness resolved
+/// against the release-prepare lock, when `lock_is_free` is given) and its
+/// manifest, when present, into one JSON object for the wire. `prepare`'s own
+/// response passes `None` for `lock_is_free` — it just ran to completion (or
+/// failed) synchronously in this same call, so there is no stale-liveness
+/// question to resolve.
+fn release_json(
+    entry: &crate::release::ReleaseIndexEntry,
+    manifest: Option<&crate::release::ReleaseManifest>,
+    lock_is_free: Option<bool>,
+) -> Value {
+    let status = match lock_is_free {
+        Some(free) => crate::release::effective_status(entry, free),
+        None => entry.status,
+    };
+    json!({
+        "id": entry.id,
+        "repo": entry.repo,
+        "recipe": entry.recipe,
+        "recipe_revision": entry.recipe_revision,
+        "requested_source": entry.requested_source,
+        "status": status,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+        "detail": entry.detail,
+        "manifest_digest": entry.manifest_digest,
+        "manifest": manifest,
+    })
 }
 
 #[derive(Deserialize)]
