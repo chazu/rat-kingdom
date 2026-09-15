@@ -14076,7 +14076,7 @@ mod native_observation_tests {
         let (_id, mut rx) = sup
             .verification
             .runs
-            .register("Nibble", Some(spawn), "req-1");
+            .register("Nibble", Some(spawn), "req-1", "repo", "verify");
 
         sup.handle_event(
             "Nibble",
