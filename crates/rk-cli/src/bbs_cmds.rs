@@ -116,6 +116,14 @@ pub enum BbsCommand {
         #[command(subcommand)]
         command: DiscoveryCommand,
     },
+    /// Inspect or change the opt-in `landing-need-retirement` setting for one
+    /// repo. Default is `off`: a landing Need is never touched unless this is
+    /// explicitly `on` for its repo. Wholly separate from `discovery` above —
+    /// toggling one has no effect on the other.
+    Retirement {
+        #[command(subcommand)]
+        command: RetirementCommand,
+    },
     /// Operator-only: assess a reuse receipt.
     Assess {
         /// The reuse receipt this assessment is about.
@@ -183,6 +191,29 @@ pub enum DiscoveryCommand {
     },
     /// Return a repo to the baseline ranking (the default and fallback).
     /// Operator-only.
+    Disable {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RetirementCommand {
+    /// Show the effective `landing-need-retirement` setting for a repo.
+    Show {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Turn on automatic retirement of landing Needs whose accepted delivery
+    /// proves the held incident head landed. Operator-only; the repo must
+    /// already be registered.
+    Enable {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Return a repo to `off` (the default): no landing Need is touched.
+    /// Retained Resolution trails and run telemetry from while it was on stay
+    /// readable. Operator-only.
     Disable {
         #[arg(long, env = "RK_REPO")]
         repo: String,
@@ -386,6 +417,33 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
                 discovery_set(&mut client, &repo, "off", as_json).await?;
             }
         },
+        BbsCommand::Retirement { command } => match command {
+            RetirementCommand::Show { repo } => {
+                let result = client
+                    .call("bbs.retirement.show", json!({"repo": repo}))
+                    .await?;
+                if as_json {
+                    println!("{result}");
+                } else {
+                    println!(
+                        "landing-need-retirement for {}: {} (revision {}{})",
+                        repo,
+                        result["mode"].as_str().unwrap_or("off"),
+                        result["revision"].as_u64().unwrap_or(0),
+                        result["updated_by"]
+                            .as_str()
+                            .map(|by| format!(", set by {by}"))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            RetirementCommand::Enable { repo } => {
+                retirement_set(&mut client, &repo, "on", as_json).await?;
+            }
+            RetirementCommand::Disable { repo } => {
+                retirement_set(&mut client, &repo, "off", as_json).await?;
+            }
+        },
         BbsCommand::Assess {
             receipt,
             verdict,
@@ -443,6 +501,24 @@ async fn discovery_set(client: &mut Client, repo: &str, mode: &str, as_json: boo
     } else {
         println!(
             "bbs-discovery-ranking for {}: now {} (revision {}); {}",
+            repo,
+            result["mode"].as_str().unwrap_or(mode),
+            result["revision"].as_u64().unwrap_or(0),
+            result["rollover_note"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+async fn retirement_set(client: &mut Client, repo: &str, mode: &str, as_json: bool) -> Result<()> {
+    let result = client
+        .call("bbs.retirement.set", json!({"repo": repo, "mode": mode}))
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "landing-need-retirement for {}: now {} (revision {}); {}",
             repo,
             result["mode"].as_str().unwrap_or(mode),
             result["revision"].as_u64().unwrap_or(0),

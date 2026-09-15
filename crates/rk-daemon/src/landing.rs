@@ -4603,6 +4603,14 @@ impl LandingPipeline {
             return Err(error);
         }
         info!(task = %entry.task, merge_commit, target = %entry.target, "recorded delivery");
+        // Automatic obsolete-Need retirement (TKT-lalap-zonop-lafoz):
+        // bounded to right after THIS accepted delivery is durable, never the
+        // hot spawn path. Best-effort — a failure here is logged and never
+        // turns this landed change into an unlanded one; the `bbs.brief` RPC
+        // (`Daemon::retire_resolved_landing_needs`, server.rs) independently
+        // retries the same idempotent pass on its own trigger, so this hook
+        // failing once is not the only chance to catch up.
+        self.retire_resolved_landing_needs_after_delivery(entry);
         if !is_ticket {
             return Ok(());
         }
@@ -4643,6 +4651,39 @@ impl LandingPipeline {
             );
         }
         Ok(())
+    }
+
+    /// Bounded, best-effort automatic reconciliation right after `entry`'s
+    /// delivery is durably recorded — see `crate::landing_need_resolution`'s
+    /// doc comment for why this hook, not the hot spawn path, is where
+    /// automatic retirement lives, and why it calls the shared
+    /// `run_retirement_pass` core directly rather than through
+    /// `spawn_blocking`: this queue-processing task already performs blocking
+    /// git operations inline (e.g. `advance_target`'s `prepare_merge`), so
+    /// one more is consistent with this file's existing style, not a new one.
+    fn retire_resolved_landing_needs_after_delivery(&self, entry: &LandingQueueEntry) {
+        let config =
+            crate::landing_need_resolution::resolve_for_repo(&self.layout, &entry.repo_name);
+        if !config.enabled {
+            return;
+        }
+        let git_repo = match rk_git::Repo::discover(Path::new(&entry.repo_path)) {
+            Ok(repo) => repo,
+            Err(error) => {
+                warn!(%error, repo = %entry.repo_name, "landing-need-retirement: could not open repo for post-landing reconciliation");
+                return;
+            }
+        };
+        if let Err(error) = crate::landing_need_resolution::run_retirement_pass(
+            &self.space,
+            &self.tickets,
+            &entry.repo_name,
+            &git_repo,
+            "daemon",
+            &config,
+        ) {
+            warn!(%error, repo = %entry.repo_name, "landing-need-retirement: post-landing reconciliation pass failed");
+        }
     }
 
     /// Visibility for a retryable post-merge bookkeeping failure. The queue

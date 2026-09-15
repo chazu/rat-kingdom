@@ -3339,13 +3339,24 @@ impl Daemon {
                 )
             }
             "bbs.brief" => {
-                let result =
-                    parse_params::<crate::bbs::BriefParams>(&req.params).and_then(|params| {
+                let result = match parse_params::<crate::bbs::BriefParams>(&req.params) {
+                    Ok(params) => {
+                        // Reconcile before reading: an ordinary `bbs.brief`
+                        // read is this feature's trigger point (its config is
+                        // resolved fresh, and this call is a no-op instantly
+                        // when the repo's `landing-need-retirement` flag is
+                        // off). A reconciliation failure never fails the
+                        // read itself.
+                        if let Err(error) = self.retire_resolved_landing_needs(&params.repo).await {
+                            warn!(%error, repo = %params.repo, "landing-need-retirement: reconciliation pass failed; brief unaffected");
+                        }
                         let discovery =
                             crate::bbs_discovery::resolve_for_brief(&self.layout, &params.repo);
                         crate::bbs::brief(&self.space, &self.tickets, &params, discovery)
                             .map_err(|e| e.to_string())
-                    });
+                    }
+                    Err(error) => Err(error),
+                };
                 reply(match result {
                     Ok(mut briefing) => {
                         // The selection is captured only AFTER it was computed
@@ -3385,6 +3396,35 @@ impl Daemon {
                             .map_err(|e| e.to_string())
                     },
                 );
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.retirement.show" => {
+                let result =
+                    parse_params::<crate::landing_need_resolution::ShowParams>(&req.params)
+                        .and_then(|params| {
+                            crate::landing_need_resolution::show(&self.layout, &params)
+                                .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.retirement.set" => {
+                let result = parse_params::<crate::landing_need_resolution::SetParams>(&req.params)
+                    .and_then(|params| {
+                        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                        crate::landing_need_resolution::set(
+                            &self.layout,
+                            &repos,
+                            &req.caller,
+                            &params,
+                        )
+                        .map_err(|e| e.to_string())
+                    });
                 reply(match result {
                     Ok(value) => Response::ok(id, value),
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
@@ -4808,6 +4848,56 @@ impl Daemon {
         })
         .await
         .map_err(|e| rk_core::Error::other(format!("git ancestry check panicked: {e}")))
+    }
+
+    /// Defensive second trigger for the shared `run_retirement_pass` core —
+    /// see `crate::landing_need_resolution`'s module doc for the full
+    /// two-trigger design (the primary one is the automatic post-landing
+    /// hook in `landing.rs`, right after an accepted delivery is durably
+    /// recorded). This one fires on every `bbs.brief` RPC for `repo` and
+    /// catches what the post-landing hook could not: a Need whose delivery
+    /// already landed before the flag was ever turned on, or whose own
+    /// post-landing pass failed. Gated by the same repo-scoped
+    /// `landing-need-retirement` flag (default off, independent of the
+    /// unrelated BBS discovery-ranking flag); returns a zeroed outcome
+    /// instantly when the flag is off or the repo is unconfigured. A
+    /// reconciliation failure here never fails the `bbs.brief` read itself.
+    async fn retire_resolved_landing_needs(
+        &self,
+        repo: &str,
+    ) -> rk_core::Result<crate::landing_need_resolution::RetirementOutcome> {
+        let config = crate::landing_need_resolution::resolve_for_repo(&self.layout, repo);
+        if !config.enabled {
+            return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+        }
+        let path = {
+            let reg = self
+                .repos
+                .lock()
+                .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+            reg.get(repo).map(|r| r.path.clone())
+        };
+        let Some(path) = path else {
+            return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+        };
+        let space = self.space.clone();
+        let tickets = Arc::clone(&self.tickets);
+        let repo = repo.to_string();
+        // A blocking git subprocess call must not stall the async dispatch
+        // loop other connections share — `spawn_blocking` is this RPC path's
+        // half of the split; the post-landing hook in `landing.rs` calls
+        // `run_retirement_pass` directly instead, consistent with that file's
+        // existing inline blocking git calls.
+        tokio::task::spawn_blocking(move || {
+            let Ok(git_repo) = rk_git::Repo::discover(&path) else {
+                return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+            };
+            crate::landing_need_resolution::run_retirement_pass(
+                &space, &tickets, &repo, &git_repo, "daemon", &config,
+            )
+        })
+        .await
+        .map_err(|e| rk_core::Error::other(format!("landing-need-retirement pass panicked: {e}")))?
     }
 
     async fn handle_inbox(&self, req: Request) -> Response {
