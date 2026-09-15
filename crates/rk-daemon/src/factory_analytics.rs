@@ -42,6 +42,16 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// `OutcomeFact`/scorecard pipeline every other metric here goes through).
 pub const NATIVE_DELIVERY_SCHEMA_VERSION: u32 = 1;
 
+/// Wire schema version of the additive `native_recorded_cost` section —
+/// versioned independently of [`SCHEMA_VERSION`] and
+/// [`NATIVE_DELIVERY_SCHEMA_VERSION`] because it joins two more producers
+/// neither of those read: `AgentRecord.cost_usd` (already loaded into
+/// `AnalyticsInputs::agents`) and the rework/conflict resubmission markers
+/// `landing.rs` writes when a landed correction requeues its original parent
+/// (`landing::REWORK_RESUBMISSION_IDENTITY` /
+/// `landing::CONFLICT_RESUBMISSION_IDENTITY`).
+pub const NATIVE_RECORDED_COST_SCHEMA_VERSION: u32 = 1;
+
 /// The exact `outcome` strings [`crate::landing::LandingPipeline::mark_processed`]
 /// writes into a `landing_processed` marker's payload, other than `"landed"`
 /// (handled separately as delivery). Any other value is malformed/unrecognized,
@@ -129,6 +139,7 @@ pub struct AnalyticsInputs {
     pub runtime_unavailable: Vec<OutcomeEvidenceKind>,
     pub read_warnings: Vec<String>,
     pub native_delivery: NativeDeliveryInputs,
+    pub native_correction_links: NativeCorrectionLinkInputs,
 }
 
 /// Bounded raw read of `landing_processed` markers plus the exact facts about
@@ -157,7 +168,23 @@ pub struct NativeDeliveryInputs {
     pub read_warning: Option<String>,
 }
 
-#[cfg(test)]
+/// Bounded raw read of `landing_rework_resubmission` /
+/// `landing_conflict_rework_resubmission` markers — the authoritative link
+/// from a filed correction ticket back to the original task it corrected
+/// (`landing::LandingPipeline`'s doc on those identities). Same truncation/
+/// failure bookkeeping as [`NativeDeliveryInputs`] and for the same reason:
+/// a bare `Vec<Tuple>` cannot say whether this bounded query is a complete
+/// view of the linkage or a partial page.
+#[derive(Default)]
+pub struct NativeCorrectionLinkInputs {
+    pub events: Vec<Tuple>,
+    pub scanned: usize,
+    pub limit: usize,
+    pub truncated: bool,
+    pub available: bool,
+    pub read_warning: Option<String>,
+}
+
 /// Convert decimal USD to integer micro-USD with round-half-away-from-zero.
 /// Non-finite or negative costs yield `None` (cost unavailable for that run).
 fn usd_to_micro(usd: f64) -> Option<u64> {
@@ -1045,6 +1072,450 @@ fn native_delivery_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsReque
     })
 }
 
+/// `tuple` really is a native rework/conflict resubmission marker written by
+/// [`crate::landing::LandingPipeline`], not merely a record with matching
+/// field names — mirrors [`is_native_landing_processed_marker`]'s defensive
+/// re-check for the same reason. `instance == "daemon"` is, again, the one
+/// check the storage-side pattern cannot express.
+fn is_native_resubmission_marker(tuple: &Tuple) -> bool {
+    tuple.category == rk_core::tuple::Category::Event
+        && (tuple.identity == crate::landing::REWORK_RESUBMISSION_IDENTITY
+            || tuple.identity == crate::landing::CONFLICT_RESUBMISSION_IDENTITY)
+        && tuple.instance == "daemon"
+}
+
+/// One resubmission marker's link from a filed correction ticket back to the
+/// original task it corrected. Deliberately task-only (not branch/head_sha
+/// scoped): the marker's own `head_sha` is the original parent's
+/// re-resolved current tip at resubmission time
+/// (`landing.rs`'s `repo.rev_parse(original_branch)`), not necessarily the
+/// exact head the correction's own delivery landed against, so joining on it
+/// would be guessing an equivalence the producer never asserts.
+struct NativeCorrectionLink {
+    rework_ticket: String,
+    original_task: String,
+}
+
+fn parse_native_correction_link(tuple: &Tuple) -> Option<NativeCorrectionLink> {
+    if !is_native_resubmission_marker(tuple) {
+        return None;
+    }
+    let get = |field: &str| -> Option<String> {
+        tuple
+            .payload
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    Some(NativeCorrectionLink {
+        rework_ticket: get("rework_ticket")?,
+        original_task: get("task")?,
+    })
+}
+
+/// Recomputes, from the same bounded `landing_processed` markers
+/// [`native_delivery_section`] reads, the set of distinct delivered work
+/// keys attributed to each task. Deliberately NOT extracted out of
+/// [`native_delivery_section`] itself — that function's tested JSON shape
+/// must stay unchanged — this reruns the identical pure reduction
+/// ([`parse_native_delivery_record`], [`reduce_native_delivery_group`]) for
+/// the recorded-cost join. A key whose disposition is not a clean
+/// `Delivered { task: Some(_) }` (conflicting, ad hoc with no task, or no
+/// delivery observed) contributes nothing here: cost is joined by task
+/// identity, so an edge with no task or a contradictory one has nothing to
+/// join it to.
+fn delivered_task_work_keys(
+    inputs: &AnalyticsInputs,
+) -> BTreeMap<String, BTreeSet<NativeDeliveryWorkKey>> {
+    let mut groups: BTreeMap<NativeDeliveryWorkKey, Vec<NativeDeliveryOutcomeRecord>> =
+        BTreeMap::new();
+    for tuple in &inputs.native_delivery.events {
+        if let Some(record) = parse_native_delivery_record(tuple) {
+            groups
+                .entry((record.branch, record.head_sha, record.target))
+                .or_default()
+                .push((record.outcome, record.task, record.target_head));
+        }
+    }
+    let mut by_task: BTreeMap<String, BTreeSet<NativeDeliveryWorkKey>> = BTreeMap::new();
+    for (key, records) in &groups {
+        if let NativeDeliveryDisposition::Delivered { task: Some(task) } =
+            reduce_native_delivery_group(records)
+        {
+            by_task
+                .entry(task.to_owned())
+                .or_default()
+                .insert(key.clone());
+        }
+    }
+    by_task
+}
+
+/// One cost bucket (implementation, review, or correction) contributing to a
+/// task's recorded cost. `cost_usd_micro` is `None` as soon as any
+/// contributing generation's cost is malformed (nonfinite/negative) or the
+/// running sum would overflow `u64` — never a partial or best-effort total.
+struct NativeCostBucket {
+    generation_count: u64,
+    generation_ids: Vec<String>,
+    cost_usd_micro: Option<u64>,
+    malformed_cost_generation_ids: Vec<String>,
+    excluded_archived_generations: u64,
+}
+
+impl NativeCostBucket {
+    fn empty() -> Self {
+        NativeCostBucket {
+            generation_count: 0,
+            generation_ids: Vec::new(),
+            cost_usd_micro: Some(0),
+            malformed_cost_generation_ids: Vec::new(),
+            excluded_archived_generations: 0,
+        }
+    }
+
+    /// `cost` is `None` for a malformed value; `archived_excluded` is `true`
+    /// when this generation is archived and the request did not opt into
+    /// `include_archived` — such a generation is counted (it is not hidden
+    /// from `generation_count`/`generation_ids`) but contributes nothing to
+    /// the cost sum, and its exclusion is surfaced via
+    /// `excluded_archived_generations` rather than silently shrinking the
+    /// total.
+    fn add(&mut self, run_id: String, cost: Option<u64>, archived_excluded: bool) {
+        self.generation_count += 1;
+        self.generation_ids.push(run_id.clone());
+        if archived_excluded {
+            self.excluded_archived_generations += 1;
+            return;
+        }
+        self.cost_usd_micro = match (self.cost_usd_micro, cost) {
+            (Some(total), Some(c)) => total.checked_add(c),
+            _ => None,
+        };
+        if cost.is_none() {
+            self.malformed_cost_generation_ids.push(run_id);
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        // Sorted at emit time, not accumulation time: `generation_ids`/
+        // `malformed_cost_generation_ids` are built by iterating
+        // `AnalyticsInputs::agents` in whatever order the caller supplied
+        // it, and this section's whole point is that its output does not
+        // depend on that order (module doc on `native_delivery_section`
+        // applies here too).
+        let mut generation_ids = self.generation_ids.clone();
+        generation_ids.sort();
+        let mut malformed_cost_generation_ids = self.malformed_cost_generation_ids.clone();
+        malformed_cost_generation_ids.sort();
+        json!({
+            "generation_count": self.generation_count,
+            "generation_ids": generation_ids,
+            "cost_usd_micro": match self.cost_usd_micro {
+                Some(v) => json!(v),
+                None => Value::Null,
+            },
+            "malformed_cost_generation_ids": malformed_cost_generation_ids,
+            "excluded_archived_generations": self.excluded_archived_generations,
+        })
+    }
+}
+
+/// Reduce settled agent generations into the additive `native_recorded_cost`
+/// section: per delivered task, the recorded (not settled-bill) ledger cost
+/// of its implementation, review, and any authoritatively linked correction
+/// generations, plus an `unattributed` bucket so a settled generation's cost
+/// never simply disappears because its task was not (yet, or ever) observed
+/// delivered in this bounded coverage.
+///
+/// Reports what `AgentRecord.cost_usd` says NOW for generations linked to a
+/// task the bounded `native_delivery` coverage shows delivered. This is not
+/// a provider invoice, does not reconstruct a missing pricing snapshot (see
+/// `normalize_inputs`'s doc on why cost is left out of the `OutcomeFact`
+/// pipeline entirely), and a `Completed`/`Stopped` state is not treated as
+/// proof a generation's usage has been finally reconciled. Every
+/// contributing generation is counted exactly once, keyed on its stable
+/// generation id (`AgentRecord::spawn_id`) — a same-generation respawn's
+/// `cost_usd` is already the current cumulative value, never summed across
+/// attempts or historical high-water samples.
+///
+/// Two joins, both authoritative (never title/body prose):
+///   - implementation/review: `AgentRecord.task` (settled, non-reviewer
+///     generations) and `AgentRecord.review.task` (reviewer generations —
+///     `ReviewContext.task` is set from the reviewed candidate's own task at
+///     dispatch, `landing.rs`'s `run_review_owned_with_id` call sites).
+///   - correction: `landing::REWORK_RESUBMISSION_IDENTITY` /
+///     `CONFLICT_RESUBMISSION_IDENTITY` markers linking a filed correction
+///     ticket back to the original task it corrected
+///     ([`parse_native_correction_link`]). A rework ticket id linked to more
+///     than one distinct original task is ambiguous and excluded from every
+///     task's correction bucket rather than guessed.
+fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsRequest) -> Value {
+    let available = inputs.native_delivery.available && inputs.native_correction_links.available;
+
+    let by_task = if inputs.native_delivery.available {
+        delivered_task_work_keys(inputs)
+    } else {
+        BTreeMap::new()
+    };
+
+    let mut rework_ticket_to_tasks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut correction_links_by_task: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut malformed_link_ids: Vec<String> = Vec::new();
+    if inputs.native_correction_links.available {
+        for tuple in &inputs.native_correction_links.events {
+            match parse_native_correction_link(tuple) {
+                Some(link) => {
+                    rework_ticket_to_tasks
+                        .entry(link.rework_ticket.clone())
+                        .or_default()
+                        .insert(link.original_task.clone());
+                    correction_links_by_task
+                        .entry(link.original_task)
+                        .or_default()
+                        .insert(link.rework_ticket);
+                }
+                None => malformed_link_ids.push(tuple.id.to_string()),
+            }
+        }
+    }
+    malformed_link_ids.sort();
+    // A rework ticket authoritatively linked to more than one distinct
+    // original task cannot be attributed without guessing which one it
+    // actually corrected — excluded from every task's correction bucket,
+    // named here instead.
+    let ambiguous_rework_tickets: BTreeSet<String> = rework_ticket_to_tasks
+        .iter()
+        .filter(|(_, tasks)| tasks.len() > 1)
+        .map(|(ticket, _)| ticket.clone())
+        .collect();
+
+    let cost_of = |agent: &AgentRecord| -> Option<u64> { usd_to_micro(agent.cost_usd) };
+    let run_id_of = |agent: &AgentRecord| -> String { format!("{}:{}", agent.name, agent.spawn_id()) };
+    let archived_excluded = |agent: &AgentRecord| -> bool {
+        agent.archived_at.is_some() && !req.include_archived
+    };
+
+    let mut tasks_json: Vec<Value> = Vec::new();
+    let mut totals_generations: u64 = 0;
+    let mut totals_cost: Option<u64> = Some(0);
+    let mut linked_tasks: BTreeSet<&String> = BTreeSet::new();
+    let mut linked_correction_tickets: BTreeSet<String> = BTreeSet::new();
+
+    if available {
+        for (task, work_keys) in &by_task {
+            linked_tasks.insert(task);
+            let confirmed_correction_tickets: BTreeSet<String> = correction_links_by_task
+                .get(task)
+                .into_iter()
+                .flatten()
+                .filter(|ticket| !ambiguous_rework_tickets.contains(*ticket))
+                .cloned()
+                .collect();
+            linked_correction_tickets.extend(confirmed_correction_tickets.iter().cloned());
+
+            let mut implementation = NativeCostBucket::empty();
+            let mut review = NativeCostBucket::empty();
+            let mut correction = NativeCostBucket::empty();
+
+            for agent in &inputs.agents {
+                if !is_settled(agent.state) {
+                    continue;
+                }
+                let run_id = run_id_of(agent);
+                let cost = cost_of(agent);
+                let excluded = archived_excluded(agent);
+                match &agent.review {
+                    Some(rc) if rc.task == *task => review.add(run_id, cost, excluded),
+                    Some(rc) if confirmed_correction_tickets.contains(&rc.task) => {
+                        correction.add(run_id, cost, excluded)
+                    }
+                    Some(_) => {}
+                    None => match &agent.task {
+                        Some(t) if t == task => implementation.add(run_id, cost, excluded),
+                        Some(t) if confirmed_correction_tickets.contains(t) => {
+                            correction.add(run_id, cost, excluded)
+                        }
+                        _ => {}
+                    },
+                }
+            }
+
+            let total_cost = [&implementation, &review, &correction].iter().try_fold(
+                0u64,
+                |acc, bucket| match bucket.cost_usd_micro {
+                    Some(c) => acc.checked_add(c),
+                    None => None,
+                },
+            );
+            let excluded_archived_total = implementation.excluded_archived_generations
+                + review.excluded_archived_generations
+                + correction.excluded_archived_generations;
+            let malformed_total = implementation.malformed_cost_generation_ids.len()
+                + review.malformed_cost_generation_ids.len()
+                + correction.malformed_cost_generation_ids.len();
+            let generation_count =
+                implementation.generation_count + review.generation_count + correction.generation_count;
+
+            let mut task_warnings: Vec<String> = Vec::new();
+            if excluded_archived_total > 0 {
+                task_warnings.push(format!(
+                    "excluded_archived_generations: {excluded_archived_total} archived generation(s) excluded from recorded cost because include_archived=false; this total is not a complete lifetime cost"
+                ));
+            }
+            if malformed_total > 0 {
+                task_warnings.push(format!(
+                    "malformed_cost_generations: {malformed_total} generation(s) had a nonfinite/negative recorded cost and were excluded from the sum"
+                ));
+            }
+
+            totals_generations += generation_count;
+            totals_cost = match (totals_cost, total_cost) {
+                (Some(t), Some(c)) => t.checked_add(c),
+                _ => None,
+            };
+
+            tasks_json.push(json!({
+                "task": task,
+                "delivered_work_keys": work_keys
+                    .iter()
+                    .map(|(branch, head_sha, target)| json!({
+                        "branch": branch,
+                        "head_sha": head_sha,
+                        "target": target,
+                    }))
+                    .collect::<Vec<_>>(),
+                "implementation": implementation.to_json(),
+                "review": review.to_json(),
+                "correction": correction.to_json(),
+                "linked_correction_tickets": confirmed_correction_tickets,
+                "recorded_cost_usd_micro": match total_cost {
+                    Some(v) => json!(v),
+                    None => Value::Null,
+                },
+                "coverage_complete": excluded_archived_total == 0 && malformed_total == 0,
+                "warnings": task_warnings,
+            }));
+        }
+    }
+
+    // Every settled generation not linked to a delivered task above still
+    // has a recorded cost; it must be visible here, not dropped because its
+    // task was never (or not yet, within this bounded coverage) observed
+    // delivered.
+    let mut unattributed = NativeCostBucket::empty();
+    if available {
+        for agent in &inputs.agents {
+            if !is_settled(agent.state) {
+                continue;
+            }
+            let linked = match &agent.review {
+                Some(rc) => linked_tasks.contains(&rc.task) || linked_correction_tickets.contains(&rc.task),
+                None => agent.task.as_ref().is_some_and(|t| {
+                    linked_tasks.contains(t) || linked_correction_tickets.contains(t)
+                }),
+            };
+            if linked {
+                continue;
+            }
+            unattributed.add(run_id_of(agent), cost_of(agent), archived_excluded(agent));
+        }
+    }
+
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(warning) = &inputs.native_delivery.read_warning {
+        warnings.push(warning.clone());
+    }
+    if let Some(warning) = &inputs.native_correction_links.read_warning {
+        warnings.push(warning.clone());
+    }
+    if inputs.native_delivery.truncated {
+        warnings.push(format!(
+            "native_recorded_cost_delivery_coverage_truncated: the underlying native_delivery read capped at {} landing_processed markers; a task delivered only by an older marker beyond this bound will not appear here",
+            inputs.native_delivery.limit
+        ));
+    }
+    if inputs.native_correction_links.truncated {
+        warnings.push(format!(
+            "native_recorded_cost_correction_link_coverage_truncated: read capped at {} resubmission markers; an older correction link beyond this bound will not be reflected in any task's correction bucket",
+            inputs.native_correction_links.limit
+        ));
+    }
+    if req.since.is_some() || req.until.is_some() {
+        warnings.push(
+            "native_recorded_cost_window_may_exclude_delivery: a requested since/until window can \
+             exclude the landing_processed marker that attributes a task as delivered, so that \
+             task's recorded cost would not appear here even though generations for it exist and \
+             are counted in `unattributed`"
+                .to_string(),
+        );
+    }
+    if !malformed_link_ids.is_empty() {
+        warnings.push(format!(
+            "malformed_correction_link_markers: {} resubmission marker(s) were missing required fields and excluded from linkage",
+            malformed_link_ids.len()
+        ));
+    }
+    if !ambiguous_rework_tickets.is_empty() {
+        warnings.push(format!(
+            "ambiguous_correction_tickets: {} correction ticket id(s) authoritatively linked to more than one original task were excluded from every task's correction cost",
+            ambiguous_rework_tickets.len()
+        ));
+    }
+
+    json!({
+        "schema_version": NATIVE_RECORDED_COST_SCHEMA_VERSION,
+        "sources": [
+            "agent_record.cost_usd",
+            "landing_processed",
+            "landing_rework_resubmission",
+            "landing_conflict_rework_resubmission",
+        ],
+        "semantics": "Recorded ledger cost observed now (AgentRecord.cost_usd at read time) for \
+            generations authoritatively linked to a task the bounded native_delivery coverage \
+            shows delivered. Not a settled provider bill, not a reconstructed price, and a \
+            Completed/Stopped generation state is not proof its usage has been finally \
+            reconciled.",
+        "unit": "usd_micro (1e-6 USD, round-half-away-from-zero; null means unavailable/malformed, never a false-healthy zero)",
+        "available": available,
+        "requested_window": {"since": req.since, "until": req.until},
+        "include_archived": req.include_archived,
+        "coverage": {
+            "delivery": {
+                "available": inputs.native_delivery.available,
+                "scanned": inputs.native_delivery.scanned,
+                "limit": inputs.native_delivery.limit,
+                "truncated": inputs.native_delivery.truncated,
+            },
+            "correction_links": {
+                "available": inputs.native_correction_links.available,
+                "scanned": inputs.native_correction_links.scanned,
+                "limit": inputs.native_correction_links.limit,
+                "truncated": inputs.native_correction_links.truncated,
+                "malformed_source_ids": malformed_link_ids,
+            },
+        },
+        "ambiguous_correction_tickets": ambiguous_rework_tickets,
+        "tasks": tasks_json,
+        "unattributed": if available { unattributed.to_json() } else { Value::Null },
+        "totals": {
+            "tasks_with_recorded_cost": tasks_json.len(),
+            "contributing_generations": if available { json!(totals_generations) } else { Value::Null },
+            "recorded_cost_usd_micro": if available {
+                match totals_cost {
+                    Some(v) => json!(v),
+                    None => Value::Null,
+                }
+            } else {
+                Value::Null
+            },
+        },
+        "warnings": warnings,
+    })
+}
+
 /// Build the read-only `factory.scorecards` response envelope.
 pub fn scorecards_response(
     inputs: &AnalyticsInputs,
@@ -1064,6 +1535,7 @@ pub fn scorecards_response(
         "availability": availability,
         "scorecards": rows,
         "native_delivery": native_delivery_section(inputs, req),
+        "native_recorded_cost": native_recorded_cost_section(inputs, req),
         "warnings": warnings,
     })
 }
@@ -1235,6 +1707,10 @@ mod tests {
                 available: true,
                 ..Default::default()
             },
+            native_correction_links: NativeCorrectionLinkInputs {
+                available: true,
+                ..Default::default()
+            },
         }
     }
 
@@ -1381,6 +1857,11 @@ mod tests {
         let mut reordered = first.reviewer_verdicts.clone();
         reordered.reverse();
         let mut second_inputs = inputs();
+        // Same agent generations (and thus the same random `SpawnId`s the
+        // native_recorded_cost join keys on) as `first` — this test varies
+        // only the order of `revert_facts`/`reviewer_verdicts`, not agent
+        // identity.
+        second_inputs.agents = first.agents.clone();
         second_inputs.revert_facts = second;
         second_inputs.reviewer_verdicts = reordered;
 
@@ -1537,6 +2018,10 @@ mod tests {
     fn deterministic_across_input_order() {
         let a = inputs();
         let mut b = inputs();
+        // Same agent generations as `a` (and thus the same random
+        // `SpawnId`s), reversed — this test asserts the output is
+        // insensitive to input order, not to agent identity itself.
+        b.agents = a.agents.clone();
         b.agents.reverse();
         let req = FactoryAnalyticsRequest::default();
         let at = Utc.timestamp_opt(2_000, 0).unwrap();
@@ -2202,5 +2687,338 @@ mod tests {
             at,
         );
         assert_eq!(a["native_delivery"], b["native_delivery"]);
+    }
+
+    // -- native_recorded_cost (agent cost_usd joined to native_delivery) --
+
+    fn implementer(name: &str, task: &str, cost: f64) -> AgentRecord {
+        let mut a = agent(name, "claude", Some("sonnet"), None);
+        a.task = Some(task.into());
+        a.branch = Some("feature".into());
+        a.cost_usd = cost;
+        a
+    }
+
+    fn reviewer_agent(
+        name: &str,
+        task: &str,
+        branch: &str,
+        head_sha: &str,
+        target: &str,
+        cost: f64,
+    ) -> AgentRecord {
+        let mut a = agent(name, "claude", Some("sonnet"), None);
+        a.review = Some(rk_core::review::ReviewContext {
+            branch: branch.into(),
+            head_sha: head_sha.into(),
+            target: target.into(),
+            task: task.into(),
+            attempt: "attempt-1".into(),
+        });
+        a.cost_usd = cost;
+        a
+    }
+
+    fn resubmission_event(rework_ticket: &str, original_task: &str, at_secs: i64) -> Tuple {
+        let mut tuple = Tuple::new(
+            rk_core::tuple::Category::Event,
+            "rat-kingdom",
+            crate::landing::REWORK_RESUBMISSION_IDENTITY,
+            "daemon",
+            json!({
+                "dispatch_key": "dk-1",
+                "rework_ticket": rework_ticket,
+                "rework_branch": "rework-branch",
+                "branch": "feature",
+                "target": "main",
+                "task": original_task,
+                "head_sha": "resolved-sha",
+                "seq": 1,
+                "state": "queued",
+            }),
+        );
+        tuple.created_at = Utc.timestamp_opt(at_secs, 0).unwrap();
+        tuple
+    }
+
+    fn cost_inputs(
+        agents: Vec<AgentRecord>,
+        delivery_events: Vec<Tuple>,
+        correction_events: Vec<Tuple>,
+    ) -> AnalyticsInputs {
+        let mut base = inputs();
+        base.agents = agents;
+        base.native_delivery = NativeDeliveryInputs {
+            events: delivery_events,
+            available: true,
+            ..Default::default()
+        };
+        base.native_correction_links = NativeCorrectionLinkInputs {
+            events: correction_events,
+            available: true,
+            ..Default::default()
+        };
+        base
+    }
+
+    #[test]
+    fn native_recorded_cost_joins_implementation_and_review_by_task() {
+        let delivery = vec![landing_processed_event(
+            "feature",
+            "sha1",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-1"),
+            1_000,
+        )];
+        let agents = vec![
+            implementer("rat-impl", "TKT-1", 0.10),
+            reviewer_agent("rat-rev", "TKT-1", "feature", "sha1", "main", 0.05),
+        ];
+        let resp = scorecards_response(
+            &cost_inputs(agents, delivery, Vec::new()),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nrc = &resp["native_recorded_cost"];
+        assert_eq!(nrc["available"], json!(true));
+        let tasks = nrc["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert_eq!(task["task"], json!("TKT-1"));
+        assert_eq!(task["implementation"]["cost_usd_micro"], json!(100_000));
+        assert_eq!(task["review"]["cost_usd_micro"], json!(50_000));
+        assert_eq!(task["recorded_cost_usd_micro"], json!(150_000));
+        assert_eq!(task["coverage_complete"], json!(true));
+    }
+
+    #[test]
+    fn native_recorded_cost_includes_an_authoritatively_linked_correction_generation() {
+        let delivery = vec![landing_processed_event(
+            "feature",
+            "sha1",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-1"),
+            1_000,
+        )];
+        let correction_links = vec![resubmission_event("TKT-2", "TKT-1", 1_100)];
+        let agents = vec![
+            implementer("rat-impl", "TKT-1", 0.10),
+            implementer("rat-fix", "TKT-2", 0.20),
+        ];
+        let resp = scorecards_response(
+            &cost_inputs(agents, delivery, correction_links),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let task = &resp["native_recorded_cost"]["tasks"][0];
+        assert_eq!(task["correction"]["cost_usd_micro"], json!(200_000));
+        assert_eq!(task["linked_correction_tickets"], json!(["TKT-2"]));
+        assert_eq!(task["recorded_cost_usd_micro"], json!(300_000));
+    }
+
+    #[test]
+    fn native_recorded_cost_excludes_archived_generation_unless_requested() {
+        let delivery = vec![landing_processed_event(
+            "feature",
+            "sha1",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-1"),
+            1_000,
+        )];
+        let mut archived_impl = implementer("rat-old", "TKT-1", 0.30);
+        archived_impl.archived_at = Some(Utc.timestamp_opt(900, 0).unwrap());
+        let agents = vec![implementer("rat-impl", "TKT-1", 0.10), archived_impl];
+
+        let resp = scorecards_response(
+            &cost_inputs(agents.clone(), delivery.clone(), Vec::new()),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let task = &resp["native_recorded_cost"]["tasks"][0];
+        assert_eq!(task["implementation"]["cost_usd_micro"], json!(100_000));
+        assert_eq!(
+            task["implementation"]["excluded_archived_generations"],
+            json!(1)
+        );
+        assert_eq!(task["coverage_complete"], json!(false));
+
+        let req = FactoryAnalyticsRequest {
+            include_archived: true,
+            ..Default::default()
+        };
+        let resp2 = scorecards_response(
+            &cost_inputs(agents, delivery, Vec::new()),
+            &req,
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let task2 = &resp2["native_recorded_cost"]["tasks"][0];
+        assert_eq!(task2["implementation"]["cost_usd_micro"], json!(400_000));
+        assert_eq!(
+            task2["implementation"]["excluded_archived_generations"],
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn native_recorded_cost_rejects_nonfinite_or_negative_cost_explicitly() {
+        let delivery = vec![landing_processed_event(
+            "feature",
+            "sha1",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-1"),
+            1_000,
+        )];
+        let agents = vec![implementer("rat-bad", "TKT-1", f64::NAN)];
+        let resp = scorecards_response(
+            &cost_inputs(agents, delivery, Vec::new()),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let task = &resp["native_recorded_cost"]["tasks"][0];
+        assert!(task["implementation"]["cost_usd_micro"].is_null());
+        assert!(task["recorded_cost_usd_micro"].is_null());
+        assert_eq!(task["coverage_complete"], json!(false));
+        assert_eq!(
+            task["implementation"]["malformed_cost_generation_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_recorded_cost_ambiguous_correction_ticket_excluded_from_every_task() {
+        let delivery = vec![
+            landing_processed_event(
+                "feature-a",
+                "sha-a",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-a"),
+                1_000,
+            ),
+            landing_processed_event(
+                "feature-b",
+                "sha-b",
+                "main",
+                "TKT-2",
+                "landed",
+                Some("merge-b"),
+                1_050,
+            ),
+        ];
+        // The same rework ticket authoritatively linked to two different
+        // originals: neither task may claim it without guessing.
+        let correction_links = vec![
+            resubmission_event("TKT-9", "TKT-1", 1_100),
+            resubmission_event("TKT-9", "TKT-2", 1_150),
+        ];
+        let agents = vec![implementer("rat-fix", "TKT-9", 0.20)];
+        let resp = scorecards_response(
+            &cost_inputs(agents, delivery, correction_links),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nrc = &resp["native_recorded_cost"];
+        assert_eq!(nrc["ambiguous_correction_tickets"], json!(["TKT-9"]));
+        for task in nrc["tasks"].as_array().unwrap() {
+            assert_eq!(task["correction"]["generation_count"], json!(0));
+        }
+        // Not silently dropped: the generation's cost still shows up,
+        // just unattributed to either candidate task.
+        assert_eq!(nrc["unattributed"]["generation_count"], json!(1));
+        assert_eq!(nrc["unattributed"]["cost_usd_micro"], json!(200_000));
+    }
+
+    #[test]
+    fn native_recorded_cost_unattributed_bucket_keeps_cost_for_a_task_never_observed_delivered() {
+        let agents = vec![implementer("rat-orphan", "TKT-404", 0.15)];
+        let resp = scorecards_response(
+            &cost_inputs(agents, Vec::new(), Vec::new()),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nrc = &resp["native_recorded_cost"];
+        assert!(nrc["tasks"].as_array().unwrap().is_empty());
+        assert_eq!(nrc["unattributed"]["generation_count"], json!(1));
+        assert_eq!(nrc["unattributed"]["cost_usd_micro"], json!(150_000));
+        assert_eq!(nrc["totals"]["recorded_cost_usd_micro"], json!(0));
+    }
+
+    #[test]
+    fn native_recorded_cost_failed_delivery_read_is_unavailable_not_a_healthy_empty() {
+        let mut base = inputs();
+        base.native_delivery = NativeDeliveryInputs {
+            available: false,
+            read_warning: Some(
+                "source_family_read_failed: NativeLandingDelivery unavailable: boom".into(),
+            ),
+            ..Default::default()
+        };
+        base.native_correction_links = NativeCorrectionLinkInputs {
+            available: true,
+            ..Default::default()
+        };
+        let resp = scorecards_response(
+            &base,
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nrc = &resp["native_recorded_cost"];
+        assert_eq!(nrc["available"], json!(false));
+        assert!(nrc["tasks"].as_array().unwrap().is_empty());
+        assert!(nrc["unattributed"].is_null());
+        assert!(nrc["totals"]["recorded_cost_usd_micro"].is_null());
+        assert!(nrc["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("NativeLandingDelivery")));
+    }
+
+    #[test]
+    fn native_recorded_cost_deterministic_across_agent_and_link_order() {
+        let delivery = vec![landing_processed_event(
+            "feature",
+            "sha1",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-1"),
+            1_000,
+        )];
+        let correction_links = vec![resubmission_event("TKT-2", "TKT-1", 1_100)];
+        let agents = vec![
+            implementer("rat-impl", "TKT-1", 0.10),
+            implementer("rat-fix", "TKT-2", 0.20),
+            reviewer_agent("rat-rev", "TKT-1", "feature", "sha1", "main", 0.05),
+        ];
+        let mut reversed_agents = agents.clone();
+        reversed_agents.reverse();
+        let mut reversed_links = correction_links.clone();
+        reversed_links.reverse();
+
+        let at = Utc.timestamp_opt(2_000, 0).unwrap();
+        let a = scorecards_response(
+            &cost_inputs(agents, delivery.clone(), correction_links),
+            &FactoryAnalyticsRequest::default(),
+            at,
+        );
+        let b = scorecards_response(
+            &cost_inputs(reversed_agents, delivery, reversed_links),
+            &FactoryAnalyticsRequest::default(),
+            at,
+        );
+        assert_eq!(a["native_recorded_cost"], b["native_recorded_cost"]);
     }
 }

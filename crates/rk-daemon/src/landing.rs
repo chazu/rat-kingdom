@@ -113,12 +113,15 @@ pub(crate) const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
 /// Evidence that a landed correction queued its reviewed parent for a fresh
 /// pass against the parent's original target. The queue tuple is the durable
 /// source of truth; this event makes the automatic hand-off inspectable.
-const REWORK_RESUBMISSION_IDENTITY: &str = "landing_rework_resubmission";
+/// `pub(crate)` so `factory_analytics`'s native recorded-cost join can read
+/// the authoritative correction-ticket -> original-task linkage this marker
+/// carries, mirroring [`LANDING_PROCESSED_IDENTITY`]'s visibility above.
+pub(crate) const REWORK_RESUBMISSION_IDENTITY: &str = "landing_rework_resubmission";
 
 /// [`REWORK_RESUBMISSION_IDENTITY`]'s counterpart for a landed merge-conflict
 /// correction: evidence that it queued the conflicted branch for a fresh
-/// gate run against its original target.
-const CONFLICT_RESUBMISSION_IDENTITY: &str = "landing_conflict_rework_resubmission";
+/// gate run against its original target. `pub(crate)` for the same reason.
+pub(crate) const CONFLICT_RESUBMISSION_IDENTITY: &str = "landing_conflict_rework_resubmission";
 
 /// Identity of the durable per-attempt evidence event for a gate
 /// infrastructure-death retry (bounded fail-safe recovery). See

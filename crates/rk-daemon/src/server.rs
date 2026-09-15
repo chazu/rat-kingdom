@@ -3055,6 +3055,55 @@ impl Daemon {
                 )),
             },
         };
+        // Same bounded pattern as `native_delivery` above, for the two
+        // resubmission-marker identities the additive `native_recorded_cost`
+        // section joins a filed correction ticket back to its original task
+        // through (`landing::REWORK_RESUBMISSION_IDENTITY` /
+        // `CONFLICT_RESUBMISSION_IDENTITY`). Both identities share one page
+        // budget rather than each getting a full `MAX_SCAN_TUPLES` of their
+        // own, since they are two producers of the same linkage relation.
+        let mut correction_link_rows: Vec<Tuple> = Vec::new();
+        let mut correction_link_scanned = 0usize;
+        let mut correction_link_truncated = false;
+        let mut correction_link_read_warning: Option<String> = None;
+        let mut correction_link_available = true;
+        for identity in [
+            crate::landing::REWORK_RESUBMISSION_IDENTITY,
+            crate::landing::CONFLICT_RESUBMISSION_IDENTITY,
+        ] {
+            let pattern = Pattern::category(Category::Event)
+                .identity(identity)
+                .scope(repo.clone());
+            match self
+                .space
+                .scan_newest_limited(&pattern, MAX_SCAN_TUPLES.saturating_add(1))
+            {
+                Ok(mut rows) => {
+                    correction_link_scanned += rows.len().min(MAX_SCAN_TUPLES);
+                    correction_link_truncated =
+                        correction_link_truncated || rows.len() > MAX_SCAN_TUPLES;
+                    rows.truncate(MAX_SCAN_TUPLES);
+                    correction_link_rows.extend(
+                        rows.into_iter()
+                            .filter(|event| in_window(event.created_at.timestamp_millis())),
+                    );
+                }
+                Err(error) => {
+                    correction_link_available = false;
+                    correction_link_read_warning = Some(format!(
+                        "source_family_read_failed: NativeCorrectionLink unavailable: {error}"
+                    ));
+                }
+            }
+        }
+        let native_correction_links = crate::factory_analytics::NativeCorrectionLinkInputs {
+            events: correction_link_rows,
+            scanned: correction_link_scanned,
+            limit: MAX_SCAN_TUPLES,
+            truncated: correction_link_truncated,
+            available: correction_link_available,
+            read_warning: correction_link_read_warning,
+        };
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
@@ -3067,6 +3116,7 @@ impl Daemon {
             runtime_unavailable,
             read_warnings,
             native_delivery,
+            native_correction_links,
         }
     }
 
