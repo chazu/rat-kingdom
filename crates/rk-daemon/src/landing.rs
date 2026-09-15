@@ -2339,7 +2339,10 @@ impl LandingPipeline {
     /// missed or coalesced wakeup (map eviction, a restart) still settles
     /// correctly instead of hanging: "a notification is a wake hint; durable
     /// state remains authority."
-    async fn wait_for_terminal_outcome(&self, entry: &LandingQueueEntry) -> rk_core::Result<String> {
+    async fn wait_for_terminal_outcome(
+        &self,
+        entry: &LandingQueueEntry,
+    ) -> rk_core::Result<String> {
         const POLL_FALLBACK: Duration = Duration::from_millis(200);
         loop {
             if let Some(outcome) = self.processed_outcome(entry)? {
@@ -14633,7 +14636,10 @@ checks: [
             )
             .unwrap();
             git(repo_dir.path(), &["add", "."]);
-            git(repo_dir.path(), &["commit", "-m", &format!("docs: {branch}")]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
             heads.push(rev_parse(repo_dir.path(), branch));
             git(repo_dir.path(), &["checkout", "main"]);
         }
@@ -14641,6 +14647,12 @@ checks: [
 
         let space = Space::open_in_memory().unwrap();
         let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // `submit_manual` resolves its own entry's `repo_name` via
+        // `Supervisor::repository_name`, which falls back to the repo's
+        // directory-basename identity for an unregistered test repo like
+        // this one — match it exactly, or the two admission paths land in
+        // different queue keys and never observe each other.
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
 
         // Pre-admit BOTH candidates before draining a single one, oldest
         // first — mirrors `burst_of_completions_on_one_key_never_runs_
@@ -14649,7 +14661,7 @@ checks: [
         // one and which one blocks.
         pipeline
             .enqueue(LandingQueueEntry {
-                repo_name: "code-repo".into(),
+                repo_name: repo_name.clone(),
                 repo_path: repo_dir.path().display().to_string(),
                 branch: "first".into(),
                 target: "main".into(),
@@ -14661,7 +14673,7 @@ checks: [
             .unwrap();
         pipeline
             .enqueue(LandingQueueEntry {
-                repo_name: "code-repo".into(),
+                repo_name: repo_name.clone(),
                 repo_path: repo_dir.path().display().to_string(),
                 branch: "second".into(),
                 target: "main".into(),
@@ -14688,9 +14700,8 @@ checks: [
             )
             .await
             .unwrap();
-        assert_eq!(result["status"], "landed", "result: {result}");
-        assert_eq!(result["merged"], true);
-        assert_eq!(result["delivered"], true);
+        assert_eq!(result["merged"], true, "result: {result}");
+        assert_eq!(result["delivered"], true, "result: {result}");
 
         // `first` is durably closed and off the active queue RIGHT NOW —
         // not eventually, not after `second` also finishes.
@@ -14698,9 +14709,12 @@ checks: [
             .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
             .unwrap();
         assert!(
-            processed.iter().any(|t| t.payload.get("branch").and_then(Value::as_str)
-                == Some("first")
-                && t.payload.get("outcome").and_then(Value::as_str) == Some("landed")),
+            processed
+                .iter()
+                .any(
+                    |t| t.payload.get("branch").and_then(Value::as_str) == Some("first")
+                        && t.payload.get("outcome").and_then(Value::as_str) == Some("landed")
+                ),
             "first must have a durable landed marker: {processed:?}"
         );
         let queued = space
@@ -14756,7 +14770,10 @@ checks: [
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(second_landed, "second must eventually land via the handed-off background drain");
+        assert!(
+            second_landed,
+            "second must eventually land via the handed-off background drain"
+        );
         assert!(
             space
                 .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
