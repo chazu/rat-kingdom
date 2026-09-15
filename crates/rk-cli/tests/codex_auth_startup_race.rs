@@ -8,7 +8,7 @@
 
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -57,6 +57,22 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"first cal
     )
 }
 
+/// Bounds a single RPC round trip. Multi-thread flavor (see the test's own
+/// doc comment) keeps the polling loops below alive even while a git
+/// subprocess call is wedged on another worker thread, but it says nothing
+/// about a call that hangs INSIDE the daemon's own handling of one specific
+/// RPC — that request's own `.await` would still never resolve, on any
+/// runtime flavor. Every RPC in this test goes through this rather than a
+/// bare `.call()`, so a daemon-side wedge fails this test with a specific,
+/// attributable panic instead of blocking indefinitely regardless of which
+/// half (test-side polling, or the daemon's handling of one call) is stuck.
+async fn call_bounded(client: &mut Client, method: &str, params: serde_json::Value) -> Value {
+    tokio::time::timeout(Duration::from_secs(20), client.call(method, params))
+        .await
+        .unwrap_or_else(|_| panic!("RPC `{method}` did not return within 20s: daemon-side handling is wedged, not just a test polling loop"))
+        .unwrap()
+}
+
 async fn connect(layout: &Layout) -> Client {
     for _ in 0..1500 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -82,8 +98,153 @@ async fn wait_for_markers(markers: &[PathBuf]) {
     panic!("first-call markers did not appear: {missing:?}");
 }
 
-#[tokio::test]
+/// Parses `ps -Ao pid=,ppid=,comm=` output into `(pid, ppid, comm)` rows.
+/// `ps` right-pads/aligns numeric columns with a variable RUN of spaces
+/// (not exactly one), so splitting on a single whitespace char at each
+/// occurrence (`str::splitn(_, char::is_whitespace)`) treats each space in
+/// that run as its own delimiter and yields empty fields between them,
+/// which then fail to parse as a pid/ppid and silently drop the row — an
+/// earlier draft did exactly that and dropped nearly every real row.
+/// `split_whitespace` treats a whole run of whitespace as one separator and
+/// skips empty fields, which is what padded `ps` output actually needs.
+fn parse_ps_pid_ppid_comm(output: &str) -> Vec<(u32, u32, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let this_pid = parts.next()?.parse().ok()?;
+            let ppid = parts.next()?.parse().ok()?;
+            let comm = parts.collect::<Vec<_>>().join(" ");
+            Some((this_pid, ppid, comm))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod parse_ps_tests {
+    use super::parse_ps_pid_ppid_comm;
+
+    /// A realistic sample: right-aligned numeric columns padded with a
+    /// variable run of spaces, exactly as `ps -Ao pid=,ppid=,comm=` prints
+    /// on a real host (not the single-space-joined fixture an earlier draft
+    /// was implicitly assuming).
+    #[test]
+    fn parses_padded_ps_columns() {
+        let sample = "\
+    1     0 launchd
+  501     1 launchd
+50234   501 zsh
+50291 50234 cargo
+50310 50291 codex_auth_startup_race
+";
+        let rows = parse_ps_pid_ppid_comm(sample);
+        assert_eq!(
+            rows,
+            vec![
+                (1, 0, "launchd".to_string()),
+                (501, 1, "launchd".to_string()),
+                (50234, 501, "zsh".to_string()),
+                (50291, 50234, "cargo".to_string()),
+                (50310, 50291, "codex_auth_startup_race".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_unparseable_lines_without_dropping_valid_ones() {
+        let sample = "garbage line\n  501     1 launchd\n";
+        assert_eq!(
+            parse_ps_pid_ppid_comm(sample),
+            vec![(501, 1, "launchd".to_string())]
+        );
+    }
+}
+
+/// Every process on the host with `pid` as an ancestor, found by walking
+/// `ps`'s `pid`/`ppid` columns transitively from `pid` — cheap, portable
+/// (no `/proc` dependency), and exact: it names only this process's own
+/// descendant tree, never a process group, which the daemon deliberately
+/// puts each harness child into its OWN copy of (`.process_group(0)` in
+/// `rk-harness`'s launcher) specifically so a daemon-side signal never
+/// reaches the wrong tree. Signalling "the process group" here would be
+/// exactly backwards — and unlike a pid ancestry walk, could just as
+/// easily land on an unrelated sibling nextest test's process group.
+fn descendants_of(pid: u32) -> Vec<(u32, String)> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-Ao", "pid=,ppid=,comm="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let rows = parse_ps_pid_ppid_comm(&String::from_utf8_lossy(&output.stdout));
+
+    let mut descendants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut frontier = vec![pid];
+    while let Some(parent) = frontier.pop() {
+        for (this_pid, ppid, comm) in &rows {
+            if *ppid == parent && seen.insert(*this_pid) {
+                descendants.push((*this_pid, comm.clone()));
+                frontier.push(*this_pid);
+            }
+        }
+    }
+    descendants
+}
+
+/// A plain OS thread, outside the tokio runtime entirely, that kills this
+/// test's own process after `bound` if it is still running. Every RPC in
+/// this test is individually bounded by [`call_bounded`], but that alone
+/// cannot bound tokio's own runtime *shutdown* — dropping a multi-thread
+/// `Runtime` joins its blocking-pool threads (where `block_in_place`
+/// hands off git subprocess calls), and a thread stuck in a genuinely
+/// wedged syscall there blocks that join with nothing async-side left to
+/// time out. This test builds to its own single-test binary, so exiting
+/// the process here cannot collaterally kill an unrelated sibling test —
+/// but exiting alone still leaks every descendant that caused the hang
+/// (the fake harness's `bash`, its own `rk scan`/`rk done` children): a
+/// dead parent does not take them with it, they're simply reparented and
+/// left running. Kill this process's own descendant tree first — logging
+/// it as evidence of exactly what was still alive — then exit.
+fn spawn_watchdog(bound: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(bound);
+        let descendants = descendants_of(std::process::id());
+        eprintln!(
+            "codex_auth_startup_race watchdog: still running after {bound:?} — wedged past \
+             every per-call RPC timeout, or during runtime shutdown, which no in-test timeout \
+             can bound. Owned descendants still alive: {descendants:?}. Terminating them and \
+             this process so this reads as a failure, not an indefinitely occupied check."
+        );
+        for (pid, _) in &descendants {
+            unsafe {
+                libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        std::process::exit(101);
+    });
+}
+
+/// Multi-thread, not the `#[tokio::test]` default current-thread flavor:
+/// `Supervisor::diff_summary_for` only routes its git subprocess call
+/// through `block_in_place` when a multi-thread runtime is available,
+/// falling back to running it inline otherwise. Inline means on this exact
+/// OS thread — the same one every `tokio::time::sleep` in this test's
+/// polling loops needs to be woken. On the current-thread flavor, a wedged
+/// git subprocess call (e.g. TKT-bikuz-kumuz-zutit's leaked-pipe hang)
+/// freezes that one thread solid, which starves the loop bounds below into
+/// silently waiting forever instead of failing with the diagnostics they
+/// carry — that is exactly how the original hang needed a manual process
+/// kill instead of a failing test. Multi-thread lets `block_in_place` hand
+/// the git call to its own thread, so the polling loops keep running and
+/// their bounds are real wall-clock bounds again.
+#[tokio::test(flavor = "multi_thread")]
 async fn first_rk_call_survives_spawn_startup_race() {
+    spawn_watchdog(Duration::from_secs(90));
+
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
@@ -96,13 +257,12 @@ async fn first_rk_call_survives_spawn_startup_race() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut operator = connect(&layout).await;
-    operator
-        .call(
-            "repo.add",
-            json!({"name": "startup-race", "path": repo_dir.path()}),
-        )
-        .await
-        .unwrap();
+    call_bounded(
+        &mut operator,
+        "repo.add",
+        json!({"name": "startup-race", "path": repo_dir.path()}),
+    )
+    .await;
 
     // The child runs its first authenticated call before it emits any harness
     // event. Concurrent spawns maximize overlap between launch, registry PID
@@ -113,22 +273,22 @@ async fn first_rk_call_survives_spawn_startup_race() {
         let repo = repo_dir.path().to_string_lossy().to_string();
         spawn_calls.push(tokio::spawn(async move {
             let mut client = Client::connect_as_operator(&layout).await.unwrap();
-            client
-                .call(
-                    "agent.spawn",
-                    json!({
-                        "repo": repo,
-                        "task": format!("codex-auth-race-{index}"),
-                        "harness": "fake"
-                    }),
-                )
-                .await
+            call_bounded(
+                &mut client,
+                "agent.spawn",
+                json!({
+                    "repo": repo,
+                    "task": format!("codex-auth-race-{index}"),
+                    "harness": "fake"
+                }),
+            )
+            .await
         }));
     }
 
     let mut markers = Vec::new();
     for call in spawn_calls {
-        let spawned = call.await.unwrap().unwrap();
+        let spawned = call.await.unwrap();
         let worktree = spawned["agent"]["worktree"]
             .as_str()
             .expect("spawn response includes the agent worktree");
@@ -155,20 +315,31 @@ async fn first_rk_call_survives_spawn_startup_race() {
     }
 
     // Drain the lifecycle so this test also proves the successful calls did
-    // not merely leave harnesses wedged at the startup boundary.
+    // not merely leave harnesses wedged at the startup boundary. Bounded at
+    // 500 * 20ms = 10s; past that this must fail loudly with the observed
+    // states, not fall through silently — a harness left wedged here is the
+    // failure this test exists to catch, and the loop previously expired
+    // with no assertion at all.
+    let mut last_agents = json!({});
+    let mut all_terminal = false;
     for _ in 0..500 {
-        let agents = operator.call("agent.list", json!({})).await.unwrap();
-        let all_terminal = agents["agents"].as_array().unwrap().iter().all(|agent| {
+        let agents = call_bounded(&mut operator, "agent.list", json!({})).await;
+        all_terminal = agents["agents"].as_array().unwrap().iter().all(|agent| {
             matches!(
                 agent["state"].as_str(),
                 Some("completed") | Some("failed") | Some("dismissed")
             )
         });
+        last_agents = agents;
         if all_terminal {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        all_terminal,
+        "not every spawned agent reached a terminal state within 10s: {last_agents}"
+    );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }

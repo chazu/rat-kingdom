@@ -675,6 +675,7 @@ pub(crate) mod runner {
             // tree, not the daemon's.
             .process_group(0)
             .kill_on_drop(true);
+        rk_core::exec::close_extra_fds(wiring.command.as_std_mut());
         let mut child = wiring.command.spawn()?;
         let pid = child.id();
         let mut group_guard = ProcessGroupGuard(pid);
@@ -866,6 +867,7 @@ pub(crate) mod runner {
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
+        rk_core::exec::close_extra_fds(command.as_std_mut());
         let mut child = command.spawn()?;
         let mut pid = child.id();
         let group_guard = ProcessGroupGuard(pid);
@@ -1065,6 +1067,7 @@ pub(crate) mod runner {
                             .stderr(Stdio::piped())
                             .process_group(0)
                             .kill_on_drop(true);
+                        rk_core::exec::close_extra_fds(resumed.as_std_mut());
                         let Ok(mut next_child) = resumed.spawn() else {
                             let _ = event_tx.send(HarnessEvent::Stderr {
                                 text: format!("Codex control {} could not resume the session", envelope.message_id),

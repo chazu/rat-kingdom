@@ -250,6 +250,33 @@ pub struct LandingPolicy {
     /// suite by default.
     #[serde(default, rename = "focusedChecks")]
     pub focused_checks: Vec<FocusedCheckRule>,
+    /// Whether a native reviewer's BBS briefing is queried against the
+    /// ACTUAL ticket under review (`ReviewContext::task`, daemon-owned —
+    /// see `LandingPipeline::dispatch_review`/`launch_shadow_review` in
+    /// `crates/rk-daemon/src/landing.rs`) instead of the reviewer's own
+    /// synthetic spawn task (e.g. `candidate-review-TKT-...`), which never
+    /// resolves to a ticket and so always surfaces zero BBS entries even
+    /// when the reviewed ticket has relevant findings/artifacts. Purely a
+    /// choice of BBS query target: the reviewer's own task/role/spawn/
+    /// attempt identity (`RK_TASK`, `ConsumerBinding`, telemetry) is always
+    /// the true reviewer's, never the reviewed ticket's, and
+    /// `bbs::brief`'s existing cross-repo scope check still refuses a
+    /// review binding naming a ticket outside this repo. `false` (the
+    /// default) restores the pre-fix behavior exactly. Only applies when
+    /// the spawn/resume/recovery actually carries a `ReviewContext`
+    /// (i.e. it is a review); ordinary workers are unaffected either way.
+    ///
+    /// Like every other field on this policy, flipping it is digest-fenced
+    /// approved-commit activation, NOT an instant file toggle: a fresh
+    /// `repo.add` against an unregistered repo activates whatever
+    /// `.rk/repo.cue` says at that commit immediately, but changing it on an
+    /// ALREADY-registered repo only takes effect once
+    /// `rk repo onboard start/propose/approve/apply/activate` records the
+    /// new digest (`RepoRecord::activated_policy`,
+    /// `crates/rk-daemon/src/repos.rs`) — editing the file on disk alone
+    /// does nothing until that activation lands.
+    #[serde(default, rename = "reviewedTicketBbsContext")]
+    pub reviewed_ticket_bbs_context: bool,
 }
 
 /// One `LandingPolicy::focused_checks` rule: a changed-path (or named-class)
@@ -299,6 +326,7 @@ impl Default for LandingPolicy {
             review_death_retry_jitter_pct: default_review_death_retry_jitter_pct(),
             protected_targets: default_protected_targets(),
             focused_checks: Vec::new(),
+            reviewed_ticket_bbs_context: false,
         }
     }
 }
@@ -390,6 +418,37 @@ fn default_protected_targets() -> Vec<String> {
     vec!["main".to_string()]
 }
 
+/// Per-repository integration/release role declaration (P5.1,
+/// `TKT-ratik-rivam-jadud`): names the rolling branch integrated deliveries
+/// land on and the protected branch a later immutable release snapshot
+/// targets, instead of inferring either from branch-naming convention. Both
+/// empty (the default) disables the role split entirely — zero behavior
+/// change for a repo that has not opted in, the same "empty string
+/// disables" convention [`LandingPolicy::shadow_review_model`] already uses.
+/// Configuring only one of the two fields is rejected at policy-validation
+/// time (`validate_repository_policy`) so a half-configured repo fails
+/// closed instead of silently looking active. This struct only names the
+/// roles; it does not itself select, build, or deploy anything — see
+/// `release::select_candidate` (`crates/rk-daemon/src/release.rs`) for the
+/// actual candidate-selection journey it activates, gated by the SAME
+/// digest-fenced `rk repo onboard` activation flow every other field on
+/// this policy already requires.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleasePolicy {
+    /// Branch ordinary integrated deliveries land on, e.g. `"integration"`.
+    /// Never inferred from `delivery.target` or `landing.protected_targets`.
+    #[serde(default, rename = "integrationBranch")]
+    pub integration_branch: String,
+    /// Protected branch a selected release candidate targets. Must also
+    /// appear in `landing.protected_targets` — an immutable release
+    /// snapshot always targets a genuinely protected edge, never an inner
+    /// one; checked in `validate_repository_policy`. Naming it here does not
+    /// grant landing authority over it: the edge's own protected-path/review
+    /// gates still apply in full, unchanged.
+    #[serde(default, rename = "releaseTarget")]
+    pub release_target: String,
+}
+
 /// Per-repository regenerable build-artifact paths (relative to a worktree
 /// root, e.g. `target` for a cargo workspace, `node_modules` for an npm one)
 /// the daemon's worktree sweep reclaims from every terminal agent's worktree
@@ -445,6 +504,8 @@ pub struct RepositoryPolicy {
     pub reap: ReapPolicy,
     #[serde(default, rename = "phaseLatency")]
     pub phase_latency: PhaseLatencyPolicy,
+    #[serde(default)]
+    pub release: ReleasePolicy,
 }
 
 impl RepositoryPolicy {
@@ -1380,6 +1441,41 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
                     "repo.phaseLatency.targets.{phase}.intervention must be >= warning"
                 )));
             }
+        }
+    }
+    let integration_set = !policy.release.integration_branch.trim().is_empty();
+    let target_set = !policy.release.release_target.trim().is_empty();
+    if integration_set != target_set {
+        return Err(rk_core::Error::other(
+            "repo.release.integrationBranch and repo.release.releaseTarget must be configured \
+             together (both set activates the integration/release role split; both empty keeps \
+             the release role disabled, preserving existing behavior)",
+        ));
+    }
+    if integration_set && target_set {
+        if policy.release.integration_branch == policy.release.release_target {
+            return Err(rk_core::Error::other(
+                "repo.release.integrationBranch and repo.release.releaseTarget must name \
+                 different branches",
+            ));
+        }
+        validate_branch_value(
+            "repo.release.integrationBranch",
+            &policy.release.integration_branch,
+        )?;
+        validate_branch_value("repo.release.releaseTarget", &policy.release.release_target)?;
+        if !policy
+            .landing
+            .protected_targets
+            .iter()
+            .any(|target| target == &policy.release.release_target)
+        {
+            return Err(rk_core::Error::other(format!(
+                "repo.release.releaseTarget {:?} must also appear in \
+                 repo.landing.protectedTargets — an immutable release snapshot must target a \
+                 genuinely protected edge",
+                policy.release.release_target
+            )));
         }
     }
     for rel in &policy.reap.artifact_paths {
@@ -2930,6 +3026,88 @@ checks: [
         assert_eq!(policy.landing.review_max_wait, "45m");
         assert_eq!(policy.landing.shadow_review_model, "");
         assert_eq!(policy.landing.shadow_review_harness, "");
+        assert_eq!(policy.release.integration_branch, "");
+        assert_eq!(policy.release.release_target, "");
+    }
+
+    #[test]
+    fn repository_policy_loads_versioned_release_roles() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                release: {
+                    integrationBranch: "integration"
+                    releaseTarget: "main"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.release.integration_branch, "integration");
+        assert_eq!(policy.release.release_target, "main");
+        // main is protected by default, so this must not require an explicit
+        // protectedTargets override to activate.
+        assert_eq!(
+            policy.landing.protected_targets,
+            default_protected_targets()
+        );
+    }
+
+    #[test]
+    fn repository_policy_rejects_half_configured_release_roles() {
+        let err = load_repository_policy_str(
+            r#"
+            repo: {
+                release: {
+                    integrationBranch: "integration"
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be configured together"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn repository_policy_rejects_identical_integration_and_release_branches() {
+        let err = load_repository_policy_str(
+            r#"
+            repo: {
+                release: {
+                    integrationBranch: "main"
+                    releaseTarget: "main"
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("different branches"), "{err}");
+    }
+
+    #[test]
+    fn repository_policy_rejects_release_target_outside_protected_targets() {
+        let err = load_repository_policy_str(
+            r#"
+            repo: {
+                landing: {
+                    protectedTargets: ["main"]
+                }
+                release: {
+                    integrationBranch: "integration"
+                    releaseTarget: "staging"
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must also appear in repo.landing.protectedTargets"),
+            "{err}"
+        );
     }
 
     #[test]

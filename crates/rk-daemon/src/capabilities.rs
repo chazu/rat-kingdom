@@ -70,9 +70,17 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
     Some(match method {
         // `bbs.export` is a bounded READ of the caller's own repository; the
         // handler refuses a foreign scope. It authors nothing.
-        "bbs.brief" | "bbs.show" | "bbs.export" | "ping" | "status" | "space.scan" | "space.rd"
+        // `control.verify` is a bounded, self-scoped lookup + narrow
+        // evidentiary write (it never touches the caller's task, git, or
+        // ticket state) — every role, including the read-only ones, needs it
+        // to check a claimed steer, exactly like the read-only surfaces
+        // beside it.
+        "bbs.brief" | "bbs.show" | "bbs.export" | "bbs.discovery.show"
+        | "bbs.retirement.show" | "ping" | "status"
+        | "space.scan" | "space.rd"
         | "repo.list"
-        | "repo.get" | "agent.status" | "agent.log" | "agent.progress" => ORDINARY_READ_ONLY,
+        | "repo.get" | "agent.status" | "agent.log" | "agent.progress" | "release.list"
+        | "release.show" | "release.status" | "control.verify" => ORDINARY_READ_ONLY,
         "space.out" => ORDINARY_SELF_DONE,
         "repo.onboard.inspect" => ORDINARY_ONBOARDER,
         "repo.onboard.propose" => ONBOARDER_ONLY,
@@ -183,6 +191,8 @@ mod tests {
             "repo.land",
             "ticket.deliver",
             "bbs.assess",
+            "bbs.discovery.set",
+            "bbs.retirement.set",
         ] {
             assert!(method_policy(method).is_none(), "{method}");
         }
@@ -232,6 +242,12 @@ mod tests {
             "ticket.ready",
             "bbs.publish",
             "bbs.reuse",
+            "control.verify",
+            "bbs.discovery.show",
+            "bbs.retirement.show",
+            "release.list",
+            "release.show",
+            "release.status",
         ] {
             assert!(
                 method_policy(method).is_some_and(|policy| policy.ordinary),

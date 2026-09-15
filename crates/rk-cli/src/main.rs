@@ -15,6 +15,7 @@ mod observe;
 mod product_to_code_cmds;
 mod reconcile_cmds;
 mod reconcile_repair_cmds;
+mod release_cmds;
 mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
@@ -179,6 +180,10 @@ enum Command {
     Log(agent_cmds::LogArgs),
     /// Send mid-session guidance to a running agent.
     Steer(agent_cmds::SteerArgs),
+    /// Verify a message claiming operator/steer authority against the
+    /// daemon's own durable control record for this exact authenticated
+    /// caller and its current session generation.
+    ControlVerify(agent_cmds::ControlVerifyArgs),
     /// Gracefully interrupt a running agent.
     Interrupt(agent_cmds::NameArg),
     /// Dismiss an agent: stop it, preserve its branch, clean up its worktree.
@@ -192,6 +197,14 @@ enum Command {
     RetryLandingAdmission(agent_cmds::RetryLandingAdmissionArgs),
     /// Explicitly cancel a candidate's currently active review attempt.
     CancelReview(agent_cmds::CancelReviewArgs),
+    /// Engage the operator-only handoff-window fence: block new landing
+    /// admission for a repository without draining or cancelling anything
+    /// already queued or actively checking/reviewing.
+    FenceRequest(agent_cmds::FenceRequestArgs),
+    /// Read the handoff fence's current state and blocking keys.
+    FenceStatus(agent_cmds::FenceStatusArgs),
+    /// Release an engaged handoff fence early; idempotent.
+    FenceRelease(agent_cmds::FenceReleaseArgs),
     /// Undo a bad landing: revert an agent's recorded merge commit and reopen
     /// its ticket.
     Revert(agent_cmds::RevertArgs),
@@ -252,6 +265,11 @@ enum Command {
     Ticket {
         #[command(subcommand)]
         command: TicketCommand,
+    },
+    /// Prepare and inspect immutable paired rk/rk-mcp releases (P6.1).
+    Release {
+        #[command(subcommand)]
+        command: release_cmds::ReleaseCommand,
     },
     /// Ingest canonical SDLC feedback events and read current facts.
     Ingest {
@@ -754,16 +772,38 @@ enum DaemonCommand {
 /// and must not be resumed) — so it never disturbs an unrelated agent an
 /// operator left `Orphaned` from an earlier incident, and it works
 /// regardless of the `respawn_enabled` policy flag.
+/// How long a physical old-instance exit is allowed to take once `stop` has
+/// been accepted, before rollover gives up. The graceful shutdown path
+/// (draining background loops via `background_tasks.join_next()` in
+/// rk-daemon's `run()`) is not instant — a confirmed production case
+/// overran the previous 3s assumption by several seconds — so this is
+/// deliberately generous, but still bounded: this command must not spin
+/// indefinitely on a daemon that has wedged mid-shutdown.
+const OLD_INSTANCE_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Result<()> {
     let mut client = Client::connect(layout)
         .await
         .map_err(|_| anyhow::anyhow!("daemon is not running — nothing to roll over"))?;
 
+    // Capture the outgoing instance's identity before we ask it to stop —
+    // this is the only way to later tell a genuine replacement apart from a
+    // reconnect to the same retiring process (see the post-stop check
+    // below). The signature (pid + start time) is captured now, while the
+    // daemon is confirmed alive, so it can be compared against later to
+    // confirm this exact process — not just some process at this pid —
+    // actually went away.
+    let old_status = client.call("status", json!({})).await?;
+    let old_pid = old_status["pid"].as_u64();
+    let old_signature = old_pid.and_then(|pid| process_signature(pid as u32));
+
     let mut live = match rollover_drain(&mut client, wait_secs, as_json).await {
         Ok(live) => live,
         Err(e) => {
             // Don't leave a live daemon stuck refusing dispatch over a
-            // failure that happened before we ever got to `stop`.
+            // failure that happened before we ever got to `stop` — this is
+            // still safe: the outgoing daemon has not been told to shut
+            // down yet, so nothing about its shutdown is irrevocable.
             let _ = client.call("daemon.resume_dispatch", json!({})).await;
             return Err(e);
         }
@@ -777,11 +817,26 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
     }
 
     client.call("stop", json!({})).await?;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        if Client::connect(layout).await.is_err() {
-            break;
-        }
+    // From this point on the outgoing daemon has unconditionally committed
+    // to shutting down — there is no "cancel stop" RPC. Resuming dispatch
+    // on it now would admit new work onto a process that is going away
+    // regardless of what happens next, so any failure below must NOT touch
+    // its dispatch state; it can only wait, then report.
+    let old_exited = wait_for_old_instance_exit(layout, old_pid, old_signature.as_deref()).await;
+    if !old_exited {
+        anyhow::bail!(
+            "rollover: the outgoing daemon (pid {}) did not actually exit within {}s of \
+             accepting stop — its shutdown is already committed and cannot be undone, so \
+             dispatch was left as-is rather than resumed on a daemon that is going away; \
+             check `rk daemon status` / `ps -p {}` before retrying",
+            old_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            OLD_INSTANCE_EXIT_BOUND.as_secs(),
+            old_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        );
     }
 
     // Bring the new daemon up onto whatever binary `rk` now resolves to.
@@ -789,6 +844,31 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
     // (RK_AGENT set) — this command is operator-only (see `authorize_reasoned`)
     // so that refusal, if hit, is itself the right answer.
     let mut client = Client::connect_or_spawn(layout).await?;
+
+    // A successful connect here is not yet proof of a replacement: confirm a
+    // genuinely different, live process running the build this `rk` binary
+    // was itself just installed with. Absent or unreadable identity is never
+    // treated as success — only an explicit match is.
+    let new_status = client.call("status", json!({})).await?;
+    let new_pid = new_status["pid"].as_u64();
+    let new_build = new_status["build_version"].as_str();
+    let expected_build = rk_core::version::build_version();
+    let replaced = matches!(
+        (new_pid, old_pid, new_build),
+        (Some(new_pid), Some(old_pid), Some(new_build))
+            if new_pid != old_pid && new_build == expected_build
+    );
+    if !replaced {
+        anyhow::bail!(
+            "rollover did not produce a verified replacement daemon: reconnected to pid {} \
+             build {} (expected a new pid running {expected_build}) — the outgoing daemon may \
+             still be retiring",
+            new_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            new_build.unwrap_or("unknown"),
+        );
+    }
 
     // Reconcile: respawn only the rats parked above, and only the ones the
     // restart actually orphaned.
@@ -903,6 +983,64 @@ async fn rollover_drain(
     Ok(live)
 }
 
+/// A best-effort physical identity for OS process `pid`: its start time, as
+/// `ps` reports it right now. PID alone is not an identity — the OS can
+/// recycle it — so this is what lets [`wait_for_old_instance_exit`] tell
+/// "this exact process is gone" apart from "the socket merely stopped
+/// answering", which can happen well before the process actually finishes
+/// its background-task drain and calls `exit()`. Mirrors the pid+start-time
+/// discipline `rk_daemon`'s own `managed_verification::process_signature`
+/// uses for the same reason; that one is `pub(crate)` and unreachable
+/// across the crate boundary, so this is a from-scratch equivalent, not a
+/// shared implementation.
+fn process_signature(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Wait (bounded by [`OLD_INSTANCE_EXIT_BOUND`]) for the outgoing daemon to
+/// physically exit, rather than for its socket to merely stop answering —
+/// the accept loop can break, and new connections start refusing, well
+/// before `background_tasks.join_next()` finishes draining and the process
+/// actually calls `exit()` (see rk-daemon's `Daemon::run`). When a baseline
+/// signature was captured before `stop`, exit is confirmed once the pid's
+/// current signature no longer matches it (gone entirely, or handed by the
+/// OS to an unrelated process — either way this exact daemon is gone).
+/// Without a baseline (e.g. `ps` itself failed even though the daemon just
+/// answered `status`), fall back to the weaker socket-refusal signal so a
+/// healthy exit is not misreported as a hang on a platform quirk alone.
+async fn wait_for_old_instance_exit(
+    layout: &Layout,
+    old_pid: Option<u64>,
+    old_signature: Option<&str>,
+) -> bool {
+    let deadline = std::time::Instant::now() + OLD_INSTANCE_EXIT_BOUND;
+    loop {
+        let exited = match (old_pid, old_signature) {
+            (Some(pid), Some(sig)) => process_signature(pid as u32).as_deref() != Some(sig),
+            _ => Client::connect(layout).await.is_err(),
+        };
+        if exited {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
 /// Emit a human approval decision for a workflow instance parked at an
 /// approval gate. The daemon writes the `workflow_approval` event the blocked
 /// gate is waiting on.
@@ -1008,6 +1146,12 @@ fn init_tracing(config: &Config) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Must run before anything below reads `rk_core::version::build_version()`
+    // / `build_sha()` — including inside `rk-daemon`, which this process runs
+    // in-process as `rk daemon run`. `RK_BUILD_SHA` is this crate's own
+    // compile-time env var, stamped by `crates/rk-cli/build.rs`.
+    rk_core::version::init_build_sha(env!("RK_BUILD_SHA"));
+
     let cli = Cli::parse();
     let layout = Layout::discover()?;
     let config = Config::load(&layout.config_file())?;
@@ -1243,6 +1387,7 @@ async fn main() -> Result<()> {
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
         Command::Log(args) => agent_cmds::log(&layout, args, cli.json).await?,
         Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
+        Command::ControlVerify(args) => agent_cmds::control_verify(&layout, args, cli.json).await?,
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Land(args) => agent_cmds::land(&layout, args, cli.json).await?,
@@ -1253,6 +1398,9 @@ async fn main() -> Result<()> {
             agent_cmds::reenqueue_review(&layout, args, cli.json).await?
         }
         Command::CancelReview(args) => agent_cmds::cancel_review(&layout, args, cli.json).await?,
+        Command::FenceRequest(args) => agent_cmds::fence_request(&layout, args, cli.json).await?,
+        Command::FenceStatus(args) => agent_cmds::fence_status(&layout, args, cli.json).await?,
+        Command::FenceRelease(args) => agent_cmds::fence_release(&layout, args, cli.json).await?,
         Command::Revert(args) => agent_cmds::revert(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
         Command::ContinueRecovery(args) => {
@@ -1294,6 +1442,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Ingest { command } => ingest_cmds::run(&layout, command, cli.json).await?,
+        Command::Release { command } => release_cmds::run(&layout, command, cli.json).await?,
         Command::Workflow { command } => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             match command {
@@ -1513,7 +1662,7 @@ async fn main() -> Result<()> {
                 })?;
             let mut client = Client::connect_or_spawn(&layout).await?;
             let mut params = serde_json::Map::new();
-            params.insert("repo".into(), json!(repo));
+            params.insert("repo".into(), json!(repo.clone()));
             if let Some(check) = check {
                 params.insert("check".into(), json!(check));
             }
@@ -1532,6 +1681,13 @@ async fn main() -> Result<()> {
                     "verify: {} (exit {exit})",
                     result["verdict"].as_str().unwrap_or("?"),
                 );
+                if let Some(id) = result["failure_receipt_id"].as_str() {
+                    println!(
+                        "failure receipt: {id} (rk scan artifact {repo} verification-failure-receipt --search {id})"
+                    );
+                } else if let Some(err) = result["failure_receipt_error"].as_str() {
+                    eprintln!("warning: failure receipt not persisted: {err}");
+                }
             }
             if exit != 0 {
                 std::process::exit(exit.clamp(1, 255) as i32);

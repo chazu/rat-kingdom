@@ -37,6 +37,18 @@ rk_done "work done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did the work","session_id":"wf-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
+/// `RK_FAKE_HARNESS_CMD` is process-global; the native_recorded_cost journey
+/// tests below vary it per-spawn within one test (a plain success, a crash,
+/// a distinct declared cost) so a concurrently-running test in this same
+/// binary overwriting it mid-spawn would corrupt an in-flight generation's
+/// reported cost. Every test in this file holds this lock for its full
+/// duration — matching the established `HARNESS_ENV_LOCK` convention used
+/// wherever `RK_FAKE_HARNESS_CMD` is mutated (e.g. `agent_lifecycle.rs`,
+/// `automated_landing.rs`) — even the ones that only ever set it to the same
+/// `WORKING_FAKE` value, since a single unguarded test in the file would
+/// reopen the race for everyone else.
+static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn fixed_clock() -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000, 123_000_000).unwrap()
 }
@@ -269,6 +281,7 @@ async fn assert_bad_params(client: &mut Client, params: Value, expected: &str) {
 
 #[tokio::test]
 async fn factory_scorecards_rpc_returns_read_only_envelope_from_structured_sources() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, mut client) = setup().await;
     let resp = client
         .call("factory.scorecards", json!({"repo":"repo-a"}))
@@ -300,6 +313,7 @@ async fn factory_scorecards_rpc_returns_read_only_envelope_from_structured_sourc
 
 #[tokio::test]
 async fn factory_recommend_rpc_returns_advisory_read_only_recommendations() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, mut client) = setup().await;
     let resp = client
         .call("factory.recommend", json!({"repo":"repo-a"}))
@@ -331,6 +345,7 @@ async fn factory_recommend_rpc_returns_advisory_read_only_recommendations() {
 
 #[tokio::test]
 async fn factory_rpcs_report_missing_source_families_as_unobserved_not_zero() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, mut client) = setup().await;
     let resp = client
         .call("factory.scorecards", json!({"repo":"repo-a"}))
@@ -369,6 +384,7 @@ async fn factory_rpcs_report_missing_source_families_as_unobserved_not_zero() {
 
 #[tokio::test]
 async fn factory_analytics_reads_revert_fact_and_rework_verdict_end_to_end() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo_dir, _layout, handle, space, mut client) = setup_with_space().await;
     run_factory_workflow(&mut client, "structured-outcomes").await;
     let agent_name = settled_agent_name(&mut client).await;
@@ -475,6 +491,7 @@ async fn factory_analytics_reads_revert_fact_and_rework_verdict_end_to_end() {
 
 #[tokio::test]
 async fn factory_rpcs_reject_invalid_read_only_params() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, mut client) = setup().await;
 
     assert_bad_params(&mut client, json!({}), "repo is required").await;
@@ -498,6 +515,7 @@ async fn factory_rpcs_reject_invalid_read_only_params() {
 
 #[tokio::test]
 async fn factory_rpcs_are_deterministic_and_read_only_across_repeated_calls() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, mut client) = setup().await;
     run_factory_workflow(&mut client, "one").await;
     let before = snapshot_state(&mut client).await;
@@ -558,6 +576,7 @@ async fn factory_rpcs_are_deterministic_and_read_only_across_repeated_calls() {
 
 #[tokio::test]
 async fn factory_analytics_scorecards_windows_workflow_approval_and_ci_sources() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, space, mut client) = setup_with_space().await;
     run_factory_workflow(&mut client, "windowed").await;
     client
@@ -629,6 +648,7 @@ fn native_delivery(resp: &Value) -> &Value {
 /// `factory_analytics` unit-test layer and are not repeated here.
 #[tokio::test]
 async fn factory_analytics_native_delivery_reads_stored_markers_end_to_end_and_scopes_by_repo() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, space, mut client) = setup_with_space().await;
     let at = fixed_clock();
 
@@ -724,6 +744,7 @@ async fn factory_analytics_native_delivery_reads_stored_markers_end_to_end_and_s
 /// say so explicitly rather than let the count read as an absolute claim.
 #[tokio::test]
 async fn factory_analytics_native_delivery_window_can_hide_a_later_delivery() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, space, mut client) = setup_with_space().await;
     let gate_held_at = fixed_clock();
     let landed_at = fixed_clock() + chrono::Duration::days(1);
@@ -795,6 +816,7 @@ async fn factory_analytics_native_delivery_window_can_hide_a_later_delivery() {
 /// cap and proves the RPC reports the exact bound and truncation honestly.
 #[tokio::test]
 async fn factory_analytics_native_delivery_truncates_at_the_real_storage_cap() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let (_home, _repo, _layout, handle, space, mut client) = setup_with_space().await;
     let at = fixed_clock();
     // Matches the daemon's private `server::MAX_SCAN_TUPLES` (10_000); kept
@@ -830,6 +852,597 @@ async fn factory_analytics_native_delivery_truncates_at_the_real_storage_cap() {
         .as_str()
         .unwrap()
         .contains("native_delivery_coverage_truncated")));
+
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+// -- native_recorded_cost (P9.2 correction, TKT-zabok-huzab-vakot): real
+// end-to-end journey through agent.spawn/agent.respawn/agent.archive and
+// genuine landing_processed/resubmission markers, not the pure reducer
+// directly (that is exhaustively covered at the factory_analytics unit-test
+// layer). ------------------------------------------------------------------
+
+fn native_recorded_cost(resp: &Value) -> &Value {
+    &resp["native_recorded_cost"]
+}
+
+const CRASHING_FAKE: &str = "read -r _prompt; exit 3";
+
+/// A fake harness reporting an exact, caller-chosen `total_cost_usd` so each
+/// generation in a journey test can carry a distinct, assertable cost.
+fn cost_fake(total_cost_usd: &str) -> String {
+    fixture::with_rk_done(&format!(
+        r#"
+read -r _prompt
+echo '{{"type":"system","subtype":"init","session_id":"wf-fake"}}'
+rk_done "work done"
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"did the work","session_id":"wf-fake","total_cost_usd":{total_cost_usd},"usage":{{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}'
+"#
+    ))
+}
+
+fn resubmission_marker(
+    repo: &str,
+    identity: &str,
+    rework_ticket: &str,
+    original_task: &str,
+    at: chrono::DateTime<Utc>,
+) -> Tuple {
+    let mut tuple = Tuple::new(
+        Category::Event,
+        repo,
+        identity,
+        "daemon",
+        json!({
+            "dispatch_key": "dk-1",
+            "rework_ticket": rework_ticket,
+            "rework_branch": "rework-branch",
+            "branch": "feature",
+            "target": "main",
+            "task": original_task,
+            "head_sha": "resolved-sha",
+            "seq": 1,
+            "state": "queued",
+        }),
+    )
+    .with_lifecycle(Lifecycle::Furniture);
+    tuple.created_at = at;
+    tuple
+}
+
+/// Spawn directly via `agent.spawn` (not a workflow), so `task`/`review` are
+/// exactly the caller's values — real `ReviewContext` binding is supported
+/// natively by `SpawnParams.review` (`crates/rk-daemon/src/supervisor.rs`),
+/// the same field a landing-pipeline review dispatch sets, not a test hack.
+async fn spawn(client: &mut Client, repo: &str, task: &str, review: Option<Value>) -> String {
+    let mut params = json!({"repo": repo, "task": task, "harness": "fake"});
+    if let Some(review) = review {
+        params["review"] = review;
+    }
+    let spawned = client.call("agent.spawn", params).await.unwrap();
+    spawned["agent"]["name"].as_str().unwrap().to_string()
+}
+
+async fn wait_for_state(client: &mut Client, name: &str, want: &[&str]) -> Value {
+    for _ in 0..250 {
+        let status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if let Some(state) = status["agent"]["state"].as_str() {
+            if want.contains(&state) {
+                return status["agent"].clone();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("agent {name} never reached one of {want:?}");
+}
+
+/// Reducer/registry-level coverage over SEEDED evidence, not a claim that a
+/// source was actually landed by the real `LandingPipeline`: the
+/// `landing_processed`/`landing_rework_resubmission` markers are written
+/// directly via `space.out` (matching the producer's exact schema, per
+/// `landing_processed_marker`'s doc, but not produced by that producer), and
+/// the reviewer's `ReviewContext` is passed straight to a generic
+/// `agent.spawn` rather than assigned by the pipeline's own
+/// `dispatch_review`. This is deliberate: it isolates the join/dedup/
+/// malformed-cost logic from the much larger real landing+review machinery,
+/// which the ONE genuine journey below
+/// (`factory_analytics_native_recorded_cost_genuine_pipeline_journey_end_to_end`)
+/// exercises instead. Covers: a real settled `AgentRecord`'s recorded
+/// implementation cost joined to a seeded delivery, a seeded reviewer
+/// binding, a correction generation for TKT-1 that is ALSO itself seeded as
+/// independently delivered TKT-2 (proving the cross-task dedup fix so the
+/// repo-wide total counts its cost once, not twice), and a malformed
+/// (negative) harness-reported cost — with a read-only invariant check.
+#[tokio::test]
+async fn factory_analytics_native_recorded_cost_reads_real_delivery_review_correction_and_malformed_cost_end_to_end(
+) {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let (_home, repo_dir, _layout, handle, space, mut client) = setup_with_space().await;
+    let repo_path = repo_dir.path().to_string_lossy().to_string();
+    let at = fixed_clock();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", cost_fake("0.10"));
+    let impl_a = spawn(&mut client, &repo_path, "TKT-1", None).await;
+    wait_for_state(&mut client, &impl_a, &["completed"]).await;
+    space
+        .out(landing_processed_marker(
+            "repo-a",
+            "feature-a",
+            "sha-a",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-a"),
+            at,
+        ))
+        .unwrap();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", cost_fake("0.05"));
+    let review = json!({
+        "branch": "feature-a", "headSha": "sha-a", "target": "main",
+        "task": "TKT-1", "attempt": "attempt-1",
+    });
+    let reviewer = spawn(&mut client, &repo_path, "review-of-TKT-1", Some(review)).await;
+    wait_for_state(&mut client, &reviewer, &["completed"]).await;
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", cost_fake("0.20"));
+    let fix = spawn(&mut client, &repo_path, "TKT-2", None).await;
+    wait_for_state(&mut client, &fix, &["completed"]).await;
+    space
+        .out(landing_processed_marker(
+            "repo-a",
+            "feature-b",
+            "sha-b",
+            "main",
+            "TKT-2",
+            "landed",
+            Some("merge-b"),
+            at,
+        ))
+        .unwrap();
+    space
+        .out(resubmission_marker(
+            "repo-a",
+            "landing_rework_resubmission",
+            "TKT-2",
+            "TKT-1",
+            at,
+        ))
+        .unwrap();
+
+    // Read BEFORE the malformed generation exists: totals must be a clean,
+    // deduplicated number here so the malformed case below can be isolated
+    // to its own read rather than poisoning this assertion too (a single
+    // malformed contribution anywhere legitimately nulls the WHOLE
+    // cross-task total, by the same null-propagation rule as everything
+    // else in this section — that is exercised separately below, not here).
+    let before = snapshot_state(&mut client).await;
+    let resp = client
+        .call("factory.scorecards", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    let after = snapshot_state(&mut client).await;
+    assert_eq!(
+        before, after,
+        "reading native_recorded_cost through factory.scorecards must not mutate factory state"
+    );
+
+    let nrc = native_recorded_cost(&resp);
+    assert_eq!(nrc["available"], json!(true));
+    let tasks = nrc["tasks"].as_array().unwrap();
+
+    let tkt1 = tasks
+        .iter()
+        .find(|t| t["task"] == json!("TKT-1"))
+        .expect("TKT-1 present");
+    assert_eq!(
+        tkt1["implementation"]["settled"]["cost_usd_micro"],
+        json!(100_000)
+    );
+    assert_eq!(tkt1["review"]["settled"]["cost_usd_micro"], json!(50_000));
+    assert_eq!(
+        tkt1["correction"]["settled"]["cost_usd_micro"],
+        json!(200_000)
+    );
+    assert_eq!(tkt1["linked_correction_tickets"], json!(["TKT-2"]));
+    assert_eq!(tkt1["recorded_cost_usd_micro"], json!(350_000));
+    assert_eq!(tkt1["coverage_complete"], json!(true));
+
+    let tkt2 = tasks
+        .iter()
+        .find(|t| t["task"] == json!("TKT-2"))
+        .expect("TKT-2 present");
+    assert_eq!(
+        tkt2["implementation"]["settled"]["cost_usd_micro"],
+        json!(200_000)
+    );
+
+    // Cross-task dedup: TKT-2's implementer contributes to both its own
+    // implementation bucket and TKT-1's correction bucket — a real
+    // authoritative shared contribution, named and counted once in totals.
+    let shared = nrc["shared_contributions"].as_array().unwrap();
+    assert_eq!(shared.len(), 1);
+    let naive_sum = 100_000 + 50_000 + 200_000 + 200_000; // TKT-1's own total + TKT-2's own total
+    let totals_cost = nrc["totals"]["recorded_cost_usd_micro"].as_u64().unwrap();
+    assert!(
+        totals_cost < naive_sum,
+        "deduplicated total ({totals_cost}) must be less than the naive per-task sum ({naive_sum})"
+    );
+
+    // Now introduce the malformed (negative) harness-reported cost and read
+    // again: TKT-5's own bucket is null'd, its coverage is marked incomplete,
+    // and — since a single malformed contribution poisons the whole
+    // cross-task dedup total by the same null-propagation rule as everything
+    // else — the top-level totals go null too rather than silently reporting
+    // a partial number as complete.
+    std::env::set_var("RK_FAKE_HARNESS_CMD", cost_fake("-1"));
+    let bad = spawn(&mut client, &repo_path, "TKT-5", None).await;
+    wait_for_state(&mut client, &bad, &["completed"]).await;
+    space
+        .out(landing_processed_marker(
+            "repo-a",
+            "feature-e",
+            "sha-e",
+            "main",
+            "TKT-5",
+            "landed",
+            Some("merge-e"),
+            at,
+        ))
+        .unwrap();
+
+    let resp2 = client
+        .call("factory.scorecards", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    let nrc2 = native_recorded_cost(&resp2);
+    let tasks2 = nrc2["tasks"].as_array().unwrap();
+    let tkt5 = tasks2
+        .iter()
+        .find(|t| t["task"] == json!("TKT-5"))
+        .expect("TKT-5 present (malformed cost)");
+    assert!(tkt5["implementation"]["settled"]["cost_usd_micro"].is_null());
+    assert!(tkt5["recorded_cost_usd_micro"].is_null());
+    assert_eq!(tkt5["coverage_complete"], json!(false));
+    assert_eq!(
+        tkt5["implementation"]["settled"]["malformed_cost_generation_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        nrc2["totals"]["recorded_cost_usd_micro"].is_null(),
+        "one malformed contributing generation must null the whole cross-task total, never a silent partial sum"
+    );
+    // TKT-1's own view is entirely unaffected by TKT-5's unrelated
+    // malformed generation.
+    let tkt1_again = tasks2
+        .iter()
+        .find(|t| t["task"] == json!("TKT-1"))
+        .expect("TKT-1 still present");
+    assert_eq!(tkt1_again["recorded_cost_usd_micro"], json!(350_000));
+
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// The crash/respawn is real (`agent.spawn`/`agent.respawn` against the real
+/// registry); the delivery attribution is seeded (`landing_processed_marker`
+/// via `space.out`, not the real `LandingPipeline`) — isolating the
+/// same-generation-identity join from the larger landing/review machinery,
+/// same rationale as the test above. A generation that crashes, is
+/// respawned, and completes on the resumed launch must be counted exactly
+/// once in `native_recorded_cost` (its stable identity never changes across
+/// the respawn) — not summed across attempts.
+#[tokio::test]
+async fn factory_analytics_native_recorded_cost_same_generation_resume_counts_once_not_summed() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let (_home, repo_dir, _layout, handle, space, mut client) = setup_with_space().await;
+    let repo_path = repo_dir.path().to_string_lossy().to_string();
+    let at = fixed_clock();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", CRASHING_FAKE);
+    let resumed = spawn(&mut client, &repo_path, "TKT-3", None).await;
+    wait_for_state(&mut client, &resumed, &["failed"]).await;
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", cost_fake("0.30"));
+    client
+        .call("agent.respawn", json!({"name": resumed}))
+        .await
+        .unwrap();
+    wait_for_state(&mut client, &resumed, &["completed"]).await;
+
+    space
+        .out(landing_processed_marker(
+            "repo-a",
+            "feature-c",
+            "sha-c",
+            "main",
+            "TKT-3",
+            "landed",
+            Some("merge-c"),
+            at,
+        ))
+        .unwrap();
+
+    let resp = client
+        .call("factory.scorecards", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    let nrc = native_recorded_cost(&resp);
+    let task = nrc["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["task"] == json!("TKT-3"))
+        .expect("TKT-3 present");
+    assert_eq!(
+        task["implementation"]["settled"]["generation_count"],
+        json!(1),
+        "one generation identity survives the crash+respawn, not two"
+    );
+    assert_eq!(
+        task["implementation"]["settled"]["cost_usd_micro"],
+        json!(300_000),
+        "resumed launch's cumulative cost, not summed across the failed attempt"
+    );
+
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// The spawn and the `agent.archive` sweep are real; the delivery
+/// attribution is seeded (`landing_processed_marker` via `space.out`), same
+/// rationale as the two tests above. A real archive sweep moves a settled
+/// generation into the archive store; `native_recorded_cost` excludes its
+/// cost from the recorded sum unless the request opts into
+/// `include_archived`, and flags `coverage_complete: false` while excluded
+/// rather than reporting a silent partial total as complete.
+#[tokio::test]
+async fn factory_analytics_native_recorded_cost_archived_generation_excluded_unless_include_archived(
+) {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let (_home, repo_dir, _layout, handle, space, mut client) = setup_with_space().await;
+    let repo_path = repo_dir.path().to_string_lossy().to_string();
+    let at = fixed_clock();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", cost_fake("0.40"));
+    let archived_impl = spawn(&mut client, &repo_path, "TKT-4", None).await;
+    wait_for_state(&mut client, &archived_impl, &["completed"]).await;
+    space
+        .out(landing_processed_marker(
+            "repo-a",
+            "feature-d",
+            "sha-d",
+            "main",
+            "TKT-4",
+            "landed",
+            Some("merge-d"),
+            at,
+        ))
+        .unwrap();
+    client
+        .call(
+            "agent.archive",
+            json!({"all": true, "reap_git": false, "reap_logs": false, "reap_artifacts": false}),
+        )
+        .await
+        .unwrap();
+
+    let resp = client
+        .call("factory.scorecards", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    let task = native_recorded_cost(&resp)["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["task"] == json!("TKT-4"))
+        .expect("TKT-4 present")
+        .clone();
+    assert_eq!(
+        task["implementation"]["settled"]["excluded_archived_generations"],
+        json!(1)
+    );
+    assert_eq!(task["recorded_cost_usd_micro"], json!(0));
+    assert_eq!(task["coverage_complete"], json!(false));
+
+    let resp2 = client
+        .call(
+            "factory.scorecards",
+            json!({"repo":"repo-a", "include_archived": true}),
+        )
+        .await
+        .unwrap();
+    let task2 = native_recorded_cost(&resp2)["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["task"] == json!("TKT-4"))
+        .expect("TKT-4 present")
+        .clone();
+    assert_eq!(
+        task2["implementation"]["settled"]["cost_usd_micro"],
+        json!(400_000)
+    );
+    assert_eq!(
+        task2["implementation"]["settled"]["excluded_archived_generations"],
+        json!(0)
+    );
+    assert_eq!(task2["coverage_complete"], json!(true));
+
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// No real agent spawns here — pure seeded markers over the real bounded
+/// storage query, isolating an edge case (ambiguous cross-task linkage) the
+/// real pipeline would rarely produce on its own. Two markers linking the
+/// SAME rework ticket to two different original tasks (ambiguous, excluded
+/// from every task's correction cost rather than guessed), and a marker
+/// written under a different repo scope (must never leak into `repo-a`'s
+/// coverage).
+#[tokio::test]
+async fn factory_analytics_native_recorded_cost_ambiguous_link_and_cross_repo_scoping_via_real_markers(
+) {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let (_home, _repo, _layout, handle, space, mut client) = setup_with_space().await;
+    let at = fixed_clock();
+
+    space
+        .out(landing_processed_marker(
+            "repo-a",
+            "feature-1",
+            "sha-1",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-1"),
+            at,
+        ))
+        .unwrap();
+    space
+        .out(landing_processed_marker(
+            "repo-a",
+            "feature-4",
+            "sha-4",
+            "main",
+            "TKT-4",
+            "landed",
+            Some("merge-4"),
+            at,
+        ))
+        .unwrap();
+    space
+        .out(resubmission_marker(
+            "repo-a",
+            "landing_rework_resubmission",
+            "TKT-9",
+            "TKT-1",
+            at,
+        ))
+        .unwrap();
+    space
+        .out(resubmission_marker(
+            "repo-a",
+            "landing_rework_resubmission",
+            "TKT-9",
+            "TKT-4",
+            at,
+        ))
+        .unwrap();
+    // A different repo's own resubmission marker must never leak in.
+    space
+        .out(landing_processed_marker(
+            "repo-other",
+            "feature-x",
+            "sha-x",
+            "main",
+            "TKT-X",
+            "landed",
+            Some("merge-x"),
+            at,
+        ))
+        .unwrap();
+    space
+        .out(resubmission_marker(
+            "repo-other",
+            "landing_rework_resubmission",
+            "TKT-X2",
+            "TKT-X",
+            at,
+        ))
+        .unwrap();
+
+    let resp = client
+        .call("factory.scorecards", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    let nrc = native_recorded_cost(&resp);
+    assert!(nrc["ambiguous_correction_tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "TKT-9"));
+    let tasks = nrc["tasks"].as_array().unwrap();
+    assert!(
+        tasks.iter().all(|t| t["task"] != json!("TKT-X")),
+        "a different repo's task must never appear under repo-a's coverage"
+    );
+    for task in tasks {
+        assert_eq!(
+            task["correction"]["settled"]["generation_count"],
+            json!(0),
+            "the ambiguous ticket must not be attributed to either candidate task"
+        );
+    }
+
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+/// The two resubmission-marker identities (`landing_rework_resubmission` /
+/// `landing_conflict_rework_resubmission`) genuinely share ONE
+/// `MAX_SCAN_TUPLES` bounded-read budget rather than each getting a full cap
+/// of its own — proven against the real storage query, matching
+/// `factory_analytics_native_delivery_truncates_at_the_real_storage_cap`'s
+/// pattern for `native_delivery`.
+#[tokio::test]
+async fn factory_analytics_native_recorded_cost_correction_links_share_one_bounded_budget() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let (_home, _repo, _layout, handle, space, mut client) = setup_with_space().await;
+    let at = fixed_clock();
+    const MAX_SCAN_TUPLES: usize = 10_000;
+    // Split across BOTH identities so a per-identity cap (a regression back
+    // to 2x the budget) would NOT show truncation here, while a genuinely
+    // shared cap does: 6_000 + 4_001 = one over MAX_SCAN_TUPLES.
+    for i in 0..6_000 {
+        space
+            .out(resubmission_marker(
+                "repo-a",
+                "landing_rework_resubmission",
+                &format!("TKT-R{i}"),
+                &format!("TKT-ORIG-{i}"),
+                at,
+            ))
+            .unwrap();
+    }
+    for i in 0..=4_000 {
+        space
+            .out(resubmission_marker(
+                "repo-a",
+                "landing_conflict_rework_resubmission",
+                &format!("TKT-C{i}"),
+                &format!("TKT-ORIG2-{i}"),
+                at,
+            ))
+            .unwrap();
+    }
+
+    let resp = client
+        .call("factory.scorecards", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    let nrc = native_recorded_cost(&resp);
+    assert_eq!(
+        nrc["coverage"]["correction_links"]["limit"],
+        json!(MAX_SCAN_TUPLES)
+    );
+    assert_eq!(
+        nrc["coverage"]["correction_links"]["scanned"],
+        json!(MAX_SCAN_TUPLES),
+        "shared budget across both identities, not 2x MAX_SCAN_TUPLES"
+    );
+    assert_eq!(
+        nrc["coverage"]["correction_links"]["truncated"],
+        json!(true)
+    );
+    assert_eq!(nrc["coverage"]["may_hide_contributors"], json!(true));
 
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();

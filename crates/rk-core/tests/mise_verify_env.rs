@@ -67,10 +67,13 @@ fn mise_test_task_strips_the_full_strip_rk_spawn_environment() {
 
 #[test]
 fn mise_verify_full_task_strips_the_full_strip_rk_spawn_environment() {
-    let source =
-        std::fs::read_to_string(workspace_root().join("mise.toml")).expect("read mise.toml");
-    let parsed: toml::Table = source.parse().expect("parse mise.toml");
-    assert_strips_canonical_env("verify-full", &task_run_command(&parsed, "verify-full"));
+    // [tasks.verify-full].run delegates to scripts/verify-full.sh (see that
+    // file's header), so the canonical env -u list lives there, not in
+    // mise.toml's run string — mirroring changed_test_runner_... below,
+    // which already checks scripts/verify-changed.sh for the same reason.
+    let script = std::fs::read_to_string(workspace_root().join("scripts/verify-full.sh"))
+        .expect("read scripts/verify-full.sh");
+    assert_strips_canonical_env("verify-full", &script);
 }
 
 #[test]

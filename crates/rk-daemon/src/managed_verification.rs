@@ -21,6 +21,16 @@ pub(crate) struct CheckExecution<'a> {
     pub id: &'a str,
     pub repo: &'a str,
     pub agent: &'a str,
+    /// Repo-registered check name (`checks.cue`'s `name`) this execution
+    /// corresponds to, or `""` for a raw inline `run` step command with no
+    /// named-check identity. Used ONLY to look up this check's configured
+    /// P3.2 weight/fast-lane class
+    /// ([`HostVerificationAdmission`]'s `check_weight`/`check_class`) — an
+    /// empty or unrecognized name simply costs the default weight 1 and
+    /// joins no fast lane, identical to pre-P3.2 behaviour, so a caller with
+    /// no natural check name to offer can pass `""` with zero behaviour
+    /// change.
+    pub check_name: &'a str,
     pub dir: &'a Path,
     pub command: &'a str,
     pub resolved: &'a ResolvedRun,
@@ -161,6 +171,14 @@ impl<'a> ManagedVerification<'a> {
     /// same drop-based cleanup `run_check_in` already relies on for a
     /// timeout — and this records a durable cancellation outcome instead of
     /// ever writing a reusable proof for it.
+    ///
+    /// A settled, non-passing verdict is never silently lost either
+    /// (TKT-lurin-bulif-gabik): [`record_verification_failure_receipt`](Self::record_verification_failure_receipt)
+    /// persists a versioned, bounded failure receipt and its id is folded
+    /// into the returned `Value` as `failure_receipt_id` — or
+    /// `failure_receipt_error` if persisting it failed — so a caller who
+    /// loses this call's own stdout/stderr can still retrieve the exact
+    /// diagnostic later without rerunning the check.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn verify_repo_check(
         &self,
@@ -224,9 +242,24 @@ impl<'a> ManagedVerification<'a> {
             }
         }
 
+        // Minted here — exactly once per ACTUAL invocation, past the cache-hit
+        // early return above — never derived from `request_key`/`conn_id`,
+        // which reset across a daemon restart and so cannot safely identify
+        // one real occurrence long-term. See
+        // `record_verification_failure_receipt`'s doc for why this is the
+        // failure receipt's idempotency boundary.
+        let occurrence_id = rk_core::id::RecordId::new();
         let progress = Arc::new(Mutex::new(RunProgress::default()));
-        let (managed_id, mut cancel_rx) =
-            self.resources.runs.register(agent, generation, request_key);
+        // Refused outright while a P7.1 handoff fence is engaged for this
+        // repo — the fence stops NEW managed work from starting behind an
+        // already-answered `ready`. See `try_register`'s doc.
+        let (managed_id, mut cancel_rx) = self.resources.runs.try_register(
+            agent,
+            generation,
+            request_key,
+            repo_name,
+            "verify",
+        )?;
         let registration = ManagedRegistration {
             runs: &self.resources.runs,
             id: managed_id,
@@ -234,6 +267,7 @@ impl<'a> ManagedVerification<'a> {
         let run_id = format!("verify-run:{agent}");
         let run_fut = self.run(CheckExecution {
             admission_timeout: None,
+            check_name,
             id: &run_id,
             repo: repo_name,
             agent,
@@ -255,7 +289,7 @@ impl<'a> ManagedVerification<'a> {
         };
         drop(registration);
 
-        let result = match outcome {
+        let mut result = match outcome {
             Ok(result) => result?,
             Err(reason) => {
                 // A cancellation is settled right here, at the moment it's
@@ -306,28 +340,68 @@ impl<'a> ManagedVerification<'a> {
             }
         };
 
+        let (queued_at, started_at, ended_at, queue_wait_ms, duration_ms) = {
+            let p = progress.lock().unwrap();
+            (
+                p.queued_at_wall,
+                p.started_at_wall,
+                p.settled.map(|s| s.ended_at_wall),
+                p.queue_wait_ms,
+                p.settled.map(|s| s.duration_ms),
+            )
+        };
+        let verdict_is_pass = result.get("verdict").and_then(Value::as_str) == Some("pass");
+        let candidate_label = candidate_sha.as_deref().unwrap_or("dirty");
+
         if let Some(sha) = &candidate_sha {
-            if result.get("verdict").and_then(Value::as_str) == Some("pass") {
+            if verdict_is_pass {
                 self.record_verification_proof(repo_name, sha, &check, &result);
             }
         }
 
+        if !verdict_is_pass {
+            match self.record_verification_failure_receipt(VerificationFailureReceiptInput {
+                occurrence_id,
+                repo_name,
+                check_name,
+                check: &check,
+                candidate: candidate_label,
+                agent,
+                generation,
+                request_key,
+                task,
+                result: &result,
+                queued_at,
+                started_at,
+                ended_at,
+                queue_wait_ms,
+                duration_ms,
+            }) {
+                Ok(id) => {
+                    if let Value::Object(map) = &mut result {
+                        map.insert("failure_receipt_id".into(), json!(id));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        repo = repo_name,
+                        check = check_name,
+                        error = %e,
+                        "failed to persist verification failure receipt"
+                    );
+                    if let Value::Object(map) = &mut result {
+                        map.insert("failure_receipt_error".into(), json!(e));
+                    }
+                }
+            }
+        }
+
         if let Some(task) = task {
-            let (queued_at, started_at, ended_at, queue_wait_ms, duration_ms) = {
-                let p = progress.lock().unwrap();
-                (
-                    p.queued_at_wall,
-                    p.started_at_wall,
-                    p.settled.map(|s| s.ended_at_wall),
-                    p.queue_wait_ms,
-                    p.settled.map(|s| s.duration_ms),
-                )
-            };
             self.record_ad_hoc_verification_span(AdHocVerificationSpan {
                 task,
                 repo_name,
                 check_name,
-                candidate: candidate_sha.as_deref().unwrap_or("dirty"),
+                candidate: candidate_label,
                 queued_at,
                 started_at,
                 ended_at,
@@ -556,6 +630,153 @@ impl<'a> ManagedVerification<'a> {
         );
     }
 
+    /// Persist a versioned, bounded failure receipt for one `verify.run` /
+    /// `rk verify` call whose settled result was not `verdict: "pass"`
+    /// (TKT-lurin-bulif-gabik) — the durable counterpart a caller who
+    /// loses or discards the RPC's own stdout/stderr (a shell pipeline that
+    /// swallows the exit status, a disconnect before it prints) can
+    /// retrieve later via `rk scan artifact <repo> verification-failure-receipt`,
+    /// without rerunning the check.
+    ///
+    /// Deliberately a DIFFERENT identity than
+    /// [`record_gate_failure`](Self::record_gate_failure)'s `gate-failure`
+    /// artifact, which keeps firing unconditionally from inside
+    /// [`run`](Self::run) for every caller (workflow `run` steps and
+    /// landing gates included) — this one adds the ad-hoc-caller identity
+    /// (`agent`/`generation`/`request_key`/`task`/`candidate`) that only
+    /// [`verify_repo_check`](Self::verify_repo_check) has, and is NEVER read
+    /// back as a pass proof: unlike [`VERIFICATION_PROOF_IDENTITY`], nothing
+    /// ever looks this identity up to satisfy a gate or skip a re-run.
+    ///
+    /// Keyed on `input.occurrence_id` alone — a fresh id
+    /// [`verify_repo_check`](Self::verify_repo_check) mints exactly once per
+    /// ACTUAL invocation (never a cache hit), before this method is ever
+    /// called. Deliberately NOT keyed on `request_key`/`conn_id`: those are
+    /// transport-level identities `server.rs` resets to 0 on every daemon
+    /// restart, so the exact same value can legitimately name two entirely
+    /// different runs across a restart (or a reused connection sequence
+    /// number) — deduplicating on them would let a stale diagnostic from an
+    /// unrelated earlier run answer a lookup for a brand new one. Using the
+    /// occurrence id both as the lookup key AND the written tuple's own id
+    /// makes the idempotency check a single bounded [`Space::get`] — no
+    /// scan, no scan-then-write race — so a caller or daemon path that
+    /// somehow re-enters this for the SAME occurrence settles on the SAME
+    /// receipt id, while two genuinely distinct occurrences (however
+    /// identical their transport identity) always mint distinct ids and so
+    /// always get distinct receipts.
+    ///
+    /// Never turns a failing check green: this only ever records evidence
+    /// alongside the verdict `run` already computed, and a storage failure
+    /// here is surfaced back to the caller as `Err` (rendered into the RPC
+    /// result's `failure_receipt_error`, never silently swallowed) — the
+    /// caller must not conclude evidence was preserved when it was not.
+    fn record_verification_failure_receipt(
+        &self,
+        input: VerificationFailureReceiptInput<'_>,
+    ) -> Result<String, String> {
+        // Bounded exact-id read, not a scan: settling the same occurrence
+        // twice must find its own prior receipt directly.
+        match self.space.get(input.occurrence_id) {
+            Ok(Some(existing)) if is_failure_receipt(&existing) => {
+                return Ok(existing.id.to_string());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(format!(
+                    "could not check for an existing failure receipt: {e}"
+                ))
+            }
+        }
+
+        let result = input.result;
+        let stdout_full = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+        let stderr_full = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+        let (stdout_tail, stdout_tail_truncated) =
+            bounded_tail_and_truncated(stdout_full, GATE_EVIDENCE_LIMIT);
+        let (stderr_tail, stderr_tail_truncated) =
+            bounded_tail_and_truncated(stderr_full, GATE_EVIDENCE_LIMIT);
+        // The truthful flag is the union of both truncation sources: the
+        // runner's own capture bound (`MAX_RUN_OUTPUT_BYTES`, already baked
+        // into `result`'s own `stdout_truncated`/`stderr_truncated`) AND this
+        // receipt's own further bound (`GATE_EVIDENCE_LIMIT`) — copying only
+        // the former would silently claim "complete" evidence that this
+        // receipt itself just cut down further.
+        let stdout_truncated = result
+            .get("stdout_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || stdout_tail_truncated;
+        let stderr_truncated = result
+            .get("stderr_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || stderr_tail_truncated;
+
+        let scope = repo_identity(self.layout, input.repo_name);
+        let mut tuple = Tuple::new(
+            Category::Artifact,
+            scope,
+            VERIFICATION_FAILURE_RECEIPT_IDENTITY,
+            "daemon",
+            json!({
+                "schema_version": VERIFICATION_FAILURE_RECEIPT_SCHEMA_VERSION,
+                // Mirrors the tuple's own `id` (set to `occurrence_id`
+                // below) inside the payload too — `rk scan`'s `--search` is
+                // `payload_search`, a substring test over the SERIALIZED
+                // PAYLOAD only (`Pattern::payload_search`); it never matches
+                // against `tuple.id`. Without this field, the documented
+                // retrieval command (`rk scan artifact <repo>
+                // verification-failure-receipt --search <receipt_id>`)
+                // always returns empty — a real operator probe caught
+                // exactly this gap (TKT-lurin-bulif-gabik).
+                "receipt_id": input.occurrence_id.to_string(),
+                "repo": input.repo_name,
+                "check": input.check_name,
+                "command": input.check.command,
+                "toolchain": input.check.toolchain,
+                "environment_policy": input.check.environment_policy.to_string(),
+                "candidate": input.candidate,
+                "agent": input.agent,
+                "generation": input.generation.map(|g| g.to_string()),
+                "request_key": input.request_key,
+                "task": input.task,
+                "exit": result.get("exit"),
+                "verdict": result.get("verdict"),
+                "timed_out": result.get("timed_out"),
+                "no_exit_code": result.get("no_exit_code"),
+                "signal": result.get("signal"),
+                "stdout_tail": stdout_tail,
+                "stdout_truncated": stdout_truncated,
+                "stderr_tail": stderr_tail,
+                "stderr_truncated": stderr_truncated,
+                "retries": bounded_retries(result.get("retries")),
+                "queued_at": input.queued_at,
+                "started_at": input.started_at,
+                "ended_at": input.ended_at,
+                "queue_wait_ms": input.queue_wait_ms,
+                "duration_ms": input.duration_ms,
+            }),
+        );
+        tuple.id = input.occurrence_id;
+        let id = tuple.id.to_string();
+        match self.space.out(tuple) {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                // Lost a race settling the exact same occurrence to another
+                // writer under this same id — a successful settlement, not a
+                // failed one.
+                if let Ok(Some(existing)) = self.space.get(input.occurrence_id) {
+                    if is_failure_receipt(&existing) {
+                        return Ok(existing.id.to_string());
+                    }
+                }
+                Err(format!(
+                    "failed to persist verification-failure-receipt: {e}"
+                ))
+            }
+        }
+    }
+
     /// Run one resolved check to completion in `dir`, with retry/timeout
     /// policy and durable gate-failure recording — everything downstream of
     /// "have a directory and a fully-resolved command". Split out of
@@ -578,6 +799,7 @@ impl<'a> ManagedVerification<'a> {
             id,
             repo,
             agent,
+            check_name,
             dir,
             command,
             resolved,
@@ -624,7 +846,7 @@ impl<'a> ManagedVerification<'a> {
             // (TKT-vilug-hujok-bolis: preventing cross-repo head-of-line
             // blocking). This does not implement check sharing — it is a
             // pure ordering property of two independent semaphores.
-            let host_guard = self.resources.host_admission.acquire().await;
+            let host_guard = self.resources.host_admission.acquire(check_name).await;
             (test_guard, admission, host_guard)
         };
         let (_test_exec_guard, admission, _host_guard) = match if wait_budget.is_zero() {
@@ -1034,6 +1256,13 @@ impl<'a> ManagedVerification<'a> {
         for (name, value) in env {
             child_command.env(name, value);
         }
+        // See rk_core::exec::close_extra_fds: a captured-output pipe
+        // created elsewhere in the daemon (a concurrent `git` call, another
+        // check, a harness launch) can be caught between `pipe()` and its
+        // own close-on-exec setup by this exact spawn; without this, this
+        // check's child could inherit it and keep that pipe's read side
+        // from ever seeing EOF (TKT-bikuz-kumuz-zutit).
+        rk_core::exec::close_extra_fds(child_command.as_std_mut());
         let child = child_command.spawn().map_err(|e| {
             rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
         })?;
@@ -1261,6 +1490,22 @@ pub(crate) const VERIFICATION_PROOF_IDENTITY: &str = "verification_proof";
 /// writes [`VERIFICATION_PROOF_IDENTITY`] either, so it can never be reused.
 pub(crate) const VERIFICATION_CANCELLED_IDENTITY: &str = "verification_cancelled";
 
+/// Durable `(Artifact, <repo>, "verification-failure-receipt")` identity
+/// (TKT-lurin-bulif-gabik) — a versioned, bounded failure diagnostic for one
+/// [`ManagedVerification::verify_repo_check`] call (`verify.run` / `rk
+/// verify`) whose settled result was not `verdict: "pass"`. Never read back
+/// by [`ManagedVerification::lookup_verification_proof`] or anything else
+/// that would let a failed, unknown, or cancelled outcome satisfy a gate or
+/// a pass-proof lookup — see
+/// [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt).
+pub(crate) const VERIFICATION_FAILURE_RECEIPT_IDENTITY: &str = "verification-failure-receipt";
+
+/// Bump when [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt)'s
+/// payload shape changes, so a consumer reading an older receipt can tell it
+/// is a different generation rather than silently misreading a missing
+/// field as absent evidence.
+pub(crate) const VERIFICATION_FAILURE_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
 /// Pause between a failed attempt and a `retryOnFail` retry. Fixed rather than
 /// configurable: this exists to ride out a transient condition (machine load,
 /// a build-lock hold), not to be tuned per workflow.
@@ -1408,6 +1653,45 @@ pub(crate) struct AdHocVerificationSpan<'a> {
     duration_ms_monotonic: Option<u64>,
     proof_reused: bool,
     terminal_reason: &'a str,
+}
+
+/// One `verify_repo_check` call's non-passing settled result, bundled for
+/// [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt)
+/// — see that method for what each field means and why this identity is
+/// separate from [`AdHocVerificationSpan`] (timing telemetry) and
+/// `gate-failure` (the generic, caller-agnostic evidence `run` already
+/// writes for every non-pass verdict).
+pub(crate) struct VerificationFailureReceiptInput<'a> {
+    /// Minted exactly once per ACTUAL invocation of
+    /// [`ManagedVerification::verify_repo_check`] (never for a cache hit,
+    /// never derived from `request_key`) — see
+    /// [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt)
+    /// for why this, and not any transport-level identity, is the
+    /// idempotency boundary.
+    pub(crate) occurrence_id: rk_core::id::RecordId,
+    pub(crate) repo_name: &'a str,
+    pub(crate) check_name: &'a str,
+    pub(crate) check: &'a rk_workflow::Check,
+    /// The candidate sha `clean_candidate_sha` resolved, or `"dirty"` when
+    /// the worktree had uncommitted changes (or the git probe itself
+    /// failed) — same convention `verify_repo_check` already uses for
+    /// [`AdHocVerificationSpan::candidate`], so a reader never sees this
+    /// field silently absent.
+    pub(crate) candidate: &'a str,
+    pub(crate) agent: &'a str,
+    pub(crate) generation: Option<rk_core::id::SpawnId>,
+    pub(crate) request_key: &'a str,
+    pub(crate) task: Option<&'a str>,
+    /// The settled `run` result: `exit`/`verdict`/`timed_out`/`no_exit_code`/
+    /// `signal`/`stdout`/`stdout_truncated`/`stderr`/`stderr_truncated`/
+    /// `retries`, read out of here rather than threaded as separate
+    /// arguments.
+    pub(crate) result: &'a Value,
+    pub(crate) queued_at: Option<DateTime<Utc>>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+    pub(crate) ended_at: Option<DateTime<Utc>>,
+    pub(crate) queue_wait_ms: Option<u64>,
+    pub(crate) duration_ms: Option<u64>,
 }
 
 /// Decode a `spawn_check_child` outcome into the flat tuple `run_check_in`
@@ -1573,10 +1857,10 @@ pub(crate) struct ProcessTableRow {
 /// falls back to signalling only the root process group it already knew
 /// about, same as before this tree-walk existed.
 pub(crate) fn live_process_table() -> Vec<ProcessTableRow> {
-    let Ok(output) = std::process::Command::new("ps")
-        .args(["-Ao", "pid=,ppid=,pgid=,stat=,comm="])
-        .output()
-    else {
+    let mut cmd = std::process::Command::new("ps");
+    cmd.args(["-Ao", "pid=,ppid=,pgid=,stat=,comm="]);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let Ok(output) = cmd.output() else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -1876,10 +2160,10 @@ impl Drop for ManagedChildMarker {
 /// identically by every caller (nothing to compare against, so no confident
 /// answer either way).
 pub(crate) fn process_signature(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("ps");
+    cmd.args(["-o", "lstart=", "-p", &pid.to_string()]);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2146,6 +2430,42 @@ pub(crate) fn bounded_tail(text: &str, limit: usize) -> String {
     trimmed[start..].to_string()
 }
 
+/// [`bounded_tail`] plus whether THIS bound cut anything off — computed on
+/// the same char-count basis `bounded_tail` slices on (never a byte length,
+/// which would misjudge a multibyte boundary) so a receipt's own truncation
+/// flag is truthful even when the text is well under any earlier capture
+/// bound but still exceeds `limit`.
+pub(crate) fn bounded_tail_and_truncated(text: &str, limit: usize) -> (String, bool) {
+    let truncated = text.trim().chars().count() > limit;
+    (bounded_tail(text, limit), truncated)
+}
+
+/// Cap a failure receipt's embedded retry-history array at
+/// [`MAX_RETRY_ON_FAIL`] entries, keeping the most recent — already the
+/// runtime's own upper bound on how many retries a single run can have
+/// (`validate_retry_on_fail`), enforced again here so the receipt can never
+/// grow unbounded even if that upstream invariant is ever loosened.
+pub(crate) fn bounded_retries(retries: Option<&Value>) -> Value {
+    match retries.and_then(Value::as_array) {
+        Some(entries) => {
+            let start = entries.len().saturating_sub(MAX_RETRY_ON_FAIL as usize);
+            json!(entries[start..].to_vec())
+        }
+        None => json!([]),
+    }
+}
+
+/// Whether `tuple` is a [`VERIFICATION_FAILURE_RECEIPT_IDENTITY`] artifact —
+/// the narrow identity check
+/// [`record_verification_failure_receipt`](ManagedVerification::record_verification_failure_receipt)
+/// applies before trusting an exact-id [`Space::get`] hit as "this
+/// occurrence already settled", so an unrelated tuple that happened to land
+/// on the same id (a practical-impossibility ULID collision) is never
+/// mistaken for a prior receipt.
+fn is_failure_receipt(tuple: &Tuple) -> bool {
+    tuple.category == Category::Artifact && tuple.identity == VERIFICATION_FAILURE_RECEIPT_IDENTITY
+}
+
 /// Bounded stdout/stderr tails for a failed check's instance error, so the
 /// operator sees what the check said, not just that it said no.
 pub(crate) fn check_failure_detail(stdout: &str, stderr: &str) -> String {
@@ -2205,23 +2525,20 @@ pub(crate) fn extract_failing_tests(stdout: &str) -> Vec<String> {
 /// the repo's common root, not necessarily this specific linked worktree) —
 /// `git -C <dir>` is exactly the worktree under test.
 pub(crate) async fn clean_candidate_sha(dir: &Path) -> Option<String> {
-    let status = tokio::process::Command::new("git")
+    let mut status_cmd = tokio::process::Command::new("git");
+    status_cmd
         .arg("-C")
         .arg(dir)
-        .args(["status", "--porcelain"])
-        .output()
-        .await
-        .ok()?;
+        .args(["status", "--porcelain"]);
+    rk_core::exec::close_extra_fds(status_cmd.as_std_mut());
+    let status = status_cmd.output().await.ok()?;
     if !status.status.success() || !status.stdout.is_empty() {
         return None;
     }
-    let head = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .await
-        .ok()?;
+    let mut head_cmd = tokio::process::Command::new("git");
+    head_cmd.arg("-C").arg(dir).args(["rev-parse", "HEAD"]);
+    rk_core::exec::close_extra_fds(head_cmd.as_std_mut());
+    let head = head_cmd.output().await.ok()?;
     if !head.status.success() {
         return None;
     }
@@ -2498,15 +2815,44 @@ impl VerificationAdmission {
 /// otherwise use immediately. Ordinary acquire-order is what prevents the
 /// cross-repo head-of-line blocking the ticket requires be prevented; no
 /// separate coordination or check-sharing is needed for it.
+///
+/// P3.2 (TKT-nasif-danob-sirok) layers two OPTIONAL, still-additive
+/// refinements on top of the P3.1 plain counting semaphore, both disabled
+/// by default (empty maps) so an unconfigured daemon behaves exactly as
+/// before this existed:
+/// - **Weighted classes**: `[policy] verification_admission_check_weight`
+///   lets a named check cost more than one aggregate unit, acquired
+///   atomically via [`tokio::sync::Semaphore::acquire_many_owned`] — never
+///   partially, so a heavy check can never hold only some of its cost while
+///   waiting on the rest.
+/// - **Fair progress**: `[policy] verification_admission_check_class` /
+///   `_class_reserve` carve a small, EXPLICITLY BOUNDED slice out of the
+///   aggregate limit into a dedicated per-class semaphore a member check
+///   tries FIRST, non-blockingly — see [`acquire`](Self::acquire). This is
+///   what lets a cheap mandatory guard (e.g. `landing-protected-paths`)
+///   keep making progress while a long check (e.g. `verify`) occupies the
+///   general pool, without ever letting that guard's own class draw
+///   unboundedly: once its reserved lane is itself full, the next request
+///   falls through to the ordinary general-pool queue like any other
+///   request. Class membership is entirely `config.toml`-owned (never read
+///   from a repository's own `checks.cue`), so no workflow- or
+///   repo-supplied check definition can self-declare its way into a
+///   reserved lane.
 #[derive(Default)]
 pub(crate) struct HostVerificationAdmission {
-    semaphore: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    general: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Total permits the general pool was last constructed with — needed to
+    /// compute `executing()` from `Semaphore::available_permits`, which
+    /// exposes only what's free, not the pool's own total.
+    general_limit: AtomicU64,
+    /// The full aggregate ceiling (`[policy] verification_admission_aggregate_limit`)
+    /// — `general_limit` plus every class's reserve sums back to this.
     limit: AtomicU64,
     /// Requests currently blocked in [`acquire`](Self::acquire)'s own
-    /// await — SPECIFICALLY waiting for the aggregate host permit, never a
-    /// broader "waiting for any managed admission" count. A request still
-    /// queued behind its own per-repo `VerificationAdmission` semaphore, or
-    /// behind the shared-`CARGO_TARGET_DIR` `TestExecLock`, has not called
+    /// await for the GENERAL pool specifically — never a reserved class's
+    /// try-only lane, which can never block. A request still queued behind
+    /// its own per-repo `VerificationAdmission` semaphore, or behind the
+    /// shared-`CARGO_TARGET_DIR` `TestExecLock`, has not called
     /// [`acquire`](Self::acquire) yet (see [`ManagedVerification::run`]'s
     /// acquire order) and so is not counted here at all — it shows up only
     /// implicitly, as elapsed queue-wait time once it settles. Distinct from
@@ -2514,20 +2860,166 @@ pub(crate) struct HostVerificationAdmission {
     /// own repo's permit but is still queued here for the host-wide one is
     /// "waiting", not yet "executing".
     waiting: AtomicU64,
+    /// P3.2 per-check-name weight, `[policy] verification_admission_check_weight`.
+    /// A name absent here costs the default weight 1.
+    check_weight: Mutex<HashMap<String, u32>>,
+    /// P3.2 per-check-name fast-lane class, `[policy] verification_admission_check_class`.
+    check_class: Mutex<HashMap<String, String>>,
+    /// P3.2 reserved fast lanes, keyed by class name — only classes with a
+    /// positive reserve appear here.
+    classes: Mutex<HashMap<String, Arc<ReservedClass>>>,
+}
+
+/// One fast-lane class's dedicated, bounded slice of the aggregate —
+/// `[policy] verification_admission_class_reserve[class]` permits, carved
+/// OUT OF (never additive to) the general pool's own capacity.
+struct ReservedClass {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    limit: u32,
+    /// Requests currently blocked in the reserved-lane BLOCKING fallback
+    /// (see [`HostVerificationAdmission::acquire`]'s "weight exceeds the
+    /// general pool" branch) — never incremented for the fast non-blocking
+    /// `try_acquire_many_owned` path, which by definition never waits.
+    waiting: AtomicU64,
+}
+
+/// Validate a proposed P3.2 weight/class-reserve configuration against
+/// `limit` (the already-set aggregate ceiling) BEFORE anything is installed
+/// — every rejection here is a daemon-startup refusal, not a runtime
+/// surprise. REWORK (native review `01M2HWE7TBKTGZZGEKK19WM16J` against
+/// candidate `9e7bde7`) found the original version of this function
+/// insufficient on two counts, both fixed here:
+/// - A reserve total EQUAL TO the aggregate limit was accepted, leaving the
+///   general pool sized `0` (`general_limit = limit - reserved_total`).
+///   `HostVerificationAdmission::acquire` used to treat "general pool is
+///   `None`" as its disabled-cap sentinel, so this silently disabled ALL
+///   host admission fleet-wide instead of routing through the reserved
+///   lane — the "full-reservation bypass". Fixed by requiring the reserve
+///   total be STRICTLY LESS than the limit whenever any class has a
+///   positive reserve, so `general_limit` is always at least `1` whenever
+///   the aggregate is enabled — every check name NOT explicitly classified
+///   (the common case: an arbitrary future check name defaults to weight 1
+///   and no class) is thus always guaranteed a nonzero pool to eventually
+///   draw from.
+/// - A weight was validated only against the raw aggregate `limit`, never
+///   against the smaller pool it would actually draw from once class
+///   reserves are carved out. `aggregate=2, reserve.guard=1` (general pool
+///   1), `weight=2` on an unclassified check passed the old check
+///   (`2 <= 2`) but could never be admitted through a general pool sized 1
+///   — it would hang forever. Fixed by validating each weight against the
+///   MAX of the pools it could actually draw from: the general pool
+///   (`limit - reserved_total`), and — for a classified check — its own
+///   class's reserve.
+fn validate_host_admission_policy(
+    limit: u32,
+    check_weight: &HashMap<String, u32>,
+    check_class: &HashMap<String, String>,
+    class_reserve: &HashMap<String, u32>,
+) -> Result<(), String> {
+    for (name, weight) in check_weight {
+        if *weight == 0 {
+            return Err(format!(
+                "verification_admission_check_weight[{name:?}] must be at least 1, got 0"
+            ));
+        }
+    }
+    let reserved_total: u64 = class_reserve.values().map(|&v| u64::from(v)).sum();
+    if reserved_total > 0 && reserved_total >= u64::from(limit) {
+        return Err(format!(
+            "verification_admission_class_reserve totals {reserved_total}, which must be \
+             strictly less than the aggregate limit {limit} — every unclassified or \
+             fallback check needs at least 1 unit of general-pool capacity left over"
+        ));
+    }
+    if limit > 0 {
+        let general_limit = u64::from(limit) - reserved_total;
+        for (name, &weight) in check_weight {
+            let weight = u64::from(weight);
+            let class_reserve_limit = check_class
+                .get(name)
+                .and_then(|class| class_reserve.get(class))
+                .copied()
+                .map(u64::from)
+                .unwrap_or(0);
+            if weight > general_limit && weight > class_reserve_limit {
+                return Err(format!(
+                    "verification_admission_check_weight[{name:?}] = {weight} exceeds every \
+                     pool it could draw from (general pool {general_limit}, its own class \
+                     reserve {class_reserve_limit}); this check could never be admitted"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl HostVerificationAdmission {
     /// Set `[policy] verification_admission_aggregate_limit`. Applied once by
     /// `Daemon::new` from config — same pattern, and same
     /// restart-required-to-change contract, as
-    /// [`VerificationAdmission::set_limits`]. Replaces any existing
-    /// semaphore outright: safe in production (called exactly once, before
-    /// the daemon serves its first request) and otherwise only ever called
-    /// again by a test.
+    /// [`VerificationAdmission::set_limits`]. Replaces any existing general
+    /// pool outright: safe in production (called exactly once, before the
+    /// daemon serves its first request) and otherwise only ever called
+    /// again by a test. Also resets any previously configured P3.2
+    /// weight/class policy to empty — a bare limit change (this plain P3.1
+    /// entry point) must never leave a class-reserve total validated
+    /// against the OLD limit silently in effect against a smaller NEW one;
+    /// a caller that wants both calls [`set_class_policy`](Self::set_class_policy)
+    /// again afterward, as `Daemon::new` does.
     pub(crate) fn set_limit(&self, limit: u32) {
         self.limit.store(u64::from(limit), Ordering::Relaxed);
-        *self.semaphore.lock().unwrap() =
+        self.general_limit
+            .store(u64::from(limit), Ordering::Relaxed);
+        *self.general.lock().unwrap() =
             (limit > 0).then(|| Arc::new(tokio::sync::Semaphore::new(limit as usize)));
+        *self.classes.lock().unwrap() = HashMap::new();
+        *self.check_weight.lock().unwrap() = HashMap::new();
+        *self.check_class.lock().unwrap() = HashMap::new();
+    }
+
+    /// Set the P3.2 weighted/fair-progress policy — `[policy]
+    /// verification_admission_check_weight` / `_check_class` /
+    /// `_class_reserve` — validated against the aggregate limit
+    /// [`set_limit`](Self::set_limit) already installed. Must be called
+    /// AFTER `set_limit` (`Daemon::new` does so in that order). On success,
+    /// shrinks the general pool to `limit - sum(class_reserve)` and
+    /// installs one fresh dedicated semaphore per class with a positive
+    /// reserve. On failure, leaves the existing policy (the P3.1-only
+    /// general pool `set_limit` just installed, if this is the first call)
+    /// completely untouched — a rejected configuration never partially
+    /// applies.
+    pub(crate) fn set_class_policy(
+        &self,
+        check_weight: HashMap<String, u32>,
+        check_class: HashMap<String, String>,
+        class_reserve: HashMap<String, u32>,
+    ) -> Result<(), String> {
+        let limit = self.limit();
+        validate_host_admission_policy(limit, &check_weight, &check_class, &class_reserve)?;
+        let reserved_total: u32 = class_reserve.values().copied().sum();
+        let general_limit = limit - reserved_total;
+        let classes: HashMap<String, Arc<ReservedClass>> = class_reserve
+            .iter()
+            .filter(|(_, &reserve)| reserve > 0)
+            .map(|(name, &reserve)| {
+                (
+                    name.clone(),
+                    Arc::new(ReservedClass {
+                        semaphore: Arc::new(tokio::sync::Semaphore::new(reserve as usize)),
+                        limit: reserve,
+                        waiting: AtomicU64::new(0),
+                    }),
+                )
+            })
+            .collect();
+        self.general_limit
+            .store(u64::from(general_limit), Ordering::Relaxed);
+        *self.general.lock().unwrap() = (general_limit > 0)
+            .then(|| Arc::new(tokio::sync::Semaphore::new(general_limit as usize)));
+        *self.classes.lock().unwrap() = classes;
+        *self.check_weight.lock().unwrap() = check_weight;
+        *self.check_class.lock().unwrap() = check_class;
+        Ok(())
     }
 
     /// The configured aggregate ceiling. `0` means disabled.
@@ -2535,35 +3027,182 @@ impl HostVerificationAdmission {
         self.limit.load(Ordering::Relaxed) as u32
     }
 
-    /// Host permits currently checked out, for reporting only
-    /// (`Supervisor::host_verification_capacity_summary`) — never consulted
-    /// for admission itself. `0` whenever the limit is `0` (disabled).
-    pub(crate) fn executing(&self) -> u32 {
-        let limit = self.limit();
-        if limit == 0 {
-            return 0;
-        }
-        match self.semaphore.lock().unwrap().as_ref() {
-            Some(sem) => limit.saturating_sub(sem.available_permits() as u32),
-            None => 0,
-        }
+    /// The configured aggregate cost for `check_name` — its own weight if
+    /// set, else the default `1`. `pub(crate)`, not private: P4.1's
+    /// `release.rs` reads this directly to report the EFFECTIVE configured
+    /// weight in its build telemetry (`HostAdmissionBounds::weight`)
+    /// instead of a hardcoded constant, so that field stays accurate once
+    /// an operator actually configures `[policy]
+    /// verification_admission_check_weight."release-build:paired-rk-mcp"]`.
+    pub(crate) fn weight_for(&self, check_name: &str) -> u32 {
+        self.check_weight
+            .lock()
+            .unwrap()
+            .get(check_name)
+            .copied()
+            .unwrap_or(1)
     }
 
-    /// Requests currently waiting for a host permit, for reporting only.
+    fn class_for(&self, check_name: &str) -> Option<String> {
+        self.check_class.lock().unwrap().get(check_name).cloned()
+    }
+
+    /// Host permits currently checked out ACROSS the general pool and every
+    /// reserved class lane, for reporting only
+    /// (`Supervisor::host_verification_capacity_summary`) — never consulted
+    /// for admission itself. `0` whenever the limit is `0` (disabled). With
+    /// no class policy configured this is exactly the P3.1 general-pool
+    /// figure, unchanged.
+    pub(crate) fn executing(&self) -> u32 {
+        if self.limit() == 0 {
+            return 0;
+        }
+        let general_limit = self.general_limit.load(Ordering::Relaxed) as u32;
+        let general_executing = match self.general.lock().unwrap().as_ref() {
+            Some(sem) => general_limit.saturating_sub(sem.available_permits() as u32),
+            None => 0,
+        };
+        let reserved_executing: u32 = self
+            .classes
+            .lock()
+            .unwrap()
+            .values()
+            .map(|c| {
+                c.limit
+                    .saturating_sub(c.semaphore.available_permits() as u32)
+            })
+            .sum();
+        general_executing + reserved_executing
+    }
+
+    /// Requests currently waiting for a GENERAL-pool permit, for reporting
+    /// only — see [`waiting`](Self::waiting) field doc for why a reserved
+    /// class's own try-only lane never contributes here.
     pub(crate) fn waiting(&self) -> u32 {
         self.waiting.load(Ordering::Relaxed) as u32
     }
 
-    /// Acquire one host-wide permit, or `None` immediately when the
-    /// aggregate cap is disabled (limit `0`) — every caller must treat that
-    /// as "proceed unbounded", matching [`VerificationAdmission::acquire`]'s
-    /// own convention. The `waiting` counter is incremented only around the
-    /// actual await and decremented by a drop guard rather than inline code
-    /// after it, so a caller that cancels this future mid-wait (the overall
-    /// admission `tokio::time::timeout`, or `verify_repo_check`'s own
-    /// cancellation race) can never leak the count.
-    pub(crate) async fn acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let sem = self.semaphore.lock().unwrap().clone()?;
+    /// Per-class `{limit, executing, waiting}` snapshot, for reporting only
+    /// — the P3.2 half of `Supervisor::host_verification_capacity_summary`.
+    /// Empty when no class policy is configured. `waiting` counts ONLY the
+    /// reserved-lane BLOCKING fallback (see [`acquire`](Self::acquire)) —
+    /// a request still trying the fast non-blocking path, or one that fell
+    /// all the way through to the general pool, is not counted here.
+    pub(crate) fn class_summary(&self) -> Value {
+        let classes = self.classes.lock().unwrap();
+        let map: serde_json::Map<String, Value> = classes
+            .iter()
+            .map(|(name, c)| {
+                let executing = c
+                    .limit
+                    .saturating_sub(c.semaphore.available_permits() as u32);
+                let waiting = c.waiting.load(Ordering::Relaxed);
+                (
+                    name.clone(),
+                    json!({"limit": c.limit, "executing": executing, "waiting": waiting}),
+                )
+            })
+            .collect();
+        Value::Object(map)
+    }
+
+    /// Acquire this check's aggregate admission cost (its configured
+    /// weight, default 1), or `None` immediately when the aggregate cap is
+    /// disabled (`limit() == 0`) — every caller must treat that as "proceed
+    /// unbounded", matching [`VerificationAdmission::acquire`]'s own
+    /// convention. REWORK (native review `01M2HWE7TBKTGZZGEKK19WM16J`
+    /// against candidate `9e7bde7`): this checks [`limit`](Self::limit)
+    /// DIRECTLY as the disabled sentinel now — the earlier version instead
+    /// read "is the general pool `None`?", which was ALSO true whenever a
+    /// class policy reserved the entire aggregate (`general_limit == 0`),
+    /// silently disabling every check's admission, classified and
+    /// unclassified alike, despite a positive aggregate limit. That
+    /// specific degenerate state is now refused at config-validation time
+    /// (`validate_host_admission_policy` requires `reserved_total < limit`
+    /// whenever any class has a positive reserve) — so this early return
+    /// fires ONLY for the genuinely disabled case, and the general pool
+    /// looked up further down is thus guaranteed `Some` whenever this point
+    /// is reached at all.
+    ///
+    /// If `check_name` is a member of a fast-lane class (P3.2), this FIRST
+    /// tries a non-blocking, atomic `try_acquire_many_owned` against that
+    /// class's own dedicated reserve — never awaiting, so it can never
+    /// itself queue behind a general-pool request. A request whose weight
+    /// exceeds the class's own total reserve is never even tried against
+    /// it (it could never fit) and falls straight through to the general
+    /// pool below.
+    ///
+    /// If that fast try fails (the reserve is momentarily saturated) AND
+    /// this weight exceeds the general pool's own capacity — only possible
+    /// for a check accepted at startup because it fit its class's reserve
+    /// even though it doesn't fit the (deliberately smaller) general pool,
+    /// see `validate_host_admission_policy` — falling through to the
+    /// general pool would wait on capacity that pool can never actually
+    /// hold, hanging forever. This blocks on the check's OWN reserved lane
+    /// instead: still FIFO, still bounded by that lane's configured size,
+    /// counted in [`class_summary`](Self::class_summary)'s per-class
+    /// `waiting` (never the general pool's own `waiting`).
+    ///
+    /// Otherwise, falling through lands in the same bounded general-pool
+    /// queue every unclassified request already uses — a saturated fast
+    /// lane degrades to ordinary shared admission for any check whose
+    /// weight the general pool can actually satisfy.
+    ///
+    /// Both `waiting` counters (general and per-class) are incremented only
+    /// around their own blocking await and decremented by a drop guard
+    /// rather than inline code after it, so a caller that cancels this
+    /// future mid-wait (the overall admission `tokio::time::timeout`, or
+    /// `verify_repo_check`'s own cancellation race) can never leak either
+    /// count.
+    pub(crate) async fn acquire(
+        &self,
+        check_name: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if self.limit() == 0 {
+            return None;
+        }
+        let weight = self.weight_for(check_name);
+        let general_limit = self.general_limit.load(Ordering::Relaxed) as u32;
+        if let Some(class_name) = self.class_for(check_name) {
+            let reserved = self.classes.lock().unwrap().get(&class_name).cloned();
+            if let Some(reserved) = reserved {
+                if weight <= reserved.limit {
+                    if let Ok(permit) =
+                        Arc::clone(&reserved.semaphore).try_acquire_many_owned(weight)
+                    {
+                        return Some(permit);
+                    }
+                    if weight > general_limit {
+                        struct ClassWaitGuard<'a>(&'a AtomicU64);
+                        impl Drop for ClassWaitGuard<'_> {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        reserved.waiting.fetch_add(1, Ordering::Relaxed);
+                        let _class_wait_guard = ClassWaitGuard(&reserved.waiting);
+                        // A semaphore is only ever closed by `close()`,
+                        // which nothing here calls — this can never
+                        // actually return `Err`.
+                        return Some(
+                            Arc::clone(&reserved.semaphore)
+                                .acquire_many_owned(weight)
+                                .await
+                                .expect("reserved class semaphore is never closed"),
+                        );
+                    }
+                }
+            }
+        }
+        // Guaranteed `Some`: `self.limit() > 0` (checked above) and either
+        // no class has a positive reserve (`general_limit == limit`) or
+        // `validate_host_admission_policy` required `reserved_total <
+        // limit`, so `general_limit >= 1` either way — see this method's
+        // own doc for the full argument.
+        let general = self.general.lock().unwrap().clone().expect(
+            "general pool must be Some whenever the aggregate limit is nonzero: \
+             validate_host_admission_policy guarantees general_limit >= 1 in that case",
+        );
         struct WaitGuard<'a>(&'a AtomicU64);
         impl Drop for WaitGuard<'_> {
             fn drop(&mut self) {
@@ -2575,7 +3214,8 @@ impl HostVerificationAdmission {
         // A semaphore is only ever closed by `close()`, which nothing here
         // calls — this can never actually return `Err`.
         Some(
-            sem.acquire_owned()
+            general
+                .acquire_many_owned(weight)
                 .await
                 .expect("host verification admission semaphore is never closed"),
         )
@@ -2597,8 +3237,31 @@ impl HostVerificationAdmission {
 struct ManagedVerificationRun {
     generation: Option<rk_core::id::SpawnId>,
     agent: String,
+    /// Which repository this run is bound to — the dimension
+    /// `active_for_repo` reports on. Recorded at `register` time, which
+    /// happens BEFORE the admission acquire inside `run()`, so an entry
+    /// covers a run that is still WAITING for its permit exactly as much as
+    /// one that is already EXECUTING. That is deliberate: P7.1's handoff
+    /// fence must treat both as owned managed work (see
+    /// [`ManagedVerificationRuns::active_for_repo`]).
+    repo: String,
+    /// `"verify"` or `"release-prepare"` — reported verbatim as a blocker's
+    /// `kind` so an operator reading `fence_status` can tell which managed
+    /// contract still owns the repo.
+    kind: &'static str,
     request_key: String,
     cancel: tokio::sync::watch::Sender<Option<&'static str>>,
+}
+
+/// One managed run still owning `repo` when the P7.1 handoff fence was
+/// asked whether a rollover is safe. Reported, never cancelled: the ticket
+/// requires reusing the existing managed-run status/cancellation contracts
+/// rather than silently killing an operator's own jobs.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct ManagedRunBlocker {
+    pub(crate) repo: String,
+    pub(crate) kind: &'static str,
+    pub(crate) agent: String,
 }
 
 /// Registry of in-flight [`ManagedVerificationRun`]s, keyed by an opaque
@@ -2617,6 +3280,19 @@ struct ManagedVerificationRun {
 pub(crate) struct ManagedVerificationRuns {
     next_id: AtomicU64,
     runs: Mutex<HashMap<u64, ManagedVerificationRun>>,
+    /// P7.1 (TKT-rufik-lafit-pisah): consulted INSIDE `runs`' own mutex by
+    /// [`Self::try_register`], so a handoff fence and a new managed run can
+    /// never interleave ambiguously. Installed once by `Server::landing`;
+    /// `None` (the default, and every test that does not install one) means
+    /// no fence exists and every registration is admitted, exactly as before
+    /// this field.
+    ///
+    /// LOCK ORDER: this closure reads the handoff store while `runs` is
+    /// held, so it is always `runs` -> store. Nothing may hold the store
+    /// while acquiring `runs` (`fence_request` deliberately finishes its
+    /// store write and releases it BEFORE taking its readiness snapshot).
+    #[allow(clippy::type_complexity)]
+    admission_fence: Mutex<Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>>,
 }
 
 struct ManagedRegistration<'a> {
@@ -2631,24 +3307,117 @@ impl Drop for ManagedRegistration<'_> {
 }
 
 impl ManagedVerificationRuns {
-    pub(crate) fn register(
+    /// Install the handoff-fence predicate — see the `admission_fence`
+    /// field doc. Called once, by `Server::landing`, right after the
+    /// `LandingPipeline` exists.
+    pub(crate) fn set_admission_fence(&self, fence: Arc<dyn Fn(&str) -> bool + Send + Sync>) {
+        *self.admission_fence.lock().unwrap() = Some(fence);
+    }
+
+    /// Admit and register ONE new managed run, refusing it outright while a
+    /// P7.1 handoff fence is engaged for `repo`.
+    ///
+    /// THE LINEARIZATION THAT MAKES READINESS TRUTHFUL: the fence check and
+    /// the registration happen under a single acquisition of `runs`' mutex,
+    /// which is the same mutex [`Self::active_for_repo`]/[`Self::active_all`]
+    /// take to build a readiness snapshot. `fence_request` engages the fence
+    /// FIRST and snapshots SECOND, so for any new run exactly one of two
+    /// things is true, never neither and never both:
+    ///
+    ///   * it registered before the snapshot — so the snapshot sees it, and
+    ///     readiness reports `draining`; or
+    ///   * it registered after the snapshot — so it necessarily took the
+    ///     mutex after the fence was already engaged, sees it, and is
+    ///     REFUSED.
+    ///
+    /// That is what stops new owned work from starting silently behind an
+    /// already-answered `ready`. Runs already registered are untouched: they
+    /// keep running and settle through their own existing contracts — the
+    /// fence never cancels anything.
+    pub(crate) fn try_register(
         &self,
         agent: &str,
         generation: Option<rk_core::id::SpawnId>,
         request_key: &str,
+        repo: &str,
+        kind: &'static str,
+    ) -> rk_core::Result<(u64, tokio::sync::watch::Receiver<Option<&'static str>>)> {
+        let mut runs = self.runs.lock().unwrap();
+        let fenced = self
+            .admission_fence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|fence| fence(repo));
+        if fenced {
+            return Err(rk_core::Error::other(format!(
+                "landing handoff fence is engaged for {repo}: new managed {kind} work is not \
+                 being admitted until the fence is released or expires (work already running \
+                 is unaffected; see `rk fence-status --repo {repo}`)"
+            )));
+        }
+        Ok(self.register_locked(&mut runs, agent, generation, request_key, repo, kind))
+    }
+
+    fn register_locked(
+        &self,
+        runs: &mut HashMap<u64, ManagedVerificationRun>,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
+        repo: &str,
+        kind: &'static str,
     ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
         let (cancel, rx) = tokio::sync::watch::channel(None);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.runs.lock().unwrap().insert(
+        runs.insert(
             id,
             ManagedVerificationRun {
                 generation,
                 agent: agent.to_string(),
+                repo: repo.to_string(),
+                kind,
                 request_key: request_key.to_string(),
                 cancel,
             },
         );
         (id, rx)
+    }
+
+    /// Every managed run this daemon currently owns, across EVERY
+    /// repository. A rollover stops the whole daemon, so whole-daemon
+    /// readiness cannot be claimed from one repo's runs alone — see
+    /// `landing::handoff`'s readiness doc.
+    pub(crate) fn active_all(&self) -> Vec<ManagedRunBlocker> {
+        let mut blockers: Vec<ManagedRunBlocker> = self
+            .runs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|run| ManagedRunBlocker {
+                repo: run.repo.clone(),
+                kind: run.kind,
+                agent: run.agent.clone(),
+            })
+            .collect();
+        blockers.sort_by(|a, b| (&a.repo, a.kind, &a.agent).cmp(&(&b.repo, b.kind, &b.agent)));
+        blockers
+    }
+
+    /// Unconditional registration, bypassing the fence. Test-only: every
+    /// production path must go through [`Self::try_register`] so a handoff
+    /// fence genuinely refuses new work.
+    #[cfg(test)]
+    pub(crate) fn register(
+        &self,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
+        repo: &str,
+        kind: &'static str,
+    ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
+        let mut runs = self.runs.lock().unwrap();
+        self.register_locked(&mut runs, agent, generation, request_key, repo, kind)
     }
 
     pub(crate) fn unregister(&self, id: u64) {
@@ -2857,6 +3626,7 @@ mod tests {
                 id: "ordinary-workflow",
                 repo: "repo",
                 agent: "rat",
+                check_name: "",
                 dir: home.path(),
                 command: &resolved.command,
                 resolved: &resolved,
@@ -3034,5 +3804,602 @@ mod tests {
         DateTime::parse_from_rfc3339(v.as_str().unwrap())
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    /// TKT-lurin-bulif-gabik: a failing named check must leave a durable,
+    /// bounded failure receipt a caller can retrieve later — even one who
+    /// lost this exact RPC's own stdout/stderr — without rerunning the
+    /// check. The receipt id must also be folded into the RPC result
+    /// itself, so a CLI/JSON consumer sees it right away. The real
+    /// RPC-level version of this journey (a genuine subprocess through
+    /// `verify.run`, then a completely independent reader of the on-disk
+    /// store) lives in
+    /// `crates/rk-daemon/tests/verification_failure_receipt_rpc.rs`; this is
+    /// the fast, focused engine-level counterpart.
+    #[tokio::test]
+    async fn verify_repo_check_persists_a_bounded_failure_receipt_and_exposes_its_id() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify",
+            command: "echo out-marker; echo err-marker 1>&2; exit 7", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        let result = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-failing",
+                Some("TKT-failing"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["verdict"], "fail");
+        assert_eq!(result["exit"], 7);
+        assert!(
+            result["failure_receipt_error"].is_null(),
+            "storage did not fail: {result}"
+        );
+        let receipt_id = result["failure_receipt_id"]
+            .as_str()
+            .expect("a failing check must expose a failure_receipt_id")
+            .to_string();
+
+        // Drop the in-process result entirely — the retrieval below must
+        // stand on its own, straight out of durable storage by id, exactly
+        // as a reconnected caller who lost this response would have to.
+        drop(result);
+        let record_id: rk_core::id::RecordId = receipt_id.parse().unwrap();
+        let receipt = space
+            .get(record_id)
+            .unwrap()
+            .expect("failure_receipt_id must resolve via a direct keyed lookup");
+        assert_eq!(receipt.category, Category::Artifact);
+        assert_eq!(receipt.identity, VERIFICATION_FAILURE_RECEIPT_IDENTITY);
+        assert_eq!(
+            receipt.payload["schema_version"],
+            VERIFICATION_FAILURE_RECEIPT_SCHEMA_VERSION
+        );
+        assert_eq!(receipt.payload["repo"], "repo");
+        assert_eq!(receipt.payload["check"], "verify");
+        assert_eq!(receipt.payload["verdict"], "fail");
+        assert_eq!(receipt.payload["exit"], 7);
+        assert_eq!(receipt.payload["candidate"], "dirty");
+        assert_eq!(receipt.payload["agent"], "operator");
+        assert_eq!(receipt.payload["task"], "TKT-failing");
+        assert_eq!(receipt.payload["request_key"], "req-failing");
+        assert!(receipt.payload["stdout_tail"]
+            .as_str()
+            .unwrap()
+            .contains("out-marker"));
+        assert!(receipt.payload["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .contains("err-marker"));
+        assert_eq!(receipt.payload["stdout_truncated"], false);
+        assert_eq!(receipt.payload["stderr_truncated"], false);
+        assert_eq!(tuples_for(&space, "repo").len(), 1);
+    }
+
+    /// The mirror image: a passing check must never write a failure receipt
+    /// or carry either receipt field in its result.
+    #[tokio::test]
+    async fn verify_repo_check_never_writes_a_failure_receipt_on_pass() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "true", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        let result = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-passing",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["verdict"], "pass");
+        assert!(result["failure_receipt_id"].is_null());
+        assert!(result["failure_receipt_error"].is_null());
+        assert!(tuples_for(&space, "repo").is_empty());
+    }
+
+    /// A real clean git worktree's failing run must NOT poison the pass-proof
+    /// cache for its own candidate sha: `lookup_verification_proof` — the
+    /// exact lookup a later caller's `verify_repo_check` cache-hit path
+    /// reads — must still return `None` for that candidate/check after a
+    /// failure receipt was written, and a fresh, independent
+    /// `verify_repo_check` call for the SAME candidate must actually re-run
+    /// rather than short-circuit on a false "pass" hit.
+    #[tokio::test]
+    async fn a_failing_run_never_satisfies_the_pass_proof_lookup_for_its_own_real_candidate() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "exit 1", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        git_init_clean(dir.path());
+        let candidate_sha = git_head(dir.path());
+
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        let result = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-1",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["verdict"], "fail");
+        let receipt_payload = tuples_for(&space, "repo")
+            .into_iter()
+            .next()
+            .expect("a failure receipt must exist")
+            .payload;
+        assert_eq!(receipt_payload["candidate"], candidate_sha);
+
+        let check = verifier
+            .find_check(&dir.path().display().to_string(), "verify")
+            .unwrap();
+        assert!(
+            verifier
+                .lookup_verification_proof("repo", &candidate_sha, &check)
+                .is_none(),
+            "a failure receipt existing must never satisfy a pass-proof lookup"
+        );
+
+        // A second, independent call for the exact same real candidate must
+        // genuinely re-run (a real second failure, not a fabricated cached
+        // "pass") rather than short-circuit on a false cache hit.
+        let second = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "req-2",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["verdict"], "fail");
+        assert_eq!(
+            tuples_for(&space, "repo").len(),
+            2,
+            "two real runs, two receipts"
+        );
+    }
+
+    /// The receipt's idempotency boundary is `occurrence_id` alone — a fresh
+    /// id `verify_repo_check` mints once per actual invocation — so settling
+    /// the exact SAME occurrence twice collapses to one receipt.
+    #[tokio::test]
+    async fn record_verification_failure_receipt_is_idempotent_on_the_same_occurrence_id() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "exit 1", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+        let check = verifier
+            .find_check(&dir.path().display().to_string(), "verify")
+            .unwrap();
+        let result = failing_result();
+        let occurrence_id = rk_core::id::RecordId::new();
+
+        let first = verifier
+            .record_verification_failure_receipt(receipt_input(&check, &result, occurrence_id))
+            .unwrap();
+        let second = verifier
+            .record_verification_failure_receipt(receipt_input(&check, &result, occurrence_id))
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "the same occurrence_id must settle on one receipt id"
+        );
+        assert_eq!(
+            tuples_for(&space, "repo").len(),
+            1,
+            "duplicate settlement of ONE occurrence must not multiply artifacts"
+        );
+    }
+
+    /// The mirror requirement: two DISTINCT actual invocations that happen
+    /// to share the exact same transport-level `request_key` (exactly what
+    /// `server.rs`'s `conn_seq` resetting to 0 on every daemon restart can
+    /// produce — a genuinely new run reusing an old connection/request
+    /// identity) must NEVER collapse into one receipt. `verify_repo_check`
+    /// mints a fresh `occurrence_id` per call regardless of `request_key`,
+    /// so this is proved at the `verify_repo_check` level, not just the
+    /// lower-level `record_verification_failure_receipt` unit.
+    #[tokio::test]
+    async fn two_distinct_runs_sharing_a_repeated_transport_key_never_deduplicate() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify",
+            command: "echo $$; exit 5", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+
+        // Same literal `request_key` on both calls — simulating a
+        // post-restart `conn_seq` collision with an unrelated earlier run —
+        // must still yield two independent receipts for two independent
+        // occurrences.
+        let first = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "reused-transport-key",
+                None,
+            )
+            .await
+            .unwrap();
+        let second = verifier
+            .verify_repo_check(
+                "operator",
+                dir.path(),
+                "repo",
+                "verify",
+                None,
+                "reused-transport-key",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let first_id = first["failure_receipt_id"].as_str().unwrap();
+        let second_id = second["failure_receipt_id"].as_str().unwrap();
+        assert_ne!(
+            first_id, second_id,
+            "two distinct executions must never be deduplicated by a repeated transport key"
+        );
+        assert_eq!(tuples_for(&space, "repo").len(), 2);
+    }
+
+    /// A real storage failure at the receipt's own write boundary — a
+    /// genuine sqlite `PRIMARY KEY` violation, forced by pre-occupying the
+    /// exact `occurrence_id` this call will try to write under with an
+    /// unrelated tuple — must surface as `Err`, never be swallowed, and must
+    /// never be reported as if it had settled successfully.
+    #[tokio::test]
+    async fn a_real_storage_failure_at_the_write_boundary_is_surfaced_not_swallowed() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        std::fs::create_dir(dir.path().join(".rk")).unwrap();
+        std::fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [{name: "verify", command: "exit 1", timeout: "2m",
+            environmentPolicy: "strip_rk_spawn", sharedCargoTarget: false}]"#,
+        )
+        .unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let resources = VerificationResources::default();
+        let verifier = ManagedVerification::new(&layout, &space, &resources, false);
+        let check = verifier
+            .find_check(&dir.path().display().to_string(), "verify")
+            .unwrap();
+
+        // Occupy the exact id this call will try to write under, with an
+        // unrelated tuple of a DIFFERENT identity — `is_failure_receipt`
+        // must refuse to treat this as an already-settled receipt, so the
+        // write is genuinely attempted and genuinely collides.
+        let occurrence_id = rk_core::id::RecordId::new();
+        let mut squatter = Tuple::new(
+            Category::Artifact,
+            "repo",
+            "unrelated-artifact",
+            "daemon",
+            json!({"unrelated": true}),
+        );
+        squatter.id = occurrence_id;
+        space.out(squatter).unwrap();
+
+        let result = failing_result();
+        let outcome = verifier.record_verification_failure_receipt(receipt_input(
+            &check,
+            &result,
+            occurrence_id,
+        ));
+        let err = outcome.expect_err("a real primary-key collision must surface as Err");
+        assert!(
+            err.contains("failed to persist"),
+            "error must name the real persistence failure: {err}"
+        );
+
+        // The verdict computed independently of this call must be
+        // untouched: a storage failure here can never turn (or report) a
+        // failing check as green.
+        assert_eq!(result["verdict"], "fail");
+    }
+
+    fn failing_result() -> Value {
+        json!({
+            "exit": 1, "verdict": "fail", "timed_out": false, "no_exit_code": false,
+            "signal": Value::Null,
+            "stdout": "", "stdout_truncated": false,
+            "stderr": "", "stderr_truncated": false,
+        })
+    }
+
+    fn receipt_input<'a>(
+        check: &'a rk_workflow::Check,
+        result: &'a Value,
+        occurrence_id: rk_core::id::RecordId,
+    ) -> VerificationFailureReceiptInput<'a> {
+        VerificationFailureReceiptInput {
+            occurrence_id,
+            repo_name: "repo",
+            check_name: "verify",
+            check,
+            candidate: "dirty",
+            agent: "operator",
+            generation: None,
+            request_key: "req",
+            task: None,
+            result,
+            queued_at: None,
+            started_at: None,
+            ended_at: None,
+            queue_wait_ms: None,
+            duration_ms: None,
+        }
+    }
+
+    fn tuples_for(space: &Space, repo: &str) -> Vec<Tuple> {
+        space
+            .scan(
+                &Pattern::category(Category::Artifact)
+                    .identity(VERIFICATION_FAILURE_RECEIPT_IDENTITY)
+                    .scope(repo),
+            )
+            .unwrap()
+    }
+
+    fn git_init_clean(dir: &Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "r@x"]);
+        run(&["config", "user.name", "R"]);
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    fn git_head(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    // P3.2 (TKT-nasif-danob-sirok): `HostVerificationAdmission::set_class_policy`
+    // validation — fast, in-process unit tests (no daemon spin-up needed);
+    // the real admission/fair-progress journey lives in
+    // `crates/rk-daemon/tests/host_verification_weighted_fair.rs`.
+
+    #[test]
+    fn class_policy_with_no_limit_or_reserve_is_a_no_op_default() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(4);
+        host.set_class_policy(HashMap::new(), HashMap::new(), HashMap::new())
+            .unwrap();
+        assert_eq!(host.limit(), 4);
+        assert_eq!(host.executing(), 0);
+        assert_eq!(host.class_summary(), json!({}));
+    }
+
+    #[test]
+    fn class_policy_rejects_a_zero_weight() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(4);
+        let err = host
+            .set_class_policy(
+                HashMap::from([("flaky".to_string(), 0)]),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap_err();
+        assert!(err.contains("flaky"), "{err}");
+        assert!(err.contains('0'), "{err}");
+    }
+
+    #[test]
+    fn class_policy_rejects_a_weight_the_aggregate_limit_could_never_satisfy() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(2);
+        let err = host
+            .set_class_policy(
+                HashMap::from([("giant".to_string(), 3)]),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("giant") && err.contains('3') && err.contains('2'),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn class_policy_rejects_a_reserve_total_exceeding_the_aggregate_limit() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(2);
+        let err = host
+            .set_class_policy(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("guard".to_string(), 1), ("urgent".to_string(), 2)]),
+            )
+            .unwrap_err();
+        assert!(err.contains('3') && err.contains('2'), "{err}");
+        // A rejected policy must never partially apply: the general pool
+        // must still behave exactly as `set_limit(2)` alone left it.
+        assert_eq!(host.class_summary(), json!({}));
+    }
+
+    /// REWORK regression (native review `01M2HWE7TBKTGZZGEKK19WM16J`): a
+    /// reserve total EQUAL TO the aggregate limit was previously accepted,
+    /// driving `general_limit` to `0` and — because `acquire()` used to
+    /// treat "general pool is `None`" as its disabled-cap sentinel —
+    /// silently disabling ALL host admission fleet-wide, classified and
+    /// unclassified checks alike, despite a positive aggregate limit. Must
+    /// now be rejected at startup instead.
+    #[test]
+    fn class_policy_rejects_a_reserve_total_exactly_equal_to_the_aggregate_limit() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(1);
+        let err = host
+            .set_class_policy(
+                HashMap::new(),
+                HashMap::from([("quick".to_string(), "cheap".to_string())]),
+                HashMap::from([("cheap".to_string(), 1)]),
+            )
+            .unwrap_err();
+        assert!(err.contains('1'), "{err}");
+        assert_eq!(host.class_summary(), json!({}));
+    }
+
+    /// REWORK regression: a weight was previously validated only against
+    /// the raw aggregate limit, never against the smaller general pool it
+    /// would actually draw from once a class reserve is carved out.
+    /// `aggregate=2, reserve.guard=1` leaves a general pool of `1`; an
+    /// UNCLASSIFIED check weighted `2` passed the old check (`2 <= 2`) but
+    /// could never be admitted through a general pool sized `1` — it would
+    /// hang forever. Must now be rejected at startup.
+    #[test]
+    fn class_policy_rejects_an_unclassified_weight_exceeding_the_shrunken_general_pool() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(2);
+        let err = host
+            .set_class_policy(
+                HashMap::from([("heavy".to_string(), 2)]),
+                HashMap::new(),
+                HashMap::from([("guard".to_string(), 1)]),
+            )
+            .unwrap_err();
+        assert!(err.contains("heavy"), "{err}");
+    }
+
+    /// A CLASSIFIED check's weight is admissible as long as it fits EITHER
+    /// pool it could draw from — its own class reserve, even when that
+    /// exceeds the (correctly, deliberately) smaller general pool left
+    /// over for every unclassified/fallback check.
+    #[test]
+    fn class_policy_accepts_a_classified_weight_that_only_fits_its_own_reserve() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(3);
+        host.set_class_policy(
+            HashMap::from([("giant_guard".to_string(), 2)]),
+            HashMap::from([("giant_guard".to_string(), "guard".to_string())]),
+            HashMap::from([("guard".to_string(), 2)]),
+        )
+        .unwrap();
+        // general_limit = 3 - 2 = 1, strictly less than this check's own
+        // weight (2) — it could ONLY ever be admitted via its own
+        // 2-permit reserved lane, never through the general pool. Startup
+        // must accept this: it is genuinely admissible, just not via the
+        // fallback pool.
+        assert_eq!(
+            host.class_summary(),
+            json!({"guard": {"limit": 2, "executing": 0, "waiting": 0}})
+        );
+    }
+
+    #[test]
+    fn set_limit_resets_a_previously_configured_class_policy() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(2);
+        host.set_class_policy(
+            HashMap::new(),
+            HashMap::from([("quick".to_string(), "guard".to_string())]),
+            HashMap::from([("guard".to_string(), 1)]),
+        )
+        .unwrap();
+        assert_eq!(
+            host.class_summary(),
+            json!({"guard": {"limit": 1, "executing": 0, "waiting": 0}})
+        );
+
+        // A bare `set_limit` (the plain P3.1 entry point) must clear the
+        // stale class policy rather than leaving it validated against a
+        // limit that may since have shrunk.
+        host.set_limit(1);
+        assert_eq!(host.class_summary(), json!({}));
     }
 }

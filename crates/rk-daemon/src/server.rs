@@ -986,6 +986,11 @@ pub struct Daemon {
     /// checkpoints and idempotent ticket coalesce keys provide restart safety;
     /// this lock prevents concurrent operator retries racing those checkpoints.
     ticket_graph_apply_lock: tokio::sync::Mutex<()>,
+    /// Serialize the shared release staging worktree; also expose in-flight preparation to reads.
+    release_prepare_lock: tokio::sync::Mutex<()>,
+    /// P4.1 (TKT-nibuv-gokun-sibin): `[policy] release_build_admission_enabled`.
+    /// See that config field's doc comment for the full contract.
+    release_build_admission_enabled: bool,
     action_approvals: crate::action_approval::ActionApprovalStore,
     /// TKT-01M0E8PN9C41BWECGNW0990R3J: the durable orchestrator lease store
     /// (one lease per repo scope) an `attention.decide` orchestrator-authority
@@ -1013,6 +1018,11 @@ pub struct Daemon {
     /// Serializes read/append cycles for one agent's effective fact vote.
     fact_vote_lock: std::sync::Mutex<()>,
     bbs_write_lock: std::sync::Mutex<()>,
+    /// Serializes `control.verify`'s check-then-act sequence (already-observed
+    /// read, then the observed-record write) so two concurrent verifications
+    /// of the same message produce exactly one durable observation, not a
+    /// race where both see "not yet observed" and both write.
+    control_verify_lock: std::sync::Mutex<()>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
     request_clock: RequestClock,
@@ -1143,6 +1153,33 @@ impl Daemon {
             .set_verification_admission_aggregate_limit(
                 config.policy.verification_admission_aggregate_limit,
             );
+        daemon
+            .supervisor
+            .set_verification_admission_class_policy(
+                config
+                    .policy
+                    .verification_admission_check_weight
+                    .clone()
+                    .into_iter()
+                    .collect(),
+                config
+                    .policy
+                    .verification_admission_check_class
+                    .clone()
+                    .into_iter()
+                    .collect(),
+                config
+                    .policy
+                    .verification_admission_class_reserve
+                    .clone()
+                    .into_iter()
+                    .collect(),
+            )
+            .map_err(|e| {
+                rk_core::Error::other(format!(
+                    "invalid [policy] verification_admission_check_weight/_check_class/_class_reserve config: {e}"
+                ))
+            })?;
         daemon.supervisor.set_implementation_admission_limits(
             config.policy.implementation_admission_limit,
             config
@@ -1180,6 +1217,7 @@ impl Daemon {
         daemon.king_config = config.king.clone();
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
+        daemon.release_build_admission_enabled = config.policy.release_build_admission_enabled;
         daemon.authority_policy = crate::authority::AuthorityPolicy::from_config(&config.policy)?;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
@@ -1256,6 +1294,15 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_require_named_checks(&mut self, v: bool) {
         self.require_named_checks = v;
+    }
+
+    /// Test-only hook, same rationale as [`set_require_named_checks`](Self::set_require_named_checks):
+    /// `Daemon::with_space_for_tests`/`new_in_memory` bypass `Daemon::new`'s
+    /// `config.policy.release_build_admission_enabled` wiring, so a test
+    /// exercising P4.1's release-build admission route sets it directly.
+    #[doc(hidden)]
+    pub fn set_release_build_admission_enabled(&mut self, v: bool) {
+        self.release_build_admission_enabled = v;
     }
 
     /// Test-only equivalent of `Daemon::new`'s
@@ -1366,6 +1413,26 @@ impl Daemon {
     pub fn set_verification_admission_aggregate_limit(&self, limit: u32) {
         self.supervisor
             .set_verification_admission_aggregate_limit(limit);
+    }
+
+    /// Test-only hook, same rationale as
+    /// [`set_verification_admission_aggregate_limit`](Self::set_verification_admission_aggregate_limit):
+    /// an integration test driving the P3.2 weighted/fair-progress policy
+    /// sets it directly, bypassing `Daemon::new`'s config wiring. Must be
+    /// called after `set_verification_admission_aggregate_limit` — see
+    /// `Supervisor::set_verification_admission_class_policy`.
+    #[doc(hidden)]
+    pub fn set_verification_admission_class_policy(
+        &self,
+        check_weight: std::collections::HashMap<String, u32>,
+        check_class: std::collections::HashMap<String, String>,
+        class_reserve: std::collections::HashMap<String, u32>,
+    ) -> Result<(), String> {
+        self.supervisor.set_verification_admission_class_policy(
+            check_weight,
+            check_class,
+            class_reserve,
+        )
     }
 
     #[doc(hidden)]
@@ -1518,6 +1585,8 @@ impl Daemon {
             onboarding_sessions,
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
             ticket_graph_apply_lock: tokio::sync::Mutex::new(()),
+            release_prepare_lock: tokio::sync::Mutex::new(()),
+            release_build_admission_enabled: false,
             action_approvals,
             orchestrator_lease,
             king,
@@ -1528,6 +1597,7 @@ impl Daemon {
             coordinator_sessions,
             fact_vote_lock: std::sync::Mutex::new(()),
             bbs_write_lock: std::sync::Mutex::new(()),
+            control_verify_lock: std::sync::Mutex::new(()),
             started: Instant::now(),
             shutdown_tx,
             request_clock: Utc::now,
@@ -2341,14 +2411,33 @@ impl Daemon {
     /// `request_review`).
     fn landing(&self) -> Arc<crate::landing::LandingPipeline> {
         Arc::clone(self.landing.get_or_init(|| {
-            let pipeline = Arc::new(crate::landing::LandingPipeline::new(
-                self.space.clone(),
-                Arc::clone(&self.supervisor),
-                self.engine(),
-                Arc::clone(&self.tickets),
-                self.layout.clone(),
-            ));
+            let pipeline = Arc::new(
+                crate::landing::LandingPipeline::new(
+                    self.space.clone(),
+                    Arc::clone(&self.supervisor),
+                    self.engine(),
+                    Arc::clone(&self.tickets),
+                    self.layout.clone(),
+                )
+                // TKT-karut-jaraf-hivur: lets the review-wait loop notice a
+                // graceful `stop`/rollover instead of blocking `Self::run`'s
+                // shutdown `join_next` behind a live reviewer for up to
+                // `GateConfig::review_max_wait`.
+                .with_shutdown(self.shutdown_tx.subscribe()),
+            );
             self.supervisor.set_landing_pipeline(&pipeline);
+            // P7.1: let the managed-run registry refuse NEW verify/release
+            // work while a handoff fence is engaged. Installed here, once,
+            // because this is the moment the pipeline first exists. A weak
+            // reference so the registry never keeps the pipeline alive.
+            let weak = Arc::downgrade(&pipeline);
+            self.supervisor
+                .verification_resources()
+                .runs
+                .set_admission_fence(Arc::new(move |repo: &str| {
+                    weak.upgrade()
+                        .is_some_and(|pipeline| pipeline.admission_fenced(repo))
+                }));
             pipeline
         }))
     }
@@ -2406,11 +2495,11 @@ impl Daemon {
             // a rat makes many calls and they all carry the same stamp.
             if let Ok(req) = &parsed {
                 if let Some(client) = req.client_version.as_deref() {
-                    if client != rk_core::version::BUILD_VERSION && !noted_client_build {
+                    if client != rk_core::version::build_version() && !noted_client_build {
                         noted_client_build = true;
                         warn!(
                             client_build = client,
-                            daemon_build = rk_core::version::BUILD_VERSION,
+                            daemon_build = rk_core::version::build_version(),
                             caller = %req.caller,
                             "caller is a different build than this daemon; `rk daemon rollover` onto it"
                         );
@@ -2428,7 +2517,11 @@ impl Daemon {
                     codes::FORBIDDEN,
                     format!("{} is not authorized for {}", req.caller, req.method),
                 )),
-                Ok(req) if req.method == "verify.run" => {
+                Ok(req)
+                    if req.method == "verify.run"
+                        || req.method == "release.prepare"
+                        || req.method == "release.select" =>
+                {
                     self.dispatch_watching_disconnect(req, &mut read, conn_id)
                         .await
                 }
@@ -2475,13 +2568,20 @@ impl Daemon {
         }
     }
 
-    /// Race `verify.run`'s dispatch against this connection dying — the
+    /// Race `verify.run`'s (and, since P4.1/TKT-nibuv-gokun-sibin,
+    /// `release.prepare`'s) dispatch against this connection dying — the
     /// RPC-disconnect half of TKT-01M0PA6C5WYRWS757R1SS2F2GR's cancellation
-    /// binding: if the caller (an agent's own `rk verify`, or an operator's)
-    /// is killed mid-call, its managed child process must not keep running
-    /// under the daemon alone. Scoped to `verify.run` only, by the one call
-    /// site above — every other method already completes fast enough that a
-    /// lost caller costs nothing but an unread reply.
+    /// binding: if the caller (an agent's own `rk verify`, an operator's, or
+    /// an operator's `rk release prepare`) is killed mid-call, its managed
+    /// child process must not keep running under the daemon alone. Scoped to
+    /// these two methods only, by the match arm above — every other method
+    /// already completes fast enough that a lost caller costs nothing but an
+    /// unread reply; both of these can run for minutes and both register a
+    /// [`crate::managed_verification::ManagedVerificationRuns`] entry keyed
+    /// on the exact same [`verify_request_key`] this function computes, so
+    /// [`Supervisor::cancel_managed_verification_request`](crate::supervisor::Supervisor::cancel_managed_verification_request)
+    /// below is generic across both callers already — no `release`-specific
+    /// cancellation registry was added.
     ///
     /// The wire protocol is strictly one in-flight request per connection: a
     /// caller always awaits its response before sending again. So any byte
@@ -2971,6 +3071,68 @@ impl Daemon {
                 )),
             },
         };
+        // Same bounded pattern as `native_delivery` above, for the two
+        // resubmission-marker identities the additive `native_recorded_cost`
+        // section joins a filed correction ticket back to its original task
+        // through (`landing::REWORK_RESUBMISSION_IDENTITY` /
+        // `CONFLICT_RESUBMISSION_IDENTITY`). The two identities genuinely
+        // share one `MAX_SCAN_TUPLES` page budget rather than each getting
+        // its own full cap: `remaining_budget` is spent by the first
+        // identity's read before the second one runs, and either identity
+        // exhausting it marks the combined read truncated — the reported
+        // `limit`/`scanned`/`truncated` describe this one shared budget, not
+        // `2 * MAX_SCAN_TUPLES`.
+        let mut correction_link_rows: Vec<Tuple> = Vec::new();
+        let mut correction_link_scanned = 0usize;
+        let mut correction_link_truncated = false;
+        let mut correction_link_read_warning: Option<String> = None;
+        let mut correction_link_available = true;
+        let mut remaining_budget = MAX_SCAN_TUPLES;
+        for identity in [
+            crate::landing::REWORK_RESUBMISSION_IDENTITY,
+            crate::landing::CONFLICT_RESUBMISSION_IDENTITY,
+        ] {
+            if remaining_budget == 0 {
+                // The other identity already spent the whole shared budget;
+                // this identity's rows (if any) are beyond it, not observed.
+                correction_link_truncated = true;
+                continue;
+            }
+            let pattern = Pattern::category(Category::Event)
+                .identity(identity)
+                .scope(repo.clone());
+            match self
+                .space
+                .scan_newest_limited(&pattern, remaining_budget.saturating_add(1))
+            {
+                Ok(mut rows) => {
+                    let this_scanned = rows.len().min(remaining_budget);
+                    correction_link_truncated =
+                        correction_link_truncated || rows.len() > remaining_budget;
+                    rows.truncate(remaining_budget);
+                    correction_link_scanned += this_scanned;
+                    remaining_budget -= this_scanned;
+                    correction_link_rows.extend(
+                        rows.into_iter()
+                            .filter(|event| in_window(event.created_at.timestamp_millis())),
+                    );
+                }
+                Err(error) => {
+                    correction_link_available = false;
+                    correction_link_read_warning = Some(format!(
+                        "source_family_read_failed: NativeCorrectionLink unavailable: {error}"
+                    ));
+                }
+            }
+        }
+        let native_correction_links = crate::factory_analytics::NativeCorrectionLinkInputs {
+            events: correction_link_rows,
+            scanned: correction_link_scanned,
+            limit: MAX_SCAN_TUPLES,
+            truncated: correction_link_truncated,
+            available: correction_link_available,
+            read_warning: correction_link_read_warning,
+        };
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
@@ -2983,6 +3145,7 @@ impl Daemon {
             runtime_unavailable,
             read_warnings,
             native_delivery,
+            native_correction_links,
         }
     }
 
@@ -3266,7 +3429,23 @@ impl Daemon {
             "status" => reply(Response::ok(id, self.status())),
             "stop" => {
                 let resp = Response::ok(id, json!({"stopping": true}));
-                let _ = self.shutdown_tx.send(true);
+                // Test-only fault injection (TKT-nusod-lizuk-jomun): hold this
+                // instance fully live — still accepting connections — for the
+                // given number of milliseconds past acknowledging `stop`,
+                // so a test can prove `rk daemon rollover` does not mistake
+                // a reconnect to a slow-exiting outgoing daemon for a
+                // replacement. Never set outside a test harness; unset, the
+                // shutdown fires on the next tick exactly as before.
+                let shutdown_tx = self.shutdown_tx.clone();
+                let delay_ms = std::env::var("RK_TEST_SHUTDOWN_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok());
+                tokio::spawn(async move {
+                    if let Some(ms) = delay_ms {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                    let _ = shutdown_tx.send(true);
+                });
                 reply(resp)
             }
             // `rk daemon rollover`'s drain step: stop admitting new dispatch
@@ -3314,11 +3493,24 @@ impl Daemon {
                 )
             }
             "bbs.brief" => {
-                let result =
-                    parse_params::<crate::bbs::BriefParams>(&req.params).and_then(|params| {
-                        crate::bbs::brief(&self.space, &self.tickets, &params)
+                let result = match parse_params::<crate::bbs::BriefParams>(&req.params) {
+                    Ok(params) => {
+                        // Reconcile before reading: an ordinary `bbs.brief`
+                        // read is this feature's trigger point (its config is
+                        // resolved fresh, and this call is a no-op instantly
+                        // when the repo's `landing-need-retirement` flag is
+                        // off). A reconciliation failure never fails the
+                        // read itself.
+                        if let Err(error) = self.retire_resolved_landing_needs(&params.repo).await {
+                            warn!(%error, repo = %params.repo, "landing-need-retirement: reconciliation pass failed; brief unaffected");
+                        }
+                        let discovery =
+                            crate::bbs_discovery::resolve_for_brief(&self.layout, &params.repo);
+                        crate::bbs::brief(&self.space, &self.tickets, &params, discovery)
                             .map_err(|e| e.to_string())
-                    });
+                    }
+                    Err(error) => Err(error),
+                };
                 reply(match result {
                     Ok(mut briefing) => {
                         // The selection is captured only AFTER it was computed
@@ -3331,11 +3523,64 @@ impl Daemon {
                             rk_core::bbs::ExposureSurface::Brief,
                             &self.consumer_binding(&req.caller),
                             &briefing,
+                            false,
                         );
                         briefing.telemetry = Some(capture.status);
                         briefing.exposure = capture.record;
                         Response::ok(id, json!(briefing))
                     }
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.discovery.show" => {
+                let result = parse_params::<crate::bbs_discovery::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::bbs_discovery::show(&self.layout, &params).map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.discovery.set" => {
+                let result = parse_params::<crate::bbs_discovery::SetParams>(&req.params).and_then(
+                    |params| {
+                        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                        crate::bbs_discovery::set(&self.layout, &repos, &req.caller, &params)
+                            .map_err(|e| e.to_string())
+                    },
+                );
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.retirement.show" => {
+                let result =
+                    parse_params::<crate::landing_need_resolution::ShowParams>(&req.params)
+                        .and_then(|params| {
+                            crate::landing_need_resolution::show(&self.layout, &params)
+                                .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.retirement.set" => {
+                let result = parse_params::<crate::landing_need_resolution::SetParams>(&req.params)
+                    .and_then(|params| {
+                        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                        crate::landing_need_resolution::set(
+                            &self.layout,
+                            &repos,
+                            &req.caller,
+                            &params,
+                        )
+                        .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
                 })
             }
@@ -3562,6 +3807,7 @@ impl Daemon {
                 }
             }
             "agent.steer" => reply(self.handle_steer(req).await),
+            "control.verify" => reply(self.handle_control_verify(req)),
             "agent.interrupt" => {
                 let params: NameParams = match parse_params(&req.params) {
                     Ok(p) => p,
@@ -3913,6 +4159,103 @@ impl Daemon {
                     Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
                 })
             }
+            "repo.land.fence_request" => {
+                let params: RepoLandFenceRequestParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let holder = params.holder.unwrap_or_else(|| {
+                    if req.caller.is_empty() {
+                        "operator".to_string()
+                    } else {
+                        req.caller.clone()
+                    }
+                });
+                // Passed as a PROBE, not a precomputed value: the snapshot
+                // must be taken after the fence is engaged, inside
+                // `fence_request`. See its doc.
+                let probe = || self.managed_work_snapshot(&repo);
+                reply(
+                    match self
+                        .landing()
+                        .fence_request(&repo, &holder, params.ttl_secs, &probe)
+                        .await
+                    {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                    },
+                )
+            }
+            "repo.land.fence_status" => {
+                let params: RepoLandFenceStatusParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let managed = self.managed_work_snapshot(&repo);
+                reply(Response::ok(
+                    id,
+                    self.landing().fence_status(&repo, &managed),
+                ))
+            }
+            "repo.land.fence_release" => {
+                let params: RepoLandFenceReleaseParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let probe = || self.managed_work_snapshot(&repo);
+                reply(
+                    match self
+                        .landing()
+                        .fence_release(&repo, &params.holder, &params.fence_id, &probe)
+                        .await
+                    {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                    },
+                )
+            }
             "repo.list" => reply(match self.repos.lock() {
                 Ok(reg) => Response::ok(id, json!({"repos": reg.list()})),
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
@@ -3966,6 +4309,11 @@ impl Daemon {
                     ),
                 })
             }
+            "release.prepare" => reply(self.handle_release_prepare(req, conn_id).await),
+            "release.select" => reply(self.handle_release_select(req, conn_id).await),
+            "release.status" => reply(self.handle_release_status(req).await),
+            "release.list" => reply(self.handle_release_list(req)),
+            "release.show" => reply(self.handle_release_show(req)),
             "ticket.new" => reply(self.handle_ticket_new(req).await),
             "ticket.list" => reply(self.handle_ticket_list(req)),
             "ticket.get" => reply(self.handle_ticket_get(req)),
@@ -4754,6 +5102,56 @@ impl Daemon {
         })
         .await
         .map_err(|e| rk_core::Error::other(format!("git ancestry check panicked: {e}")))
+    }
+
+    /// Defensive second trigger for the shared `run_retirement_pass` core —
+    /// see `crate::landing_need_resolution`'s module doc for the full
+    /// two-trigger design (the primary one is the automatic post-landing
+    /// hook in `landing.rs`, right after an accepted delivery is durably
+    /// recorded). This one fires on every `bbs.brief` RPC for `repo` and
+    /// catches what the post-landing hook could not: a Need whose delivery
+    /// already landed before the flag was ever turned on, or whose own
+    /// post-landing pass failed. Gated by the same repo-scoped
+    /// `landing-need-retirement` flag (default off, independent of the
+    /// unrelated BBS discovery-ranking flag); returns a zeroed outcome
+    /// instantly when the flag is off or the repo is unconfigured. A
+    /// reconciliation failure here never fails the `bbs.brief` read itself.
+    async fn retire_resolved_landing_needs(
+        &self,
+        repo: &str,
+    ) -> rk_core::Result<crate::landing_need_resolution::RetirementOutcome> {
+        let config = crate::landing_need_resolution::resolve_for_repo(&self.layout, repo);
+        if !config.enabled {
+            return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+        }
+        let path = {
+            let reg = self
+                .repos
+                .lock()
+                .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+            reg.get(repo).map(|r| r.path.clone())
+        };
+        let Some(path) = path else {
+            return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+        };
+        let space = self.space.clone();
+        let tickets = Arc::clone(&self.tickets);
+        let repo = repo.to_string();
+        // A blocking git subprocess call must not stall the async dispatch
+        // loop other connections share — `spawn_blocking` is this RPC path's
+        // half of the split; the post-landing hook in `landing.rs` calls
+        // `run_retirement_pass` directly instead, consistent with that file's
+        // existing inline blocking git calls.
+        tokio::task::spawn_blocking(move || {
+            let Ok(git_repo) = rk_git::Repo::discover(&path) else {
+                return Ok(crate::landing_need_resolution::RetirementOutcome::default());
+            };
+            crate::landing_need_resolution::run_retirement_pass(
+                &space, &tickets, &repo, &git_repo, "daemon", &config,
+            )
+        })
+        .await
+        .map_err(|e| rk_core::Error::other(format!("landing-need-retirement pass panicked: {e}")))?
     }
 
     async fn handle_inbox(&self, req: Request) -> Response {
@@ -7887,6 +8285,429 @@ impl Daemon {
         }
     }
 
+    async fn handle_release_prepare(&self, req: Request, conn_id: u64) -> Response {
+        let params: ReleasePrepareParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        self.run_release_prepare(req, conn_id, params.repo, params.candidate, params.recipe)
+            .await
+    }
+
+    /// P5.1 (`TKT-ratik-rivam-jadud`): resolve the repo's activated
+    /// `release.integrationBranch` to its current head and select it as the
+    /// candidate, instead of requiring an operator-supplied `--candidate`.
+    /// Everything past candidate resolution is byte-for-byte the same code
+    /// path `release.prepare` already uses — the same content-addressed
+    /// identity, admission wiring, and cancellation — so a later integration
+    /// commit can never mutate an already-selected candidate: it simply
+    /// resolves to a different commit and thus a different, separately
+    /// immutable release id. `release.list`/`release.show` are the existing
+    /// observation surface for a selected candidate; this adds no new one.
+    async fn handle_release_select(&self, req: Request, conn_id: u64) -> Response {
+        let params: ReleaseSelectParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        // `run_release_prepare` re-resolves the repo path from the registry
+        // itself (the same shape `release.prepare` always used); only the
+        // resolved integration branch name is needed from here.
+        let (_repo_path, integration_branch, _release_target) =
+            match self.resolve_release_role(&params.repo) {
+                Ok(v) => v,
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+            };
+        self.run_release_prepare(req, conn_id, params.repo, integration_branch, params.recipe)
+            .await
+    }
+
+    /// Look up `repo`'s activated release role
+    /// (`RepositoryPolicy::release.{integration_branch,release_target}`),
+    /// requiring both to be configured — shared by `release.select` and
+    /// `release.status` so the exact same "not activated at all" vs
+    /// "activated but the release role is unset" error text (and the
+    /// distinction between them) is not duplicated or allowed to drift.
+    fn resolve_release_role(
+        &self,
+        repo: &str,
+    ) -> Result<(std::path::PathBuf, String, String), String> {
+        let (repo_path, policy) = {
+            let reg = self
+                .repos
+                .lock()
+                .map_err(|_| "repo registry lock poisoned".to_string())?;
+            match reg.get(repo) {
+                Some(record) => {
+                    let policy = record.effective_policy().map_err(|e| e.to_string())?;
+                    (record.path.clone(), policy)
+                }
+                None => return Err(format!("unknown repository: {repo}")),
+            }
+        };
+        let integration_branch = policy.release.integration_branch.trim().to_string();
+        let release_target = policy.release.release_target.trim().to_string();
+        if integration_branch.is_empty() || release_target.is_empty() {
+            return Err(format!(
+                "repository '{repo}' has no activated release role (repo.release.integrationBranch \
+                 and repo.release.releaseTarget); configure both and activate via `rk repo \
+                 onboard`, or use release.prepare with an explicit --candidate"
+            ));
+        }
+        Ok((repo_path, integration_branch, release_target))
+    }
+
+    /// P5.1: read-only view tying the activated release role together —
+    /// the integration branch's current head, the release target's current
+    /// head (when resolvable), and whether the integration head already has
+    /// a recorded, content-verified `Prepared` release inventory entry
+    /// (`integration_head_prepared`). PRECISE MEANING, corrected after a
+    /// verified operator review: this reports only `ReleaseStatus::Prepared`
+    /// — an immutable artifact inventory entry exists for this exact commit,
+    /// nothing more. It is NOT "accepted" (no review/gate has run over it as
+    /// a release), NOT "deployed" (nothing was installed or activated
+    /// anywhere), and NOT "enabled" (no feature-exposure state changed) —
+    /// those are distinct states from other subsystems (`rk feature
+    /// show/set`, a future release-activation slice) that this field must
+    /// never be read as implying. Never advances or authorizes anything on
+    /// `release_target`; landing onto that branch is unchanged, governed
+    /// entirely by its own existing protected-path/review gates. This only
+    /// makes `releaseTarget` observable, closing the gap where it was
+    /// previously validated at activation time but never read at runtime.
+    /// Resolve whatever the caller passed as `repo` — a registered name OR a
+    /// filesystem path — to the CANONICAL registered name.
+    ///
+    /// This is load-bearing, not a convenience. The landing pipeline keys
+    /// every drain lane, fence record and admission check on the registered
+    /// NAME, while `rk`'s own `resolve_path` helper sends a PATH. Taking the
+    /// caller's string verbatim meant a fence requested through the CLI was
+    /// filed under a key nothing else ever consults: `admission_fenced` kept
+    /// answering false, so the fence blocked nothing at all, while
+    /// `active_keys` found no lanes under that key and reported a confident
+    /// `ready`. Caught by the cross-process CLI fixture, which is the only
+    /// place the two spellings actually meet.
+    fn resolve_repo_name(&self, repo: &str) -> rk_core::Result<String> {
+        let registry = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+        if let Some(record) = registry.get(repo) {
+            return Ok(record.name.clone());
+        }
+        let canonical =
+            std::fs::canonicalize(repo).unwrap_or_else(|_| std::path::PathBuf::from(repo));
+        registry
+            .get_by_path(&canonical)
+            .map(|record| record.name.clone())
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "'{repo}' is neither a registered repo name nor a registered repo path"
+                ))
+            })
+    }
+
+    /// Everything outside the landing queue that can still own `repo` when
+    /// P7.1's handoff fence is asked whether a rollover is safe. Built here
+    /// because `Server` is the only place that can observe all three
+    /// dimensions at once — the landing pipeline cannot reach back for the
+    /// managed-run registry or the release-prepare lock without a cycle.
+    ///
+    /// Read-only and non-blocking: `try_lock` never waits on, and never
+    /// itself becomes, the release-prepare owner, and the run registry is a
+    /// plain snapshot. Nothing here cancels anything — see
+    /// `landing::handoff`'s module doc on reusing rather than pre-empting
+    /// the existing managed-run and release contracts.
+    fn managed_work_snapshot(&self, repo: &str) -> crate::landing::ManagedWorkSnapshot {
+        // Every repo's runs, not just this one: a rollover stops the WHOLE
+        // daemon, so another repository's managed check hangs it exactly as
+        // this one's would. `ManagedWorkSnapshot` splits them by scope.
+        let all = self.supervisor.verification_resources().runs.active_all();
+        crate::landing::ManagedWorkSnapshot::new(
+            repo,
+            all,
+            self.release_prepare_lock.try_lock().is_err(),
+        )
+    }
+
+    async fn handle_release_status(&self, req: Request) -> Response {
+        let params: ReleaseSelectParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let (repo_path, integration_branch, release_target) =
+            match self.resolve_release_role(&params.repo) {
+                Ok(v) => v,
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+            };
+        let integration_head = {
+            let repo_path = repo_path.clone();
+            let branch = integration_branch.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::release::resolve_candidate(&repo_path, &branch)
+            })
+            .await
+            {
+                Ok(Ok((commit, _tree))) => commit,
+                Ok(Err(e)) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+                Err(e) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("integration branch resolution task failed: {e}"),
+                    )
+                }
+            }
+        };
+        // The release target may not resolve locally (e.g. an unusual
+        // fetch/mirror state) — that is reported as `null`, not a hard
+        // error, since it never blocks the read-only status view itself.
+        let release_target_head = {
+            let repo_path = repo_path.clone();
+            let branch = release_target.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::release::resolve_candidate(&repo_path, &branch)
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|(commit, _tree)| commit)
+        };
+        let id = crate::release::id_for(&params.repo, &integration_head, &params.recipe);
+        let lock_is_free = self.release_prepare_lock.try_lock().is_ok();
+        let selected = crate::release::show(&self.layout, &id).ok().flatten();
+        // Reports ONLY `ReleaseStatus::Prepared` — see this handler's doc
+        // comment for the accepted/deployed/enabled distinctions this field
+        // must never be read as implying.
+        let integration_head_prepared = selected.as_ref().is_some_and(|s| {
+            crate::release::effective_status(&s.entry, lock_is_free)
+                == crate::release::ReleaseStatus::Prepared
+        });
+        Response::ok(
+            req.id,
+            json!({
+                "repo": params.repo,
+                "integration_branch": integration_branch,
+                "integration_head": integration_head,
+                "release_target": release_target,
+                "release_target_head": release_target_head,
+                "selected_release": selected.map(|s| {
+                    release_json(&s.entry, s.manifest.as_ref(), Some(lock_is_free))
+                }),
+                "integration_head_prepared": integration_head_prepared,
+            }),
+        )
+    }
+
+    async fn run_release_prepare(
+        &self,
+        req: Request,
+        conn_id: u64,
+        repo: String,
+        candidate: String,
+        recipe: String,
+    ) -> Response {
+        let repo_path = {
+            let reg = match self.repos.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned")
+                }
+            };
+            match reg.get(&repo) {
+                Some(record) => record.path.clone(),
+                None => {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!("unknown repository: {repo}"),
+                    )
+                }
+            }
+        };
+        // Serialize staging access and expose preparation liveness to list/show.
+        let _guard = self.release_prepare_lock.lock().await;
+        // Freeze the mutable ref once under the lock for both proof lookup and building.
+        let (resolved_commit, tree_sha) = {
+            let repo_path = repo_path.clone();
+            let candidate = candidate.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::release::resolve_candidate(&repo_path, &candidate)
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+                Err(e) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("candidate resolution task failed: {e}"),
+                    )
+                }
+            }
+        };
+        // Look up existing exact-key proof only; a cache miss must never execute verification.
+        let check = {
+            let repo_path = repo_path.clone();
+            let resolved_commit = resolved_commit.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::release::load_named_check(&repo_path, &resolved_commit, "verify")
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let known_verification = check.and_then(|check| {
+            let proof = crate::managed_verification::ManagedVerification::new(
+                &self.layout,
+                &self.space,
+                self.supervisor.verification_resources(),
+                check.shared_cargo_target,
+            )
+            .lookup_verification_proof(&repo, &resolved_commit, &check)?;
+            // Retain the exact lookup key so consumers can independently trace the durable proof.
+            let key = crate::managed_verification::verification_proof_key(
+                &repo,
+                &resolved_commit,
+                &check,
+            );
+            // Include the check context with its proof reference.
+            Some(json!({
+                "check": {
+                    "name": check.name,
+                    "command": check.command,
+                    "toolchain": check.toolchain,
+                    "environment_policy": check.environment_policy.to_string(),
+                },
+                "resolved_commit": resolved_commit,
+                "key": key,
+                "proof": proof,
+            }))
+        });
+        // P4.1 (TKT-nibuv-gokun-sibin): route the build through the SAME
+        // aggregate host-wide admission semaphore every managed named check
+        // already shares, only when the operator has explicitly opted in.
+        let release_admission = self
+            .release_build_admission_enabled
+            .then(|| &self.supervisor.verification_resources().host_admission);
+        // P4.1 cancellation: register with the SAME `ManagedVerificationRuns`
+        // registry `verify.run` uses, keyed by the identical `request_key`
+        // `dispatch_watching_disconnect` computes for this connection/request
+        // — no release-specific cancellation registry. `generation` follows
+        // `handle_verify_run`'s own convention: `None` for the operator (no
+        // live agent record to fence a namesake against), the caller's
+        // current spawn id otherwise.
+        let generation = if req.caller.is_empty() || req.caller == crate::client::OPERATOR {
+            None
+        } else {
+            self.supervisor.status(&req.caller).map(|r| r.spawn_id())
+        };
+        let request_key = verify_request_key(conn_id, &req.id);
+        // Refused while a P7.1 handoff fence is engaged for this repo: a
+        // release prepare started after `ready` would silently invalidate the
+        // handoff the operator is mid-way through. Already-running prepares
+        // are untouched.
+        let (managed_id, mut cancel_rx) =
+            match self.supervisor.verification_resources().runs.try_register(
+                &req.caller,
+                generation,
+                &request_key,
+                &repo,
+                "release-prepare",
+            ) {
+                Ok(registered) => registered,
+                Err(error) => return Response::err(req.id, codes::FORBIDDEN, error.to_string()),
+            };
+        let prepare_fut = crate::release::prepare(
+            &self.layout,
+            crate::release::PrepareParams {
+                repo_name: repo,
+                repo_path,
+                requested: candidate,
+                resolved_commit,
+                tree_sha,
+                recipe,
+                known_verification,
+            },
+            release_admission,
+        );
+        tokio::pin!(prepare_fut);
+        // Dropping `prepare_fut` on the cancel branch — never polling it
+        // again — is what actually tears the build down: its `ProcessGroupGuard`
+        // (owned deep inside `run_recipe`'s `collect_child_output` call, same
+        // guard `verify.run`'s own cancellation relies on) and its
+        // `HostVerificationAdmission` permit are both plain locals in the
+        // future being abandoned here, so both release via ordinary Rust
+        // drop the instant this function returns below. The `release_prepare_lock`
+        // guard (`_guard` above) drops the same way, so a cancelled build's
+        // release entry is exposed by `effective_status` as `Unknown` (lock
+        // free, still `Preparing`) rather than lying about it forever.
+        let outcome = tokio::select! {
+            result = &mut prepare_fut => result,
+            _ = cancel_rx.changed() => {
+                let reason: Option<&'static str> = *cancel_rx.borrow();
+                Err(rk_core::Error::other(format!(
+                    "release.prepare cancelled ({})",
+                    reason.unwrap_or("cancelled")
+                )))
+            }
+        };
+        self.supervisor
+            .verification_resources()
+            .runs
+            .unregister(managed_id);
+        match outcome {
+            Ok(outcome) => Response::ok(
+                req.id,
+                json!({
+                    "release": release_json(&outcome.entry, Some(&outcome.manifest), None),
+                    "already_prepared": outcome.already_prepared,
+                }),
+            ),
+            Err(e) => Response::err(req.id, codes::CONFLICT, e.to_string()),
+        }
+    }
+
+    fn handle_release_list(&self, req: Request) -> Response {
+        let params: ReleaseListParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let lock_is_free = self.release_prepare_lock.try_lock().is_ok();
+        match crate::release::list(&self.layout, params.repo.as_deref()) {
+            Ok(entries) => {
+                let releases: Vec<Value> = entries
+                    .iter()
+                    .map(|entry| release_json(entry, None, Some(lock_is_free)))
+                    .collect();
+                Response::ok(req.id, json!({"releases": releases}))
+            }
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_release_show(&self, req: Request) -> Response {
+        let params: ReleaseShowParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let lock_is_free = self.release_prepare_lock.try_lock().is_ok();
+        match crate::release::show(&self.layout, &params.id) {
+            Ok(Some(result)) => Response::ok(
+                req.id,
+                json!({
+                    "release": release_json(
+                        &result.entry,
+                        result.manifest.as_ref(),
+                        Some(lock_is_free),
+                    ),
+                    "content_verified": result.content_verified,
+                }),
+            ),
+            Ok(None) => Response::ok(req.id, json!({"release": null})),
+            Err(e) => Response::err(req.id, codes::CONFLICT, e.to_string()),
+        }
+    }
+
     /// Front-gate for `rk spawn`: lets the CLI resolve the SAME effective
     /// landing target `agent.spawn` would use — a caller-supplied `--base`,
     /// or (when omitted) the policy-derived delivery default — and confirm
@@ -10842,6 +11663,172 @@ impl Daemon {
         }
     }
 
+    /// Let an agent check a message claiming operator/steer authority in its
+    /// own transcript against the daemon's durable control record, instead of
+    /// trusting the claim's text at face value.
+    ///
+    /// `req.caller` is the connection's kernel-authenticated identity (see
+    /// `client::ambient_identity`), never a value this RPC's params can
+    /// override — so the lookup is always scoped to whoever is actually
+    /// asking, exactly like `handle_out`'s "agents may only write tuples for
+    /// their own instance" rule. This is deliberately narrower than
+    /// `handle_steer`: it answers a question, mutates nothing about the
+    /// agent's own session, and grants no new authority beyond what
+    /// `agent.steer` already had to admit for the record to exist at all.
+    ///
+    /// A copied-but-genuine envelope (real `message_id`, real original text)
+    /// still fails here if it is not addressed to the calling agent, or the
+    /// calling agent's live session has since moved past the generation the
+    /// envelope was delivered to — `crate::steer::find` and the generation
+    /// check below are what make "the exact bytes exist somewhere" different
+    /// from "the daemon holds this for me, right now". Conversely, a genuine,
+    /// still-current record copied into a file or BBS post legitimately
+    /// VERIFIES: origin is not what this checks. What must never happen is
+    /// acting on the surrounding untrusted text instead of the text this
+    /// call returns, and treating a second, third, ... verification of the
+    /// same message as a second action.
+    ///
+    /// A successful result here means: an authenticated call from this exact
+    /// agent asked the daemon for its own durable control record, and the
+    /// daemon found one addressed to it, at its current session generation,
+    /// with this instruction text. It does NOT mean the model read this
+    /// response, believed it, or changed its behavior — whether the
+    /// instruction was actually applied is a separate fact this RPC has no
+    /// way to observe and does not claim.
+    ///
+    /// The read (does a matching, current record exist) and the write
+    /// (record that this agent observed it) are serialized under
+    /// `control_verify_lock` so two concurrent verifications of the same
+    /// message cannot both see "not yet observed" and both write — see that
+    /// field's doc comment.
+    fn handle_control_verify(&self, req: Request) -> Response {
+        let params: ControlVerifyParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        if req.caller.is_empty() || req.caller == OPERATOR_ACTOR {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "control.verify must be called by a spawned agent's own authenticated session",
+            );
+        }
+        let _guard = self
+            .control_verify_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(record) = self.supervisor.status(&req.caller) else {
+            return Response::err(req.id, codes::INTERNAL, "no live record for caller");
+        };
+        if !record.state.is_live() {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "control.verify refused for a terminal caller",
+            );
+        }
+        let envelope = match crate::steer::find(
+            &self.space,
+            &record.repo_name,
+            &req.caller,
+            &self.castle,
+            &params.message_id,
+        ) {
+            Ok(found) => found,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let Some(envelope) = envelope else {
+            return Response::ok(req.id, json!({"verified": false, "reason": "not_found"}));
+        };
+        // The stored envelope's own `resume_generation` can be stale after a
+        // daemon-restart replay (`enqueue` runs once, at original admission,
+        // and is never rewritten); the ack it produced when actually
+        // delivered is what reflects the live generation. See
+        // `steer::last_delivered_generation`'s doc comment.
+        let delivered_generation = match crate::steer::last_delivered_generation(
+            &self.space,
+            &record.repo_name,
+            &req.caller,
+            &self.castle,
+            &envelope.message_id,
+        ) {
+            Ok(generation) => generation,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let Some(delivered_generation) = delivered_generation else {
+            return Response::ok(
+                req.id,
+                json!({"verified": false, "reason": "not_delivered"}),
+            );
+        };
+        // ONE coherent live-binding snapshot, read together and used for
+        // BOTH the freshness decision and (if we write) the observed
+        // record's fields — on every success path, not only when we are
+        // about to write. `status` and `session_generation` are still two
+        // separate reads from two separate locks (no single call returns
+        // both atomically), so this is a fail-closed linearization, not a
+        // true atomic read: if a respawn/dismissal lands between them, the
+        // mismatch this produces refuses rather than silently recording a
+        // stale binding as if it were current. `control_verify_lock` only
+        // serializes concurrent `control.verify` calls against each other
+        // (see its own doc comment) — it does not, and cannot, exclude a
+        // respawn running under the supervisor's own locks.
+        let live = self.supervisor.status(&req.caller);
+        let coherent = live.as_ref().is_some_and(|r| {
+            r.state.is_live()
+                && r.spawn_id() == record.spawn_id()
+                && r.current_attempt == record.current_attempt
+        }) && self
+            .supervisor
+            .session_generation(&req.caller)
+            .map(|g| g.to_string())
+            == Some(delivered_generation.clone());
+        if !coherent {
+            return Response::ok(
+                req.id,
+                json!({"verified": false, "reason": "stale_generation"}),
+            );
+        }
+        let record = live.expect("coherent implies Some");
+        let already_observed = crate::steer::already_observed(
+            &self.space,
+            &record.repo_name,
+            &req.caller,
+            &envelope.message_id,
+            &self.castle,
+        )
+        .unwrap_or(false);
+        if !already_observed {
+            if let Err(error) = crate::steer::record_observed(
+                &self.space,
+                &record.repo_name,
+                &envelope,
+                &req.caller,
+                &record.spawn_id().to_string(),
+                record.current_attempt.map(|a| a.to_string()).as_deref(),
+                &delivered_generation,
+                &self.castle,
+            ) {
+                warn!(
+                    agent = %req.caller,
+                    message_id = %envelope.message_id,
+                    %error,
+                    "failed to persist control.verify observation"
+                );
+            }
+        }
+        Response::ok(
+            req.id,
+            json!({
+                "verified": true,
+                "message_id": envelope.message_id,
+                "sender": envelope.sender,
+                "generation": delivered_generation,
+                "text": envelope.text,
+            }),
+        )
+    }
+
     /// The daemon's own authenticated view of who a read was served to.
     ///
     /// Derived from the supervisor registry, never from anything the caller
@@ -11478,7 +12465,7 @@ impl Daemon {
             // The version that can actually distinguish two daemons: `version`
             // above has read `0.1.0` since the first commit, so an operator
             // comparing it against a freshly installed binary learns nothing.
-            "build_version": rk_core::version::BUILD_VERSION,
+            "build_version": rk_core::version::build_version(),
             "pid": std::process::id(),
             // Operator-facing: the friendly alias if configured, else the actor
             // id. The wire id (self.castle) is never exposed here as a name.
@@ -12399,6 +13386,11 @@ struct SteerParams {
 }
 
 #[derive(Deserialize)]
+struct ControlVerifyParams {
+    message_id: String,
+}
+
+#[derive(Deserialize)]
 struct DismissParams {
     name: String,
     #[serde(default)]
@@ -12485,6 +13477,45 @@ struct RepoLandCancelReviewParams {
     task: String,
 }
 
+fn default_handoff_fence_ttl_secs() -> i64 {
+    600
+}
+
+/// `repo.land.fence_request` — P7.1 (TKT-rufik-lafit-pisah): engage the
+/// operator-only handoff-window fence for `repo`, blocking new landing
+/// admission there without draining or cancelling anything already queued
+/// or in flight. See [`crate::landing::handoff`]'s module doc.
+#[derive(Deserialize)]
+struct RepoLandFenceRequestParams {
+    repo: String,
+    #[serde(default)]
+    holder: Option<String>,
+    #[serde(default = "default_handoff_fence_ttl_secs")]
+    ttl_secs: i64,
+}
+
+/// `repo.land.fence_status` — read-only: state, blockers, whether it is
+/// safe to proceed with a rollover for `repo`.
+#[derive(Deserialize)]
+struct RepoLandFenceStatusParams {
+    repo: String,
+}
+
+/// `repo.land.fence_release` — end a fence early; idempotent, fenced on
+/// `(holder, fence_id)` so a stale/foreign caller cannot release someone
+/// else's active fence. NOT `generation`: that counter restarts at 1 when the
+/// durable store has to be recovered, which made a replayed release
+/// indistinguishable from a legitimate one.
+#[derive(Deserialize)]
+struct RepoLandFenceReleaseParams {
+    repo: String,
+    holder: String,
+    /// Opaque identity returned by `fence_request`. Replaces the old
+    /// `generation`, which resets to 1 on a corrupt-store recovery and so
+    /// could not fence a replayed release. See `HandoffFenceRecord::fence_id`.
+    fence_id: String,
+}
+
 #[derive(Deserialize)]
 struct RevertParams {
     name: String,
@@ -12504,12 +13535,13 @@ struct BlockingParams {
 }
 
 fn repository_head(path: &std::path::Path) -> rk_core::Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
         .arg(path)
         .args(["rev-parse", "HEAD"])
-        .env("LC_ALL", "C")
-        .output()?;
+        .env("LC_ALL", "C");
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let output = cmd.output()?;
     if !output.status.success() {
         return Err(rk_core::Error::other(format!(
             "cannot resolve repository HEAD for {}: {}",
@@ -12528,12 +13560,12 @@ fn repository_head(path: &std::path::Path) -> rk_core::Result<String> {
 /// can be inferred at registration time. Returns `None` when the path is not a
 /// repo or has no such remote — host inference is best-effort, never fatal.
 fn repo_remote_url(path: &std::path::Path, remote: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C"])
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-C"])
         .arg(path)
-        .args(["remote", "get-url", remote])
-        .output()
-        .ok()?;
+        .args(["remote", "get-url", remote]);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -12549,6 +13581,66 @@ fn repo_remote_url(path: &std::path::Path, remote: &str) -> Option<String> {
 struct RepoAddParams {
     name: String,
     path: String,
+}
+
+#[derive(Deserialize)]
+struct ReleasePrepareParams {
+    repo: String,
+    candidate: String,
+    #[serde(default = "default_release_recipe")]
+    recipe: String,
+}
+
+fn default_release_recipe() -> String {
+    crate::release::RECIPE_PAIRED_RK_MCP.to_string()
+}
+
+#[derive(Deserialize)]
+struct ReleaseSelectParams {
+    repo: String,
+    #[serde(default = "default_release_recipe")]
+    recipe: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseListParams {
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReleaseShowParams {
+    id: String,
+}
+
+/// Flatten a release's index entry (with its `Preparing`-staleness resolved
+/// against the release-prepare lock, when `lock_is_free` is given) and its
+/// manifest, when present, into one JSON object for the wire. `prepare`'s own
+/// response passes `None` for `lock_is_free` — it just ran to completion (or
+/// failed) synchronously in this same call, so there is no stale-liveness
+/// question to resolve.
+fn release_json(
+    entry: &crate::release::ReleaseIndexEntry,
+    manifest: Option<&crate::release::ReleaseManifest>,
+    lock_is_free: Option<bool>,
+) -> Value {
+    let status = match lock_is_free {
+        Some(free) => crate::release::effective_status(entry, free),
+        None => entry.status,
+    };
+    json!({
+        "id": entry.id,
+        "repo": entry.repo,
+        "recipe": entry.recipe,
+        "recipe_revision": entry.recipe_revision,
+        "requested_source": entry.requested_source,
+        "status": status,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+        "detail": entry.detail,
+        "manifest_digest": entry.manifest_digest,
+        "manifest": manifest,
+    })
 }
 
 #[derive(Deserialize)]
@@ -12798,13 +13890,13 @@ fn touches_protected_path(
 fn grep_matches(files: &[String], pattern: &str) -> Option<bool> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("grep")
-        .args(["-qE", pattern])
+    let mut cmd = Command::new("grep");
+    cmd.args(["-qE", pattern])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = writeln!(stdin, "{}", files.join("\n"));
     }

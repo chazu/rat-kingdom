@@ -680,7 +680,7 @@ impl Lane {
         }
     }
 
-    fn tag(self) -> &'static str {
+    pub(crate) fn tag(self) -> &'static str {
         match self {
             Lane::Implementation => "implementation",
             Lane::Review => "review",
@@ -1208,6 +1208,31 @@ impl Registry {
             self.persist_lane_waiters()?;
         }
         Ok(())
+    }
+
+    /// Relinquish a SPECIFIC caller's own durable lane-wait reservation the
+    /// moment that caller's own admission attempt becomes terminal —
+    /// refused, cancelled, or otherwise never going to retry
+    /// (TKT-minak-mogiz-lizun). Same underlying record as
+    /// [`clear_lane_wait`](Self::clear_lane_wait) (a queued key never
+    /// admitted through `try_reserve_lane_wip`, rather than one that just
+    /// did), but reached from a caller who now knows this exact
+    /// `(repo, lane, key)` request will never be retried under this
+    /// generation. Without this, a terminally refused automatic rework/
+    /// correction dispatch stays parked at the FIFO head for the full
+    /// [`LANE_WAIT_STALE_SECS`] window, blocking every other waiter behind
+    /// it even once real capacity frees up. Scoped to exactly the one
+    /// `(repo, lane, key)` triple named — never touches any other waiter, so
+    /// an actively retrying caller elsewhere in the same queue keeps its
+    /// place regardless. A no-op (and cheap: no write) if this key was never
+    /// queued at all.
+    pub(crate) fn abandon_lane_wait(
+        &mut self,
+        repo: &str,
+        lane: Lane,
+        key: &str,
+    ) -> rk_core::Result<()> {
+        self.clear_lane_wait(repo, lane, key)
     }
 
     /// Evict any waiter on `(repo, lane)` that has gone [`LANE_WAIT_STALE_SECS`]
@@ -1959,6 +1984,49 @@ mod tests {
             1,
             "restart recovery must retain an old but actively retrying waiter"
         );
+    }
+
+    /// TKT-minak-mogiz-lizun: a terminally refused automatic dispatch (a
+    /// rework/correction spawn the landing pipeline will never auto-retry)
+    /// must relinquish its OWN exact lane-wait reservation immediately,
+    /// rather than block every other waiter behind it for the full
+    /// `LANE_WAIT_STALE_SECS` crash-fallback window even once real capacity
+    /// frees up. No real sleep: the free slot is created by an explicit
+    /// `release_lane_wip` (simulating the occupying agent's completion), not
+    /// by advancing a clock.
+    #[test]
+    fn terminal_dispatch_releases_its_lane_wait_without_the_stale_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let mut reg = Registry::load(&path).unwrap();
+
+        // "first" saturates the repo's one-slot Implementation lane.
+        assert!(reg.try_reserve_lane_wip("repo", Lane::Implementation, 1, "first"));
+
+        // An automatic rework's correction spawn ("second") is refused and
+        // durably queued as the FIFO head behind "first".
+        assert!(!reg.try_reserve_lane_wip("repo", Lane::Implementation, 1, "second"));
+        assert_eq!(reg.lane_wait_stats("repo", Lane::Implementation).0, 1);
+
+        // "first" completes and its slot frees — but nothing has yet told
+        // the registry that "second" is terminal and will never retry.
+        reg.release_lane_wip("repo", Lane::Implementation, 1);
+
+        // A distinct, unrelated request ("third") is refused even though a
+        // slot is actually free: FIFO order still defers to the abandoned
+        // "second" waiter. This is the confirmed production defect.
+        assert!(!reg.try_reserve_lane_wip("repo", Lane::Implementation, 1, "third"));
+
+        // The lifecycle correction: "second"'s own caller reaches a terminal
+        // outcome (e.g. `dispatch-refused`) and relinquishes exactly its own
+        // reservation.
+        reg.abandon_lane_wait("repo", Lane::Implementation, "second")
+            .unwrap();
+
+        // "third" now proceeds immediately — no advancing the clock past
+        // LANE_WAIT_STALE_SECS.
+        assert!(reg.try_reserve_lane_wip("repo", Lane::Implementation, 1, "third"));
+        assert_eq!(reg.lane_wait_stats("repo", Lane::Implementation).0, 0);
     }
 
     /// TKT-147: the predicate a workflow gate leans on to tell a rat that

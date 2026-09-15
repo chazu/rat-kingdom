@@ -104,6 +104,22 @@ pub(crate) fn transport_breaker_open_refused(provider: &str) -> String {
 /// [`crate::workflow_exec::is_fleet_wip_refusal`].
 pub(crate) const DUPLICATE_TASK_REFUSED_PREFIX: &str = "duplicate dispatch refused for task";
 
+/// The durable [`crate::agents::LaneWaiter`] key for one logical spawn
+/// request — stable across THIS caller's own retries, matching
+/// [`Registry::try_reserve_lane_wip`](crate::agents::Registry::try_reserve_lane_wip)'s
+/// key contract. Shared by [`Supervisor::spawn`] (which mints the key a
+/// refused admission is queued under) and
+/// [`Supervisor::abandon_lane_wait`] (which must reconstruct the identical
+/// key to release the SAME queued reservation once that request's caller
+/// knows it is terminal) — TKT-minak-mogiz-lizun: the two must never drift,
+/// or an abandonment call would silently clear (or miss) the wrong record.
+fn lane_wait_key(role: &str, task: &str, workflow_instance: Option<&str>) -> String {
+    match workflow_instance {
+        Some(instance) => format!("workflow:{instance}:{task}"),
+        None => format!("{role}:{task}"),
+    }
+}
+
 fn duplicate_task_refused(task: &str, owner: &str) -> String {
     if owner.is_empty() {
         format!(
@@ -1323,6 +1339,25 @@ impl Supervisor {
         self.verification.host_admission.set_limit(limit);
     }
 
+    /// Set the P3.2 (TKT-nasif-danob-sirok) weighted/fair-progress policy —
+    /// `[policy] verification_admission_check_weight` / `_check_class` /
+    /// `_class_reserve`. MUST be called after
+    /// [`set_verification_admission_aggregate_limit`](Self::set_verification_admission_aggregate_limit)
+    /// — it validates against, and carves reserved fast lanes out of, the
+    /// limit that call just installed. `Daemon::new` does so in that order
+    /// and propagates a validation failure as a daemon-startup error, same
+    /// fail-closed convention as `crate::authority::AuthorityPolicy::from_config`.
+    pub fn set_verification_admission_class_policy(
+        &self,
+        check_weight: HashMap<String, u32>,
+        check_class: HashMap<String, String>,
+        class_reserve: HashMap<String, u32>,
+    ) -> Result<(), String> {
+        self.verification
+            .host_admission
+            .set_class_policy(check_weight, check_class, class_reserve)
+    }
+
     /// Acquire one bounded per-repo verification admission permit for `repo`.
     /// See [`crate::managed_verification::VerificationAdmission`] for what this bounds, the FIFO fairness
     /// guarantee, and why a daemon restart can never leak one.
@@ -1497,6 +1532,11 @@ impl Supervisor {
             "limit": limit,
             "executing": self.verification.host_admission.executing(),
             "waiting": self.verification.host_admission.waiting(),
+            // P3.2 (TKT-nasif-danob-sirok): per-fast-lane-class {limit,
+            // executing} snapshot, empty unless a class policy is
+            // configured — additive, so a P3.1-only deployment reads
+            // identically to before this field existed.
+            "classes": self.verification.host_admission.class_summary(),
         })
     }
 
@@ -1900,10 +1940,11 @@ impl Supervisor {
         // reclaiming the same ticket) so the durable wait queue holds this
         // logical request's place in line instead of minting a fresh entry
         // per attempt — see `Registry::try_reserve_lane_wip`/`LaneWaiter`.
-        let lane_wait_key = match &params.workflow_instance {
-            Some(instance) => format!("workflow:{instance}:{}", params.task),
-            None => format!("{}:{}", params.role, params.task),
-        };
+        let lane_wait_key = lane_wait_key(
+            &params.role,
+            &params.task,
+            params.workflow_instance.as_deref(),
+        );
         let name = {
             let mut reg = self.lock_registry();
             if !reg.try_reserve_wip(fleet_wip_cap) {
@@ -2043,6 +2084,11 @@ impl Supervisor {
             return Err(e);
         }
 
+        let (bbs_task, reviewed_ticket_bbs_context) = self.reviewed_bbs_task(
+            repo_policy.as_ref(),
+            params.review.as_ref(),
+            Some(&params.task),
+        );
         let prime_ctx = PrimeContext {
             agent: name.clone(),
             repo: repo_name.clone(),
@@ -2053,9 +2099,10 @@ impl Supervisor {
             parent: params.parent.clone(),
             briefing: self.bbs_briefing(
                 &repo_name,
-                Some(&params.task),
+                bbs_task,
                 rk_core::bbs::ExposureSurface::Spawn,
                 &crate::bbs::ConsumerBinding::agent(&name, &spawn.to_string(), Some(&params.task)),
+                reviewed_ticket_bbs_context,
             ),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
@@ -2312,17 +2359,18 @@ impl Supervisor {
                 spec.prompt.clone()
             };
             tokio::task::spawn_blocking(move || {
-                let _ = std::process::Command::new("herdr")
-                    .args([
-                        "agent",
-                        "wait",
-                        &target,
-                        "--status",
-                        "idle",
-                        "--timeout",
-                        "30000",
-                    ])
-                    .output();
+                let mut cmd = std::process::Command::new("herdr");
+                cmd.args([
+                    "agent",
+                    "wait",
+                    &target,
+                    "--status",
+                    "idle",
+                    "--timeout",
+                    "30000",
+                ]);
+                rk_core::exec::close_extra_fds(&mut cmd);
+                let _ = cmd.output();
                 if let Err(e) = rk_mux::HerdrMux::send(&target, &prompt) {
                     warn!(error = %e, "failed to deliver prompt to herdr pane");
                 }
@@ -2486,6 +2534,12 @@ impl Supervisor {
             record.review.as_ref(),
         );
 
+        let resume_repo_policy = self.repository_policy(&repo).ok();
+        let (resume_bbs_task, resume_reviewed_ticket_bbs_context) = self.reviewed_bbs_task(
+            resume_repo_policy.as_ref(),
+            record.review.as_ref(),
+            record.task.as_deref(),
+        );
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
             repo: record.repo_name.clone(),
@@ -2498,13 +2552,14 @@ impl Supervisor {
             // exposure binds to the generation that is resuming, not a new one.
             briefing: self.bbs_briefing(
                 &record.repo_name,
-                record.task.as_deref(),
+                resume_bbs_task,
                 rk_core::bbs::ExposureSurface::Resume,
                 &crate::bbs::ConsumerBinding::agent(
                     &record.name,
                     &record.spawn_id().to_string(),
                     record.task.as_deref(),
                 ),
+                resume_reviewed_ticket_bbs_context,
             ),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
@@ -2702,17 +2757,18 @@ impl Supervisor {
                 spec.prompt
             };
             tokio::task::spawn_blocking(move || {
-                let _ = std::process::Command::new("herdr")
-                    .args([
-                        "agent",
-                        "wait",
-                        &target,
-                        "--status",
-                        "idle",
-                        "--timeout",
-                        "30000",
-                    ])
-                    .output();
+                let mut cmd = std::process::Command::new("herdr");
+                cmd.args([
+                    "agent",
+                    "wait",
+                    &target,
+                    "--status",
+                    "idle",
+                    "--timeout",
+                    "30000",
+                ]);
+                rk_core::exec::close_extra_fds(&mut cmd);
+                let _ = cmd.output();
                 if let Err(e) = rk_mux::HerdrMux::send(&target, &prompt) {
                     warn!(error = %e, "failed to deliver resume prompt to herdr pane");
                 }
@@ -3852,6 +3908,36 @@ impl Supervisor {
         }
     }
 
+    /// Selects which ticket a reviewer's BBS briefing is queried against, and
+    /// whether that selection is the reviewed-ticket redirect. Ordinarily
+    /// (and always when `policy` is unavailable, disabled, or this spawn/
+    /// resume/recovery carries no `ReviewContext`) the query is just
+    /// `fallback` — the agent's own task, synthetic or not, exactly as
+    /// before this setting existed — and the returned flag is `false`. When
+    /// `LandingPolicy::reviewed_ticket_bbs_context` is on for the repo and a
+    /// daemon-owned `ReviewContext` is present (never workflow-supplied —
+    /// see `LandingPipeline::dispatch_review`/`launch_shadow_review`), the
+    /// query instead targets the actual reviewed ticket so its findings/
+    /// artifacts/dependency chain become visible, and the flag is `true`.
+    /// This never touches the reviewer's own task/role/spawn/attempt
+    /// identity — callers still pass their own task/spawn to
+    /// `bbs_briefing`'s `binding` argument unchanged — and `bbs::brief`'s
+    /// existing cross-repo scope check still refuses (fails closed, logged,
+    /// no entries) a review binding naming a ticket outside this repo.
+    fn reviewed_bbs_task<'a>(
+        &self,
+        policy: Option<&rk_workflow::RepositoryPolicy>,
+        review: Option<&'a rk_core::review::ReviewContext>,
+        fallback: Option<&'a str>,
+    ) -> (Option<&'a str>, bool) {
+        if policy.is_some_and(|p| p.landing.reviewed_ticket_bbs_context) {
+            if let Some(review) = review {
+                return (Some(review.task.as_str()), true);
+            }
+        }
+        (fallback, false)
+    }
+
     /// The bounded selection prepared for one agent context, captured as a
     /// daemon-authored exposure record bound to that exact generation.
     ///
@@ -3863,18 +3949,25 @@ impl Supervisor {
     /// benefited; a spawn that later fails leaves this record standing, so a
     /// report must join native lifecycle evidence before counting an active
     /// consumer.
+    ///
+    /// `reviewed_ticket_bbs_context` (see [`Self::reviewed_bbs_task`]) is
+    /// recorded on the exposure alongside `task` so an operator can tell a
+    /// reviewed-ticket-redirected query apart from an ordinary own-task one.
     fn bbs_briefing(
         &self,
         repo: &str,
         task: Option<&str>,
         surface: rk_core::bbs::ExposureSurface,
         binding: &crate::bbs::ConsumerBinding,
+        reviewed_ticket_bbs_context: bool,
     ) -> Option<rk_core::bbs::Briefing> {
         let task = task?;
+        let discovery = crate::bbs_discovery::resolve_for_brief(&self.layout, repo);
         match crate::bbs::brief(
             &self.space,
             &self.tickets,
             &crate::bbs::BriefParams::for_task(repo, task),
+            discovery,
         ) {
             Ok(mut briefing) => {
                 let capture = crate::bbs::record_exposure(
@@ -3883,6 +3976,7 @@ impl Supervisor {
                     surface,
                     binding,
                     &briefing,
+                    reviewed_ticket_bbs_context,
                 );
                 if capture.is_failed() {
                     warn!(
@@ -5209,6 +5303,12 @@ impl Supervisor {
             record.workflow_instance.as_deref(),
             record.review.as_ref(),
         );
+        let recovery_repo_policy = self.repository_policy(&repo).ok();
+        let (recovery_bbs_task, recovery_reviewed_ticket_bbs_context) = self.reviewed_bbs_task(
+            recovery_repo_policy.as_ref(),
+            record.review.as_ref(),
+            record.task.as_deref(),
+        );
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
             repo: record.repo_name.clone(),
@@ -5219,13 +5319,14 @@ impl Supervisor {
             parent: record.parent.clone(),
             briefing: self.bbs_briefing(
                 &record.repo_name,
-                record.task.as_deref(),
+                recovery_bbs_task,
                 rk_core::bbs::ExposureSurface::Recovery,
                 &crate::bbs::ConsumerBinding::agent(
                     &record.name,
                     &record.spawn_id().to_string(),
                     record.task.as_deref(),
                 ),
+                recovery_reviewed_ticket_bbs_context,
             ),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
@@ -8564,6 +8665,41 @@ impl Supervisor {
         match self.registry.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Release one specific automatic dispatch's own durable lane-wait
+    /// reservation the moment that dispatch becomes terminal — refused,
+    /// cancelled, or otherwise never going to retry under this generation
+    /// (TKT-minak-mogiz-lizun). `role`/`task`/`workflow_instance` must match
+    /// the exact [`SpawnParams`] the terminal attempt used, so the
+    /// reconstructed key ([`lane_wait_key`]) names the SAME
+    /// `(repo, lane, key)` record [`spawn`](Self::spawn) queued — this never
+    /// touches any other waiter, so an actively retrying caller elsewhere in
+    /// the same repo/lane queue keeps its FIFO place regardless. Without
+    /// this, a terminally refused automatic rework/correction dispatch (e.g.
+    /// `landing.rs`'s `dispatch-refused` withhold) stays parked at the FIFO
+    /// head for the full `LANE_WAIT_STALE_SECS` window, leaving a free slot
+    /// unusable by the next legitimate request until that crash-fallback
+    /// expiry. A no-op if this key was never queued at all (admitted on its
+    /// first attempt, or refused for a reason other than lane capacity).
+    pub(crate) fn abandon_lane_wait(
+        &self,
+        repo_name: &str,
+        role: &str,
+        task: &str,
+        workflow_instance: Option<&str>,
+    ) {
+        let lane = crate::agents::Lane::for_role(role);
+        let key = lane_wait_key(role, task, workflow_instance);
+        if let Err(e) = self
+            .lock_registry()
+            .abandon_lane_wait(repo_name, lane, &key)
+        {
+            tracing::error!(
+                repo = repo_name, lane = lane.tag(), key = %key, error = %e,
+                "failed to release an abandoned lane-wait reservation for a terminal dispatch"
+            );
         }
     }
 
@@ -13999,10 +14135,10 @@ mod native_observation_tests {
             .update("Nibble", |r| r.pid = Some(4242))
             .unwrap();
 
-        let (_id, mut rx) = sup
-            .verification
-            .runs
-            .register("Nibble", Some(spawn), "req-1");
+        let (_id, mut rx) =
+            sup.verification
+                .runs
+                .register("Nibble", Some(spawn), "req-1", "repo", "verify");
 
         sup.handle_event(
             "Nibble",

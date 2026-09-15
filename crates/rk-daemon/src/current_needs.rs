@@ -36,6 +36,12 @@ pub(crate) struct ResolutionCandidate {
     pub repo: String,
     pub merge_commit: String,
     pub target: String,
+    /// The delivery's own recorded source branch. Exposed so a stricter
+    /// consumer (`crate::landing_need_resolution`) can require an exact
+    /// binding to the incident's branch on top of this module's own
+    /// deliberately looser repo/task/target/timing match — this module's
+    /// inbox-facing acceptance is unchanged by adding it.
+    pub branch: String,
 }
 
 /// A ticket closed by hand, with no delivery ever recorded on it, has no
@@ -135,6 +141,7 @@ pub(crate) fn resolution_candidates(
             repo: need.scope.clone(),
             merge_commit: delivery.merge_commit,
             target: delivery.target,
+            branch: delivery.branch,
         });
     }
     Ok(candidates)

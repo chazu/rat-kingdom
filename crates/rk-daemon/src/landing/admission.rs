@@ -651,6 +651,15 @@ impl LandingPipeline {
         )
         .with_lifecycle(Lifecycle::Furniture);
         self.space.out(evidence.clone())?;
+        // Quarantine bypasses `mark_processed` (it never gets a
+        // `landing_processed` marker — see that method's own doc), so it is
+        // the one terminal outcome that must wake a
+        // `Self::wait_for_terminal_outcome` waiter here explicitly rather
+        // than through `mark_processed`'s call to `Self::notify_terminal`.
+        // `settled_terminal_json`'s own durable-state check is what makes
+        // this safe rather than load-bearing — a missed/late notify still
+        // settles on the next bounded poll.
+        self.notify_terminal(entry);
         Ok(LandingOutcome::Quarantined(evidence))
     }
 }

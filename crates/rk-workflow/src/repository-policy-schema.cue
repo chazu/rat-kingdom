@@ -11,6 +11,7 @@ repo: #RepositoryPolicy
 	landing: #LandingPolicy | *{}
 	reap: #ReapPolicy | *{}
 	phaseLatency: #PhaseLatencyPolicy | *{}
+	release: #ReleasePolicy | *{}
 }
 
 #WorkPolicy: {
@@ -123,6 +124,19 @@ repo: #RepositoryPolicy
 	// means no additional check runs beyond protectedPaths/diffScope: an
 	// inner edge never falls back to the full suite by default.
 	focusedChecks: [...#FocusedCheckRule] | *[]
+	// Whether a native reviewer's BBS briefing is queried against the actual
+	// reviewed ticket instead of the reviewer's own synthetic spawn task
+	// (which never resolves to a ticket, so it always surfaces zero BBS
+	// entries). Only the BBS query target changes — the reviewer's own
+	// task/role/spawn/attempt identity is untouched, and the existing
+	// cross-repo scope check still refuses a review binding naming a
+	// ticket outside this repo. false (the default) is the pre-fix
+	// behavior. Like the rest of this policy, changing it on an
+	// already-registered repo requires digest-fenced approved-commit
+	// activation (rk repo onboard start/propose/approve/apply/activate) —
+	// editing this file alone does not take effect until that activation
+	// lands.
+	reviewedTicketBbsContext: bool | *false
 }
 
 #FocusedCheckRule: {
@@ -165,4 +179,17 @@ repo: #RepositoryPolicy
 // one.
 #ReapPolicy: {
 	artifactPaths: [...string] | *[]
+}
+
+// INTEGRATION/RELEASE ROLES (P5.1, TKT-ratik-rivam-jadud): names the rolling
+// branch integrated deliveries land on and the protected branch a later
+// immutable release snapshot targets, instead of inferring either from
+// branch-naming convention. Both empty (the default) disables the role split
+// entirely — zero behavior change for a repo that has not opted in. Setting
+// only one of the two fields fails activation rather than silently looking
+// active. releaseTarget must also appear in landing.protectedTargets — an
+// immutable release snapshot always targets a genuinely protected edge.
+#ReleasePolicy: {
+	integrationBranch: string | *""
+	releaseTarget: string | *""
 }
