@@ -1150,6 +1150,33 @@ impl Daemon {
             .set_verification_admission_aggregate_limit(
                 config.policy.verification_admission_aggregate_limit,
             );
+        daemon
+            .supervisor
+            .set_verification_admission_class_policy(
+                config
+                    .policy
+                    .verification_admission_check_weight
+                    .clone()
+                    .into_iter()
+                    .collect(),
+                config
+                    .policy
+                    .verification_admission_check_class
+                    .clone()
+                    .into_iter()
+                    .collect(),
+                config
+                    .policy
+                    .verification_admission_class_reserve
+                    .clone()
+                    .into_iter()
+                    .collect(),
+            )
+            .map_err(|e| {
+                rk_core::Error::other(format!(
+                    "invalid [policy] verification_admission_check_weight/_check_class/_class_reserve config: {e}"
+                ))
+            })?;
         daemon.supervisor.set_implementation_admission_limits(
             config.policy.implementation_admission_limit,
             config
@@ -1373,6 +1400,26 @@ impl Daemon {
     pub fn set_verification_admission_aggregate_limit(&self, limit: u32) {
         self.supervisor
             .set_verification_admission_aggregate_limit(limit);
+    }
+
+    /// Test-only hook, same rationale as
+    /// [`set_verification_admission_aggregate_limit`](Self::set_verification_admission_aggregate_limit):
+    /// an integration test driving the P3.2 weighted/fair-progress policy
+    /// sets it directly, bypassing `Daemon::new`'s config wiring. Must be
+    /// called after `set_verification_admission_aggregate_limit` — see
+    /// `Supervisor::set_verification_admission_class_policy`.
+    #[doc(hidden)]
+    pub fn set_verification_admission_class_policy(
+        &self,
+        check_weight: std::collections::HashMap<String, u32>,
+        check_class: std::collections::HashMap<String, String>,
+        class_reserve: std::collections::HashMap<String, u32>,
+    ) -> Result<(), String> {
+        self.supervisor.set_verification_admission_class_policy(
+            check_weight,
+            check_class,
+            class_reserve,
+        )
     }
 
     #[doc(hidden)]

@@ -1225,6 +1225,41 @@ pub struct PolicyConfig {
     /// this file — changing this value requires a daemon restart to take
     /// effect, it is not live-reloaded.
     pub verification_admission_aggregate_limit: u32,
+    /// P3.2 (TKT-nasif-danob-sirok): per-named-check resource weight, in
+    /// [`verification_admission_aggregate_limit`](Self::verification_admission_aggregate_limit)
+    /// units, keyed by check name. A check name absent here costs weight 1 —
+    /// the same cost every check has always implicitly paid against the
+    /// aggregate's plain counting semaphore, so a daemon that never
+    /// populates this map behaves identically to before this field existed.
+    /// Validated at daemon startup: a weight of `0`, or a weight exceeding
+    /// the aggregate limit (which could never be admitted), refuses to
+    /// start rather than hang that check's every future admission attempt.
+    pub verification_admission_check_weight: BTreeMap<String, u32>,
+    /// P3.2: per-named-check fast-lane class, keyed by check name, naming a
+    /// key of [`verification_admission_class_reserve`](Self::verification_admission_class_reserve).
+    /// A check name absent here is not a member of any fast lane and draws
+    /// only from the general aggregate pool — identical to pre-P3.2
+    /// behaviour. Class membership is entirely operator-config-owned: a
+    /// repository's own (possibly untrusted) `checks.cue` cannot place its
+    /// own check into a reserved lane merely by naming itself something
+    /// that looks cheap, because nothing in the admission path reads
+    /// `checks.cue` for this — only this `config.toml` map does, so no
+    /// arbitrary command can self-declare an unlimited cheap bypass.
+    pub verification_admission_check_class: BTreeMap<String, String>,
+    /// P3.2: reserved aggregate-admission capacity per fast-lane class,
+    /// keyed by class name (values of
+    /// [`verification_admission_check_class`](Self::verification_admission_check_class)).
+    /// A class absent here gets a `0` reserve — its members draw straight
+    /// from the general pool, same as an unclassified check. Reserved
+    /// capacity is carved OUT OF, never additive to, the aggregate limit
+    /// above: that limit remains the one true ceiling on daemon-managed
+    /// verification concurrency. The sum of every class's reserve must not
+    /// exceed the aggregate limit — validated at daemon startup, which
+    /// refuses to start rather than run with an oversized reserve silently
+    /// clamped. Empty (the default): zero behaviour change from before this
+    /// existed, and the general pool alone spans the full aggregate limit
+    /// exactly as under P3.1.
+    pub verification_admission_class_reserve: BTreeMap<String, u32>,
     /// Fleet-wide default max concurrent LIVE implementing agents (every role
     /// except `"reviewer"`) for one repository at a time — the
     /// "implementation lane" (TKT-01M0P2KM83Y4MD5QYETR3JCKF2). Checked
@@ -1268,6 +1303,9 @@ impl Default for PolicyConfig {
             verification_admission_limit: 0,
             verification_admission_limit_by_repo: BTreeMap::new(),
             verification_admission_aggregate_limit: 0,
+            verification_admission_check_weight: BTreeMap::new(),
+            verification_admission_check_class: BTreeMap::new(),
+            verification_admission_class_reserve: BTreeMap::new(),
             implementation_admission_limit: 0,
             implementation_admission_limit_by_repo: BTreeMap::from([(
                 "rat-kingdom".to_string(),
