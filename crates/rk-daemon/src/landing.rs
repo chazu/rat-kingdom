@@ -3319,6 +3319,32 @@ impl LandingPipeline {
             self.queue
                 .persist(entry, LandingEntryStatus::RunningGates)?;
         }
+        // P7.1 handoff fence, extended to a split-batch boundary
+        // (TKT-vaful-sabuh-rajon): every member above is already durably
+        // RunningGates with its candidate cleared — the same on-disk shape
+        // restart-safety already recovers from — so returning here without
+        // starting any of them leaves nothing but ordinary pending work for
+        // the next `claim_batch`/`claim_next` to pick back up once the fence
+        // lifts. This is checked again below, between the two halves, since
+        // the LEFT half's own `process_batch` call can run an arbitrarily
+        // long gate/review and a fence may be requested while it is in
+        // flight; it is never checked WITHIN an already-executing half, so a
+        // shared cohort's own in-flight check/reviewer/target-advance is
+        // never interrupted, only the not-yet-started other half.
+        //
+        // A 3+-member cohort nests: `process_batch(right)` below can itself
+        // hit a combined-candidate conflict/gate failure and recurse into a
+        // FRESH call to this same function for its own two grandchild
+        // halves. That nested call re-runs this exact prologue and its own
+        // left/right boundary check at its own entry — an ancestor level
+        // completing its left half can never let a *grandchild* start after
+        // the fence engages either, since nothing upstream of a nested call
+        // skips past this function's own checks. There is no separate
+        // "nested" code path to keep in sync with this one.
+        let repo_name = entries[0].repo_name.clone();
+        if self.admission_fenced_at_split_boundary(&repo_name).await {
+            return Ok(Vec::new());
+        }
         if entries.len() == 1 {
             let entry = entries.pop().unwrap();
             let outcome = self.process_entry(&entry).await?;
@@ -3327,6 +3353,15 @@ impl LandingPipeline {
         }
         let right = entries.split_off(entries.len() / 2);
         let mut outcomes = Box::pin(self.process_batch(entries)).await?;
+        if self.admission_fenced_at_split_boundary(&repo_name).await {
+            // `right` was already persisted (RunningGates, candidate
+            // cleared) above and is durably queued; leaving it out of the
+            // returned outcomes here is what keeps it unclaimed — the
+            // caller (`drain_key`/`process_batch`) only removes/retires
+            // entries it actually gets back. Nothing terminal is fabricated
+            // for it, and its retry/spending budgets are untouched.
+            return Ok(outcomes);
+        }
         outcomes.extend(Box::pin(self.process_batch(right)).await?);
         Ok(outcomes)
     }
@@ -15877,6 +15912,526 @@ checks: [
             .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
             .unwrap()
             .is_empty());
+    }
+
+    /// TKT-vaful-sabuh-rajon: a live operator fence must be honored at the
+    /// boundary BETWEEN a bisected batch's two members, not just between
+    /// separate `claim_batch` calls (the coarse boundary
+    /// `handoff_fence_blocks_new_admission_without_draining_the_queue`
+    /// already proves). `member-a` and `member-b` are claimed TOGETHER in
+    /// one `claim_batch` call; their combined gate check always fails on
+    /// its first invocation, forcing `bisect_batch` to split them without
+    /// ever returning through a claim site; `member-a`'s own solo gate sits
+    /// at a barrier when the fence is requested. Proves: `member-a`'s
+    /// already-executing check finishes uninterrupted and lands normally
+    /// while fenced; `member-b` — the second, not-yet-started half — never
+    /// starts its own gate while the fence is live (the shared invocation
+    /// counter never advances past `member-a`'s check); `member-b`'s durable
+    /// row (`seq`, `enqueued_at`, retry budget) is untouched by the
+    /// deferral, not re-created or re-budgeted; a genuine concurrent
+    /// `submit_manual` waiter for `member-b` (the `try_lock_owned` loser
+    /// path, same construct as
+    /// `submit_manual_as_a_genuine_loser_observes_a_real_background_drainers_outcome`)
+    /// neither resolves early nor hangs — it settles only once `member-b`
+    /// reaches its own real terminal outcome after an explicit release.
+    #[tokio::test]
+    async fn handoff_fence_blocks_the_second_half_of_an_already_claimed_bisected_batch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("reached");
+        let release = barrier_dir.path().join("release");
+        let count_file = barrier_dir.path().join("count");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'; if [ \"$n\" = \"1\" ]; then exit 1; fi; if [ -f docs/member-a.md ] && [ ! -f docs/member-b.md ]; then touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done; fi; exit 0", timeout: "30s"}},
+]
+"#,
+            count = count_file.display(),
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut heads = Vec::new();
+        for branch in ["member-a", "member-b"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("{branch}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+            heads.push(rev_parse(repo_dir.path(), branch));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+        let (a_head, b_head) = (heads[0].clone(), heads[1].clone());
+
+        let space = Space::open_in_memory().unwrap();
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "member-a".into(),
+                target: "main".into(),
+                head_sha: a_head,
+                diff_class: "doc-only".into(),
+                task: "member-a-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "member-b".into(),
+                target: "main".into(),
+                head_sha: b_head,
+                diff_class: "doc-only".into(),
+                task: "member-b-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Both entries claim together (same key, one `claim_batch`), so the
+        // combined gate check runs once and, on failure, `bisect_batch`
+        // splits them in-process — the boundary this test is about never
+        // goes back through a claim site.
+        let drain_pipeline = Arc::clone(&pipeline);
+        let drain_repo = repo_name.clone();
+        let drain_task =
+            tokio::spawn(async move { drain_pipeline.drain_key(&drain_repo, "main").await });
+
+        let mut member_a_reached = false;
+        for _ in 0..300 {
+            if reached.exists() {
+                member_a_reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            member_a_reached,
+            "member-a's solo gate never started running"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&count_file).unwrap().trim(),
+            "2",
+            "exactly the combined check and member-a's solo check must have run so far"
+        );
+
+        // member-b's durable row right now — already rewritten by
+        // `bisect_batch`'s prologue (RunningGates, candidate cleared) before
+        // the split, but never touched again while deferred. Captured here
+        // so the post-deferral snapshot below can prove `seq`/`enqueued_at`/
+        // retry budget survive untouched, not merely that a row exists.
+        let member_b_before = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b"))
+            .expect("member-b must already be durably present before the fence is requested")
+            .payload;
+
+        // Request the fence while member-a is genuinely mid-check — the
+        // still-executing FIRST half of the split, which must finish
+        // uninterrupted.
+        let requested = pipeline
+            .fence_request(
+                &repo_name,
+                "operator-test",
+                60,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(requested["state"], "draining", "requested: {requested}");
+        let fence_id = requested["fence_id"].as_str().unwrap().to_string();
+
+        // A genuine concurrent operator resubmission of member-b: it must
+        // take the `try_lock_owned` loser path (drain_task still owns the
+        // key) and fall into `wait_for_terminal_outcome`, exactly like
+        // `submit_manual_as_a_genuine_loser_observes_a_real_background_drainers_outcome`.
+        let waiter_pipeline = Arc::clone(&pipeline);
+        let waiter_repo_dir = repo_dir.path().to_path_buf();
+        let waiter_handle = tokio::spawn(async move {
+            waiter_pipeline
+                .submit_manual(
+                    &waiter_repo_dir,
+                    "member-b",
+                    "main",
+                    false,
+                    Some("member-b-task".into()),
+                    None,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiter_handle.is_finished(),
+            "the waiter must not resolve before member-a (the real, still-blocked owner) \
+             even finishes its own gate"
+        );
+
+        // Let member-a finish — a live, normal completion, unaffected by
+        // the fence.
+        std::fs::write(&release, b"go").unwrap();
+
+        let drain_outcomes = tokio::time::timeout(Duration::from_secs(10), drain_task)
+            .await
+            .expect("the drain must return once member-a settles, not wait on member-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            drain_outcomes.len(),
+            1,
+            "only member-a's outcome must come back from this drain: {drain_outcomes:?}"
+        );
+        assert!(matches!(drain_outcomes[0], LandingOutcome::Landed(_)));
+
+        // member-b never started its own gate: the shared invocation
+        // counter still reads exactly what member-a alone produced.
+        assert_eq!(
+            std::fs::read_to_string(&count_file).unwrap().trim(),
+            "2",
+            "member-b's gate must not have started while the fence is engaged"
+        );
+
+        let queued = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap();
+        assert!(
+            queued
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b")),
+            "member-b must remain durably queued while fenced: {queued:?}"
+        );
+        assert!(
+            !space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+                .unwrap()
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b")),
+            "member-b must not have been processed while fenced"
+        );
+        assert!(
+            !waiter_handle.is_finished(),
+            "the waiter must still not resolve while member-b is genuinely deferred by the fence \
+             — no early success, and no fabricated terminal outcome"
+        );
+
+        // The deferral itself must not mutate member-b's durable identity or
+        // spend/reset any budget it did not actually use: same `seq` (the
+        // same queue row, not a re-created one), same `enqueued_at` (age
+        // keeps accruing from its original arrival, never resets), and its
+        // infra-retry budget untouched (it never actually ran a gate).
+        let member_b_deferred = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b"))
+            .expect("member-b must still be durably present while deferred")
+            .payload;
+        assert_eq!(member_b_deferred["seq"], member_b_before["seq"]);
+        assert_eq!(
+            member_b_deferred["enqueued_at"],
+            member_b_before["enqueued_at"]
+        );
+        assert_eq!(
+            member_b_deferred["gate_infra_retry_used"],
+            member_b_before["gate_infra_retry_used"]
+        );
+        assert_eq!(
+            member_b_deferred["gate_infra_retry_check"],
+            member_b_before["gate_infra_retry_check"]
+        );
+
+        // Release the fence — member-b may now resume, exactly once, with a
+        // fresh candidate binding of its own.
+        pipeline
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                &fence_id,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+
+        let outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "member-b must resume exactly once: {outcomes:?}"
+        );
+        assert!(matches!(outcomes[0], LandingOutcome::Landed(_)));
+
+        // The waiter observes member-b's REAL terminal outcome, settled only
+        // after the fence actually lifted and the deferred half actually ran
+        // — never returned early, never hung.
+        let waiter_result = tokio::time::timeout(Duration::from_secs(10), waiter_handle)
+            .await
+            .expect("the waiter must resolve once member-b actually lands, not hang forever")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            waiter_result["merged"], true,
+            "waiter_result: {waiter_result}"
+        );
+        assert_eq!(
+            waiter_result["delivered"], true,
+            "waiter_result: {waiter_result}"
+        );
+
+        let listing = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["ls-tree", "-r", "--name-only", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("docs/member-a.md"));
+        assert!(listing.contains("docs/member-b.md"));
+
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// TKT-vaful-sabuh-rajon: the deferred half's durability must survive a
+    /// real restart, not just an in-process return. `Space::open_in_memory`
+    /// (used by the sibling test above) cannot prove this — it never
+    /// touches disk at all. Here a real on-disk `Space` and the SAME
+    /// [`Layout`] home back TWO successive `LandingPipeline` instances, with
+    /// the first dropped entirely (simulating a daemon restart) while
+    /// `member-b` is deferred behind a live fence. Proves: `member-b`'s
+    /// durable row (and its `seq`) survives into the fresh instance
+    /// unchanged; the fence record itself — a separate on-disk store under
+    /// the same home — survives too, so the fresh instance still refuses to
+    /// admit `member-b` on its own `drain_key` call; and releasing the
+    /// SAME `fence_id` against the fresh instance resumes and lands
+    /// `member-b` exactly once.
+    #[tokio::test]
+    async fn a_fence_deferred_member_survives_a_restart_and_resumes_on_the_new_instance() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("reached");
+        let release = barrier_dir.path().join("release");
+        let count_file = barrier_dir.path().join("count");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'; if [ \"$n\" = \"1\" ]; then exit 1; fi; if [ -f docs/member-a.md ] && [ ! -f docs/member-b.md ]; then touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done; fi; exit 0", timeout: "30s"}},
+]
+"#,
+            count = count_file.display(),
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut heads = Vec::new();
+        for branch in ["member-a", "member-b"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("{branch}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+            heads.push(rev_parse(repo_dir.path(), branch));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+        let (a_head, b_head) = (heads[0].clone(), heads[1].clone());
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
+
+        let fence_id;
+        let member_b_before_restart;
+        // "Before restart": a real on-disk Space, member-b durably deferred
+        // behind a live fence when this whole pipeline instance is dropped.
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: repo_name.clone(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: "member-a".into(),
+                    target: "main".into(),
+                    head_sha: a_head,
+                    diff_class: "doc-only".into(),
+                    task: "member-a-task".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: repo_name.clone(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: "member-b".into(),
+                    target: "main".into(),
+                    head_sha: b_head,
+                    diff_class: "doc-only".into(),
+                    task: "member-b-task".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let drain_pipeline = Arc::clone(&pipeline);
+            let drain_repo = repo_name.clone();
+            let drain_task =
+                tokio::spawn(async move { drain_pipeline.drain_key(&drain_repo, "main").await });
+
+            let mut member_a_reached = false;
+            for _ in 0..300 {
+                if reached.exists() {
+                    member_a_reached = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                member_a_reached,
+                "member-a's solo gate never started running"
+            );
+
+            let requested = pipeline
+                .fence_request(
+                    &repo_name,
+                    "operator-test",
+                    600,
+                    &ManagedWorkSnapshot::default,
+                )
+                .await
+                .unwrap();
+            assert_eq!(requested["state"], "draining", "requested: {requested}");
+            fence_id = requested["fence_id"].as_str().unwrap().to_string();
+
+            std::fs::write(&release, b"go").unwrap();
+            let drain_outcomes = tokio::time::timeout(Duration::from_secs(10), drain_task)
+                .await
+                .expect("the drain must return once member-a settles")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                drain_outcomes.len(),
+                1,
+                "drain_outcomes: {drain_outcomes:?}"
+            );
+            assert!(matches!(drain_outcomes[0], LandingOutcome::Landed(_)));
+
+            member_b_before_restart = space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .into_iter()
+                .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b"))
+                .expect("member-b must be durably deferred before the restart")
+                .payload;
+
+            // Pipeline, its background-drain continuation and its Space
+            // handle all go out of scope here — the simulated crash.
+        }
+
+        // "After restart": fresh Space handle and fresh pipeline over the
+        // SAME on-disk store/home.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+
+        let member_b_after_restart = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b"))
+            .expect("member-b must survive the restart durably queued")
+            .payload;
+        assert_eq!(
+            member_b_after_restart["seq"], member_b_before_restart["seq"],
+            "member-b must be the SAME durable row across the restart, not re-created"
+        );
+        assert_eq!(
+            member_b_after_restart["enqueued_at"],
+            member_b_before_restart["enqueued_at"]
+        );
+
+        let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
+        assert_eq!(
+            status["fenced"], true,
+            "the fence record must survive the restart too: {status}"
+        );
+        assert_eq!(status["fence_id"], fence_id, "status: {status}");
+
+        // The fresh instance must still refuse to admit member-b on its own
+        // — the existing coarse `claim_batch`-boundary fence check, now
+        // proven to apply across a restart of the whole process, not just
+        // within one still-live instance.
+        let still_fenced_outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert!(
+            still_fenced_outcomes.is_empty(),
+            "the fresh instance must not admit member-b while the restored fence is live: \
+             {still_fenced_outcomes:?}"
+        );
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b")),
+            "member-b must remain queued on the fresh instance while fenced"
+        );
+
+        // Release the SAME fence (its identity crossed the restart too) —
+        // member-b may now resume, exactly once, on the fresh instance.
+        pipeline
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                &fence_id,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        let outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "member-b must resume exactly once on the fresh instance: {outcomes:?}"
+        );
+        assert!(matches!(outcomes[0], LandingOutcome::Landed(_)));
+
+        let listing = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["ls-tree", "-r", "--name-only", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("docs/member-a.md"));
+        assert!(listing.contains("docs/member-b.md"));
     }
 
     /// TKT-dobas-lujom-lipog rework (native verdict `01M2HVGV7KC9X36MMEC7D3NZXS`,

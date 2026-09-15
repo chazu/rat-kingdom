@@ -74,6 +74,22 @@
 //! readiness never requires pending entries to disappear. That is the whole
 //! point of the window.
 //!
+//! # Split-batch boundaries
+//!
+//! [`LandingPipeline::bisect_batch`] claims its members as one cohort, then
+//! discards the failed shared candidate and awaits each half's
+//! `process_batch` call in turn. A fence engaged while the first half is
+//! still running is invisible to the four claim sites above — none of them
+//! run again until the whole bisect returns — so
+//! [`LandingPipeline::admission_fenced_at_split_boundary`] adds one more
+//! linearized checkpoint: immediately after a shared candidate is discarded
+//! (before the first not-yet-started half begins) and again between the two
+//! halves (before the second, not-yet-started half begins). It never checks
+//! *inside* an already-running half — an executing shared cohort's own
+//! check, reviewer, target advance, or durable settlement always finishes
+//! uninterrupted; only the transition to a member that has not yet started
+//! can be refused.
+//!
 //! The fence record itself is a small file-backed store — modeled directly
 //! on [`crate::orchestrator_lease::LeaseStore`] — so a request survives a
 //! daemon restart, is idempotent for its own holder, is fenced against a
@@ -540,6 +556,20 @@ impl LandingPipeline {
         self.handoff
             .current(repo_name)
             .is_some_and(|record| record.blocks_admission(Utc::now()))
+    }
+
+    /// [`Self::admission_fenced`], but self-linearizing: takes this repo's
+    /// [`Self::admission_gate`] SHARED for the span of the check itself, so
+    /// callers that are not already holding it across a wider check-and-claim
+    /// window (unlike the four claim sites in the module doc) still get the
+    /// same "no `fence_request` can land between the read and the decision it
+    /// gates" guarantee. Used at [`LandingPipeline::bisect_batch`]'s
+    /// split-batch boundaries — see the module doc's "Split-batch boundaries"
+    /// section for why those need a checkpoint of their own.
+    pub(crate) async fn admission_fenced_at_split_boundary(&self, repo_name: &str) -> bool {
+        let gate = self.admission_gate(repo_name);
+        let _admit = gate.read().await;
+        self.admission_fenced(repo_name)
     }
 
     /// Every `(repo_name, *)` key whose exclusive drain lane is held RIGHT
