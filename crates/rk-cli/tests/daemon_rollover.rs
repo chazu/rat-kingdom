@@ -203,12 +203,25 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"resumed a
     let _ = rk(home.path()).args(["daemon", "stop"]).output();
 }
 
+/// A daemon process holding this env var when it handles `"stop"` keeps the
+/// socket fully live for that many milliseconds before actually shutting
+/// down — a fault-injection knob added for this ticket (see the `"stop"`
+/// handler in rk-daemon's dispatch). It is read from the *daemon's own*
+/// process env, inherited only at the moment something spawns it — setting
+/// it on a later CLI invocation that merely talks to an already-running
+/// daemon has no effect, so every command in these tests carries it from the
+/// first one that can trigger `connect_or_spawn`.
+fn rk_delayed_shutdown(home: &Path) -> Command {
+    let mut cmd = rk(home);
+    cmd.env("RK_TEST_SHUTDOWN_DELAY_MS", "4000");
+    cmd
+}
+
 /// TKT-nusod-lizuk-jomun: a real daemon process told to hold the socket open
-/// past `daemon_rollover`'s bounded 3s wait for old-instance exit (via
-/// `RK_TEST_SHUTDOWN_DELAY_MS`, a fault-injection knob added for this test —
-/// see the `"stop"` handler in rk-daemon's dispatch) must never be reported
-/// as a successful rollover. This is the exact production failure: the CLI
-/// reconnecting to the still-live retiring daemon and declaring victory.
+/// past `daemon_rollover`'s bounded 3s wait for old-instance exit must never
+/// be reported as a successful rollover. This is the exact production
+/// failure: the CLI reconnecting to the still-live retiring daemon and
+/// declaring victory.
 #[test]
 fn rollover_fails_loudly_when_old_daemon_outlives_the_wait_bound() {
     let home = tempfile::tempdir().unwrap();
@@ -216,12 +229,12 @@ fn rollover_fails_loudly_when_old_daemon_outlives_the_wait_bound() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    rk(home.path())
+    rk_delayed_shutdown(home.path())
         .args(["ping"])
         .output()
         .expect("run rk ping");
     json_stdout(
-        &rk(home.path())
+        &rk_delayed_shutdown(home.path())
             .args(["--json", "repo", "add", repo_dir.path().to_str().unwrap()])
             .output()
             .unwrap(),
@@ -240,8 +253,7 @@ fn rollover_fails_loudly_when_old_daemon_outlives_the_wait_bound() {
     // exactly the "zero parked rats" branch the production bug hit — no
     // further RPC or identity check happened before reporting success.
     // The delay (4s) exceeds the CLI's fixed 3s (50 * 60ms) old-exit bound.
-    let rollover_out = rk(home.path())
-        .env("RK_TEST_SHUTDOWN_DELAY_MS", "4000")
+    let rollover_out = rk_delayed_shutdown(home.path())
         .args(["--json", "daemon", "rollover", "--wait-secs", "0"])
         .output()
         .expect("run rk daemon rollover");
@@ -305,14 +317,14 @@ fn rollover_does_not_falsely_park_when_old_daemon_outlives_the_wait_bound() {
     scratch_repo(repo_dir.path());
 
     json_stdout(
-        &rk(home.path())
+        &rk_delayed_shutdown(home.path())
             .env("RK_FAKE_HARNESS_CMD", "sleep 60")
             .args(["--json", "repo", "add", repo_dir.path().to_str().unwrap()])
             .output()
             .unwrap(),
     );
 
-    let spawn_out = rk(home.path())
+    let spawn_out = rk_delayed_shutdown(home.path())
         .env("RK_FAKE_HARNESS_CMD", "sleep 60")
         .args([
             "--json",
@@ -354,8 +366,7 @@ fn rollover_does_not_falsely_park_when_old_daemon_outlives_the_wait_bound() {
     }
     assert!(running, "rat never reached Running");
 
-    let rollover_out = rk(home.path())
-        .env("RK_TEST_SHUTDOWN_DELAY_MS", "4000")
+    let rollover_out = rk_delayed_shutdown(home.path())
         .args(["--json", "daemon", "rollover", "--wait-secs", "1"])
         .output()
         .expect("run rk daemon rollover");
