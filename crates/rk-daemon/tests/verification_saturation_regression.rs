@@ -816,24 +816,22 @@ triggers: [
 "#;
 
 /// Two policy gates pass instantly; `verify`'s FIRST attempt holds itself
-/// open (bounded to 10s as an absolute safety cap) rather than sleeping a
-/// fixed duration — a fixed sleep cannot GUARANTEE the check is still alive
-/// at the exact moment the restart test below kills daemon A, since
-/// candidate 2's own spawn/complete/queue steps in between have no fixed
-/// duration of their own; if they ever took longer than the sleep, the
-/// check would exit as an ordinary natural completion, and the restart
-/// test's kill would prove nothing about it. Once `held` exists, EVERY
-/// later attempt — including daemon B's own recovery re-run of this same
-/// interrupted gate — completes immediately, so restart-recovery marches
-/// through the once-real hold with no lingering timing dependency.
-///
-/// The hold's own bound (60s) is deliberately LONGER than the check's own
-/// declared 30s `timeout` below, not shorter: if either the kill or the
-/// recovery this test exercises ever silently failed to happen, the first
-/// attempt must surface that as a genuine timed-out check FAILURE, not
-/// quietly finish its sleep and report an untruthful success — a bound
-/// shorter than the declared timeout would let exactly that defect hide
-/// behind an ordinary-looking pass.
+/// open on an explicit release-marker loop rather than a plain `sleep N` —
+/// a fixed sleep's "success" path is just elapsed time, and once daemon A
+/// (the only thing with any timeout notion for this check) is dead, NOTHING
+/// still enforces that timeout: an orphaned `sleep` simply finishes on its
+/// own and exits 0, which would silently misreport a broken kill/recovery
+/// path as a passing check. The loop instead waits for a `release` marker
+/// this test deliberately NEVER creates, bounded by a finite iteration
+/// budget that self-terminates with `exit 124` (the conventional
+/// `timeout(1)` code) if ever exhausted — so the only two possible
+/// outcomes are: killed for real by production recovery (no exit code at
+/// all — SIGKILL, not a return), or an explicit, loud, nonzero failure.
+/// There is no third path where elapsed time alone reports success. Once
+/// `held` exists, EVERY later attempt — including daemon B's own recovery
+/// re-run of this same interrupted gate — completes immediately, so
+/// restart-recovery marches through the once-real hold with no lingering
+/// timing dependency.
 ///
 /// The first attempt also drops its own real shell pid (`$$`) into `shared`
 /// before holding — `.process_group(0)`
@@ -853,7 +851,7 @@ checks: [
 ]
 "#,
         cue_command(&format!(
-            r#"if [ -f "{shared}/held" ]; then exit 0; fi; echo $$ > "{shared}/verify.pid"; touch "{shared}/held"; sleep 60"#,
+            r#"if [ -f "{shared}/held" ]; then exit 0; fi; echo $$ > "{shared}/verify.pid"; touch "{shared}/held"; i=0; while [ ! -f "{shared}/release" ]; do i=$((i+1)); [ "$i" -ge 200 ] && exit 124; sleep 0.1; done"#,
             shared = shared.display()
         ))
     )
