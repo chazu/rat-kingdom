@@ -1266,14 +1266,14 @@ fn ere_matches_any(pattern: &str, paths: &[String]) -> bool {
     if pattern.trim().is_empty() || paths.is_empty() {
         return false;
     }
-    let mut child = match std::process::Command::new("grep")
-        .arg("-qE")
+    let mut cmd = std::process::Command::new("grep");
+    cmd.arg("-qE")
         .arg(pattern)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return false,
     };

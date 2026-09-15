@@ -3322,7 +3322,9 @@ impl Daemon {
             "bbs.brief" => {
                 let result =
                     parse_params::<crate::bbs::BriefParams>(&req.params).and_then(|params| {
-                        crate::bbs::brief(&self.space, &self.tickets, &params)
+                        let discovery =
+                            crate::bbs_discovery::resolve_for_brief(&self.layout, &params.repo);
+                        crate::bbs::brief(&self.space, &self.tickets, &params, discovery)
                             .map_err(|e| e.to_string())
                     });
                 reply(match result {
@@ -3342,6 +3344,29 @@ impl Daemon {
                         briefing.exposure = capture.record;
                         Response::ok(id, json!(briefing))
                     }
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.discovery.show" => {
+                let result = parse_params::<crate::bbs_discovery::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::bbs_discovery::show(&self.layout, &params).map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.discovery.set" => {
+                let result = parse_params::<crate::bbs_discovery::SetParams>(&req.params).and_then(
+                    |params| {
+                        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                        crate::bbs_discovery::set(&self.layout, &repos, &req.caller, &params)
+                            .map_err(|e| e.to_string())
+                    },
+                );
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
                 })
             }
@@ -12617,12 +12642,13 @@ struct BlockingParams {
 }
 
 fn repository_head(path: &std::path::Path) -> rk_core::Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
         .arg(path)
         .args(["rev-parse", "HEAD"])
-        .env("LC_ALL", "C")
-        .output()?;
+        .env("LC_ALL", "C");
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let output = cmd.output()?;
     if !output.status.success() {
         return Err(rk_core::Error::other(format!(
             "cannot resolve repository HEAD for {}: {}",
@@ -12641,12 +12667,12 @@ fn repository_head(path: &std::path::Path) -> rk_core::Result<String> {
 /// can be inferred at registration time. Returns `None` when the path is not a
 /// repo or has no such remote — host inference is best-effort, never fatal.
 fn repo_remote_url(path: &std::path::Path, remote: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C"])
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-C"])
         .arg(path)
-        .args(["remote", "get-url", remote])
-        .output()
-        .ok()?;
+        .args(["remote", "get-url", remote]);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -12911,13 +12937,13 @@ fn touches_protected_path(
 fn grep_matches(files: &[String], pattern: &str) -> Option<bool> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("grep")
-        .args(["-qE", pattern])
+    let mut cmd = Command::new("grep");
+    cmd.args(["-qE", pattern])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = writeln!(stdin, "{}", files.join("\n"));
     }

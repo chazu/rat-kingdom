@@ -600,6 +600,102 @@ while :; do sleep 1; done
         assert!(log.contains("message-1"));
     }
 
+    /// Same trusted-control interrupt/resume fixture as the test above, but
+    /// checking TKT-bikuz-kumuz-zutit's fd-inheritance fix specifically at
+    /// the resume boundary: `command_for`'s resumed `Command` is a SEPARATE
+    /// spawn from the initial one (`resumed.spawn()` in `runner.rs`'s Codex
+    /// control-turn handling), so it needs its own coverage — the initial
+    /// launch going through `close_extra_fds` correctly says nothing about
+    /// whether the resume spawn does too. A pipe left open (no
+    /// `FD_CLOEXEC`) in this test process must not be visible to the
+    /// RESUMED process, while the resumed turn still reaches the agent
+    /// normally (stdout/control intact).
+    #[tokio::test]
+    async fn trusted_control_resume_does_not_inherit_an_unrelated_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex-fake");
+        let marker = dir.path().join("fd-check");
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (leak_r, leak_w) = (fds[0], fds[1]);
+
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/sh
+if [ "$2" = "resume" ]; then
+  if test -e /dev/fd/{leak_w}; then echo leaked > "$RK_FD_MARKER"; else echo clean > "$RK_FD_MARKER"; fi
+  echo '{{"type":"thread.started","thread_id":"session-rat"}}'
+  echo '{{"type":"item.completed","item":{{"item_type":"agent_message","text":"control applied"}}}}'
+  exit 0
+fi
+echo '{{"type":"thread.started","thread_id":"session-rat"}}'
+trap 'exit 130' INT
+while :; do sleep 1; done
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("RK_CODEX_BIN".into(), binary.to_string_lossy().into_owned());
+        env.insert("RK_FD_MARKER".into(), marker.to_string_lossy().into_owned());
+        let mut session = CodexHarness
+            .launch(&LaunchSpec {
+                prompt: "keep working".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut started = false;
+        while !started {
+            let event = tokio::time::timeout(Duration::from_secs(2), session.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            started = matches!(event, HarnessEvent::Started { .. });
+        }
+
+        let envelope = ControlEnvelope::new(
+            "message-1",
+            "operator",
+            "rat",
+            "delivery-1",
+            "resume-1",
+            "also run the focused tests",
+        );
+        session.control.steer_envelope(&envelope).await.unwrap();
+
+        let mut applied = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(3), session.events.recv())
+            .await
+            .unwrap()
+        {
+            match event {
+                HarnessEvent::AssistantText { text } if text == "control applied" => applied = true,
+                HarnessEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(applied, "the resumed turn must still reach the agent");
+
+        unsafe {
+            libc::close(leak_r);
+            libc::close(leak_w);
+        }
+
+        let seen = fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            seen.trim(),
+            "clean",
+            "the codex resume spawn leaked an unrelated parent descriptor into the resumed process"
+        );
+    }
+
     #[tokio::test]
     async fn resume_failure_without_session_is_visible_and_not_acknowledged() {
         let dir = tempfile::tempdir().unwrap();

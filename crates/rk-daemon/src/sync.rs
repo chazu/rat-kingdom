@@ -365,10 +365,10 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> rk_core::Result<()> {
 }
 
 fn run_git(dir: &std::path::Path, args: &[&str]) -> rk_core::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let out = cmd
         .output()
         .map_err(|e| rk_core::Error::other(format!("git not runnable: {e}")))?;
     if !out.status.success() {
