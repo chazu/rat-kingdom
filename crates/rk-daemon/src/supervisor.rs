@@ -1930,10 +1930,24 @@ impl Supervisor {
             repo_policy.as_ref(),
         )?;
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
+        // A review spawn must fork from the exact candidate head the landing
+        // pipeline already gated, not from whatever `target_branch` (the
+        // candidate's source branch — a live, movable ref) has drifted to
+        // since gates ran. Fleet/lane/tier admission between gate-pass and
+        // this spawn can take long enough for the branch to move; resolving
+        // it live here would hand the reviewer a tip the pipeline never
+        // gated while its verdict artifact still self-reports the frozen
+        // `head_sha`. Pin to that frozen sha instead whenever this is a
+        // review spawn; every other spawn keeps resolving `target_branch`
+        // live, which is the intended chaining behavior for ordinary work.
+        let checkout_target = match params.review.as_ref().map(|r| r.head_sha.as_str()) {
+            Some(head_sha) if !head_sha.is_empty() => head_sha.to_string(),
+            _ => target_branch.clone(),
+        };
         // Capture before creating the branch. Unlike a later merge-base read,
         // this remains the original fork even after a forge fast-forwards the
         // target to the branch tip.
-        let fork_point = repo.rev_parse(&target_branch)?;
+        let fork_point = repo.rev_parse(&checkout_target)?;
 
         // Resolve the harness before journaling so an unknown adapter never
         // leaves a durable failed row. After this point every side effect has a
@@ -2139,7 +2153,7 @@ impl Supervisor {
                 params.workflow_instance.as_deref(),
             );
         }
-        if let Err(e) = repo.create_worktree(&worktree, &branch, &target_branch) {
+        if let Err(e) = repo.create_worktree(&worktree, &branch, &checkout_target) {
             self.mark_spawn_failed(&name, &e);
             return Err(e);
         }
@@ -11779,6 +11793,78 @@ mod respawn_tests {
         assert!(
             sup.lock_registry().list().is_empty(),
             "a refused spawn must not create any registry row (no WIP/budget consumed)"
+        );
+    }
+
+    /// A source-binding regression fixture (TKT-zajob-japos-dalot): if the
+    /// candidate's source branch gains new commits between candidate
+    /// preparation/gate-pass and this reviewer's actual spawn (fleet/lane/
+    /// tier admission can delay a spawn well past gate-pass), the reviewer's
+    /// worktree must still fork from the exact frozen `head_sha` the landing
+    /// pipeline gated — never a live resolve of the branch name's now-newer
+    /// tip. Asserts real Git content (checked-out HEAD + file contents), not
+    /// just a metadata field equality.
+    #[tokio::test]
+    async fn review_spawn_forks_from_the_frozen_head_not_a_moved_branch_tip() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let repo = Repo::discover(repo_dir.path()).unwrap();
+
+        git(repo_dir.path(), &["checkout", "-b", "rat/nibble/task"]);
+        std::fs::write(repo_dir.path().join("f"), "gated content\n").unwrap();
+        git(repo_dir.path(), &["add", "f"]);
+        git(repo_dir.path(), &["commit", "-m", "gated candidate"]);
+        let gated_head = repo.rev_parse("rat/nibble/task").unwrap();
+
+        // The branch moves AFTER the candidate was gated but BEFORE this
+        // reviewer is actually spawned.
+        std::fs::write(repo_dir.path().join("f"), "unreviewed content\n").unwrap();
+        git(repo_dir.path(), &["add", "f"]);
+        git(repo_dir.path(), &["commit", "-m", "unreviewed follow-up"]);
+        let moved_tip = repo.rev_parse("rat/nibble/task").unwrap();
+        assert_ne!(gated_head, moved_tip);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let sup = supervisor(home.path());
+        let params = SpawnParams {
+            review: Some(rk_core::review::ReviewContext {
+                branch: "rat/nibble/task".into(),
+                head_sha: gated_head.clone(),
+                target: "main".into(),
+                task: "TKT-review".into(),
+                attempt: "landing-review-1".into(),
+            }),
+            base: Some("rat/nibble/task".into()),
+            role: "reviewer".into(),
+            ..spawn_params(repo_dir.path(), "TKT-review")
+        };
+
+        let record = sup.spawn(params, 0).unwrap();
+
+        assert_eq!(
+            record.fork_point.as_deref(),
+            Some(gated_head.as_str()),
+            "fork_point must pin the gated head, not the branch's live tip"
+        );
+        // `Repo::discover` deliberately resolves a worktree path back up to
+        // the shared main repo root (see `discover_resolves_worktree_to_root`
+        // in rk-git), so it cannot read a worktree-local HEAD. The reviewer's
+        // own branch name is a normal ref shared repo-wide, so resolve it
+        // through the original `repo` handle instead — this is exactly how
+        // the rest of the daemon inspects a spawned agent's branch tip.
+        let reviewer_branch = record.branch.clone().unwrap();
+        assert_eq!(
+            repo.rev_parse(&reviewer_branch).unwrap(),
+            gated_head,
+            "the reviewer's actual branch must fork from the gated candidate, not the moved tip"
+        );
+        assert_ne!(repo.rev_parse(&reviewer_branch).unwrap(), moved_tip);
+        let worktree = record.worktree.clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("f")).unwrap(),
+            "gated content\n",
+            "the reviewer's actual working-tree file content must match the gated candidate"
         );
     }
 

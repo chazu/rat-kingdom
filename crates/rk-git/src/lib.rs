@@ -835,16 +835,70 @@ impl Repo {
     /// swap, which is the intended retryable outcome.
     ///
     /// Nothing here knows or cares what language the repo is written in.
+    ///
+    /// Delegates to [`prepare_merge_at`](Repo::prepare_merge_at) with
+    /// `branch` doubling as its own frozen revision — i.e. "whatever
+    /// `branch` currently points at". Callers that already froze an exact
+    /// source sha earlier (e.g. at enqueue time) must call
+    /// [`prepare_merge_at`](Repo::prepare_merge_at) directly instead of this,
+    /// or a branch that gained commits since the freeze silently substitutes
+    /// its newer tip here.
     pub fn prepare_merge(&self, branch: &str, target: &str) -> rk_core::Result<PrepareOutcome> {
+        self.prepare_merge_at(branch, branch, target)
+    }
+
+    /// Build the merge of `branch`'s exact `head_sha` into `target`
+    /// **without landing it**, and park the result so it survives until a
+    /// gate has run on it. `branch` is validated and kept as the merge
+    /// commit's identity/message; the merged CONTENT always comes from
+    /// `head_sha`, never from `branch`'s current tip.
+    ///
+    /// This is what makes a caller's own frozen source binding — recorded
+    /// once, e.g. at enqueue time — durable through to the actual merge
+    /// build: a source branch that gains commits in between (fleet/lane
+    /// admission can hold a queued candidate for a while) cannot silently
+    /// substitute newer, ungated content under the frozen identity. `branch`
+    /// must still be a real local branch and `head_sha` must be reachable
+    /// from it (its current tip or an ancestor) — a caller passing a
+    /// revision unrelated to `branch` is a bug, not a drift to tolerate.
+    ///
+    /// Together with [`advance_target_to`](Repo::advance_target_to) this is
+    /// the "test the merge, land the tested tree" primitive:
+    ///
+    /// ```text
+    /// prepare_merge_at(branch, head_sha, target) -> PreparedMerge { commit, base }
+    ///     run the repo's named checks against `commit`
+    /// advance_target_to(target, commit, base) -> Advanced { commit }
+    /// ```
+    ///
+    /// The landed sha is the sha the gate ran on, by construction — the merge
+    /// is built once and never rebuilt. Contrast
+    /// [`merge_branch`](Repo::merge_branch), which builds a fresh merge commit
+    /// at land time: nothing a gate tested beforehand is what it lands.
+    ///
+    /// The candidate is built in a detached worktree pinned to the target tip
+    /// read at entry, so a target that moves mid-build cannot silently change
+    /// what was merged; the resulting [`PreparedMerge::base`] then fails the
+    /// swap, which is the intended retryable outcome.
+    ///
+    /// Nothing here knows or cares what language the repo is written in.
+    pub fn prepare_merge_at(
+        &self,
+        branch: &str,
+        head_sha: &str,
+        target: &str,
+    ) -> rk_core::Result<PrepareOutcome> {
         self.validate_local_branch(branch, "merge source")?;
         self.validate_local_branch(target, "merge target")?;
+        let source = self.frozen_source_rev(branch, head_sha)?;
         let base = self.rev_parse(&format!("refs/heads/{target}"))?;
-        let message = format!("merge {branch} into {target} [rk]");
+        let message = format!("merge {branch}@{source} into {target} [rk]");
         // Built against `base` (the sha), not `target` (the name): pinning the
         // worktree to the sha we will guard on closes the window where the
-        // target moves between the read and the checkout.
+        // target moves between the read and the checkout. `source` is
+        // likewise the frozen sha, never `branch`'s live name.
         let built = self.in_temp_worktree(&base, |tmp| {
-            if let Err(e) = git_in(tmp, &["merge", "--no-ff", "-m", &message, branch]) {
+            if let Err(e) = git_in(tmp, &["merge", "--no-ff", "-m", &message, &source]) {
                 return Ok(Err(format!("merge conflict or failure: {e}")));
             }
             Ok(Ok(git_in(tmp, &["rev-parse", "HEAD"])?.trim().to_string()))
@@ -865,27 +919,68 @@ impl Repo {
         }))
     }
 
+    /// Resolve and validate a caller's frozen source revision against the
+    /// branch it claims to be from: `head_sha` must be `branch`'s current
+    /// tip or an ancestor of it. Shared by [`prepare_merge_at`] and
+    /// [`prepare_merge_batch_at`] so both reject the same class of caller
+    /// bug (a `head_sha` unrelated to `branch`) identically.
+    fn frozen_source_rev(&self, branch: &str, head_sha: &str) -> rk_core::Result<String> {
+        let source = self.rev_parse(head_sha)?;
+        let branch_tip = self.rev_parse(branch)?;
+        if source != branch_tip && !self.is_ancestor(&source, &branch_tip) {
+            return Err(rk_core::Error::other(format!(
+                "{head_sha} is not part of {branch}'s history (tip is {branch_tip}); refusing \
+                 to merge a revision unrelated to the frozen source's own branch"
+            )));
+        }
+        Ok(source)
+    }
+
     /// Build several source branches onto one pinned target tip, producing a
     /// single parked candidate for one shared gate run. Branch order is
     /// caller-defined and therefore deterministic. A conflict abandons the
     /// whole candidate; callers may bisect the ordered slice and retry.
+    ///
+    /// Delegates to [`prepare_merge_batch_at`](Repo::prepare_merge_batch_at)
+    /// with each branch doubling as its own frozen revision. Callers that
+    /// already froze exact source shas earlier must call
+    /// [`prepare_merge_batch_at`](Repo::prepare_merge_batch_at) directly.
     pub fn prepare_merge_batch(
         &self,
         branches: &[String],
         target: &str,
     ) -> rk_core::Result<PrepareOutcome> {
-        if branches.is_empty() {
+        let sources: Vec<(String, String)> =
+            branches.iter().map(|b| (b.clone(), b.clone())).collect();
+        self.prepare_merge_batch_at(&sources, target)
+    }
+
+    /// Frozen-revision variant of
+    /// [`prepare_merge_batch`](Repo::prepare_merge_batch): merges each
+    /// `(branch, head_sha)` pair's exact `head_sha`, never a branch's live
+    /// tip. See [`prepare_merge_at`](Repo::prepare_merge_at) for why this
+    /// matters — a batch member's source moving while an earlier member
+    /// waits its turn in the same build must not silently fold in content no
+    /// gate has seen.
+    pub fn prepare_merge_batch_at(
+        &self,
+        sources: &[(String, String)],
+        target: &str,
+    ) -> rk_core::Result<PrepareOutcome> {
+        if sources.is_empty() {
             return Err(rk_core::Error::other("cannot prepare an empty merge batch"));
         }
-        for branch in branches {
+        let mut resolved = Vec::with_capacity(sources.len());
+        for (branch, head_sha) in sources {
             self.validate_local_branch(branch, "merge source")?;
+            resolved.push((branch.clone(), self.frozen_source_rev(branch, head_sha)?));
         }
         self.validate_local_branch(target, "merge target")?;
         let base = self.rev_parse(&format!("refs/heads/{target}"))?;
         let built = self.in_temp_worktree(&base, |tmp| {
-            for branch in branches {
-                let message = format!("merge {branch} into {target} [rk batch]");
-                if let Err(error) = git_in(tmp, &["merge", "--no-ff", "-m", &message, branch]) {
+            for (branch, source) in &resolved {
+                let message = format!("merge {branch}@{source} into {target} [rk batch]");
+                if let Err(error) = git_in(tmp, &["merge", "--no-ff", "-m", &message, source]) {
                     return Ok(Err(format!(
                         "merge conflict or failure in {branch}: {error}"
                     )));

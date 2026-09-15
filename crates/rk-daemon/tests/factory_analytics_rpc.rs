@@ -67,6 +67,21 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 async fn setup() -> (
     tempfile::TempDir,
     tempfile::TempDir,
@@ -964,6 +979,13 @@ async fn factory_analytics_native_recorded_cost_reads_real_delivery_review_corre
     let (_home, repo_dir, _layout, handle, space, mut client) = setup_with_space().await;
     let repo_path = repo_dir.path().to_string_lossy().to_string();
     let at = fixed_clock();
+    // The reviewer spawn below is a real `agent.spawn` RPC, so its
+    // `ReviewContext.headSha` must be an actual resolvable commit (the
+    // daemon now forks the reviewer's worktree from it, TKT-zajob-japos-
+    // dalot) — unlike the seeded `landing_processed_marker`'s own "sha-a"
+    // string, which is read only by the analytics reducer and never
+    // touches git.
+    let real_head_sha = git_out(repo_dir.path(), &["rev-parse", "main"]);
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", cost_fake("0.10"));
     let impl_a = spawn(&mut client, &repo_path, "TKT-1", None).await;
@@ -983,7 +1005,7 @@ async fn factory_analytics_native_recorded_cost_reads_real_delivery_review_corre
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", cost_fake("0.05"));
     let review = json!({
-        "branch": "feature-a", "headSha": "sha-a", "target": "main",
+        "branch": "feature-a", "headSha": real_head_sha, "target": "main",
         "task": "TKT-1", "attempt": "attempt-1",
     });
     let reviewer = spawn(&mut client, &repo_path, "review-of-TKT-1", Some(review)).await;
