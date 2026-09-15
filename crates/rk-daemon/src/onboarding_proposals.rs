@@ -549,12 +549,13 @@ pub fn repository_identity(repo_path: &Path) -> String {
 /// The exact committed tree a human reviews. Approval re-reads this value so
 /// branch movement after proposal creation makes the decision stale.
 pub fn onboarding_tree_revision(worktree: &Path) -> rk_core::Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(worktree)
         .args(["rev-parse", "HEAD^{tree}"])
-        .env("LC_ALL", "C")
-        .output()?;
+        .env("LC_ALL", "C");
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let output = cmd.output()?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(rk_core::Error::other(format!(

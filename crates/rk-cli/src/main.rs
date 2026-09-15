@@ -180,6 +180,10 @@ enum Command {
     Log(agent_cmds::LogArgs),
     /// Send mid-session guidance to a running agent.
     Steer(agent_cmds::SteerArgs),
+    /// Verify a message claiming operator/steer authority against the
+    /// daemon's own durable control record for this exact authenticated
+    /// caller and its current session generation.
+    ControlVerify(agent_cmds::ControlVerifyArgs),
     /// Gracefully interrupt a running agent.
     Interrupt(agent_cmds::NameArg),
     /// Dismiss an agent: stop it, preserve its branch, clean up its worktree.
@@ -1249,6 +1253,7 @@ async fn main() -> Result<()> {
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
         Command::Log(args) => agent_cmds::log(&layout, args, cli.json).await?,
         Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
+        Command::ControlVerify(args) => agent_cmds::control_verify(&layout, args, cli.json).await?,
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Land(args) => agent_cmds::land(&layout, args, cli.json).await?,
@@ -1520,7 +1525,7 @@ async fn main() -> Result<()> {
                 })?;
             let mut client = Client::connect_or_spawn(&layout).await?;
             let mut params = serde_json::Map::new();
-            params.insert("repo".into(), json!(repo));
+            params.insert("repo".into(), json!(repo.clone()));
             if let Some(check) = check {
                 params.insert("check".into(), json!(check));
             }
@@ -1539,6 +1544,13 @@ async fn main() -> Result<()> {
                     "verify: {} (exit {exit})",
                     result["verdict"].as_str().unwrap_or("?"),
                 );
+                if let Some(id) = result["failure_receipt_id"].as_str() {
+                    println!(
+                        "failure receipt: {id} (rk scan artifact {repo} verification-failure-receipt --search {id})"
+                    );
+                } else if let Some(err) = result["failure_receipt_error"].as_str() {
+                    eprintln!("warning: failure receipt not persisted: {err}");
+                }
             }
             if exit != 0 {
                 std::process::exit(exit.clamp(1, 255) as i32);

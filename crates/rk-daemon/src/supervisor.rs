@@ -2315,17 +2315,18 @@ impl Supervisor {
                 spec.prompt.clone()
             };
             tokio::task::spawn_blocking(move || {
-                let _ = std::process::Command::new("herdr")
-                    .args([
-                        "agent",
-                        "wait",
-                        &target,
-                        "--status",
-                        "idle",
-                        "--timeout",
-                        "30000",
-                    ])
-                    .output();
+                let mut cmd = std::process::Command::new("herdr");
+                cmd.args([
+                    "agent",
+                    "wait",
+                    &target,
+                    "--status",
+                    "idle",
+                    "--timeout",
+                    "30000",
+                ]);
+                rk_core::exec::close_extra_fds(&mut cmd);
+                let _ = cmd.output();
                 if let Err(e) = rk_mux::HerdrMux::send(&target, &prompt) {
                     warn!(error = %e, "failed to deliver prompt to herdr pane");
                 }
@@ -2705,17 +2706,18 @@ impl Supervisor {
                 spec.prompt
             };
             tokio::task::spawn_blocking(move || {
-                let _ = std::process::Command::new("herdr")
-                    .args([
-                        "agent",
-                        "wait",
-                        &target,
-                        "--status",
-                        "idle",
-                        "--timeout",
-                        "30000",
-                    ])
-                    .output();
+                let mut cmd = std::process::Command::new("herdr");
+                cmd.args([
+                    "agent",
+                    "wait",
+                    &target,
+                    "--status",
+                    "idle",
+                    "--timeout",
+                    "30000",
+                ]);
+                rk_core::exec::close_extra_fds(&mut cmd);
+                let _ = cmd.output();
                 if let Err(e) = rk_mux::HerdrMux::send(&target, &prompt) {
                     warn!(error = %e, "failed to deliver resume prompt to herdr pane");
                 }
@@ -3874,10 +3876,12 @@ impl Supervisor {
         binding: &crate::bbs::ConsumerBinding,
     ) -> Option<rk_core::bbs::Briefing> {
         let task = task?;
+        let discovery = crate::bbs_discovery::resolve_for_brief(&self.layout, repo);
         match crate::bbs::brief(
             &self.space,
             &self.tickets,
             &crate::bbs::BriefParams::for_task(repo, task),
+            discovery,
         ) {
             Ok(mut briefing) => {
                 let capture = crate::bbs::record_exposure(
@@ -6399,39 +6403,170 @@ impl Supervisor {
         }
     }
 
-    /// A harness's transport can end up with a live control channel for a
-    /// reason unrelated to trusted mid-session steering — Maki's stream-json
+    /// Resolve, admit, and hand a steer envelope all the way into its
+    /// harness's channel — or `Ok(false)` when this name has no native
+    /// control at all (the attach-mode case, left to the caller's
+    /// herdr-pane fallback).
+    ///
+    /// Four things have to agree before a message reaches a process: which
+    /// session currently owns `name`, whether its record is still admitted
+    /// as live work, whether its harness even trusts this channel, and
+    /// whether the channel actually accepts the message right now. Reading
+    /// the first three as a consistent snapshot but then releasing every
+    /// lock and `.await`-ing the actual send — an earlier version of this
+    /// fix did exactly that — reopens the same hole for the fourth: the
+    /// channel send can suspend under backpressure, and everything validated
+    /// before that suspend can go stale during it (the record can
+    /// terminalize, or a respawn can supersede the session) with nothing on
+    /// either side positioned to notice — [`SessionControl::steer_envelope`]
+    /// awaits capacity with no way to abort once state changes underneath
+    /// it, and the receiving side's ack fence
+    /// ([`handle_event`](Self::handle_event)'s `ControlDelivered` arm,
+    /// gated on `self.own(name, session)`) only checks session ownership: it
+    /// stops a respawn's successor from being credited with a stale
+    /// predecessor's belated ack, but a same-session message that was
+    /// merely queued before `rk done` and lands after it keeps the SAME
+    /// session end to end, so `own` sees nothing wrong — the message is
+    /// genuinely delivered to, and read by, a process this fix meant to
+    /// have refused.
+    ///
+    /// The actual fix is to never suspend in the first place:
+    /// [`SessionControl::try_steer_envelope_with`] reserves a channel slot
+    /// with `try_reserve` — instant, never blocks — and only sends once a
+    /// slot is actually held. Doing that reservation-and-send HERE, before
+    /// any lock in this function is released, closes the window completely
+    /// rather than narrowing it: there is no suspend point between
+    /// "admitted" and "in the channel" for a concurrent terminalization or
+    /// respawn to land in, because the whole decision — session, state,
+    /// capability, AND the send itself — is one uninterrupted critical
+    /// section under the same `session_tokens`-first lock order
+    /// [`own`](Self::own) and [`publish_launch`](Self::publish_launch)
+    /// already use for exactly this reason (see their doc comments):
+    /// holding `session_tokens` across the whole thing blocks a concurrent
+    /// takeover from interleaving with it at all, rather than merely racing
+    /// it. A channel that happens to be saturated at that exact instant is
+    /// refused outright, on the same footing as any other admission
+    /// failure, rather than queued behind backpressure of unknown duration.
+    ///
+    /// `try_steer_envelope_with`'s `persist` callback (wired to
+    /// [`crate::steer::enqueue`] when `durable` is set below) runs between
+    /// the reservation and the send, not before it and not after: before,
+    /// a terminal/stale/saturated request would get durably journaled for
+    /// no reason it could ever be delivered from — exactly the "rejected
+    /// request replayed on a later `rk respawn`" bug this whole fix targets,
+    /// just moved into storage instead of the channel. After, a journal
+    /// failure would be discovered only once the message was already sent,
+    /// reporting a delivery whose durable record does not actually exist —
+    /// silently weakening the guarantee restart-replay depends on. Gating
+    /// the send on `persist`'s success keeps both invariants intact at
+    /// once: nothing refused is ever journaled, and everything journaled
+    /// was, at minimum, accepted and reserved a slot at that moment — not a
+    /// guarantee it was also physically sent. A crash in the gap between
+    /// `persist` returning and `permit.send` running is a real process
+    /// crash, not a fallible step in this code, and it is exactly the case
+    /// restart-replay already exists to cover: the journal entry survives,
+    /// the channel does not, and the next live session for this name
+    /// replays it as an ordinary unacknowledged pending message.
+    ///
+    /// `expected_generation`, when given, must match the session token this
+    /// snapshot observes — the fence against a stale envelope (built against
+    /// an earlier `session_generation` read in `handle_steer`, server.rs)
+    /// reaching a replacement session. Order matters for one existing
+    /// caller: state and harness capability are checked before generation,
+    /// not after, so an unsteerable harness is always reported as
+    /// "does not support trusted mid-session steering" rather than a
+    /// generation mismatch that happens to also be true.
+    ///
+    /// Nor is a retained `steer_tx`/registry row proof the record is still
+    /// *admitted* as live work: `kill_lingering_after_done` deliberately
+    /// keeps the control handle in place for a grace window after a clean
+    /// `rk done` so a lingering process can still be reached and killed, and
+    /// a `Completed`/`Failed`/`Stopped`/`Dismissed`/`Orphaned` record never
+    /// re-occupies an implementation slot on its own. An ordinary steer
+    /// delivered into that window would silently resume source editing and
+    /// provider cost on a generation the daemon, ticket routing, and
+    /// capacity accounting all already consider finished — TKT-jobib-zahaj-
+    /// tilaj.
+    ///
+    /// Maki is the motivating case for the harness check: its stream-json
     /// input mode has no CLI-argument prompt, so its adapter wires the same
     /// channel purely to deliver the one unavoidable initial message, even
     /// though `caps().steer` stays `false` because Maki drops the
     /// daemon-authenticated `rk_control` side-band metadata that makes a
     /// steer turn verifiable. A live `steer_tx` is therefore not proof an
     /// operator's mid-session guidance is trusted or even distinguishable
-    /// from ordinary conversation text; `caps().steer` is the actual signal,
-    /// and this must be checked before ever handing an operator's message to
-    /// that channel. The adapter's own internal initial-prompt delivery calls
-    /// `SessionControl::steer` directly on its session handle and never goes
-    /// through here, so it is unaffected by this gate.
-    fn assert_steerable(&self, name: &str) -> rk_core::Result<()> {
-        let harness_kind = self
+    /// from ordinary conversation text. The adapter's own internal
+    /// initial-prompt delivery calls `SessionControl::steer` directly on its
+    /// session handle and never goes through here, so it is unaffected by
+    /// this gate.
+    /// `durable`, when true, journals the envelope via [`crate::steer::enqueue`]
+    /// between the channel reservation and the actual send —
+    /// [`SessionControl::try_steer_envelope_with`]'s `persist` callback —
+    /// so operator/RPC steering keeps the exact "journaled before it can
+    /// possibly be delivered" guarantee the pre-existing restart-replay
+    /// design depends on, while never journaling a request this function
+    /// is about to refuse outright (terminal state, stale generation, wrong
+    /// harness, or a saturated channel). `steer`'s internal daemon nudges
+    /// pass `false`: they were never journaled before this fix either, and
+    /// still don't need to be.
+    fn admit_steer(
+        &self,
+        name: &str,
+        expected_generation: Option<&str>,
+        envelope: ControlEnvelope,
+        durable: bool,
+    ) -> rk_core::Result<bool> {
+        let tokens = self.lock_session_tokens();
+        let controls = self.lock_controls();
+        let Some(control) = controls.get(name) else {
+            return Ok(false);
+        };
+        let record = self
             .lock_registry()
             .get(name)
-            .map(|r| r.harness.clone())
+            .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
-        if make_harness(&harness_kind)?.caps().steer {
-            Ok(())
-        } else {
-            Err(rk_core::Error::other(format!(
-                "{harness_kind} does not support trusted mid-session steering"
-            )))
+        if !record.state.is_live() {
+            return Err(rk_core::Error::other(format!(
+                "{name} is {:?}, not a live session — steering a terminal generation would \
+                 silently reopen finished work outside implementation admission. Use \
+                 `rk respawn {name}` to resume the same generation/cost ledger instead.",
+                record.state
+            )));
         }
+        if !make_harness(&record.harness)?.caps().steer {
+            return Err(rk_core::Error::other(format!(
+                "{} does not support trusted mid-session steering",
+                record.harness
+            )));
+        }
+        if let Some(expected) = expected_generation {
+            let current = tokens.get(name).copied();
+            if current.map(|g| g.to_string()).as_deref() != Some(expected) {
+                let described = current.map_or_else(|| "none".to_string(), |g| g.to_string());
+                return Err(rk_core::Error::other(format!(
+                    "{name}'s live session has moved on to generation {described}; this \
+                     envelope was addressed to {expected}, which is no longer the current \
+                     session — refusing to deliver an operator's guidance to a replacement \
+                     session",
+                )));
+            }
+        }
+        if durable {
+            let repo_name = record.repo_name.clone();
+            control.try_steer_envelope_with(envelope, |envelope| {
+                crate::steer::enqueue(&self.space, &repo_name, envelope, &self.castle)
+            })?;
+        } else {
+            control.try_steer_envelope(envelope)?;
+        }
+        Ok(true)
     }
 
     pub async fn steer(&self, name: &str, message: &str) -> rk_core::Result<()> {
-        let control = self.lock_controls().get(name).cloned();
-        if let Some(control) = control {
-            self.assert_steerable(name)?;
-            return control.steer(message).await;
+        let envelope = ControlEnvelope::system("unknown", message);
+        if self.admit_steer(name, None, envelope, false)? {
+            return Ok(());
         }
         // Attach-mode rats steer through their herdr pane.
         let target = self
@@ -6459,15 +6594,23 @@ impl Supervisor {
     /// Deliver a durable control envelope to a live harness. The old string
     /// method remains for daemon-internal nudges; operator/RPC steering must
     /// use this typed path so the adapter can acknowledge the exact message.
+    ///
+    /// Journals the envelope itself (`admit_steer(..., durable: true)`) —
+    /// callers (`handle_steer` in server.rs) must NOT also call
+    /// `crate::steer::enqueue` before or after this; that would either
+    /// journal a request this rejects, or double-journal an accepted one.
     pub async fn steer_envelope(
         &self,
         name: &str,
         envelope: &ControlEnvelope,
     ) -> rk_core::Result<()> {
-        let control = self.lock_controls().get(name).cloned();
-        if let Some(control) = control {
-            self.assert_steerable(name)?;
-            return control.steer_envelope(envelope).await;
+        if self.admit_steer(
+            name,
+            Some(envelope.delivery_generation.as_str()),
+            envelope.clone(),
+            true,
+        )? {
+            return Ok(());
         }
         if self
             .lock_registry()
@@ -8556,6 +8699,20 @@ impl Supervisor {
                     for envelope in pending {
                         let envelope = envelope.for_resume_generation(token.to_string());
                         let control = control.clone();
+                        // Deliberately still the `.await`-ing `steer_envelope`,
+                        // not the non-blocking `try_steer_envelope`: a
+                        // session can accumulate more than the channel's
+                        // capacity worth of genuinely unacknowledged pending
+                        // envelopes (a crash loop, or simply a busy agent),
+                        // and this replay must eventually deliver all of
+                        // them, not fail outright past the first
+                        // channel-full and strand the rest until yet
+                        // another restart. Each is already durably
+                        // persisted (that is what made it `pending`), so
+                        // waiting for capacity here is not the same
+                        // admission-then-await race `admit_steer` closes —
+                        // there is no live admission decision left to go
+                        // stale while this waits.
                         handle.spawn(async move {
                             if let Err(error) = control.steer_envelope(&envelope).await {
                                 warn!(
@@ -9439,6 +9596,530 @@ mod respawn_tests {
         assert!(error
             .to_string()
             .contains("does not support trusted mid-session steering"));
+    }
+
+    /// TKT-jobib-zahaj-tilaj: `kill_lingering_after_done` deliberately keeps
+    /// the control handle in place for a grace window after a clean
+    /// `rk done` so a lingering process can still be reached and killed — a
+    /// retained `steer_tx` is therefore never proof the generation is still
+    /// admitted as live implementation work. A steer against a `Completed`
+    /// record must be rejected before it ever reaches the harness's control
+    /// channel (no provider continuation), and the rejection itself must not
+    /// mutate the record's state.
+    #[tokio::test]
+    async fn steer_is_rejected_for_a_completed_record_despite_a_retained_control_handle() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Completed;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let session = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            session.control.can_steer(),
+            "fake's channel is wired for trusted steering"
+        );
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            session.control.clone(),
+        );
+
+        let error = sup
+            .steer("Nibble", "keep going")
+            .await
+            .expect_err("a retained control handle on a Completed record must not accept a steer");
+        let text = error.to_string();
+        assert!(text.contains("Completed"), "got: {text}");
+        assert!(text.contains("rk respawn"), "got: {text}");
+
+        let envelope = ControlEnvelope::new("m1", "operator", "Nibble", "g1", "g1", "keep going");
+        let error = sup
+            .steer_envelope("Nibble", &envelope)
+            .await
+            .expect_err("the typed path must reject the same terminal record");
+        assert!(error.to_string().contains("Completed"), "got: {error}");
+
+        assert_eq!(
+            sup.status("Nibble").unwrap().state,
+            AgentState::Completed,
+            "a rejected steer must never mutate agent state or occupy a live slot"
+        );
+    }
+
+    /// `handle_steer` in server.rs captures `session_generation` immediately
+    /// before constructing the envelope, naming the process the operator's
+    /// message was meant for. If a respawn races in between and registers a
+    /// new session token under the same name, the live control handle now
+    /// belongs to the successor — an envelope still addressed to the
+    /// predecessor's generation must be refused rather than silently
+    /// rerouted onto whichever process happens to hold the name now
+    /// (TKT-jobib-zahaj-tilaj).
+    #[tokio::test]
+    async fn steer_envelope_is_rejected_after_a_respawn_supersedes_its_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let first = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        let stale_generation = sup
+            .track_session(
+                &mut sup.lock_session_tokens(),
+                "Nibble",
+                first.control.clone(),
+            )
+            .to_string();
+
+        // A respawn takes over the name with a fresh session, exactly as
+        // `publish_launch`/`track_session` do for a real `rk respawn`.
+        let second = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            second.control.clone(),
+        );
+
+        let envelope = ControlEnvelope::new(
+            "m1",
+            "operator",
+            "Nibble",
+            stale_generation.clone(),
+            stale_generation,
+            "guidance meant for the predecessor",
+        );
+        let error = sup
+            .steer_envelope("Nibble", &envelope)
+            .await
+            .expect_err("an envelope addressed to a superseded generation must be refused");
+        assert!(
+            error.to_string().contains("replacement session"),
+            "got: {error}"
+        );
+    }
+
+    /// Positive control for the two rejection tests above: ordinary live
+    /// steering against the current generation of a `Running` record must
+    /// keep working unchanged.
+    #[tokio::test]
+    async fn steer_envelope_succeeds_for_a_live_matching_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let session = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        let generation = sup
+            .track_session(
+                &mut sup.lock_session_tokens(),
+                "Nibble",
+                session.control.clone(),
+            )
+            .to_string();
+
+        let envelope = ControlEnvelope::new(
+            "m1",
+            "operator",
+            "Nibble",
+            generation.clone(),
+            generation,
+            "keep going",
+        );
+        sup.steer_envelope("Nibble", &envelope)
+            .await
+            .expect("ordinary live steering against the current generation must still work");
+    }
+
+    /// TKT-jobib-zahaj-tilaj, native RPC/control coverage: proves the
+    /// terminal rejection through the REAL production completion path — a
+    /// durable `task_done` tuple plus the harness's own final turn, exactly
+    /// what `handle_event`'s `Completed` arm processes for an actual
+    /// `rk done` — rather than only poking `AgentRecord.state` directly.
+    /// `schedule_done_kill`/`kill_lingering_after_done` then keeps the
+    /// control handle retained for the grace window this test operates
+    /// inside (`set_done_kill_grace_secs` widened so the window cannot close
+    /// mid-test). The rejected steer is proven to never reach the process
+    /// itself — not just that the API call returned an error — via a script
+    /// that durably marks receipt of any line past its own automatic
+    /// initial-prompt delivery (`FakeHarness::launch` always steers the
+    /// prompt through the same channel first). That same rig is proven
+    /// capable of observing a real delivery by
+    /// `steer_is_delivered_to_a_live_paused_agents_process` below, so the
+    /// marker's absence here is not merely an artifact of a harness that
+    /// never reads its stdin at all.
+    #[tokio::test]
+    async fn steer_never_reaches_the_process_during_the_post_done_grace_window() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        sup.set_done_kill_grace_secs(5);
+
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Running;
+        let spawn = rec.spawn.unwrap();
+        let created_at = rec.created_at;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let markers = tempfile::tempdir().unwrap();
+        let marker_path = markers.path().join("delivered");
+        let marker_arg = format!("\"{}\"", marker_path.display());
+        // Scans every stdin line for a needle unique to the operator's
+        // rejected message, rather than assuming which numbered `read` it
+        // would land on — `FakeHarness::launch` races its own automatic
+        // initial-prompt delivery against this test's first real steer over
+        // the SAME channel, so a fixed read count is not reliably ordered.
+        // The needle never appears in that harmless auto-delivered empty
+        // prompt, so this cannot false-positive on it.
+        let script = format!(
+            "echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fake-session-1\"}}'\n\
+             while IFS= read -r line; do\n\
+               case \"$line\" in\n\
+                 *REJECTED_STEER_PAYLOAD*) printf '%s' \"$line\" > {marker_arg} ;;\n\
+               esac\n\
+             done\n"
+        );
+        let mut env = HashMap::new();
+        env.insert("RK_FAKE_HARNESS_CMD".into(), script);
+        let session = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+        let generation = sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            session.control.clone(),
+        );
+
+        // The real production sequence: a clean `rk done` durably publishes
+        // `task_done` first, and the harness's own terminal event follows.
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "castle",
+                json!({"agent": "Nibble", "spawn": spawn.to_string()}),
+            ))
+            .unwrap();
+        sup.handle_event(
+            "Nibble",
+            created_at,
+            spawn,
+            generation,
+            HarnessEvent::Completed {
+                result: "work complete".into(),
+                is_error: false,
+                usage: TokenUsage::default(),
+                cost_usd: Some(0.001),
+                session_id: Some("fake-session-1".into()),
+            },
+        );
+
+        let after = sup.status("Nibble").unwrap();
+        assert_eq!(
+            after.state,
+            AgentState::Completed,
+            "a clean rk done must terminalize the record"
+        );
+        assert!(
+            sup.lock_controls().contains_key("Nibble"),
+            "the grace window must still be holding the control handle open"
+        );
+
+        let error = sup
+            .steer("Nibble", "REJECTED_STEER_PAYLOAD via steer")
+            .await
+            .expect_err("a Completed record inside the grace window must reject a steer");
+        assert!(error.to_string().contains("Completed"), "got: {error}");
+
+        let envelope = ControlEnvelope::new(
+            "m1",
+            "operator",
+            "Nibble",
+            "g1",
+            "g1",
+            "REJECTED_STEER_PAYLOAD via steer_envelope",
+        );
+        sup.steer_envelope("Nibble", &envelope)
+            .await
+            .expect_err("the typed path must reject the same terminal record");
+
+        // Give a wrongly-permissive implementation every chance to have
+        // already delivered before asserting it never did.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !marker_path.exists(),
+            "the terminal record's process must never receive a rejected steer"
+        );
+    }
+
+    /// Positive control for the grace-window test above: a live `Paused`
+    /// generation's process DOES receive a real steer through the exact
+    /// same rig, proving the marker file is a faithful delivery signal
+    /// rather than something that would read empty regardless of whether
+    /// the guard held.
+    #[tokio::test]
+    async fn steer_is_delivered_to_a_live_paused_agents_process() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Paused;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let markers = tempfile::tempdir().unwrap();
+        let marker_path = markers.path().join("delivered");
+        let marker_arg = format!("\"{}\"", marker_path.display());
+        // Scans every stdin line for a needle unique to this test's real
+        // steer, rather than assuming which numbered `read` it lands on:
+        // `FakeHarness::launch` races its own automatic initial-prompt
+        // delivery against this steer over the SAME channel.
+        let script = format!(
+            "echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fake-session-1\"}}'\n\
+             while IFS= read -r line; do\n\
+               case \"$line\" in\n\
+                 *ADMITTED_STEER_PAYLOAD*) printf '%s' \"$line\" > {marker_arg} ;;\n\
+               esac\n\
+             done\n"
+        );
+        let mut env = HashMap::new();
+        env.insert("RK_FAKE_HARNESS_CMD".into(), script);
+        let session = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            session.control.clone(),
+        );
+
+        sup.steer("Nibble", "ADMITTED_STEER_PAYLOAD")
+            .await
+            .expect("a live Paused record must accept an ordinary steer");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a legitimately admitted steer must actually reach the process"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let marker_content = std::fs::read_to_string(&marker_path).unwrap();
+        assert!(
+            marker_content.contains("ADMITTED_STEER_PAYLOAD"),
+            "the marker must record the actual steer text delivered, got: {marker_content:?}"
+        );
+    }
+
+    /// Regression for the exact race a review pass on this fix identified:
+    /// the original `admit_steer` validated session/state/capability under
+    /// lock, then released every lock and `.await`-ed
+    /// `SessionControl::steer_envelope`'s send — which can suspend on a
+    /// saturated channel, and while suspended, the record backing it could
+    /// terminalize (or the session could be superseded) with nothing on
+    /// either side positioned to notice before the suspended send landed
+    /// anyway; the receiving side's `self.own(name, session)` fence only
+    /// protects a respawn's successor from a stale predecessor's belated
+    /// ack, not a same-session message merely queued before `rk done` and
+    /// delivered after it. The fix is `SessionControl::try_steer_envelope`'s
+    /// synchronous reserve-then-send, called while `admit_steer` still
+    /// holds its locks (see its doc comment) — this proves a steer issued
+    /// against a genuinely saturated channel is refused immediately, not
+    /// silently queued to be delivered later once capacity frees up and the
+    /// record has since gone terminal.
+    #[tokio::test]
+    async fn a_saturated_channel_refuses_a_steer_immediately_rather_than_queuing_it() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let session = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                env: HashMap::from([(
+                    "RK_FAKE_HARNESS_CMD".into(),
+                    "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fake-session-1\"}'\n\
+                     while :; do sleep 1; done\n"
+                        .into(),
+                )]),
+                ..Default::default()
+            })
+            .unwrap();
+        // Filled synchronously, with no `.await` yet in this test — on the
+        // single-threaded `#[tokio::test]` runtime neither the runner's own
+        // channel-draining task nor `FakeHarness::launch`'s automatic
+        // initial-prompt delivery (both merely `tokio::spawn`ed, not yet
+        // polled) has had a chance to consume a slot, so this deterministically
+        // saturates all 32 (`mpsc::channel::<ControlEnvelope>(32)` in
+        // runner.rs) rather than racing whichever happens to drain first.
+        for i in 0..32 {
+            session
+                .control
+                .try_steer_envelope(ControlEnvelope::system("Nibble", format!("filler-{i}")))
+                .expect("capacity must still be available while filling the channel");
+        }
+
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            session.control.clone(),
+        );
+
+        let error = sup
+            .steer("Nibble", "should never queue")
+            .await
+            .expect_err("a genuinely saturated channel must refuse a steer outright");
+        assert!(error.to_string().contains("saturated"), "got: {error}");
+
+        assert_eq!(
+            sup.status("Nibble").unwrap().state,
+            AgentState::Running,
+            "a refused steer must not mutate agent state"
+        );
+    }
+
+    /// `admit_steer` holds `session_tokens` across its current-session,
+    /// state, and capability checks specifically so a concurrent respawn
+    /// cannot land between them (see its doc comment). This proves that
+    /// holds under actual lock contention, not merely as a sequential
+    /// happy-path predicate: a takeover thread is made to actually hold
+    /// `session_tokens` — confirmed via the same `try_lock` polling idiom
+    /// this file already uses to prove ordering deterministically (see
+    /// `an_attach_respawn_publishes_no_session_and_evicts_the_headless_one`'s
+    /// neighboring takeover tests) — before `steer_envelope` for the
+    /// pre-takeover generation is even issued, so the steer call is
+    /// guaranteed to block on the SAME mutex mid-takeover rather than merely
+    /// running cleanly before or after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn steer_envelope_stays_correct_when_it_contends_with_a_live_respawn() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.harness = "fake".into();
+        rec.state = AgentState::Running;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let first = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        let stale_generation = sup
+            .track_session(
+                &mut sup.lock_session_tokens(),
+                "Nibble",
+                first.control.clone(),
+            )
+            .to_string();
+
+        let second = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let takeover = std::thread::spawn({
+            let sup = Arc::clone(&sup);
+            move || {
+                let mut tokens = sup.lock_session_tokens();
+                // Widen the critical section a real respawn briefly holds,
+                // so the steer below is guaranteed to contend on this exact
+                // lock instead of merely racing around it.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                sup.track_session(&mut tokens, "Nibble", second.control.clone())
+            }
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sup.session_tokens.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the takeover never took the session_tokens lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Issued while the takeover genuinely holds `session_tokens` — this
+        // call must block on that same mutex, then observe the
+        // POST-takeover world once it wakes, never a torn read straddling
+        // the two.
+        let envelope = ControlEnvelope::new(
+            "m1",
+            "operator",
+            "Nibble",
+            stale_generation.clone(),
+            stale_generation,
+            "guidance meant for the predecessor",
+        );
+        let error = sup.steer_envelope("Nibble", &envelope).await.expect_err(
+            "a steer contending with a live respawn must still see a consistent outcome",
+        );
+        assert!(
+            error.to_string().contains("replacement session"),
+            "got: {error}"
+        );
+
+        let new_token = takeover.join().unwrap();
+        assert_eq!(
+            sup.session_generation("Nibble"),
+            Some(new_token),
+            "sanity: the takeover's new token is what's current now"
+        );
     }
 
     /// `interrupt` is harness-agnostic (every `runner::launch`-based adapter

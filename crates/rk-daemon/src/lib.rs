@@ -7,6 +7,7 @@ pub mod agents;
 pub mod attention;
 pub mod authority;
 pub mod bbs;
+pub mod bbs_discovery;
 mod capabilities;
 pub mod client;
 pub mod coordinator;
