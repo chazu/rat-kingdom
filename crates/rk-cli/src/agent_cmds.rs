@@ -340,11 +340,19 @@ pub async fn fence_status(layout: &Layout, args: FenceStatusArgs, as_json: bool)
             .as_array()
             .cloned()
             .unwrap_or_default();
+        // Both boundaries printed, never collapsed: `ready` is the
+        // whole-daemon rollover claim, `repo_drain_ready` the narrower
+        // fenced-repo one. An operator deciding to roll over reads `ready`.
         println!(
-            "{repo}: state={state} ready={ready} blocking_keys={} managed_blockers={}",
+            "{repo}: state={state} ready={ready} repo_drain_ready={} \
+             blocking_keys={} managed_blockers={}",
+            result["repo_drain_ready"].as_bool().unwrap_or(false),
             keys.len(),
             managed.len(),
         );
+        if let Some(guarantee) = result["guarantee"].as_str() {
+            println!("  guarantee: {guarantee}");
+        }
         for key in &keys {
             println!("  landing lane: {}", key.as_str().unwrap_or("?"));
         }
@@ -354,9 +362,16 @@ pub async fn fence_status(layout: &Layout, args: FenceStatusArgs, as_json: bool)
         // tell WHAT is still holding the repo.
         for blocker in &managed {
             println!(
-                "  managed {} [{}]: {}",
+                "  managed {} [{}{}]: {}",
                 blocker["kind"].as_str().unwrap_or("?"),
                 blocker["scope"].as_str().unwrap_or("?"),
+                // Uncovered blockers are marked, because they can reappear
+                // on their own no matter how long the operator waits.
+                if blocker["fenced"].as_bool().unwrap_or(false) {
+                    ""
+                } else {
+                    ", not covered by this fence"
+                },
                 blocker["agent"]
                     .as_str()
                     .or_else(|| blocker["detail"].as_str())

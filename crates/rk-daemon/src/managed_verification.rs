@@ -250,10 +250,13 @@ impl<'a> ManagedVerification<'a> {
         // failure receipt's idempotency boundary.
         let occurrence_id = rk_core::id::RecordId::new();
         let progress = Arc::new(Mutex::new(RunProgress::default()));
+        // Refused outright while a P7.1 handoff fence is engaged for this
+        // repo — the fence stops NEW managed work from starting behind an
+        // already-answered `ready`. See `try_register`'s doc.
         let (managed_id, mut cancel_rx) =
             self.resources
                 .runs
-                .register(agent, generation, request_key, repo_name, "verify");
+                .try_register(agent, generation, request_key, repo_name, "verify")?;
         let registration = ManagedRegistration {
             runs: &self.resources.runs,
             id: managed_id,
@@ -3274,6 +3277,19 @@ pub(crate) struct ManagedRunBlocker {
 pub(crate) struct ManagedVerificationRuns {
     next_id: AtomicU64,
     runs: Mutex<HashMap<u64, ManagedVerificationRun>>,
+    /// P7.1 (TKT-rufik-lafit-pisah): consulted INSIDE `runs`' own mutex by
+    /// [`Self::try_register`], so a handoff fence and a new managed run can
+    /// never interleave ambiguously. Installed once by `Server::landing`;
+    /// `None` (the default, and every test that does not install one) means
+    /// no fence exists and every registration is admitted, exactly as before
+    /// this field.
+    ///
+    /// LOCK ORDER: this closure reads the handoff store while `runs` is
+    /// held, so it is always `runs` -> store. Nothing may hold the store
+    /// while acquiring `runs` (`fence_request` deliberately finishes its
+    /// store write and releases it BEFORE taking its readiness snapshot).
+    #[allow(clippy::type_complexity)]
+    admission_fence: Mutex<Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>>,
 }
 
 struct ManagedRegistration<'a> {
@@ -3288,8 +3304,61 @@ impl Drop for ManagedRegistration<'_> {
 }
 
 impl ManagedVerificationRuns {
-    pub(crate) fn register(
+    /// Install the handoff-fence predicate — see the `admission_fence`
+    /// field doc. Called once, by `Server::landing`, right after the
+    /// `LandingPipeline` exists.
+    pub(crate) fn set_admission_fence(&self, fence: Arc<dyn Fn(&str) -> bool + Send + Sync>) {
+        *self.admission_fence.lock().unwrap() = Some(fence);
+    }
+
+    /// Admit and register ONE new managed run, refusing it outright while a
+    /// P7.1 handoff fence is engaged for `repo`.
+    ///
+    /// THE LINEARIZATION THAT MAKES READINESS TRUTHFUL: the fence check and
+    /// the registration happen under a single acquisition of `runs`' mutex,
+    /// which is the same mutex [`Self::active_for_repo`]/[`Self::active_all`]
+    /// take to build a readiness snapshot. `fence_request` engages the fence
+    /// FIRST and snapshots SECOND, so for any new run exactly one of two
+    /// things is true, never neither and never both:
+    ///
+    ///   * it registered before the snapshot — so the snapshot sees it, and
+    ///     readiness reports `draining`; or
+    ///   * it registered after the snapshot — so it necessarily took the
+    ///     mutex after the fence was already engaged, sees it, and is
+    ///     REFUSED.
+    ///
+    /// That is what stops new owned work from starting silently behind an
+    /// already-answered `ready`. Runs already registered are untouched: they
+    /// keep running and settle through their own existing contracts — the
+    /// fence never cancels anything.
+    pub(crate) fn try_register(
         &self,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
+        repo: &str,
+        kind: &'static str,
+    ) -> rk_core::Result<(u64, tokio::sync::watch::Receiver<Option<&'static str>>)> {
+        let mut runs = self.runs.lock().unwrap();
+        let fenced = self
+            .admission_fence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|fence| fence(repo));
+        if fenced {
+            return Err(rk_core::Error::other(format!(
+                "landing handoff fence is engaged for {repo}: new managed {kind} work is not \
+                 being admitted until the fence is released or expires (work already running \
+                 is unaffected; see `rk fence-status --repo {repo}`)"
+            )));
+        }
+        Ok(self.register_locked(&mut runs, agent, generation, request_key, repo, kind))
+    }
+
+    fn register_locked(
+        &self,
+        runs: &mut HashMap<u64, ManagedVerificationRun>,
         agent: &str,
         generation: Option<rk_core::id::SpawnId>,
         request_key: &str,
@@ -3298,7 +3367,7 @@ impl ManagedVerificationRuns {
     ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
         let (cancel, rx) = tokio::sync::watch::channel(None);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.runs.lock().unwrap().insert(
+        runs.insert(
             id,
             ManagedVerificationRun {
                 generation,
@@ -3312,29 +3381,40 @@ impl ManagedVerificationRuns {
         (id, rx)
     }
 
-    /// Every managed run currently bound to `repo`, whether it is executing
-    /// or still queued behind an admission permit (see the `repo` field
-    /// doc). This is the "owned managed work that would make ordinary
-    /// shutdown hang" P7.1's readiness condition must account for — a
-    /// landing-key snapshot alone cannot see it, because a `verify.run` or
-    /// `release.prepare` holds no landing drain lane at all.
-    ///
-    /// Sorted for a stable operator-facing report.
-    pub(crate) fn active_for_repo(&self, repo: &str) -> Vec<ManagedRunBlocker> {
+    /// Every managed run this daemon currently owns, across EVERY
+    /// repository. A rollover stops the whole daemon, so whole-daemon
+    /// readiness cannot be claimed from one repo's runs alone — see
+    /// `landing::handoff`'s readiness doc.
+    pub(crate) fn active_all(&self) -> Vec<ManagedRunBlocker> {
         let mut blockers: Vec<ManagedRunBlocker> = self
             .runs
             .lock()
             .unwrap()
             .values()
-            .filter(|run| run.repo == repo)
             .map(|run| ManagedRunBlocker {
                 repo: run.repo.clone(),
                 kind: run.kind,
                 agent: run.agent.clone(),
             })
             .collect();
-        blockers.sort_by(|a, b| (a.kind, &a.agent).cmp(&(b.kind, &b.agent)));
+        blockers.sort_by(|a, b| (&a.repo, a.kind, &a.agent).cmp(&(&b.repo, b.kind, &b.agent)));
         blockers
+    }
+
+    /// Unconditional registration, bypassing the fence. Test-only: every
+    /// production path must go through [`Self::try_register`] so a handoff
+    /// fence genuinely refuses new work.
+    #[cfg(test)]
+    pub(crate) fn register(
+        &self,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
+        repo: &str,
+        kind: &'static str,
+    ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
+        let mut runs = self.runs.lock().unwrap();
+        self.register_locked(&mut runs, agent, generation, request_key, repo, kind)
     }
 
     pub(crate) fn unregister(&self, id: u64) {

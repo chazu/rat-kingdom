@@ -312,44 +312,92 @@ impl HandoffFenceStore {
     }
 }
 
-/// Everything outside the landing queue that can still own `repo` when an
-/// operator asks whether a rollover is safe. Gathered by `Server`, which is
-/// the only place that can see all three contracts at once, and passed in —
-/// rather than reaching back into `Server` from the pipeline, which would
-/// need a cycle. See the module doc for why each dimension counts.
+/// Everything outside the landing queue that can still own the DAEMON when
+/// an operator asks whether a rollover is safe. Gathered by `Server`, which
+/// is the only place that can see all the contracts at once, and passed in
+/// rather than reached back for (which would need a cycle).
+///
+/// Split by scope on purpose. A rollover stops the whole daemon, so another
+/// repository's managed check hangs it exactly as the fenced repo's would —
+/// but the FENCE itself only covers the repo it names, so those two facts
+/// must not be reported as one number. See the module doc.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ManagedWorkSnapshot {
-    /// Managed `verify.run`/`release.prepare` runs bound to this repo,
-    /// executing or queued.
-    pub(crate) runs: Vec<crate::managed_verification::ManagedRunBlocker>,
+    /// Managed runs bound to the fenced repo. Covered BY the fence: while it
+    /// is engaged, no new one can register (see
+    /// [`crate::managed_verification::ManagedVerificationRuns::try_register`]),
+    /// so once this is empty it STAYS empty until release/expiry.
+    pub(crate) repo_runs: Vec<crate::managed_verification::ManagedRunBlocker>,
+    /// Managed runs bound to any OTHER repository. These block a rollover
+    /// (the daemon is shared) but are NOT covered by this repo's fence, so
+    /// they are only ever an observation — a new one can start at any moment.
+    pub(crate) other_repo_runs: Vec<crate::managed_verification::ManagedRunBlocker>,
     /// Whether the daemon-wide release-prepare lock is currently held.
     pub(crate) release_prepare_in_flight: bool,
 }
 
 impl ManagedWorkSnapshot {
-    fn is_clear(&self) -> bool {
-        self.runs.is_empty() && !self.release_prepare_in_flight
+    /// Split a daemon-wide run list against the repo the fence names.
+    pub(crate) fn new(
+        repo: &str,
+        all_runs: Vec<crate::managed_verification::ManagedRunBlocker>,
+        release_prepare_in_flight: bool,
+    ) -> Self {
+        let (repo_runs, other_repo_runs) =
+            all_runs.into_iter().partition(|run| run.repo == repo);
+        Self {
+            repo_runs,
+            other_repo_runs,
+            release_prepare_in_flight,
+        }
+    }
+
+    /// Nothing the FENCE covers is still running. Combined with empty
+    /// landing lanes this is `repo_drain_ready` — a guaranteed property,
+    /// because the fence refuses new work in both dimensions.
+    fn repo_clear(&self) -> bool {
+        self.repo_runs.is_empty()
+    }
+
+    /// Nothing anywhere in this daemon is still running. Combined with empty
+    /// landing lanes this is `rollover_ready` — an OBSERVATION, not a
+    /// guarantee, for the other-repo part.
+    fn daemon_clear(&self) -> bool {
+        self.repo_clear() && self.other_repo_runs.is_empty() && !self.release_prepare_in_flight
     }
 
     /// Operator-facing blocker rows, each carrying the SCOPE it applies at
-    /// so a reader can tell a repo-bound check from a daemon-wide release
-    /// prepare without guessing from the kind.
+    /// and whether the fence actually COVERS it, so a reader never has to
+    /// guess which blockers can reappear on their own.
     fn blocker_rows(&self) -> Vec<Value> {
         let mut rows: Vec<Value> = self
-            .runs
+            .repo_runs
             .iter()
             .map(|run| {
                 json!({
                     "scope": "repo",
+                    "fenced": true,
                     "kind": run.kind,
                     "agent": run.agent,
                     "repo": run.repo,
                 })
             })
             .collect();
+        rows.extend(self.other_repo_runs.iter().map(|run| {
+            json!({
+                "scope": "daemon",
+                "fenced": false,
+                "kind": run.kind,
+                "agent": run.agent,
+                "repo": run.repo,
+                "detail": "another repository's managed run; it blocks a whole-daemon \
+                           rollover but is NOT covered by this repo's fence",
+            })
+        }));
         if self.release_prepare_in_flight {
             rows.push(json!({
                 "scope": "daemon",
+                "fenced": false,
                 "kind": "release-prepare-lock",
                 "detail": "a release prepare/select holds the daemon-wide \
                            release_prepare_lock; a rollover would interrupt it",
@@ -481,7 +529,22 @@ impl LandingPipeline {
         let now = Utc::now();
         let landing_keys = self.active_keys(repo_name);
         let managed_rows = managed.blocker_rows();
-        let clear = landing_keys.is_empty() && managed.is_clear();
+        // Two DIFFERENT questions, deliberately not collapsed into one:
+        //
+        //   repo_drain_ready — is everything THIS FENCE COVERS finished?
+        //     Guaranteed to stay true until release/expiry: the fence
+        //     refuses both new landing claims and new managed runs for this
+        //     repo.
+        //   rollover_ready   — is the whole daemon safe to stop?
+        //     Includes other repositories' managed runs and the daemon-wide
+        //     release-prepare lock, none of which this repo's fence covers,
+        //     so it is an OBSERVATION that can be invalidated by work
+        //     starting elsewhere.
+        //
+        // `ready` is the conservative one (rollover), because that is the
+        // decision an operator actually makes on it.
+        let repo_drain_ready = landing_keys.is_empty() && managed.repo_clear();
+        let rollover_ready = landing_keys.is_empty() && managed.daemon_clear();
 
         // An unreadable store can never yield a readiness claim, whatever
         // the in-memory view happens to say — it is reported first, above
@@ -491,11 +554,13 @@ impl LandingPipeline {
                 "repo": repo_name,
                 "state": "unavailable",
                 "ready": false,
+                "repo_drain_ready": false,
+                "rollover_ready": false,
                 "fenced": false,
                 "error": reason,
                 "recovery": format!(
                     "the durable handoff store could not be read; inspect the preserved \
-                     copy alongside it and re-run `rk land fence-request --repo {repo_name}` \
+                     copy alongside it and re-run `rk fence-request --repo {repo_name}` \
                      to re-establish a fence before rolling over"
                 ),
                 "blocking_keys": landing_keys,
@@ -508,6 +573,8 @@ impl LandingPipeline {
                 "repo": repo_name,
                 "state": "released",
                 "ready": false,
+                "repo_drain_ready": false,
+                "rollover_ready": false,
                 "fenced": false,
                 "blocking_keys": landing_keys,
                 "managed_blockers": managed_rows,
@@ -518,18 +585,27 @@ impl LandingPipeline {
         let state = match record.state {
             HandoffFenceState::Released => "released",
             HandoffFenceState::Requested if now > record.deadline_at => "expired",
-            HandoffFenceState::Requested if clear => "ready",
+            HandoffFenceState::Requested if rollover_ready => "ready",
+            HandoffFenceState::Requested if repo_drain_ready => "repo-drained",
             HandoffFenceState::Requested => "draining",
         };
-        // Readiness is asserted ONLY for a live fence with every dimension
-        // clear. A released or expired record is not "safe to roll over" —
-        // admission has already resumed under it, so new work can arrive at
-        // any moment.
-        let ready = engaged && clear;
+        // Readiness is asserted ONLY for a LIVE fence. A released or expired
+        // record is not "safe to roll over": admission has already resumed
+        // under it, so new work can arrive at any moment.
         json!({
             "repo": repo_name,
             "state": state,
-            "ready": ready,
+            "ready": engaged && rollover_ready,
+            "repo_drain_ready": engaged && repo_drain_ready,
+            "rollover_ready": engaged && rollover_ready,
+            // What the fence actually guarantees, spelled out rather than
+            // left for a reader to infer from `state`.
+            "guarantee": if engaged {
+                "new landing claims and new managed verify/release runs for this repo are \
+                 refused until release or expiry; other repositories are not covered"
+            } else {
+                "no fence is in force; admission is open"
+            },
             "fenced": engaged,
             "holder": record.holder,
             "generation": record.generation,
@@ -718,44 +794,59 @@ mod tests {
         assert!(!store.current("repo").unwrap().blocks_admission(at(13)));
     }
 
-    /// Readiness is a three-dimensional claim. A managed run that holds NO
-    /// landing lane must still stop `ready` — the exact gap a bare
-    /// key-lock snapshot cannot see.
+    /// Readiness is multi-dimensional. A managed run that holds NO landing
+    /// lane must still deny it — the exact gap a bare key-lock snapshot
+    /// cannot see — and an OTHER repository's run must deny the ROLLOVER
+    /// claim while leaving the fenced repo's own drain claim intact.
     #[test]
     fn managed_work_alone_is_enough_to_deny_readiness() {
-        let clear = ManagedWorkSnapshot::default();
-        assert!(clear.is_clear());
+        let clear = ManagedWorkSnapshot::new("repo", Vec::new(), false);
+        assert!(clear.repo_clear() && clear.daemon_clear());
 
-        let verifying = ManagedWorkSnapshot {
-            runs: vec![crate::managed_verification::ManagedRunBlocker {
-                repo: "repo".into(),
-                kind: "verify",
-                agent: "Rummage-16".into(),
-            }],
-            release_prepare_in_flight: false,
-        };
-        assert!(
-            !verifying.is_clear(),
-            "an executing/queued managed verify run must deny readiness"
-        );
+        fn run(repo: &str, kind: &'static str) -> crate::managed_verification::ManagedRunBlocker {
+            crate::managed_verification::ManagedRunBlocker {
+                repo: repo.into(),
+                kind,
+                agent: "Peer-1".into(),
+            }
+        }
+
+        // A managed verify run on the FENCED repo denies both claims.
+        let verifying = ManagedWorkSnapshot::new("repo", vec![run("repo", "verify")], false);
+        assert!(!verifying.repo_clear());
+        assert!(!verifying.daemon_clear());
         let rows = verifying.blocker_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["scope"], "repo");
-        assert_eq!(rows[0]["kind"], "verify");
-
-        let releasing = ManagedWorkSnapshot {
-            runs: Vec::new(),
-            release_prepare_in_flight: true,
-        };
-        assert!(
-            !releasing.is_clear(),
-            "an in-flight release prepare must deny readiness"
-        );
-        let rows = releasing.blocker_rows();
-        assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0]["scope"], "daemon",
-            "the release-prepare lock is daemon-wide, and must say so"
+            rows[0]["fenced"], true,
+            "the fence genuinely covers this one, so it cannot come back on its own"
         );
+
+        // A run on ANOTHER repo denies the whole-daemon rollover claim but
+        // NOT this repo's drain claim — and must say it is uncovered.
+        let elsewhere = ManagedWorkSnapshot::new("repo", vec![run("other", "verify")], false);
+        assert!(
+            elsewhere.repo_clear(),
+            "another repo's run does not hold this repo's fenced boundary"
+        );
+        assert!(
+            !elsewhere.daemon_clear(),
+            "but it does hang a rollover, which stops the whole daemon"
+        );
+        let rows = elsewhere.blocker_rows();
+        assert_eq!(rows[0]["scope"], "daemon");
+        assert_eq!(
+            rows[0]["fenced"], false,
+            "an uncovered blocker must be reported as uncovered, not implied safe"
+        );
+
+        // The daemon-wide release-prepare lock behaves the same way.
+        let releasing = ManagedWorkSnapshot::new("repo", Vec::new(), true);
+        assert!(releasing.repo_clear());
+        assert!(!releasing.daemon_clear());
+        let rows = releasing.blocker_rows();
+        assert_eq!(rows[0]["scope"], "daemon");
+        assert_eq!(rows[0]["kind"], "release-prepare-lock");
     }
 }

@@ -15223,6 +15223,47 @@ checks: [
             0,
             "ready: {ready}"
         );
+        assert_eq!(ready["ready"], true, "ready: {ready}");
+
+        // THE gap-1 regression, asserted against a REAL pipeline at the
+        // exact instant it would otherwise report ready: every landing drain
+        // lane is genuinely free, so a key-lock snapshot alone says "safe to
+        // roll over". A managed `verify.run` bound to this repo holds no
+        // landing lane at all, yet it would hang an ordinary stop — so it
+        // must flip the very same call to `draining`.
+        let with_managed = pipeline.fence_status(
+            &repo_name,
+            &ManagedWorkSnapshot::new(
+                &repo_name,
+                vec![crate::managed_verification::ManagedRunBlocker {
+                    repo: repo_name.clone(),
+                    kind: "verify",
+                    agent: "Peer-1".into(),
+                }],
+                false,
+            ),
+        );
+        assert_eq!(
+            with_managed["state"], "draining",
+            "a managed verify run must deny readiness even with every landing lane free: \
+             {with_managed}"
+        );
+        assert_eq!(with_managed["ready"], false, "{with_managed}");
+        assert_eq!(
+            with_managed["blocking_keys"].as_array().unwrap().len(),
+            0,
+            "the denial must come from managed work, not a landing lane: {with_managed}"
+        );
+        assert_eq!(with_managed["managed_blockers"][0]["kind"], "verify");
+
+        // The daemon-wide release-prepare lock denies it too, and says so at
+        // daemon scope rather than pretending to be a repo-bound blocker.
+        let with_release = pipeline.fence_status(
+            &repo_name,
+            &ManagedWorkSnapshot::new(&repo_name, Vec::new(), true),
+        );
+        assert_eq!(with_release["ready"], false, "{with_release}");
+        assert_eq!(with_release["managed_blockers"][0]["scope"], "daemon");
 
         // B is durably queued and untouched: not claimed, not processed.
         let queued = space

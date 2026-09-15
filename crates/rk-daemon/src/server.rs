@@ -2426,6 +2426,18 @@ impl Daemon {
                 .with_shutdown(self.shutdown_tx.subscribe()),
             );
             self.supervisor.set_landing_pipeline(&pipeline);
+            // P7.1: let the managed-run registry refuse NEW verify/release
+            // work while a handoff fence is engaged. Installed here, once,
+            // because this is the moment the pipeline first exists. A weak
+            // reference so the registry never keeps the pipeline alive.
+            let weak = Arc::downgrade(&pipeline);
+            self.supervisor
+                .verification_resources()
+                .runs
+                .set_admission_fence(Arc::new(move |repo: &str| {
+                    weak.upgrade()
+                        .is_some_and(|pipeline| pipeline.admission_fenced(repo))
+                }));
             pipeline
         }))
     }
@@ -4091,6 +4103,18 @@ impl Daemon {
                         return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
                     }
                 };
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
                 let holder = params.holder.unwrap_or_else(|| {
                     if req.caller.is_empty() {
                         "operator".to_string()
@@ -4098,11 +4122,11 @@ impl Daemon {
                         req.caller.clone()
                     }
                 });
-                let managed = self.managed_work_snapshot(&params.repo);
+                let managed = self.managed_work_snapshot(&repo);
                 reply(
                     match self
                         .landing()
-                        .fence_request(&params.repo, &holder, params.ttl_secs, &managed)
+                        .fence_request(&repo, &holder, params.ttl_secs, &managed)
                         .await
                     {
                         Ok(value) => Response::ok(id, value),
@@ -4117,10 +4141,22 @@ impl Daemon {
                         return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
                     }
                 };
-                let managed = self.managed_work_snapshot(&params.repo);
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let managed = self.managed_work_snapshot(&repo);
                 reply(Response::ok(
                     id,
-                    self.landing().fence_status(&params.repo, &managed),
+                    self.landing().fence_status(&repo, &managed),
                 ))
             }
             "repo.land.fence_release" => {
@@ -4130,12 +4166,24 @@ impl Daemon {
                         return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
                     }
                 };
-                let managed = self.managed_work_snapshot(&params.repo);
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let managed = self.managed_work_snapshot(&repo);
                 reply(
                     match self
                         .landing()
                         .fence_release(
-                            &params.repo,
+                            &repo,
                             &params.holder,
                             params.generation,
                             &managed,
@@ -8263,6 +8311,38 @@ impl Daemon {
     /// entirely by its own existing protected-path/review gates. This only
     /// makes `releaseTarget` observable, closing the gap where it was
     /// previously validated at activation time but never read at runtime.
+    /// Resolve whatever the caller passed as `repo` — a registered name OR a
+    /// filesystem path — to the CANONICAL registered name.
+    ///
+    /// This is load-bearing, not a convenience. The landing pipeline keys
+    /// every drain lane, fence record and admission check on the registered
+    /// NAME, while `rk`'s own `resolve_path` helper sends a PATH. Taking the
+    /// caller's string verbatim meant a fence requested through the CLI was
+    /// filed under a key nothing else ever consults: `admission_fenced` kept
+    /// answering false, so the fence blocked nothing at all, while
+    /// `active_keys` found no lanes under that key and reported a confident
+    /// `ready`. Caught by the cross-process CLI fixture, which is the only
+    /// place the two spellings actually meet.
+    fn resolve_repo_name(&self, repo: &str) -> rk_core::Result<String> {
+        let registry = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+        if let Some(record) = registry.get(repo) {
+            return Ok(record.name.clone());
+        }
+        let canonical =
+            std::fs::canonicalize(repo).unwrap_or_else(|_| std::path::PathBuf::from(repo));
+        registry
+            .get_by_path(&canonical)
+            .map(|record| record.name.clone())
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "'{repo}' is neither a registered repo name nor a registered repo path"
+                ))
+            })
+    }
+
     /// Everything outside the landing queue that can still own `repo` when
     /// P7.1's handoff fence is asked whether a rollover is safe. Built here
     /// because `Server` is the only place that can observe all three
@@ -8275,14 +8355,15 @@ impl Daemon {
     /// `landing::handoff`'s module doc on reusing rather than pre-empting
     /// the existing managed-run and release contracts.
     fn managed_work_snapshot(&self, repo: &str) -> crate::landing::ManagedWorkSnapshot {
-        crate::landing::ManagedWorkSnapshot {
-            runs: self
-                .supervisor
-                .verification_resources()
-                .runs
-                .active_for_repo(repo),
-            release_prepare_in_flight: self.release_prepare_lock.try_lock().is_err(),
-        }
+        // Every repo's runs, not just this one: a rollover stops the WHOLE
+        // daemon, so another repository's managed check hangs it exactly as
+        // this one's would. `ManagedWorkSnapshot` splits them by scope.
+        let all = self.supervisor.verification_resources().runs.active_all();
+        crate::landing::ManagedWorkSnapshot::new(
+            repo,
+            all,
+            self.release_prepare_lock.try_lock().is_err(),
+        )
     }
 
     async fn handle_release_status(&self, req: Request) -> Response {
@@ -8459,13 +8540,19 @@ impl Daemon {
             self.supervisor.status(&req.caller).map(|r| r.spawn_id())
         };
         let request_key = verify_request_key(conn_id, &req.id);
-        let (managed_id, mut cancel_rx) = self.supervisor.verification_resources().runs.register(
-            &req.caller,
-            generation,
-            &request_key,
-            &repo,
-            "release-prepare",
-        );
+        // Refused while a P7.1 handoff fence is engaged for this repo: a
+        // release prepare started after `ready` would silently invalidate the
+        // handoff the operator is mid-way through. Already-running prepares
+        // are untouched.
+        let (managed_id, mut cancel_rx) = match self
+            .supervisor
+            .verification_resources()
+            .runs
+            .try_register(&req.caller, generation, &request_key, &repo, "release-prepare")
+        {
+            Ok(registered) => registered,
+            Err(error) => return Response::err(req.id, codes::FORBIDDEN, error.to_string()),
+        };
         let prepare_fut = crate::release::prepare(
             &self.layout,
             crate::release::PrepareParams {
