@@ -363,6 +363,43 @@ impl Reactor {
         self
     }
 
+    /// Whether `repo_name` currently has a LIVE automatic completion route
+    /// through this reactor: a [`LandingPipeline`] is wired ([`Self::
+    /// with_landing`]) AND at least one loaded `action: "land"` trigger
+    /// resolves to this repo under the exact same precedence [`Self::
+    /// try_fire`] applies at dispatch time (`trigger.repo` explicit override
+    /// > the trigger file's own repo > the matched tuple's scope — for this
+    /// repo's own `harness_result` tuples that scope is always `repo_name`,
+    /// so a trigger with no `repo:` at all still counts as a match here).
+    /// This exists to disprove `Supervisor::landing_pipeline().is_some()` as
+    /// a live-route signal (TKT-hisag-nubaf-kugon REWORK finding #1): that
+    /// pipeline is installed unconditionally at daemon startup regardless of
+    /// `reactor.enabled` or whether any repo has an `action: "land"` trigger
+    /// at all (`server.rs`'s "Install the merge-mode landing seam even when
+    /// the background reactor is disabled" comment), so it is true in
+    /// essentially every live daemon and proves nothing about whether THIS
+    /// repo's completions actually reach the queue. A `Reactor` only exists
+    /// when `reactor.enabled` (`server.rs` only constructs one inside that
+    /// gate), so a caller holding a live `Reactor` handle at all already
+    /// proves the reactor half; this method adds the per-repo trigger half.
+    pub(crate) fn has_land_route(&self, repo_name: &str) -> bool {
+        if self.landing.is_none() {
+            return false;
+        }
+        let Ok(registry) = RepoRegistry::load(&self.layout.home().join("repos.json")) else {
+            return false;
+        };
+        self.cached_triggers(&registry).iter().any(|loaded| {
+            loaded.trigger.action == TriggerAction::Land
+                && loaded
+                    .trigger
+                    .repo
+                    .clone()
+                    .or_else(|| loaded.source_repo.clone())
+                    .is_none_or(|resolved| resolved == repo_name)
+        })
+    }
+
     /// Baseline the cursor to the newest existing tuple so a fresh daemon does
     /// not react to the entire pre-existing backlog on first boot. A no-op once
     /// a cursor file exists (restarts resume where they left off).
