@@ -349,6 +349,35 @@ fn process_alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// A start-time+command snapshot for one real OS process, captured once
+/// while it is known-good. A pid alone is not an identity — the OS can
+/// recycle it for an unrelated process — so re-checking this snapshot
+/// before signaling is what tells "still the same process" apart from
+/// "coincidentally the same number". Mirrors, in test-only `ps` terms,
+/// the pid+start-time signature discipline
+/// `workflow_exec::reap_stale_managed_children` (the actual production
+/// recovery mechanism this test exercises) uses internally — that
+/// function is `pub(crate)` and unreachable from this external test
+/// crate, so this is a from-scratch equivalent, not a shared
+/// implementation. `lstart` is immutable for a process's whole lifetime,
+/// so an unchanged signature is as strong a same-process proof as this
+/// test can get without reading `/proc` (unavailable on this host's OS).
+fn process_signature(pid: i32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=,command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// Best-effort test-hygiene safety net for the exact real check subprocess
 /// a restart test observes, armed for the window between confirming a
 /// daemon's physical death and confirming the replacement daemon's own
@@ -356,31 +385,60 @@ fn process_alive(pid: i32) -> bool {
 /// window (e.g. a failed assertion) must not leak a live background
 /// process. This is NOT part of, and never races, the actual recovery
 /// mechanism under test (`workflow_exec::reap_stale_managed_children`'s
-/// pid+signature check) — on the successful path that mechanism already
-/// kills the process well before this guard ever drops, so `process_alive`
-/// is false and `drop` is a no-op. Only signals if the pid is both still
-/// alive AND still running the exact command this test spawned (checked via
-/// `ps`), bounding — the ticket's own caution about a bare, reused-pid
-/// signal applies to an unconditional kill, not to one gated on confirming
-/// the target is still the process this test started.
-struct OwnedCheckCleanup(i32);
+/// own pid+signature check) — on the successful path that mechanism
+/// already kills the process well before this guard ever drops, so
+/// `process_alive` is false and `drop` is a no-op.
+///
+/// Fails closed: `signature` is captured once, at construction, from a
+/// pid this test just confirmed alive; if that capture ever comes back
+/// empty (a narrow liveness/ps race), `signature` is `None` and `drop`
+/// never signals, full stop — there is nothing trustworthy left to compare
+/// against. When a signature was captured, `drop` re-derives it fresh and
+/// only signals if it is BYTE-IDENTICAL to the one captured at
+/// construction (rules out pid reuse) AND still names this exact test
+/// invocation's unique fixture path (rules out matching a sibling
+/// invocation's own, differently-pathed "verify.pid" check — every
+/// invocation of this test shares that literal filename, so it alone is
+/// not a unique identity).
+struct OwnedCheckCleanup {
+    pid: i32,
+    signature: Option<String>,
+    fixture_path: String,
+}
+
+impl OwnedCheckCleanup {
+    fn new(pid: i32, fixture_path: impl Into<String>) -> Self {
+        Self {
+            pid,
+            signature: process_signature(pid),
+            fixture_path: fixture_path.into(),
+        }
+    }
+}
 
 impl Drop for OwnedCheckCleanup {
     fn drop(&mut self) {
-        if !process_alive(self.0) {
+        let Some(expected) = &self.signature else {
+            return;
+        };
+        if !process_alive(self.pid) {
             return;
         }
-        let is_ours = Command::new("ps")
-            .args(["-o", "command=", "-p", &self.0.to_string()])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("verify.pid"))
-            .unwrap_or(false);
-        if is_ours {
-            let _ = Command::new("kill")
-                .args(["-9", &self.0.to_string()])
-                .status();
+        let Some(current) = process_signature(self.pid) else {
+            return;
+        };
+        if &current != expected || !current.contains(&self.fixture_path) {
+            return;
         }
+        // Negative pid: the production check spawns with `.process_group(0)`
+        // (`managed_verification.rs::spawn_check_child`), so this owned
+        // group's `sleep` descendant — which does not itself carry the
+        // `verify.pid`-writing `sh` leader's own signature — is reached too,
+        // bounded to this exact confirmed-identity group and never a bare
+        // or reused-pid signal.
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{}", self.pid)])
+            .status();
     }
 }
 
@@ -1036,8 +1094,11 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
         "the verify check's real child must be running before the mid-gate kill below"
     );
     // Panic-safety net (see `OwnedCheckCleanup` doc comment) for the
-    // remainder of this test — a no-op on the successful path.
-    let _owned_check_cleanup = OwnedCheckCleanup(verify_pid);
+    // remainder of this test — a no-op on the successful path. The unique
+    // fixture path (not just the "verify.pid" filename every invocation of
+    // this test shares) is part of the identity `drop` re-checks.
+    let _owned_check_cleanup =
+        OwnedCheckCleanup::new(verify_pid, shared.path().display().to_string());
 
     // Candidate 2: spawned and completed WHILE candidate 1's gate run is
     // still in flight, so its own landing completion enqueues behind
