@@ -284,12 +284,17 @@ pub struct LandingPolicy {
     /// repository's own automatic native landing route is the authoritative
     /// acceptance gate for the exact merge candidate. The daemon only ever
     /// composes this into a spawn's prompt when the flag is set AND the
-    /// spawn is actually routed to a live native landing pipeline
-    /// (`delivery.mode` is `merge`/`merge-push` and a `LandingPipeline` is
-    /// registered) — a repo with this flag set but `delivery.mode:
-    /// push-branch`/`pr`, or no registered pipeline, keeps the unmodified
-    /// mandatory-self-verify prompt, because there is no automatic gate to
-    /// hand the check to. Reviewer/foreman spawns, and any resume/recovery
+    /// spawn is actually routed to a LIVE automatic landing route right now
+    /// (`delivery.mode` is `merge`/`merge-push`, the reactor is enabled, and
+    /// this repo has a matching `action: "land"` trigger registered) — a
+    /// repo with this flag set but `delivery.mode: push-branch`/`pr`, a
+    /// disabled reactor, or no matching "land" trigger installed keeps the
+    /// unmodified mandatory-self-verify prompt, because there is no
+    /// automatic gate to hand the check to. A merely-constructed
+    /// `LandingPipeline` is NOT sufficient proof of a live route: the daemon
+    /// installs that seam unconditionally at startup (so manual `rk land`
+    /// still works with the reactor disabled), independent of whether any
+    /// repo has ever registered a "land" trigger. Reviewer/foreman spawns, and any resume/recovery
     /// of a non-"rat" role, are never affected regardless of this setting.
     /// Defaults `false`: an unactivated or opted-out repo sees no prompt
     /// change from today. Like every other field here, flipping it is

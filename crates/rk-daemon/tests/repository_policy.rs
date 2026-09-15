@@ -405,6 +405,31 @@ repo: {
 }
 "#;
 
+/// The daemon-native landing pipeline's real completion feed, repo-local —
+/// same trigger `live_landing_burst.rs` installs to prove the reactor's
+/// `action: "land"` dispatch actually routes THIS repo's completions onto
+/// the queue, as opposed to a merely-wired (but inert) `LandingPipeline`
+/// (TKT-hisag-nubaf-kugon REWORK finding #1).
+const LANDING_TRIGGER: &str = r#"
+triggers: [
+	{
+		name:   "landing-on-completion"
+		action: "land"
+		match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
+		maxFires: 20
+	},
+]
+"#;
+
+/// Write and commit a repo-local `.rk/triggers.cue` carrying [`LANDING_TRIGGER`]
+/// — the reactor resolves it the same way it resolves the global trigger
+/// directory (`Reactor::trigger_files`).
+fn install_landing_trigger(repo: &Path) {
+    std::fs::write(repo.join(".rk/triggers.cue"), LANDING_TRIGGER).unwrap();
+    git(repo, &["add", ".rk/triggers.cue"]);
+    git(repo, &["commit", "-m", "test: register landing trigger"]);
+}
+
 fn capture_prompt_fake() -> String {
     fixture::with_rk_done(
         r#"
@@ -468,6 +493,11 @@ async fn verification_handoff_enabled_merge_mode_swaps_step_3_in_spawned_prompt(
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
     support::install_passing_landing_checks(repo);
+    // Without a registered `action: "land"` trigger there is no live
+    // automatic route, no matter how the policy flag is set (see the sibling
+    // `_without_land_trigger_` test below) — this is what makes THIS test
+    // actually prove a live route, not just a wired-but-inert pipeline.
+    install_landing_trigger(repo);
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", capture_prompt_fake());
     let layout = Layout::at(home.path());
@@ -479,12 +509,67 @@ async fn verification_handoff_enabled_merge_mode_swaps_step_3_in_spawned_prompt(
     let primed = spawn_and_capture_prompt(&mut client, repo, "handoff-enabled").await;
     assert!(
         primed.contains("This repository has opted into verification handoff"),
-        "opted-in merge-mode repo with a live landing pipeline must receive \
-         the handoff step 3:\n{primed}"
+        "opted-in merge-mode repo with a live automatic land route must \
+         receive the handoff step 3:\n{primed}"
     );
     assert!(
         !primed.contains("Verify with the project's documented verification entrypoint"),
         "handoff step 3 must replace, not append to, the standard mandate:\n{primed}"
+    );
+
+    handle.abort();
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verification_handoff_enabled_merge_mode_without_land_trigger_keeps_standard_step_3_in_spawned_prompt(
+) {
+    // TKT-hisag-nubaf-kugon REWORK finding #1: a `LandingPipeline` is wired
+    // unconditionally at daemon startup (so manual `rk land` still works with
+    // the reactor disabled), so its mere existence proves nothing about
+    // whether THIS repo's completions ever reach an automatic gate. This is
+    // otherwise byte-for-byte the same fixture as
+    // `verification_handoff_enabled_merge_mode_swaps_step_3_in_spawned_prompt`
+    // MINUS `install_landing_trigger` — same opted-in policy, same merge
+    // delivery, same live reactor — proving the flag alone, or the pipeline
+    // alone, is not sufficient: only a repo with a registered matching
+    // "land" trigger gets the handoff.
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path();
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["config", "user.email", "r@x"]);
+    git(repo, &["config", "user.name", "R"]);
+    std::fs::create_dir_all(repo.join(".rk")).unwrap();
+    std::fs::write(repo.join(".rk/repo.cue"), HANDOFF_POLICY).unwrap();
+    std::fs::write(
+        repo.join("README.md"),
+        "# handoff enabled, no land trigger\n",
+    )
+    .unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo);
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", capture_prompt_fake());
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "handoff-no-trigger-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo).await;
+
+    let primed = spawn_and_capture_prompt(&mut client, repo, "handoff-no-trigger").await;
+    assert!(
+        primed.contains("Verify with the project's documented verification entrypoint"),
+        "no registered land trigger means no live automatic route, so the \
+         opted-in flag must not activate even with the reactor enabled and \
+         a LandingPipeline wired:\n{primed}"
+    );
+    assert!(
+        !primed.contains("This repository has opted into verification handoff"),
+        "a merely-wired LandingPipeline must never be mistaken for a live \
+         route:\n{primed}"
     );
 
     handle.abort();

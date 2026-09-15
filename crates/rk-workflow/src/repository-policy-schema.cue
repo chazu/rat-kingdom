@@ -143,8 +143,12 @@ repo: #RepositoryPolicy
 	// rk verify) before rk done — this repo's own automatic native landing
 	// route is the authoritative acceptance gate for the exact merge
 	// candidate. Only composed into a prompt when the flag is set AND the
-	// spawn is actually routed to a live native merge/merge-push landing
-	// pipeline; reviewer/foreman spawns are never affected. false (the
+	// spawn is actually routed to a LIVE automatic landing route right now:
+	// delivery.mode is merge/merge-push, the reactor is enabled, and this
+	// repo has a matching action:"land" trigger registered — a repo with
+	// this flag set but a disabled reactor or no matching trigger keeps the
+	// standard prompt, since there is nothing to actually run the check
+	// automatically; reviewer/foreman spawns are never affected. false (the
 	// default) is today's unmodified mandatory-self-verify behavior. Like
 	// the rest of this policy, changing it on an already-registered repo
 	// requires digest-fenced approved-commit activation (rk repo onboard
