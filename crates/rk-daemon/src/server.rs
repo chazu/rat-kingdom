@@ -35,6 +35,14 @@ use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 
 const GC_INTERVAL: Duration = Duration::from_secs(60);
+// Internal scheduler granularity for the continuous-assessment sweep (P9.3,
+// TKT-bahov-lakat-darif) — NOT the operator-declared per-objective
+// `evaluation_cadence_seconds` (which stays fully configurable; this is just
+// how often the daemon checks whether any activated repo's own cadence has
+// elapsed). Small and fixed, unlike the other sweep intervals above, because
+// unlike those this one gates a per-objective-declared cadence rather than
+// running its own work directly on this tick.
+const CONTINUOUS_ASSESSMENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 // Default lifetime for a pheromone trail (claim / obstacle / need) written
 // without an explicit TTL — the hard-TTL backstop for strength decay — lives in
 // rk-core so daemon-internal trail writers (supervisor, syncer) age on the same
@@ -1829,6 +1837,38 @@ impl Daemon {
             });
         }
 
+        // Continuous-assessment scheduler sweep (P9.3, TKT-bahov-lakat-darif):
+        // bounded, cadence-driven autonomous evaluation over every repo with
+        // an ACTIVE assessment. This reuses the exact same
+        // `continuous_assessment::tick` the RPC path calls — enabling an
+        // objective via `bbs.assessment.activate` is sufficient on its own to
+        // produce results; no operator `bbs.assessment.tick` call is
+        // required, and `bbs.assessment.disable` stops future evaluation
+        // immediately because `sweep_due` never selects a repo whose
+        // `activation` is `None`. Registry state is durable JSON
+        // (`continuous-assessment.json`), so a restarted daemon resumes each
+        // repo's saved cursor and reducer totals from exactly where the prior
+        // generation left off. No agents, no King wake, no paid work.
+        {
+            let space = daemon.space.clone();
+            let layout = daemon.layout.clone();
+            let mut assessment_shutdown = daemon.shutdown_tx.subscribe();
+            background_tasks.spawn(async move {
+                let mut tick = tokio::time::interval(CONTINUOUS_ASSESSMENT_POLL_INTERVAL);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let ticked = crate::continuous_assessment::sweep_due(&space, &layout, Utc::now());
+                            if ticked > 0 {
+                                debug!(ticked, "continuous-assessment sweep advanced due repos");
+                            }
+                        }
+                        _ = assessment_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
         // Install the merge-mode landing seam even when the background
         // reactor is disabled: explicit workflow/operator `land` calls still
         // enter and synchronously drive this queue.
@@ -2058,6 +2098,12 @@ impl Daemon {
                 // no change at any escalation source.
                 .with_sinks(&daemon.notify_config),
             );
+            // So `verification_handoff_active` can tell a live automatic
+            // land route from a merely-wired (but inert) LandingPipeline
+            // (TKT-hisag-nubaf-kugon REWORK finding #1): only reachable
+            // inside this `reactor_config.enabled` gate, so an upgradeable
+            // handle here is itself proof the reactor is live.
+            daemon.supervisor.set_reactor(&reactor);
             // Baseline the cursor so a fresh daemon does not react to the whole
             // pre-existing backlog on first boot.
             if let Err(e) = reactor.initialize_cursor() {
@@ -2347,6 +2393,21 @@ impl Daemon {
         // channel even if the value is unchanged, so this is a harmless no-op
         // when a `stop` RPC already sent it.
         let _ = daemon.shutdown_tx.send(true);
+        // Cancel every currently owned managed-check subprocess BEFORE
+        // waiting on anything below (TKT-rohib-rukaf-sizak): a background
+        // loop inside `background_tasks` (the landing consumer loop in
+        // particular) or a `spawn_background_drain` continuation can be
+        // genuinely blocked awaiting `execute_gate_plan_at`'s own check
+        // child for up to that check's OWN timeout — production default well
+        // past any reasonable shutdown bound. Cancelling here makes
+        // `verify_repo_check`'s `tokio::select!` observe this immediately,
+        // drop its `run_fut` (killing the check's real process group via its
+        // own `ProcessGroupGuard::drop`) and release its
+        // `ManagedRegistration`, so whatever was awaiting it below unblocks
+        // promptly instead of racing this signal against the join loops.
+        daemon
+            .supervisor
+            .cancel_all_managed_verification("daemon_shutdown");
         // Wait for every background loop to actually exit before returning —
         // see the `background_tasks` comment above for why this, rather than
         // a bare detached `tokio::spawn`, is what makes shutdown observable
@@ -2359,6 +2420,28 @@ impl Daemon {
                 warn!(error = %e, "background loop task panicked");
             }
         }
+
+        // Explicitly join the landing pipeline's detached background-drain
+        // continuations before touching owned OS processes below — these are
+        // plain async loops, not process trees, and joining them first lets
+        // any `process_entry` review wait they are mid-cycle on notice the
+        // shutdown signal already sent above rather than racing it.
+        // `daemon.landing.get()` (not `daemon.landing()`) so a daemon that
+        // never touched the landing pipeline does not spuriously construct
+        // one just to shut it down.
+        if let Some(landing) = daemon.landing.get() {
+            landing
+                .join_background_drains(LANDING_BACKGROUND_DRAIN_GRACE)
+                .await;
+        }
+
+        // Deliberate owned-reviewer-process shutdown (TKT-rohib-rukaf-sizak):
+        // see `shut_down_owned_reviewer_processes`'s own doc comment for the
+        // full rationale, the incidental-`kill_on_drop` gap this replaces,
+        // and why an ordinary rat is deliberately excluded. Managed check
+        // subprocesses were already handled above, before the
+        // background-loop joins that could be waiting on one.
+        shut_down_owned_reviewer_processes(&daemon.supervisor).await;
 
         // Remove the socket/pid files only if they are still OURS — a newer
         // daemon may have already bound a fresh socket at the same path, and
@@ -2426,6 +2509,18 @@ impl Daemon {
                 .with_shutdown(self.shutdown_tx.subscribe()),
             );
             self.supervisor.set_landing_pipeline(&pipeline);
+            // P7.1: let the managed-run registry refuse NEW verify/release
+            // work while a handoff fence is engaged. Installed here, once,
+            // because this is the moment the pipeline first exists. A weak
+            // reference so the registry never keeps the pipeline alive.
+            let weak = Arc::downgrade(&pipeline);
+            self.supervisor
+                .verification_resources()
+                .runs
+                .set_admission_fence(Arc::new(move |repo: &str| {
+                    weak.upgrade()
+                        .is_some_and(|pipeline| pipeline.admission_fenced(repo))
+                }));
             pipeline
         }))
     }
@@ -3059,6 +3154,68 @@ impl Daemon {
                 )),
             },
         };
+        // Same bounded pattern as `native_delivery` above, for the two
+        // resubmission-marker identities the additive `native_recorded_cost`
+        // section joins a filed correction ticket back to its original task
+        // through (`landing::REWORK_RESUBMISSION_IDENTITY` /
+        // `CONFLICT_RESUBMISSION_IDENTITY`). The two identities genuinely
+        // share one `MAX_SCAN_TUPLES` page budget rather than each getting
+        // its own full cap: `remaining_budget` is spent by the first
+        // identity's read before the second one runs, and either identity
+        // exhausting it marks the combined read truncated — the reported
+        // `limit`/`scanned`/`truncated` describe this one shared budget, not
+        // `2 * MAX_SCAN_TUPLES`.
+        let mut correction_link_rows: Vec<Tuple> = Vec::new();
+        let mut correction_link_scanned = 0usize;
+        let mut correction_link_truncated = false;
+        let mut correction_link_read_warning: Option<String> = None;
+        let mut correction_link_available = true;
+        let mut remaining_budget = MAX_SCAN_TUPLES;
+        for identity in [
+            crate::landing::REWORK_RESUBMISSION_IDENTITY,
+            crate::landing::CONFLICT_RESUBMISSION_IDENTITY,
+        ] {
+            if remaining_budget == 0 {
+                // The other identity already spent the whole shared budget;
+                // this identity's rows (if any) are beyond it, not observed.
+                correction_link_truncated = true;
+                continue;
+            }
+            let pattern = Pattern::category(Category::Event)
+                .identity(identity)
+                .scope(repo.clone());
+            match self
+                .space
+                .scan_newest_limited(&pattern, remaining_budget.saturating_add(1))
+            {
+                Ok(mut rows) => {
+                    let this_scanned = rows.len().min(remaining_budget);
+                    correction_link_truncated =
+                        correction_link_truncated || rows.len() > remaining_budget;
+                    rows.truncate(remaining_budget);
+                    correction_link_scanned += this_scanned;
+                    remaining_budget -= this_scanned;
+                    correction_link_rows.extend(
+                        rows.into_iter()
+                            .filter(|event| in_window(event.created_at.timestamp_millis())),
+                    );
+                }
+                Err(error) => {
+                    correction_link_available = false;
+                    correction_link_read_warning = Some(format!(
+                        "source_family_read_failed: NativeCorrectionLink unavailable: {error}"
+                    ));
+                }
+            }
+        }
+        let native_correction_links = crate::factory_analytics::NativeCorrectionLinkInputs {
+            events: correction_link_rows,
+            scanned: correction_link_scanned,
+            limit: MAX_SCAN_TUPLES,
+            truncated: correction_link_truncated,
+            available: correction_link_available,
+            read_warning: correction_link_read_warning,
+        };
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
@@ -3071,6 +3228,7 @@ impl Daemon {
             runtime_unavailable,
             read_warnings,
             native_delivery,
+            native_correction_links,
         }
     }
 
@@ -3502,6 +3660,117 @@ impl Daemon {
                             &req.caller,
                             &params,
                         )
+                        .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.show" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::show(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.status" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::status(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.latest" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::latest(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.configure" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::ConfigureParams>(&req.params)
+                        .and_then(|params| {
+                            let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                            crate::continuous_assessment::configure(
+                                &self.layout,
+                                &repos,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.activate" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::ActivateParams>(&req.params)
+                        .and_then(|params| {
+                            crate::continuous_assessment::activate(
+                                &self.layout,
+                                &self.space,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.disable" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::DisableParams>(&req.params)
+                        .and_then(|params| {
+                            crate::continuous_assessment::disable(
+                                &self.layout,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.tick" => {
+                let result = parse_params::<crate::continuous_assessment::TickParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::tick(
+                            &self.space,
+                            &self.layout,
+                            &params.repo,
+                            "daemon",
+                            chrono::Utc::now(),
+                        )
+                        .map(|outcome| {
+                            serde_json::json!({
+                                "repo": params.repo,
+                                "pages_processed": outcome.pages_processed,
+                                "events_consumed": outcome.events_consumed,
+                                "truncated": outcome.truncated,
+                                "verdict": outcome.verdict,
+                                "published": outcome.published,
+                            })
+                        })
                         .map_err(|e| e.to_string())
                     });
                 reply(match result {
@@ -4084,11 +4353,109 @@ impl Daemon {
                     Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
                 })
             }
+            "repo.land.fence_request" => {
+                let params: RepoLandFenceRequestParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let holder = params.holder.unwrap_or_else(|| {
+                    if req.caller.is_empty() {
+                        "operator".to_string()
+                    } else {
+                        req.caller.clone()
+                    }
+                });
+                // Passed as a PROBE, not a precomputed value: the snapshot
+                // must be taken after the fence is engaged, inside
+                // `fence_request`. See its doc.
+                let probe = || self.managed_work_snapshot(&repo);
+                reply(
+                    match self
+                        .landing()
+                        .fence_request(&repo, &holder, params.ttl_secs, &probe)
+                        .await
+                    {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                    },
+                )
+            }
+            "repo.land.fence_status" => {
+                let params: RepoLandFenceStatusParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let managed = self.managed_work_snapshot(&repo);
+                reply(Response::ok(
+                    id,
+                    self.landing().fence_status(&repo, &managed),
+                ))
+            }
+            "repo.land.fence_release" => {
+                let params: RepoLandFenceReleaseParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                // Canonical NAME, never the caller's spelling — see
+                // `resolve_repo_name`. A path-spelled fence key blocks nothing.
+                let repo = match self.resolve_repo_name(&params.repo) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::BAD_PARAMS,
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let probe = || self.managed_work_snapshot(&repo);
+                reply(
+                    match self
+                        .landing()
+                        .fence_release(&repo, &params.holder, &params.fence_id, &probe)
+                        .await
+                    {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                    },
+                )
+            }
             "repo.list" => reply(match self.repos.lock() {
                 Ok(reg) => Response::ok(id, json!({"repos": reg.list()})),
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
             }),
             "repo.get" => reply(self.handle_repo_get(req)),
+            "repo.resolve_landing_target" => reply(self.handle_resolve_landing_target(req).await),
             "repo.onboard.start" => reply(self.handle_onboarding_start(req).await),
             "repo.onboard.propose" => reply(self.handle_onboarding_propose(req).await),
             "repo.onboard.approve" => reply(self.handle_onboarding_approve(req)),
@@ -8200,6 +8567,61 @@ impl Daemon {
     /// entirely by its own existing protected-path/review gates. This only
     /// makes `releaseTarget` observable, closing the gap where it was
     /// previously validated at activation time but never read at runtime.
+    /// Resolve whatever the caller passed as `repo` — a registered name OR a
+    /// filesystem path — to the CANONICAL registered name.
+    ///
+    /// This is load-bearing, not a convenience. The landing pipeline keys
+    /// every drain lane, fence record and admission check on the registered
+    /// NAME, while `rk`'s own `resolve_path` helper sends a PATH. Taking the
+    /// caller's string verbatim meant a fence requested through the CLI was
+    /// filed under a key nothing else ever consults: `admission_fenced` kept
+    /// answering false, so the fence blocked nothing at all, while
+    /// `active_keys` found no lanes under that key and reported a confident
+    /// `ready`. Caught by the cross-process CLI fixture, which is the only
+    /// place the two spellings actually meet.
+    fn resolve_repo_name(&self, repo: &str) -> rk_core::Result<String> {
+        let registry = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+        if let Some(record) = registry.get(repo) {
+            return Ok(record.name.clone());
+        }
+        let canonical =
+            std::fs::canonicalize(repo).unwrap_or_else(|_| std::path::PathBuf::from(repo));
+        registry
+            .get_by_path(&canonical)
+            .map(|record| record.name.clone())
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "'{repo}' is neither a registered repo name nor a registered repo path"
+                ))
+            })
+    }
+
+    /// Everything outside the landing queue that can still own `repo` when
+    /// P7.1's handoff fence is asked whether a rollover is safe. Built here
+    /// because `Server` is the only place that can observe all three
+    /// dimensions at once — the landing pipeline cannot reach back for the
+    /// managed-run registry or the release-prepare lock without a cycle.
+    ///
+    /// Read-only and non-blocking: `try_lock` never waits on, and never
+    /// itself becomes, the release-prepare owner, and the run registry is a
+    /// plain snapshot. Nothing here cancels anything — see
+    /// `landing::handoff`'s module doc on reusing rather than pre-empting
+    /// the existing managed-run and release contracts.
+    fn managed_work_snapshot(&self, repo: &str) -> crate::landing::ManagedWorkSnapshot {
+        // Every repo's runs, not just this one: a rollover stops the WHOLE
+        // daemon, so another repository's managed check hangs it exactly as
+        // this one's would. `ManagedWorkSnapshot` splits them by scope.
+        let all = self.supervisor.verification_resources().runs.active_all();
+        crate::landing::ManagedWorkSnapshot::new(
+            repo,
+            all,
+            self.release_prepare_lock.try_lock().is_err(),
+        )
+    }
+
     async fn handle_release_status(&self, req: Request) -> Response {
         let params: ReleaseSelectParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -8374,11 +8796,21 @@ impl Daemon {
             self.supervisor.status(&req.caller).map(|r| r.spawn_id())
         };
         let request_key = verify_request_key(conn_id, &req.id);
-        let (managed_id, mut cancel_rx) = self.supervisor.verification_resources().runs.register(
-            &req.caller,
-            generation,
-            &request_key,
-        );
+        // Refused while a P7.1 handoff fence is engaged for this repo: a
+        // release prepare started after `ready` would silently invalidate the
+        // handoff the operator is mid-way through. Already-running prepares
+        // are untouched.
+        let (managed_id, mut cancel_rx) =
+            match self.supervisor.verification_resources().runs.try_register(
+                &req.caller,
+                generation,
+                &request_key,
+                &repo,
+                "release-prepare",
+            ) {
+                Ok(registered) => registered,
+                Err(error) => return Response::err(req.id, codes::FORBIDDEN, error.to_string()),
+            };
         let prepare_fut = crate::release::prepare(
             &self.layout,
             crate::release::PrepareParams {
@@ -8467,6 +8899,67 @@ impl Daemon {
             ),
             Ok(None) => Response::ok(req.id, json!({"release": null})),
             Err(e) => Response::err(req.id, codes::CONFLICT, e.to_string()),
+        }
+    }
+
+    /// Front-gate for `rk spawn`: lets the CLI resolve the SAME effective
+    /// landing target `agent.spawn` would use — a caller-supplied `--base`,
+    /// or (when omitted) the policy-derived spawn default for the caller's
+    /// role, integration routing included — and confirm
+    /// it names a real local branch, not a bare commit that would later be
+    /// persisted as an unmergeable landing target. This must cover the
+    /// no-`--base` case too: the CLI flips a dispatched ticket to
+    /// `in_progress` before calling `agent.spawn` regardless of whether
+    /// `--base` was given, so checking only an explicit base would still
+    /// leave a policy-derived-but-invalid default free to mark the ticket
+    /// `in_progress` before `Supervisor::spawn_async`'s own (authoritative)
+    /// re-check refuses the spawn.
+    ///
+    /// `method_policy` grants this `FOREMAN_CHILD`, same as `agent.spawn`
+    /// itself: a foreman's own `rk spawn` for a delegated child must pass
+    /// through this preflight too, and an ordinary rat has no legitimate
+    /// call to make here at all (it could never call `agent.spawn` either).
+    /// For a foreman caller, this answers ONLY for that foreman's own
+    /// repository and integration branch — never a foreign, unregistered,
+    /// or role-spoofed one a caller-supplied `repo`/`base` might otherwise
+    /// probe — via the exact same boundary [`crate::supervisor::Supervisor::prepare_foreman_spawn`]
+    /// enforces for the real dispatch.
+    async fn handle_resolve_landing_target(&self, req: Request) -> Response {
+        let params: ResolveLandingTargetParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let caller = req.caller.clone();
+        let is_foreman_caller = caller != "operator" && !caller.is_empty();
+        let repo_path = std::path::PathBuf::from(&params.repo);
+        let supervisor = Arc::clone(&self.supervisor);
+        let result = tokio::task::spawn_blocking(move || {
+            let repo = rk_git::Repo::discover(&repo_path)?;
+            if is_foreman_caller {
+                let branch = supervisor.foreman_child_target_branch(
+                    &caller,
+                    &repo,
+                    params.base.as_deref(),
+                )?;
+                return supervisor.resolve_landing_target(&repo, &params.role, Some(&branch), None);
+            }
+            let repo_policy = if params.role == crate::onboarding_sessions::ONBOARDER_ROLE {
+                None
+            } else {
+                Some(supervisor.repository_policy(&repo)?)
+            };
+            supervisor.resolve_landing_target(
+                &repo,
+                &params.role,
+                params.base.as_deref(),
+                repo_policy.as_ref(),
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(target)) => Response::ok(req.id, json!({"target": target})),
+            Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
 
@@ -12858,6 +13351,15 @@ struct NameParams {
 }
 
 #[derive(Deserialize)]
+struct ResolveLandingTargetParams {
+    repo: String,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default = "crate::supervisor::default_role")]
+    role: String,
+}
+
+#[derive(Deserialize)]
 struct RespawnParams {
     name: String,
     #[serde(default)]
@@ -13173,6 +13675,45 @@ struct RepoLandCancelReviewParams {
     #[serde(default = "default_main_branch")]
     target: String,
     task: String,
+}
+
+fn default_handoff_fence_ttl_secs() -> i64 {
+    600
+}
+
+/// `repo.land.fence_request` — P7.1 (TKT-rufik-lafit-pisah): engage the
+/// operator-only handoff-window fence for `repo`, blocking new landing
+/// admission there without draining or cancelling anything already queued
+/// or in flight. See [`crate::landing::handoff`]'s module doc.
+#[derive(Deserialize)]
+struct RepoLandFenceRequestParams {
+    repo: String,
+    #[serde(default)]
+    holder: Option<String>,
+    #[serde(default = "default_handoff_fence_ttl_secs")]
+    ttl_secs: i64,
+}
+
+/// `repo.land.fence_status` — read-only: state, blockers, whether it is
+/// safe to proceed with a rollover for `repo`.
+#[derive(Deserialize)]
+struct RepoLandFenceStatusParams {
+    repo: String,
+}
+
+/// `repo.land.fence_release` — end a fence early; idempotent, fenced on
+/// `(holder, fence_id)` so a stale/foreign caller cannot release someone
+/// else's active fence. NOT `generation`: that counter restarts at 1 when the
+/// durable store has to be recovered, which made a replayed release
+/// indistinguishable from a legitimate one.
+#[derive(Deserialize)]
+struct RepoLandFenceReleaseParams {
+    repo: String,
+    holder: String,
+    /// Opaque identity returned by `fence_request`. Replaces the old
+    /// `generation`, which resets to 1 on a corrupt-store recovery and so
+    /// could not fence a replayed release. See `HandoffFenceRecord::fence_id`.
+    fence_id: String,
 }
 
 #[derive(Deserialize)]
@@ -13828,6 +14369,138 @@ async fn wait_for_shutdown_signal(term: &mut Option<Signal>, int: &mut Option<Si
             int.recv().await;
         }
         (None, None) => std::future::pending().await,
+    }
+}
+
+/// A graceful stop's grace window for an owned agent/check process to exit
+/// after `SessionControl::kill` (SIGTERM) before escalating to
+/// `hard_kill` (SIGKILL). Generous relative to an ordinary CLI turn winding
+/// down (writing a final transcript line, closing a subprocess) but nowhere
+/// near `GateConfig::review_max_wait` — the whole point is that this no
+/// longer blocks `Server::run`'s own shutdown the way a live review wait
+/// used to (TKT-karut-jaraf-hivur).
+const OWNED_PROCESS_GRACEFUL_GRACE: Duration = Duration::from_secs(10);
+/// The shorter bound given to actually confirm exit once `hard_kill`
+/// (SIGKILL) has been sent — a process that survives THIS is not going to
+/// exit on its own, so there is nothing more to wait for.
+const OWNED_PROCESS_HARD_KILL_GRACE: Duration = Duration::from_secs(5);
+/// Bound for joining the landing pipeline's detached background-drain
+/// continuations (`LandingPipeline::spawn_background_drain`) — these are
+/// plain async loops making durable-store calls, not OS processes, so a
+/// much shorter bound than the owned-process grace above is enough.
+const LANDING_BACKGROUND_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// TKT-rohib-rukaf-sizak: on a graceful stop, deliberately signal and
+/// bounded-join every currently owned live REVIEWER harness process
+/// (`Supervisor::live_reviewer_session_controls`) instead of leaving
+/// `rk-harness`'s pre-existing `Child::kill_on_drop(true)` to reap it as an
+/// incidental side effect of this task tree tearing down once `Server::run`
+/// can actually return promptly (see
+/// `crates/rk-cli/tests/bounded_daemon_stop_with_active_review.rs`, BBS
+/// finding 01M2HWNZA7V4WCSRTJ04XYN7ES). This is the reviewer half only —
+/// managed CHECK subprocesses (`ManagedVerificationRuns`) are a completely
+/// separate registry with their own owner-signalled cancellation, handled by
+/// `cancel_all_managed_verification` above, before this runs; and an
+/// ordinary `"rat"` generation is deliberately NOT touched here at all — see
+/// `live_reviewer_session_controls`'s own doc for why signalling one would
+/// silently break `rk daemon rollover`'s pre-existing, tested
+/// park-then-`agent.respawn` contract (acceptance correction: this used to
+/// signal every live session and broke
+/// `daemon_rollover.rs::rollover_parks_a_live_rat_and_it_respawns` and
+/// `agent_archive.rs::live_and_orphaned_records_are_never_archived`).
+/// `kill()` (SIGTERM) is tried first — harnesses treat it as a request to
+/// shut down cleanly (`SessionControl::kill`'s own doc) — with `hard_kill()`
+/// (SIGKILL) reserved for whatever is still alive past the graceful grace
+/// window, mirroring `SessionControl::hard_kill`'s documented escalation
+/// order. A generation that survives even that bound is left for
+/// `kill_on_drop` as the final backstop, exactly as before this change —
+/// nothing here weakens that guarantee, it only makes the ordinary case
+/// deliberate instead of incidental.
+///
+/// TKT-ravig-kumob-timuh acceptance correction: a genuine same-generation
+/// recovery path IS built here, and it is exercised BEFORE any process is
+/// signalled — `Supervisor::orphan_for_owned_shutdown` transitions each
+/// owned reviewer's still-live record straight to `Orphaned` first, so
+/// `Supervisor::handle_event`'s `Exited` arm — which observes the exit this
+/// function is about to cause, since this daemon's own event-consumer task
+/// is still alive and listening — finds `state.is_live()` already false and
+/// never runs its crash arm (`state -> Failed`, `crashed = true`, a
+/// synthesized "process exited" result). The record instead carries exactly
+/// the disposition `on_daemon_started`'s `orphan_live_agents` sweep gives a
+/// rat whose process died while the daemon was down, so it resumes through
+/// that SAME already-tested contract: `respawn_sweep`'s self-healing tick
+/// (or `rk daemon rollover`'s own explicit `agent.respawn` reconciliation,
+/// which already treats a reviewer no differently from a rat once its
+/// record reads `Orphaned`) relaunches the identical `SpawnId`/review
+/// binding/branch/worktree, and `cost_usd`/`usage` — never reset by a
+/// respawn — keep accumulating on that one record. The review workflow's own
+/// `wait` step survives the gap for free: `abandoned()`
+/// (`workflow_exec.rs`) never treats a record still `Orphaned` (or `Failed`
+/// while respawn is enabled and not yet exhausted) as gone for good, so it
+/// stays parked on the SAME workflow instance polling for that generation's
+/// own `harness_result` rather than timing out. The landing pipeline's own
+/// review-death detection / bounded-replacement dispatch — proven end to end
+/// by `bounded_daemon_stop_with_active_review.rs` — is therefore never
+/// reached for a deliberately-stopped reviewer at all; it remains exactly as
+/// it was for a reviewer that genuinely crashes outside a shutdown.
+async fn shut_down_owned_reviewer_processes(supervisor: &crate::supervisor::Supervisor) {
+    let owned = supervisor.live_reviewer_session_controls();
+    if owned.is_empty() {
+        return;
+    }
+    info!(
+        count = owned.len(),
+        "signalling owned agent/check processes for graceful stop"
+    );
+    for (name, _) in &owned {
+        supervisor.orphan_for_owned_shutdown(name);
+    }
+    for (_, control) in &owned {
+        let _ = control.kill().await;
+    }
+    let mut graceful: tokio::task::JoinSet<(String, rk_harness::SessionControl, bool)> =
+        tokio::task::JoinSet::new();
+    for (name, control) in owned {
+        graceful.spawn(async move {
+            let exited = control.wait_exited(OWNED_PROCESS_GRACEFUL_GRACE).await;
+            (name, control, exited)
+        });
+    }
+    let mut stragglers = Vec::new();
+    while let Some(result) = graceful.join_next().await {
+        match result {
+            Ok((name, _, true)) => debug!(agent = %name, "owned process confirmed exit"),
+            Ok((name, control, false)) => stragglers.push((name, control)),
+            Err(e) => warn!(error = %e, "owned-process shutdown join task panicked"),
+        }
+    }
+    if stragglers.is_empty() {
+        return;
+    }
+    warn!(
+        count = stragglers.len(),
+        "escalating to SIGKILL for owned processes still alive past the graceful grace window"
+    );
+    for (_, control) in &stragglers {
+        let _ = control.hard_kill().await;
+    }
+    let mut hard: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
+    for (name, control) in stragglers {
+        hard.spawn(async move {
+            let exited = control.wait_exited(OWNED_PROCESS_HARD_KILL_GRACE).await;
+            (name, exited)
+        });
+    }
+    while let Some(result) = hard.join_next().await {
+        match result {
+            Ok((name, true)) => debug!(agent = %name, "owned process confirmed exit after SIGKILL"),
+            Ok((name, false)) => warn!(
+                agent = %name,
+                "owned process still not confirmed exited after SIGKILL; leaving it to \
+                 process teardown"
+            ),
+            Err(e) => warn!(error = %e, "owned-process hard-kill join task panicked"),
+        }
     }
 }
 

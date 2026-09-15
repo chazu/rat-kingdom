@@ -1120,3 +1120,143 @@ async fn concurrent_connections_sharing_a_caller_and_colliding_request_id_stay_i
     let _ = call_a.await;
     wait_for_death(pid_a).await;
 }
+
+/// TKT-rohib-rukaf-sizak acceptance correction (finding
+/// `owned-cleanup-does-not-cover-active-managed-work-before-join`): a
+/// genuine `rk daemon stop` while a real agent's own `verify.run` managed
+/// check is actively in flight — the exact "active managed gate" shape the
+/// original owned-process shutdown slice did not cover (it only signalled
+/// `Supervisor::live_session_controls`, agent harness sessions, never
+/// `ManagedVerificationRuns`). Modeled on
+/// `bounded_shutdown_with_active_review.rs`'s real graceful-`stop`-RPC-
+/// against-the-real-`run()`-future shape, but for an active CHECK instead of
+/// an active REVIEWER, and on this file's own
+/// `daemon_restart_never_blocks_progress_on_a_run_that_was_in_flight_when_it_died`
+/// for the real-child/real-pid proof style.
+///
+/// Proves, against the real subprocess/CLI journey (no injected verdicts —
+/// there is no verdict here to inject, only a check outcome that must never
+/// be fabricated):
+/// 1. `Daemon::run` physically returns within a small bound despite a
+///    genuinely live, 30s-sleeping managed check child — before
+///    `cancel_all_managed_verification`, this would have blocked
+///    `background_tasks.join_next()` behind the landing/whatever consumer
+///    awaiting `execute_gate_plan_at` for up to the check's OWN timeout.
+/// 2. The check's real OS child is confirmed dead (`kill -0`), not merely
+///    presumed — the actual owned-tree exit the finding asked for.
+/// 3. Ownership is genuinely released, not just the process killed: a
+///    replacement daemon over the SAME on-disk home can immediately admit
+///    and run its own fresh `verify.run` against the same repo — if
+///    `ManagedVerificationRuns`/`VerificationAdmission` state leaked a stuck
+///    permit or registration, this would hang or refuse.
+#[tokio::test]
+async fn graceful_stop_cancels_a_real_active_managed_check_and_physically_exits_within_bound() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    install_verify_check(repo_dir.path());
+
+    let rk = rk_bin();
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&hold_for_verify_script(&rk)),
+    );
+
+    let config = rk_core::config::Config::default();
+    let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_a = tokio::spawn(daemon_a.run());
+    let mut client = connect(&layout).await;
+
+    let (agent, worktree) =
+        spawn_verify_holder(&mut client, repo_dir.path(), "graceful-stop-active-check").await;
+
+    let pid_path = worktree.join("verify.pid");
+    let child_pid = wait_for_pid(&pid_path).await;
+    assert!(
+        process_alive(child_pid),
+        "the check's real child must be alive before the graceful stop"
+    );
+    let status = client
+        .call("agent.status", json!({"name": &agent}))
+        .await
+        .unwrap();
+    // Recorded but deliberately not asserted dead below: this holding agent
+    // has `role: "rat"` (`spawn_verify_holder`), and a graceful stop must
+    // NOT signal an ordinary rat's own harness process at all — only its
+    // managed CHECK is cancelled here. Killing the rat too would reproduce
+    // the acceptance regression this correction fixed
+    // (`live_reviewer_session_controls`'s own doc: it would terminalize the
+    // record as `Failed` via this still-alive daemon's own `handle_event`
+    // before `rk daemon rollover`'s `agent.respawn` reconciliation — which
+    // depends on finding it `Orphaned` instead — ever gets a chance to see
+    // it). Best-effort killed at the end of this test purely so it does not
+    // outlive the test process; not part of this test's contract.
+    let harness_pid = status["agent"]["pid"].as_u64().map(|pid| pid as i32);
+
+    // The graceful stop itself: the exact RPC a real `rk daemon stop`/
+    // rollover sends — not `handle_a.abort()` (that would prove nothing
+    // about `Server::run`'s own shutdown sequence, only that aborting a
+    // future stops it).
+    let stop_started = tokio::time::Instant::now();
+    client.call("stop", json!({})).await.unwrap();
+
+    // Before this correction, this would race `background_tasks.join_next()`
+    // against `execute_gate_plan_at`'s own check timeout (30s here,
+    // production checks routinely far longer) instead of the deliberate
+    // cancellation this proves. A bound well clear of that 30s check.
+    let join_result = tokio::time::timeout(Duration::from_secs(15), handle_a)
+        .await
+        .expect(
+            "Daemon::run must physically exit within a bounded time despite the live \
+             active managed check — this is the owned-cleanup-does-not-cover-active-managed-\
+             work-before-join regression",
+        );
+    join_result.unwrap().unwrap();
+    let stop_elapsed = stop_started.elapsed();
+    assert!(
+        stop_elapsed < Duration::from_secs(10),
+        "graceful stop took {stop_elapsed:?}, which is no longer bounded well clear of the \
+         15s timeout margin above"
+    );
+
+    // The actual owned-tree exit: the check's real child (the process this
+    // correction is actually about) is genuinely gone, not merely presumed
+    // dead.
+    wait_for_death(child_pid).await;
+
+    // Released ownership, not just a killed process: a replacement daemon
+    // over the same on-disk home can immediately admit and run its own
+    // fresh `verify.run` against the same repo. If cancellation left a
+    // stuck `ManagedVerificationRuns` entry or a leaked admission permit,
+    // this would hang or be refused.
+    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_b = tokio::spawn(daemon_b.run());
+    let mut client = connect(&layout).await;
+
+    let (_second_agent, worktree_2) =
+        spawn_verify_holder(&mut client, repo_dir.path(), "graceful-stop-active-check-2").await;
+    let child_pid_2 = wait_for_pid(&worktree_2.join("verify.pid")).await;
+    assert!(
+        process_alive(child_pid_2),
+        "daemon B must be able to run its own fresh verify.run against the same repo, \
+         unblocked by any trace of the gracefully-stopped daemon A's cancelled run"
+    );
+
+    // Best-effort cleanup: daemon B is about to be aborted, so its own
+    // shutdown sweep will never run again to catch this check's 30s sleep.
+    let _ = Command::new("kill")
+        .args(["-9", &child_pid_2.to_string()])
+        .status();
+    // Also clean up daemon A's deliberately-unsignalled rat harness process
+    // (see the comment above `harness_pid`) so it does not outlive this
+    // test — an external `kill -9`, not this ticket's owned-process
+    // mechanism, since a rat is intentionally not part of that mechanism.
+    if let Some(pid) = harness_pid {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+    handle_b.abort();
+    let _ = handle_b.await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}

@@ -387,6 +387,40 @@ fn uses_harness_terminal_completion(role: &str, harness: &str) -> bool {
     })
 }
 
+/// Whether this spawn should receive the verification-handoff completion
+/// text (TKT-hisag-nubaf-kugon): the repo opted in (`LandingPolicy::
+/// verification_handoff`), the spawn is an ordinary "rat" (never reviewer,
+/// foreman, or any other role — those keep the mandatory self-verify text
+/// unconditionally), the delivery mode is merge/merge-push, and — the
+/// caller-supplied `land_route_live` — this repo is actually routed to a
+/// LIVE automatic completion route right now: the reactor is enabled AND it
+/// has a matching `action: "land"` trigger registered for this repo (see
+/// [`Supervisor::has_live_land_route`] / [`crate::reactor::Reactor::
+/// has_land_route`]). Deliberately NOT `Supervisor::landing_pipeline().
+/// is_some()` (REWORK finding #1, TKT-hisag-nubaf-kugon): that pipeline is
+/// installed unconditionally at daemon startup regardless of whether the
+/// reactor is enabled or any repo has a "land" trigger at all, so it is true
+/// in essentially every live daemon and proves nothing about whether THIS
+/// repo's completions actually reach an automatic gate. A standalone
+/// generation (no policy), a repo delivering via `push-branch`/`pr`, a
+/// disabled reactor, or a repo with no matching "land" trigger installed all
+/// fall back to the truthful standard protocol.
+fn verification_handoff_active(
+    role: &str,
+    policy: Option<&rk_workflow::RepositoryPolicy>,
+    land_route_live: bool,
+) -> bool {
+    role == "rat"
+        && land_route_live
+        && policy.is_some_and(|p| {
+            p.landing.verification_handoff
+                && matches!(
+                    p.delivery.mode,
+                    DeliveryMode::Merge | DeliveryMode::MergePush
+                )
+        })
+}
+
 /// Whether `tuple`'s top-level `attempt` field is EXACTLY `attempt` —
 /// deliberately a parsed-field comparison, not a `payload_search` substring
 /// test: a substring search over the whole serialized payload can be
@@ -573,7 +607,7 @@ pub struct SpawnParams {
     pub instance_max_usd: Option<f64>,
 }
 
-fn default_role() -> String {
+pub(crate) fn default_role() -> String {
     "rat".into()
 }
 
@@ -790,6 +824,16 @@ pub struct Supervisor {
     /// Arc cycle (`LandingPipeline` already owns its `Supervisor`). In a live
     /// daemon, merge-mode `land` fails closed if this seam is absent.
     landing_pipeline: Mutex<Option<Weak<crate::landing::LandingPipeline>>>,
+    /// Installed by `server.rs` only inside its `if daemon.reactor_config.
+    /// enabled` gate, right after constructing the `Reactor` (`None` when the
+    /// reactor is disabled, or before that startup step runs). Weak avoids an
+    /// Arc cycle (`Reactor` already holds an `Arc<Supervisor>`). Existence of
+    /// an upgradeable handle here is itself proof the reactor is live; see
+    /// [`Self::reactor`] and [`verification_handoff_active`], which also
+    /// needs `Reactor::has_land_route` for the per-repo trigger half of that
+    /// same predicate (TKT-hisag-nubaf-kugon REWORK finding #1 —
+    /// `landing_pipeline().is_some()` alone proves neither).
+    reactor: Mutex<Option<Weak<crate::reactor::Reactor>>>,
     /// Verification owns its per-repo queues and exact-generation cancellation
     /// registrations; the supervisor forwards configuration/lifecycle events.
     verification: VerificationResources,
@@ -1220,6 +1264,7 @@ impl Supervisor {
             log,
             merge_queue: MergeQueue::default(),
             landing_pipeline: Mutex::new(None),
+            reactor: Mutex::new(None),
             verification: VerificationResources::default(),
             implementation_admission_limits: LaneLimits::default(),
             review_admission_limits: LaneLimits::default(),
@@ -1396,6 +1441,16 @@ impl Supervisor {
         reason: &'static str,
     ) {
         self.verification.runs.cancel_request(request_key, reason);
+    }
+
+    /// Cancel EVERY currently registered managed verification run — the
+    /// daemon-shutdown case (TKT-rohib-rukaf-sizak). Agent harness sessions
+    /// ([`Self::live_session_controls`]) and managed check subprocesses are
+    /// both "owned processes" a graceful stop must not leave running behind
+    /// it or hold shutdown open behind, but they are tracked in two
+    /// completely separate registries — this is the check half.
+    pub(crate) fn cancel_all_managed_verification(&self, reason: &'static str) {
+        self.verification.runs.cancel_all(reason);
     }
 
     /// Set `[policy] implementation_admission_limit` / `_by_repo`. Applied by
@@ -1863,15 +1918,17 @@ impl Supervisor {
             params.instance_max_usd,
         )?;
         self.check_disk_floor(&repo_name)?;
-        let target_branch = match &params.base {
-            Some(b) => b.clone(),
-            None => repo_policy
-                .as_ref()
-                .ok_or_else(|| {
-                    rk_core::Error::other("onboarder spawn requires an explicit base branch")
-                })?
-                .spawn_base(&params.role, &repo.current_branch()?),
-        };
+        // Shared with the `repo.resolve_landing_target` RPC (the CLI's
+        // pre-ticket-transition check) so the two boundaries can never
+        // silently diverge on what "the effective target" means or on how
+        // a bad one is reported — including on the role-dependent routing an
+        // activated release role applies to an unbased spawn.
+        let target_branch = self.resolve_landing_target(
+            &repo,
+            &params.role,
+            params.base.as_deref(),
+            repo_policy.as_ref(),
+        )?;
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
         // Capture before creating the branch. Unlike a later merge-base read,
         // this remains the original fork even after a forge fast-forwards the
@@ -2092,6 +2149,11 @@ impl Supervisor {
             params.review.as_ref(),
             Some(&params.task),
         );
+        let verification_handoff = verification_handoff_active(
+            &params.role,
+            repo_policy.as_ref(),
+            self.has_live_land_route(&repo_name),
+        );
         let prime_ctx = PrimeContext {
             agent: name.clone(),
             repo: repo_name.clone(),
@@ -2114,6 +2176,7 @@ impl Supervisor {
                 &params.role,
                 &effective.harness,
             ),
+            verification_handoff,
         };
         let prompt = params
             .prompt
@@ -2213,6 +2276,11 @@ impl Supervisor {
                 // provider id before one exists, and this must never be
                 // filled in from a previous launch's value.
                 "provider_session": null,
+                // Attributability for TKT-hisag-nubaf-kugon: whether this
+                // spawn's prompt carries the verification-handoff step 3
+                // (focused checks only, native landing owns acceptance) or
+                // the standard mandatory self-verify text.
+                "verification_handoff": verification_handoff,
             }),
         );
         self.emit_coordinator_event(
@@ -2543,6 +2611,11 @@ impl Supervisor {
             record.review.as_ref(),
             record.task.as_deref(),
         );
+        let resume_verification_handoff = verification_handoff_active(
+            &record.role,
+            resume_repo_policy.as_ref(),
+            self.has_live_land_route(&record.repo_name),
+        );
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
             repo: record.repo_name.clone(),
@@ -2571,6 +2644,7 @@ impl Supervisor {
                 &record.role,
                 &record.harness,
             ),
+            verification_handoff: resume_verification_handoff,
         };
         let resume_prompt = if uses_harness_terminal_completion(&record.role, &record.harness)
             && record.role == ONBOARDER_ROLE
@@ -2652,6 +2726,7 @@ impl Supervisor {
                 "session": launch_session,
                 "launched_at": launch_time,
                 "provider_session": null,
+                "verification_handoff": resume_verification_handoff,
             }),
         );
         self.emit_coordinator_event(
@@ -5312,6 +5387,11 @@ impl Supervisor {
             record.review.as_ref(),
             record.task.as_deref(),
         );
+        let recovery_verification_handoff = verification_handoff_active(
+            &record.role,
+            recovery_repo_policy.as_ref(),
+            self.has_live_land_route(&record.repo_name),
+        );
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
             repo: record.repo_name.clone(),
@@ -5338,6 +5418,7 @@ impl Supervisor {
                 &record.role,
                 harness_kind,
             ),
+            verification_handoff: recovery_verification_handoff,
         };
         let resume_prompt = if same_provider {
             format!(
@@ -5433,6 +5514,7 @@ impl Supervisor {
                 // it must never be borrowed from the recovery record's
                 // preserved (now-superseded) provider session.
                 "provider_session": null,
+                "verification_handoff": recovery_verification_handoff,
             }),
         );
 
@@ -6780,6 +6862,56 @@ impl Supervisor {
         resolve_repository_policy(self.layout.home(), repo)
     }
 
+    /// Resolve the landing target a spawn would use — an explicit `--base`
+    /// or, absent one, the policy-derived spawn default — and confirm it
+    /// names a real local branch before returning it. `repo_policy` is
+    /// `None` exactly when the caller's role has no activated policy to
+    /// fall back on (onboarding); threading it in rather than re-resolving
+    /// lets [`Self::spawn`] (which already has one) skip a second lookup,
+    /// while the `repo.resolve_landing_target` RPC resolves its own the same
+    /// way — so the CLI's pre-ticket-transition check and this native
+    /// boundary can never silently diverge on what "the effective target"
+    /// means or on how a bad one is reported.
+    ///
+    /// `role` is threaded in for the same reason: the unbased default is
+    /// [`rk_workflow::RepositoryPolicy::spawn_base`], which routes an
+    /// ordinary worker to an activated integration branch but deliberately
+    /// leaves a `reviewer` on the delivery default. That routing is part of
+    /// "the effective target", so the preflight must see the same role the
+    /// real spawn will. It is unused when `base` is `Some` — an explicit
+    /// base is never overridden by policy, for any role.
+    ///
+    /// `Ok(false)` from `branch_exists_checked` is a definitive verdict —
+    /// refused outright. `Err` is not proof of absence, but it is also not
+    /// permission to launch a generation against a target that was never
+    /// actually verified, so it propagates rather than silently letting the
+    /// caller through or manufacturing a permanent refusal from an
+    /// inconclusive check.
+    pub(crate) fn resolve_landing_target(
+        &self,
+        repo: &Repo,
+        role: &str,
+        base: Option<&str>,
+        repo_policy: Option<&rk_workflow::RepositoryPolicy>,
+    ) -> rk_core::Result<String> {
+        let target_branch = match base {
+            Some(b) => b.to_string(),
+            None => repo_policy
+                .ok_or_else(|| {
+                    rk_core::Error::other("onboarder spawn requires an explicit base branch")
+                })?
+                .spawn_base(role, &repo.current_branch()?),
+        };
+        match repo.branch_exists_checked(&target_branch) {
+            Ok(true) => Ok(target_branch),
+            Ok(false) => Err(rk_core::Error::other(format!(
+                "landing target {target_branch:?} is not an existing branch; a landing target \
+                 must be a real branch, not a bare commit"
+            ))),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Use the same registered identity as policy resolution. A directory's
     /// basename is only a fallback for unregistered diagnostic/test repos.
     pub(crate) fn repository_name(&self, repo: &Repo) -> rk_core::Result<String> {
@@ -6803,6 +6935,29 @@ impl Supervisor {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .and_then(Weak::upgrade)
+    }
+
+    pub(crate) fn set_reactor(&self, reactor: &Arc<crate::reactor::Reactor>) {
+        *self.reactor.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(reactor));
+    }
+
+    fn reactor(&self) -> Option<Arc<crate::reactor::Reactor>> {
+        self.reactor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    /// Whether `repo_name` has a live automatic landing route right now: a
+    /// reactor is running AND it has an `action: "land"` trigger that
+    /// resolves to this repo (see [`crate::reactor::Reactor::has_land_route`]
+    /// for the exact matching rule). Used only by [`verification_handoff_active`]
+    /// — kept as its own method so that predicate reads as intent, not
+    /// plumbing.
+    fn has_live_land_route(&self, repo_name: &str) -> bool {
+        self.reactor()
+            .is_some_and(|reactor| reactor.has_land_route(repo_name))
     }
 
     /// Resolve branch metadata only when every matching registry row names the
@@ -6909,56 +7064,243 @@ impl Supervisor {
         task: Option<&str>,
         record: &crate::tickets::DeliveryRecord,
         exact_spawn: Option<rk_core::id::SpawnId>,
+        successor_policy: crate::lifecycle::SuccessorPolicy,
     ) -> rk_core::Result<()> {
+        use crate::lifecycle::MergePointerDecision;
+
+        // Resolve (and, for the ordinary cases, apply) the agent-side merge
+        // pointer BEFORE writing the ticket's delivery record. Previously the
+        // ticket was written first, unconditionally: a delivery that then
+        // failed the agent-pointer check (or, worse, a stale receipt replay
+        // that should have been a no-op) had already durably overwritten the
+        // ticket's delivery evidence with an unconfirmed or backward-rolling
+        // commit (TKT-jonis-faror-zufuj).
+        let conflict = {
+            let mut registry = self.lock_registry();
+            let decision = {
+                let agents = registry.list_all();
+                crate::lifecycle::resolve_merge_pointer(
+                    agents.into_iter(),
+                    repo_root,
+                    &record.branch,
+                    &record.target,
+                    &record.merge_commit,
+                    exact_spawn,
+                )
+            };
+            match decision {
+                MergePointerDecision::Set { agent } => {
+                    let commit = record.merge_commit.clone();
+                    registry.update(&agent, move |r| r.merge_commit = Some(commit))?;
+                    None
+                }
+                MergePointerDecision::AlreadyRecorded | MergePointerDecision::NoTarget => None,
+                MergePointerDecision::Conflict { agent, recorded } => Some((agent, recorded)),
+            }
+        };
+
+        if let Some((agent, recorded)) = conflict {
+            let proceed = self
+                .resolve_delivery_conflict(
+                    repo_root,
+                    repo_name,
+                    record,
+                    exact_spawn,
+                    successor_policy,
+                    (&agent, &recorded),
+                )
+                .await?;
+            if !proceed {
+                // A stale/late receipt replaying older evidence after a
+                // newer delivery already landed: a safe no-op. Neither the
+                // agent pointer nor the ticket's delivery record may move.
+                return Ok(());
+            }
+        }
+
         if let Some(task) = task {
             self.tickets.record_delivery(task, record).await?;
         }
-        use crate::lifecycle::MergePointerDecision;
-        let mut registry = self.lock_registry();
-        let decision = {
-            let agents = registry.list_all();
-            crate::lifecycle::resolve_merge_pointer(
-                agents.into_iter(),
-                repo_root,
-                &record.branch,
-                &record.target,
-                &record.merge_commit,
-                exact_spawn,
-            )
-        };
-        match decision {
-            MergePointerDecision::Set { agent } => {
-                let commit = record.merge_commit.clone();
-                registry.update(&agent, move |r| r.merge_commit = Some(commit))?;
-            }
-            MergePointerDecision::AlreadyRecorded | MergePointerDecision::NoTarget => {}
-            MergePointerDecision::Conflict { agent, recorded } => {
-                drop(registry);
+        Ok(())
+    }
+
+    /// Resolve a `MergePointerDecision::Conflict` for `finalize_delivery`.
+    /// Under [`crate::lifecycle::SuccessorPolicy::FailClosed`] this is
+    /// exactly the original behavior: emit the conflict event and fail.
+    /// Under `AdvanceOnDescendant`, use proven git ancestry between the
+    /// recorded and candidate commits to tell a genuine resumed-generation
+    /// successor delivery (advance) apart from a stale replay (silently
+    /// dropped, returns `Ok(false)`) and from a truly unrelated commit
+    /// (fails closed exactly as before). Returns `Ok(true)` when the caller
+    /// should proceed to record ticket delivery.
+    async fn resolve_delivery_conflict(
+        &self,
+        repo_root: &std::path::Path,
+        repo_name: &str,
+        record: &crate::tickets::DeliveryRecord,
+        exact_spawn: Option<rk_core::id::SpawnId>,
+        successor_policy: crate::lifecycle::SuccessorPolicy,
+        (agent, recorded): (&str, &str),
+    ) -> rk_core::Result<bool> {
+        use crate::lifecycle::{MergePointerDecision, SuccessorClassification};
+
+        let repo_path = repo_root.to_path_buf();
+        let recorded_owned = recorded.to_string();
+        let candidate_owned = record.merge_commit.clone();
+        let (recorded_is_ancestor, candidate_is_ancestor) =
+            blocking_io("finalize_delivery successor ancestry check", move || {
+                let repo = Repo::discover(&repo_path)?;
+                Ok((
+                    repo.is_ancestor(&recorded_owned, &candidate_owned),
+                    repo.is_ancestor(&candidate_owned, &recorded_owned),
+                ))
+            })
+            .await?;
+
+        match crate::lifecycle::classify_successor(
+            successor_policy,
+            recorded_is_ancestor,
+            candidate_is_ancestor,
+        ) {
+            SuccessorClassification::StaleReplay => {
                 self.emit_event(
                     repo_name,
-                    "delivery_merge_pointer_conflict",
+                    "delivery_merge_pointer_stale_replay",
                     json!({
-                        "agent": &agent,
-                        "recorded_merge_commit": &recorded,
-                        "candidate_merge_commit": &record.merge_commit,
+                        "agent": agent,
+                        "recorded_merge_commit": recorded,
+                        "stale_candidate_merge_commit": &record.merge_commit,
                         "branch": &record.branch,
                         "target": &record.target,
                         "text": format!(
-                            "agent {agent} already carries a different merge commit \
-                             ({recorded}) than this delivery's candidate ({}) — not \
-                             overwritten, needs manual reconciliation",
+                            "agent {agent} already advanced past this delivery's candidate \
+                             ({}) — an old receipt replaying after a newer one landed; not an \
+                             error, not applied",
                             record.merge_commit
                         ),
                     }),
                 );
-                return Err(rk_core::Error::other(format!(
-                    "agent {agent} already carries a different merge commit ({recorded}) than \
-                     this delivery's candidate ({}); refusing to overwrite",
-                    record.merge_commit
-                )));
+                Ok(false)
             }
+            SuccessorClassification::Advance => {
+                // The ancestry check above ran unlocked; apply as a
+                // compare-and-swap against the exact `recorded` value it was
+                // computed for, never as a raw write. If the registry moved
+                // in between, resolve once more and stop — never loop.
+                let mut registry = self.lock_registry();
+                let agents = registry.list_all();
+                let fresh = crate::lifecycle::resolve_merge_pointer(
+                    agents.into_iter(),
+                    repo_root,
+                    &record.branch,
+                    &record.target,
+                    &record.merge_commit,
+                    exact_spawn,
+                );
+                match fresh {
+                    MergePointerDecision::Conflict {
+                        agent: fresh_agent,
+                        recorded: fresh_recorded,
+                    } if fresh_recorded == recorded => {
+                        let commit = record.merge_commit.clone();
+                        registry.update(&fresh_agent, move |r| r.merge_commit = Some(commit))?;
+                        drop(registry);
+                        self.emit_event(
+                            repo_name,
+                            "delivery_merge_pointer_advanced",
+                            json!({
+                                "agent": &fresh_agent,
+                                "from_merge_commit": recorded,
+                                "to_merge_commit": &record.merge_commit,
+                                "branch": &record.branch,
+                                "target": &record.target,
+                                "text": format!(
+                                    "agent {fresh_agent} resumed and delivered a proven \
+                                     successor commit ({}) descending from its recorded merge \
+                                     pointer ({recorded}); advanced",
+                                    record.merge_commit
+                                ),
+                            }),
+                        );
+                        Ok(true)
+                    }
+                    MergePointerDecision::AlreadyRecorded => {
+                        drop(registry);
+                        Ok(true)
+                    }
+                    MergePointerDecision::Set { agent: fresh_agent } => {
+                        let commit = record.merge_commit.clone();
+                        registry.update(&fresh_agent, move |r| r.merge_commit = Some(commit))?;
+                        drop(registry);
+                        Ok(true)
+                    }
+                    MergePointerDecision::NoTarget => {
+                        drop(registry);
+                        Ok(true)
+                    }
+                    MergePointerDecision::Conflict {
+                        agent: fresh_agent,
+                        recorded: fresh_recorded,
+                    } => {
+                        // A concurrent writer already settled the pointer
+                        // onto something else between our unlocked ancestry
+                        // check and this re-resolution. Fail closed with the
+                        // fresh evidence rather than retrying.
+                        drop(registry);
+                        Err(self.delivery_conflict_error(
+                            repo_name,
+                            &record.merge_commit,
+                            &record.branch,
+                            &record.target,
+                            &fresh_agent,
+                            &fresh_recorded,
+                        ))
+                    }
+                }
+            }
+            SuccessorClassification::Unrelated => Err(self.delivery_conflict_error(
+                repo_name,
+                &record.merge_commit,
+                &record.branch,
+                &record.target,
+                agent,
+                recorded,
+            )),
         }
-        Ok(())
+    }
+
+    /// Emit the conflict event and build the matching error for a delivery
+    /// whose candidate commit could not be reconciled with the agent's
+    /// already-recorded merge pointer.
+    fn delivery_conflict_error(
+        &self,
+        repo_name: &str,
+        candidate: &str,
+        branch: &str,
+        target: &str,
+        agent: &str,
+        recorded: &str,
+    ) -> rk_core::Error {
+        self.emit_event(
+            repo_name,
+            "delivery_merge_pointer_conflict",
+            json!({
+                "agent": agent,
+                "recorded_merge_commit": recorded,
+                "candidate_merge_commit": candidate,
+                "branch": branch,
+                "target": target,
+                "text": format!(
+                    "agent {agent} already carries a different merge commit ({recorded}) than \
+                     this delivery's candidate ({candidate}) — not overwritten, needs manual \
+                     reconciliation",
+                ),
+            }),
+        );
+        rk_core::Error::other(format!(
+            "agent {agent} already carries a different merge commit ({recorded}) than this \
+             delivery's candidate ({candidate}); refusing to overwrite",
+        ))
     }
 
     fn recorded_fork_point(&self, repo_root: &std::path::Path, branch: &str) -> Option<String> {
@@ -7732,7 +8074,19 @@ impl Supervisor {
                 landed_at: chrono::Utc::now().to_rfc3339(),
             };
             if let Err(error) = self
-                .finalize_delivery(repo.root(), &repo_name, None, &record, source_spawn)
+                .finalize_delivery(
+                    repo.root(),
+                    &repo_name,
+                    None,
+                    &record,
+                    source_spawn,
+                    // `land_force` is a deliberately ungated operator escape
+                    // hatch (no native review/gate behind it), so a
+                    // conflicting pointer must keep failing closed onto
+                    // manual reconciliation rather than trusting git
+                    // ancestry to auto-advance it.
+                    crate::lifecycle::SuccessorPolicy::FailClosed,
+                )
                 .await
             {
                 warn!(repo = %repo_name, branch, %error, "forced landing merged but failed to derive its agent merge pointer");
@@ -8170,6 +8524,47 @@ impl Supervisor {
         Ok(())
     }
 
+    /// The repo/branch boundary a foreman-delegated child spawn must satisfy,
+    /// factored out of [`Self::prepare_foreman_spawn`] so a read-only
+    /// preflight (`repo.resolve_landing_target`) can answer for a foreman
+    /// without duplicating — or drifting from — the same check: the caller
+    /// must be a live `foreman` with an integration branch, `repo` must
+    /// resolve to exactly that foreman's own repository (never a foreign or
+    /// unregistered one a role-spoofed caller might name), and any explicit
+    /// `base` must name exactly that branch. Returns the foreman's own
+    /// branch — the only value `base` may ever effectively be for a child
+    /// spawn, so a caller cannot merge directly into the repository target
+    /// or escape its supervision subtree.
+    pub(crate) fn foreman_child_target_branch(
+        &self,
+        foreman: &str,
+        repo: &Repo,
+        base: Option<&str>,
+    ) -> rk_core::Result<String> {
+        let record = self
+            .status(foreman)
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {foreman}")))?;
+        if record.role != "foreman" {
+            return Err(rk_core::Error::other(
+                "only a foreman may spawn worker agents",
+            ));
+        }
+        let branch = record.branch.clone().ok_or_else(|| {
+            rk_core::Error::other("foreman has no integration branch for a worker spawn")
+        })?;
+        if repo.root().canonicalize()? != record.repo_root.canonicalize()? {
+            return Err(rk_core::Error::other(
+                "a foreman may only act within its own repository",
+            ));
+        }
+        if base.is_some_and(|b| Some(b) != Some(branch.as_str())) {
+            return Err(rk_core::Error::other(
+                "a foreman child must target the foreman's integration branch",
+            ));
+        }
+        Ok(branch)
+    }
+
     /// Normalize a foreman's child spawn. The caller is the source of truth
     /// for parentage, workflow ownership, and the shared integration branch;
     /// accepting any of those fields from an agent would let it escape its
@@ -8179,19 +8574,11 @@ impl Supervisor {
         foreman: &str,
         mut params: SpawnParams,
     ) -> rk_core::Result<SpawnParams> {
+        let repo = Repo::discover(std::path::Path::new(&params.repo))?;
+        let branch = self.foreman_child_target_branch(foreman, &repo, params.base.as_deref())?;
         let record = self
             .status(foreman)
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {foreman}")))?;
-        if record.role != "foreman" {
-            return Err(rk_core::Error::other(
-                "only a foreman may spawn worker agents",
-            ));
-        }
-        if record.branch.is_none() {
-            return Err(rk_core::Error::other(
-                "foreman has no integration branch for a worker spawn",
-            ));
-        }
         if params
             .parent
             .as_deref()
@@ -8210,18 +8597,9 @@ impl Supervisor {
                 "a foreman child must remain in its parent's workflow instance",
             ));
         }
-        if params
-            .base
-            .as_deref()
-            .is_some_and(|base| Some(base) != record.branch.as_deref())
-        {
-            return Err(rk_core::Error::other(
-                "a foreman child must target the foreman's integration branch",
-            ));
-        }
         params.parent = Some(foreman.to_string());
         params.workflow_instance = record.workflow_instance.clone();
-        params.base = record.branch.clone();
+        params.base = Some(branch);
         Ok(params)
     }
 
@@ -8669,6 +9047,86 @@ impl Supervisor {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
+    }
+
+    /// Snapshot of every currently owned, live REVIEWER `SessionControl`,
+    /// keyed by agent name — deliberately NOT every live session. An entry
+    /// only exists here between a launch publishing its control handle and
+    /// that same generation's `Exited` event removing it (`handle_event`'s
+    /// `Exited` arm), so this is precisely "the exact owned reviewer process
+    /// tree" right now — never a deliberately stopped/held generation, which
+    /// has already been removed.
+    ///
+    /// Scoped to `role == "reviewer"` on purpose (TKT-rohib-rukaf-sizak
+    /// acceptance correction): an ordinary `"rat"` generation still `Running`
+    /// when a graceful stop/`rk daemon rollover` fires depends on being left
+    /// EXACTLY as `kill_on_drop`'s incidental teardown always left it — its
+    /// harness process dies, but the still-alive daemon's own per-agent
+    /// `handle_event` loop never gets to observe or process that `Exited`
+    /// event, so the durable record stays frozen mid-life for the successor
+    /// daemon's `on_daemon_started`/`orphan_live_agents` sweep to correctly
+    /// reclassify as `Orphaned` — the exact state `rk daemon rollover`'s own
+    /// `agent.respawn` reconciliation (and `agent_archive.rs`'s
+    /// `live_and_orphaned_records_are_never_archived`) requires. Signalling
+    /// and bounded-JOINING a rat here — waiting for its confirmed exit while
+    /// this daemon's own event-consumer loop is still very much alive and
+    /// listening — lets that SAME daemon's `handle_event` observe the
+    /// resulting `Exited` and terminalize the record as `Failed` before it
+    /// ever reaches the successor, which is a genuine behavior change from
+    /// the pre-existing, tested rollover contract, not a hardening of it.
+    /// Reviewers carry no such contract by default — their `Exited` would
+    /// terminalize the same way `Failed`, routing recovery into the landing
+    /// pipeline's bounded-replacement dispatch instead of resuming this
+    /// generation — so [`orphan_for_owned_shutdown`](Self::orphan_for_owned_shutdown)
+    /// is called on each of these BEFORE it is signalled
+    /// (TKT-ravig-kumob-timuh), pre-empting that with the exact same
+    /// `Orphaned` disposition the successor's `orphan_live_agents` sweep
+    /// would have given a rat — see that method's own doc for why this is
+    /// genuine recovery, not merely routing around the crash arm. The
+    /// original incident this ticket follows up on is BBS finding
+    /// 01M2HWNZA7V4WCSRTJ04XYN7ES: a live REVIEWER reaped incidentally, not a
+    /// live rat.
+    pub(crate) fn live_reviewer_session_controls(&self) -> Vec<(String, SessionControl)> {
+        let reviewer_names: std::collections::HashSet<String> = self
+            .lock_registry()
+            .list_all()
+            .into_iter()
+            .filter(|r| r.role == "reviewer")
+            .map(|r| r.name.clone())
+            .collect();
+        self.lock_controls()
+            .iter()
+            .filter(|(name, _)| reviewer_names.contains(*name))
+            .map(|(name, control)| (name.clone(), control.clone()))
+            .collect()
+    }
+
+    /// TKT-ravig-kumob-timuh: transition a still-live generation straight to
+    /// [`Orphaned`](AgentState::Orphaned) — the exact disposition
+    /// `on_daemon_started`'s `orphan_live_agents` sweep gives a rat whose
+    /// process died while the daemon itself was down — but done HERE, on the
+    /// originating daemon, before this generation's process is signalled by
+    /// `shut_down_owned_reviewer_processes` in `server.rs`. Ordering is the
+    /// whole point: called before `control.kill()`, so by the time the
+    /// resulting `Exited` event reaches `handle_event`, `r.state.is_live()`
+    /// is already false and its crash arm (`state -> Failed`, `crashed =
+    /// true`, a synthesized "process exited" result) never fires — the
+    /// record stays exactly `Orphaned`, `pid` cleared, `cost_usd`/`usage`/
+    /// `review` untouched, ready for the SAME `respawn_generation` /
+    /// `respawn_sweep` / `abandoned()`-patience contract already proven for a
+    /// rat, rather than falling into the landing pipeline's review-death
+    /// bounded-replacement dispatch (a new generation, a new $0 budget
+    /// window, a re-authored `review_attempt`). A record that has already
+    /// raced to some OTHER terminal state on its own between enumeration and
+    /// this call is left alone — this only ever narrows a live state to
+    /// `Orphaned`, never widens it.
+    pub(crate) fn orphan_for_owned_shutdown(&self, name: &str) {
+        let _ = self.lock_registry().update(name, |r| {
+            if r.state.is_live() {
+                r.state = AgentState::Orphaned;
+                r.pid = None;
+            }
+        });
     }
 
     fn lock_attempts(
@@ -9492,6 +9950,68 @@ mod respawn_tests {
         assert!(!ordinary.declared_done);
     }
 
+    #[test]
+    fn verification_handoff_active_requires_rat_role_opted_in_policy_and_live_pipeline() {
+        let mut policy = rk_workflow::RepositoryPolicy::default();
+        policy.landing.verification_handoff = true;
+        policy.delivery.mode = DeliveryMode::Merge;
+
+        // The bar case: opted-in policy, merge delivery, a live pipeline, role "rat".
+        assert!(verification_handoff_active("rat", Some(&policy), true));
+
+        // Any non-"rat" role keeps the standard protocol regardless of policy —
+        // reviewer/foreman must never see a weakened mandate.
+        assert!(!verification_handoff_active(
+            "reviewer",
+            Some(&policy),
+            true
+        ));
+        assert!(!verification_handoff_active("foreman", Some(&policy), true));
+        assert!(!verification_handoff_active(
+            "verifier",
+            Some(&policy),
+            true
+        ));
+
+        // No policy at all (a standalone/unregistered generation) never activates.
+        assert!(!verification_handoff_active("rat", None, true));
+
+        // Policy present but the flag itself is off (today's default) never activates.
+        let mut default_policy = rk_workflow::RepositoryPolicy::default();
+        default_policy.delivery.mode = DeliveryMode::Merge;
+        assert!(!verification_handoff_active(
+            "rat",
+            Some(&default_policy),
+            true
+        ));
+
+        // Opted in, but delivery mode has no automatic gate to hand the check
+        // to (push-branch/pr) — missing delivery route must not activate.
+        let mut push_branch_policy = policy.clone();
+        push_branch_policy.delivery.mode = DeliveryMode::PushBranch;
+        assert!(!verification_handoff_active(
+            "rat",
+            Some(&push_branch_policy),
+            true
+        ));
+        let mut pr_policy = policy.clone();
+        pr_policy.delivery.mode = DeliveryMode::Pr;
+        assert!(!verification_handoff_active("rat", Some(&pr_policy), true));
+
+        // MergePush is also a real automatic route.
+        let mut merge_push_policy = policy.clone();
+        merge_push_policy.delivery.mode = DeliveryMode::MergePush;
+        assert!(verification_handoff_active(
+            "rat",
+            Some(&merge_push_policy),
+            true
+        ));
+
+        // Opted in and a supported delivery mode, but no live LandingPipeline
+        // (e.g. daemon still starting up) — never activate.
+        assert!(!verification_handoff_active("rat", Some(&policy), false));
+    }
+
     /// Probe O6/O8, RAT path: a rat whose harness returns control at a turn
     /// boundary without an `rk done` is PAUSED, not `Completed` — and paused is
     /// live, so it keeps its drain slot and its ticket.
@@ -10088,6 +10608,81 @@ mod respawn_tests {
         );
     }
 
+    /// TKT-rohib-rukaf-sizak: `live_session_controls` is the exact snapshot
+    /// `Server::run`'s graceful-shutdown owned-process sweep signs off on —
+    /// it must return every currently tracked live control, each of them
+    /// genuinely killable and bounded-joinable, and the map must be empty
+    /// again once `Exited` retires it (`handle_event`'s `Exited` arm calls
+    /// `lock_controls().remove(name)`).
+    #[tokio::test]
+    async fn live_reviewer_session_controls_snapshots_only_reviewer_role_live_controls() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        assert!(
+            sup.live_reviewer_session_controls().is_empty(),
+            "a fresh supervisor owns nothing yet"
+        );
+
+        fn launch_sleeping_session() -> rk_harness::HarnessSession {
+            let mut env = HashMap::new();
+            env.insert("RK_FAKE_HARNESS_CMD".into(), "sleep 300".to_string());
+            make_harness("fake")
+                .unwrap()
+                .launch(&LaunchSpec {
+                    cwd: std::env::temp_dir(),
+                    env,
+                    ..Default::default()
+                })
+                .unwrap()
+        }
+
+        // An ordinary rat: tracked in `controls` exactly like a reviewer, but
+        // must NOT appear in this snapshot (TKT-rohib-rukaf-sizak acceptance
+        // correction) — signalling it here would break `rk daemon
+        // rollover`'s park-then-`agent.respawn` contract.
+        let mut rat = record(repo.path(), None);
+        rat.name = "Whisker".into();
+        rat.role = "rat".into();
+        rat.state = AgentState::Running;
+        sup.lock_registry().insert(rat).unwrap();
+        let rat_session = launch_sleeping_session();
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Whisker",
+            rat_session.control,
+        );
+
+        // The reviewer this snapshot exists for.
+        let mut reviewer = record(repo.path(), None);
+        reviewer.name = "Nibble".into();
+        reviewer.role = "reviewer".into();
+        reviewer.state = AgentState::Running;
+        sup.lock_registry().insert(reviewer).unwrap();
+        let reviewer_session = launch_sleeping_session();
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            reviewer_session.control.clone(),
+        );
+
+        let owned = sup.live_reviewer_session_controls();
+        assert_eq!(
+            owned
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Nibble"],
+            "must snapshot only the reviewer-role control, excluding the tracked rat"
+        );
+        let (_, control) = owned.into_iter().next().unwrap();
+        control.kill().await.unwrap();
+        assert!(
+            control.wait_exited(std::time::Duration::from_secs(5)).await,
+            "the snapshot's control must be the real, killable, joinable session control"
+        );
+    }
+
     /// Regression for the exact race a review pass on this fix identified:
     /// the original `admit_steer` validated session/state/capability under
     /// lock, then released every lock and `.await`-ed
@@ -10448,8 +11043,15 @@ mod respawn_tests {
                     target: "main".into(),
                     landed_at: chrono::Utc::now().to_rfc3339(),
                 };
-                sup.finalize_delivery(&repo_root, "repo", None, &delivery, spawn)
-                    .await
+                sup.finalize_delivery(
+                    &repo_root,
+                    "repo",
+                    None,
+                    &delivery,
+                    spawn,
+                    crate::lifecycle::SuccessorPolicy::FailClosed,
+                )
+                .await
             }));
         }
         let mut oks = 0;
@@ -10518,6 +11120,187 @@ mod respawn_tests {
             sup.lock_registry().get("worker1").unwrap().merge_commit,
             first_commit,
             "a conflicting pointer must fail closed, not overwrite the first delivery"
+        );
+    }
+
+    /// TKT-jonis-faror-zufuj bounded native successor/replay journey: a
+    /// resumed SAME generation delivers a genuine successor commit through
+    /// the native (gated) `AdvanceOnDescendant` policy, a later replay of
+    /// the now-superseded first commit is a safe no-op that never rolls
+    /// either projection (agent pointer or ticket delivery) backward, and a
+    /// truly unrelated candidate still fails closed exactly as before.
+    #[tokio::test]
+    async fn finalize_delivery_advances_a_proven_successor_and_drops_stale_replays() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let p = repo_dir.path();
+        git(p, &["checkout", "-b", "feature"]);
+        std::fs::write(p.join("f"), "1\n").unwrap();
+        git(p, &["commit", "-am", "c1"]);
+        git(p, &["checkout", "main"]);
+        git(p, &["merge", "--no-ff", "feature", "-m", "merge1"]);
+        let first_commit = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+
+        let sup = supervisor(home.path());
+        let canonical_root = Repo::discover(p).unwrap().root().to_path_buf();
+        let mut rec = record(&canonical_root, Some("feature"));
+        rec.name = "gen1".into();
+        let source_spawn = rec.spawn;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let ticket = sup
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: "test".into(),
+                body: None,
+                scope: None,
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        let task_id = ticket.identity.clone();
+
+        let advance = crate::lifecycle::SuccessorPolicy::AdvanceOnDescendant;
+        let first_record = crate::tickets::DeliveryRecord {
+            merge_commit: first_commit.clone(),
+            branch: "feature".into(),
+            target: "main".into(),
+            landed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        sup.finalize_delivery(
+            &canonical_root,
+            "repo",
+            Some(&task_id),
+            &first_record,
+            source_spawn,
+            advance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sup.lock_registry().get("gen1").unwrap().merge_commit,
+            Some(first_commit.clone())
+        );
+        assert_eq!(
+            sup.tickets
+                .delivery(&task_id)
+                .unwrap()
+                .unwrap()
+                .merge_commit,
+            first_commit
+        );
+
+        // The SAME generation is resumed and delivers a genuine successor: a
+        // real git descendant of the first merge commit.
+        git(p, &["checkout", "feature"]);
+        std::fs::write(p.join("f"), "2\n").unwrap();
+        git(p, &["commit", "-am", "c2"]);
+        git(p, &["checkout", "main"]);
+        git(p, &["merge", "--no-ff", "feature", "-m", "merge2"]);
+        let second_commit = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+        assert!(Repo::discover(p)
+            .unwrap()
+            .is_ancestor(&first_commit, &second_commit));
+
+        let second_record = crate::tickets::DeliveryRecord {
+            merge_commit: second_commit.clone(),
+            branch: "feature".into(),
+            target: "main".into(),
+            landed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        sup.finalize_delivery(
+            &canonical_root,
+            "repo",
+            Some(&task_id),
+            &second_record,
+            source_spawn,
+            advance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sup.lock_registry().get("gen1").unwrap().merge_commit,
+            Some(second_commit.clone()),
+            "a proven successor commit must advance the agent's merge pointer"
+        );
+        assert_eq!(
+            sup.tickets
+                .delivery(&task_id)
+                .unwrap()
+                .unwrap()
+                .merge_commit,
+            second_commit,
+            "a proven successor commit must advance the ticket's delivery record too"
+        );
+
+        // A late replay of the now-superseded FIRST receipt must be a safe
+        // no-op: it must not roll either the agent pointer or the ticket's
+        // delivery record backward.
+        sup.finalize_delivery(
+            &canonical_root,
+            "repo",
+            Some(&task_id),
+            &first_record,
+            source_spawn,
+            advance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sup.lock_registry().get("gen1").unwrap().merge_commit,
+            Some(second_commit.clone()),
+            "a stale receipt replay must not roll the agent pointer backward"
+        );
+        assert_eq!(
+            sup.tickets
+                .delivery(&task_id)
+                .unwrap()
+                .unwrap()
+                .merge_commit,
+            second_commit,
+            "a stale receipt replay must not roll the ticket's delivery record backward"
+        );
+
+        // A genuinely unrelated candidate (unresolvable in this repo, so
+        // ancestry cannot be established either way) must still fail closed,
+        // even under the permissive `AdvanceOnDescendant` policy.
+        let unrelated_record = crate::tickets::DeliveryRecord {
+            merge_commit: "0000000000000000000000000000000000dead".into(),
+            branch: "feature".into(),
+            target: "main".into(),
+            landed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let err = sup
+            .finalize_delivery(
+                &canonical_root,
+                "repo",
+                Some(&task_id),
+                &unrelated_record,
+                source_spawn,
+                advance,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            sup.lock_registry().get("gen1").unwrap().merge_commit,
+            Some(second_commit.clone()),
+            "an unrelated candidate must fail closed, not overwrite"
+        );
+        assert_eq!(
+            sup.tickets
+                .delivery(&task_id)
+                .unwrap()
+                .unwrap()
+                .merge_commit,
+            second_commit,
+            "a failed-closed conflict must never touch the ticket's delivery record"
         );
     }
 
@@ -14225,10 +15008,10 @@ mod native_observation_tests {
             .update("Nibble", |r| r.pid = Some(4242))
             .unwrap();
 
-        let (_id, mut rx) = sup
-            .verification
-            .runs
-            .register("Nibble", Some(spawn), "req-1");
+        let (_id, mut rx) =
+            sup.verification
+                .runs
+                .register("Nibble", Some(spawn), "req-1", "repo", "verify");
 
         sup.handle_event(
             "Nibble",

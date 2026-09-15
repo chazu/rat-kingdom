@@ -197,6 +197,14 @@ enum Command {
     RetryLandingAdmission(agent_cmds::RetryLandingAdmissionArgs),
     /// Explicitly cancel a candidate's currently active review attempt.
     CancelReview(agent_cmds::CancelReviewArgs),
+    /// Engage the operator-only handoff-window fence: block new landing
+    /// admission for a repository without draining or cancelling anything
+    /// already queued or actively checking/reviewing.
+    FenceRequest(agent_cmds::FenceRequestArgs),
+    /// Read the handoff fence's current state and blocking keys.
+    FenceStatus(agent_cmds::FenceStatusArgs),
+    /// Release an engaged handoff fence early; idempotent.
+    FenceRelease(agent_cmds::FenceReleaseArgs),
     /// Undo a bad landing: revert an agent's recorded merge commit and reopen
     /// its ticket.
     Revert(agent_cmds::RevertArgs),
@@ -1116,6 +1124,11 @@ fn print_prime(role: String, json_output: bool) -> Result<()> {
         conventions: Vec::new(),
         verification_checks: Vec::new(),
         harness_terminal_completion: false,
+        // `rk prime` is a standalone, policy-less inspection of the template
+        // shape — never a live spawn routed through a repo's activated
+        // LandingPolicy — so it must always show the truthful default
+        // (mandatory self-verify) protocol, never the handoff variant.
+        verification_handoff: false,
     };
     let text = rk_core::prime::render(&role, &ctx);
     if json_output {
@@ -1390,6 +1403,9 @@ async fn main() -> Result<()> {
             agent_cmds::reenqueue_review(&layout, args, cli.json).await?
         }
         Command::CancelReview(args) => agent_cmds::cancel_review(&layout, args, cli.json).await?,
+        Command::FenceRequest(args) => agent_cmds::fence_request(&layout, args, cli.json).await?,
+        Command::FenceStatus(args) => agent_cmds::fence_status(&layout, args, cli.json).await?,
+        Command::FenceRelease(args) => agent_cmds::fence_release(&layout, args, cli.json).await?,
         Command::Revert(args) => agent_cmds::revert(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
         Command::ContinueRecovery(args) => {

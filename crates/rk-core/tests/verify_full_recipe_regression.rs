@@ -335,7 +335,7 @@ fn verify_full_passes_a_fully_valid_fixture() {
 }
 
 #[test]
-fn fmt_violation_rejects_and_stops_before_build() {
+fn fmt_violation_rejects_and_stops_before_clippy_and_build() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture(dir.path(), FMT_BROKEN_LIB, VALID_IT);
     let result = expect_completed(
@@ -350,6 +350,14 @@ fn fmt_violation_rejects_and_stops_before_build() {
     assert!(
         !result
             .combined_output
+            .contains("Checking verify_full_fixture"),
+        "a failed fmt phase must stop the recipe (set -euo pipefail) before the clippy phase \
+         ever runs. Output:\n{}",
+        result.combined_output
+    );
+    assert!(
+        !result
+            .combined_output
             .contains("Compiling verify_full_fixture"),
         "a failed fmt phase must stop the recipe (set -euo pipefail) before the build phase \
          ever runs. Output:\n{}",
@@ -358,7 +366,7 @@ fn fmt_violation_rejects_and_stops_before_build() {
 }
 
 #[test]
-fn clippy_violation_rejects_after_running_every_earlier_phase() {
+fn clippy_violation_rejects_and_stops_before_build_and_tests() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture(dir.path(), CLIPPY_BROKEN_LIB, VALID_IT);
     let result = expect_completed(
@@ -374,6 +382,15 @@ fn clippy_violation_rejects_after_running_every_earlier_phase() {
         result.combined_output.contains("needless_return"),
         "expected the failure to actually be the needless_return lint, not something else. \
          Output:\n{}",
+        result.combined_output
+    );
+    assert!(
+        !result
+            .combined_output
+            .contains("Compiling verify_full_fixture"),
+        "a failed clippy phase must stop the recipe (set -euo pipefail) before the build phase \
+         — and therefore before the expensive nextest and doctest phases — ever runs. This is \
+         the fail-fast behavior this recipe ordering exists for. Output:\n{}",
         result.combined_output
     );
 }
@@ -402,7 +419,7 @@ fn integration_test_failure_rejects_and_stops_before_doctests() {
 }
 
 #[test]
-fn doctest_failure_rejects_and_stops_before_clippy() {
+fn doctest_failure_rejects_after_running_every_earlier_phase() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture(dir.path(), DOCTEST_BROKEN_LIB, VALID_IT);
     let result = expect_completed(
@@ -416,11 +433,19 @@ fn doctest_failure_rejects_and_stops_before_clippy() {
          `cargo nextest run` silently skips, which is why this step exists"
     );
     assert!(
-        !result
+        result
             .combined_output
             .contains("Checking verify_full_fixture"),
-        "a failed doctest phase must stop the recipe before the clippy phase ever runs. \
-         Output:\n{}",
+        "the doctest phase runs last, after clippy — a failing doctest here must not be read \
+         as evidence clippy was skipped. Output:\n{}",
+        result.combined_output
+    );
+    assert!(
+        result
+            .combined_output
+            .contains("Compiling verify_full_fixture"),
+        "the doctest phase runs last, after build — a failing doctest here must not be read \
+         as evidence the build phase was skipped. Output:\n{}",
         result.combined_output
     );
 }

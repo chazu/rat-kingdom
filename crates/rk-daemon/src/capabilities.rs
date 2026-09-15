@@ -76,7 +76,8 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
         // to check a claimed steer, exactly like the read-only surfaces
         // beside it.
         "bbs.brief" | "bbs.show" | "bbs.export" | "bbs.discovery.show"
-        | "bbs.retirement.show" | "ping" | "status"
+        | "bbs.retirement.show" | "bbs.assessment.show" | "bbs.assessment.status"
+        | "bbs.assessment.latest" | "ping" | "status"
         | "space.scan" | "space.rd"
         | "repo.list"
         | "repo.get" | "agent.status" | "agent.log" | "agent.progress" | "release.list"
@@ -84,9 +85,11 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
         "space.out" => ORDINARY_SELF_DONE,
         "repo.onboard.inspect" => ORDINARY_ONBOARDER,
         "repo.onboard.propose" => ONBOARDER_ONLY,
-        "agent.spawn" | "agent.respawn" | "agent.dismiss" | "agent.interrupt" | "agent.steer" => {
-            FOREMAN_CHILD
-        }
+        "agent.spawn" | "agent.respawn" | "agent.dismiss" | "agent.interrupt" | "agent.steer"
+        // A foreman's own `rk spawn` for a delegated child calls this as a
+        // preflight ahead of `agent.spawn`; the handler answers only for
+        // that foreman's own repo/branch (see `handle_resolve_landing_target`).
+        | "repo.resolve_landing_target" => FOREMAN_CHILD,
         "ticket.update" => GROOMER_CLOSE,
         "bbs.ask"
         | "bbs.answer"
@@ -191,6 +194,10 @@ mod tests {
             "bbs.assess",
             "bbs.discovery.set",
             "bbs.retirement.set",
+            "bbs.assessment.configure",
+            "bbs.assessment.activate",
+            "bbs.assessment.disable",
+            "bbs.assessment.tick",
         ] {
             assert!(method_policy(method).is_none(), "{method}");
         }
@@ -243,6 +250,9 @@ mod tests {
             "control.verify",
             "bbs.discovery.show",
             "bbs.retirement.show",
+            "bbs.assessment.show",
+            "bbs.assessment.status",
+            "bbs.assessment.latest",
             "release.list",
             "release.show",
             "release.status",
