@@ -985,4 +985,51 @@ mod host_admission {
             "a disabled aggregate cap must never make the build genuinely wait: {result}"
         );
     }
+
+    /// P3.2 compatibility point (TKT-nasif-danob-sirok, finding
+    /// `01M2HTEKQEY1DEQJR2QGCH5NK9`): `acquire()` became
+    /// `acquire(check_name)`, which now does a real weight lookup keyed on
+    /// `RELEASE_ADMISSION_IDENTITY` (`release-build:paired-rk-mcp`). The
+    /// manifest's `host_admission.weight` telemetry must report that
+    /// EFFECTIVE configured weight, not the old hardcoded constant `1` —
+    /// proven here with a real `[policy]
+    /// verification_admission_check_weight` entry, not merely the default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn weight_reflects_the_effective_configured_weight_not_a_hardcoded_constant() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_fixture_repo(repo_dir.path(), "v1");
+        let repo_name = repo_name_of(repo_dir.path());
+
+        let layout = Layout::at(home.path());
+        let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        daemon.set_release_build_admission_enabled(true);
+        daemon.set_verification_admission_aggregate_limit(5);
+        daemon
+            .set_verification_admission_class_policy(
+                std::collections::HashMap::from([("release-build:paired-rk-mcp".to_string(), 3)]),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+            .expect("test-constructed weight policy must validate");
+        let _handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        register_repo(&mut client, repo_dir.path()).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            prepare(&mut client, &repo_name, "main"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["release"]["status"], "prepared", "{result}");
+        let host_admission = &result["release"]["manifest"]["recipe_bounds"]["host_admission"];
+        assert_eq!(
+            host_admission["weight"],
+            json!(3),
+            "must report the configured weight for release-build:paired-rk-mcp, not the old \
+             hardcoded 1: {result}"
+        );
+    }
 }

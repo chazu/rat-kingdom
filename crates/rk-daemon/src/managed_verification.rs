@@ -21,6 +21,16 @@ pub(crate) struct CheckExecution<'a> {
     pub id: &'a str,
     pub repo: &'a str,
     pub agent: &'a str,
+    /// Repo-registered check name (`checks.cue`'s `name`) this execution
+    /// corresponds to, or `""` for a raw inline `run` step command with no
+    /// named-check identity. Used ONLY to look up this check's configured
+    /// P3.2 weight/fast-lane class
+    /// ([`HostVerificationAdmission`]'s `check_weight`/`check_class`) — an
+    /// empty or unrecognized name simply costs the default weight 1 and
+    /// joins no fast lane, identical to pre-P3.2 behaviour, so a caller with
+    /// no natural check name to offer can pass `""` with zero behaviour
+    /// change.
+    pub check_name: &'a str,
     pub dir: &'a Path,
     pub command: &'a str,
     pub resolved: &'a ResolvedRun,
@@ -249,6 +259,7 @@ impl<'a> ManagedVerification<'a> {
         let run_id = format!("verify-run:{agent}");
         let run_fut = self.run(CheckExecution {
             admission_timeout: None,
+            check_name,
             id: &run_id,
             repo: repo_name,
             agent,
@@ -780,6 +791,7 @@ impl<'a> ManagedVerification<'a> {
             id,
             repo,
             agent,
+            check_name,
             dir,
             command,
             resolved,
@@ -826,7 +838,7 @@ impl<'a> ManagedVerification<'a> {
             // (TKT-vilug-hujok-bolis: preventing cross-repo head-of-line
             // blocking). This does not implement check sharing — it is a
             // pure ordering property of two independent semaphores.
-            let host_guard = self.resources.host_admission.acquire().await;
+            let host_guard = self.resources.host_admission.acquire(check_name).await;
             (test_guard, admission, host_guard)
         };
         let (_test_exec_guard, admission, _host_guard) = match if wait_budget.is_zero() {
@@ -2795,15 +2807,44 @@ impl VerificationAdmission {
 /// otherwise use immediately. Ordinary acquire-order is what prevents the
 /// cross-repo head-of-line blocking the ticket requires be prevented; no
 /// separate coordination or check-sharing is needed for it.
+///
+/// P3.2 (TKT-nasif-danob-sirok) layers two OPTIONAL, still-additive
+/// refinements on top of the P3.1 plain counting semaphore, both disabled
+/// by default (empty maps) so an unconfigured daemon behaves exactly as
+/// before this existed:
+/// - **Weighted classes**: `[policy] verification_admission_check_weight`
+///   lets a named check cost more than one aggregate unit, acquired
+///   atomically via [`tokio::sync::Semaphore::acquire_many_owned`] — never
+///   partially, so a heavy check can never hold only some of its cost while
+///   waiting on the rest.
+/// - **Fair progress**: `[policy] verification_admission_check_class` /
+///   `_class_reserve` carve a small, EXPLICITLY BOUNDED slice out of the
+///   aggregate limit into a dedicated per-class semaphore a member check
+///   tries FIRST, non-blockingly — see [`acquire`](Self::acquire). This is
+///   what lets a cheap mandatory guard (e.g. `landing-protected-paths`)
+///   keep making progress while a long check (e.g. `verify`) occupies the
+///   general pool, without ever letting that guard's own class draw
+///   unboundedly: once its reserved lane is itself full, the next request
+///   falls through to the ordinary general-pool queue like any other
+///   request. Class membership is entirely `config.toml`-owned (never read
+///   from a repository's own `checks.cue`), so no workflow- or
+///   repo-supplied check definition can self-declare its way into a
+///   reserved lane.
 #[derive(Default)]
 pub(crate) struct HostVerificationAdmission {
-    semaphore: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    general: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Total permits the general pool was last constructed with — needed to
+    /// compute `executing()` from `Semaphore::available_permits`, which
+    /// exposes only what's free, not the pool's own total.
+    general_limit: AtomicU64,
+    /// The full aggregate ceiling (`[policy] verification_admission_aggregate_limit`)
+    /// — `general_limit` plus every class's reserve sums back to this.
     limit: AtomicU64,
     /// Requests currently blocked in [`acquire`](Self::acquire)'s own
-    /// await — SPECIFICALLY waiting for the aggregate host permit, never a
-    /// broader "waiting for any managed admission" count. A request still
-    /// queued behind its own per-repo `VerificationAdmission` semaphore, or
-    /// behind the shared-`CARGO_TARGET_DIR` `TestExecLock`, has not called
+    /// await for the GENERAL pool specifically — never a reserved class's
+    /// try-only lane, which can never block. A request still queued behind
+    /// its own per-repo `VerificationAdmission` semaphore, or behind the
+    /// shared-`CARGO_TARGET_DIR` `TestExecLock`, has not called
     /// [`acquire`](Self::acquire) yet (see [`ManagedVerification::run`]'s
     /// acquire order) and so is not counted here at all — it shows up only
     /// implicitly, as elapsed queue-wait time once it settles. Distinct from
@@ -2811,20 +2852,166 @@ pub(crate) struct HostVerificationAdmission {
     /// own repo's permit but is still queued here for the host-wide one is
     /// "waiting", not yet "executing".
     waiting: AtomicU64,
+    /// P3.2 per-check-name weight, `[policy] verification_admission_check_weight`.
+    /// A name absent here costs the default weight 1.
+    check_weight: Mutex<HashMap<String, u32>>,
+    /// P3.2 per-check-name fast-lane class, `[policy] verification_admission_check_class`.
+    check_class: Mutex<HashMap<String, String>>,
+    /// P3.2 reserved fast lanes, keyed by class name — only classes with a
+    /// positive reserve appear here.
+    classes: Mutex<HashMap<String, Arc<ReservedClass>>>,
+}
+
+/// One fast-lane class's dedicated, bounded slice of the aggregate —
+/// `[policy] verification_admission_class_reserve[class]` permits, carved
+/// OUT OF (never additive to) the general pool's own capacity.
+struct ReservedClass {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    limit: u32,
+    /// Requests currently blocked in the reserved-lane BLOCKING fallback
+    /// (see [`HostVerificationAdmission::acquire`]'s "weight exceeds the
+    /// general pool" branch) — never incremented for the fast non-blocking
+    /// `try_acquire_many_owned` path, which by definition never waits.
+    waiting: AtomicU64,
+}
+
+/// Validate a proposed P3.2 weight/class-reserve configuration against
+/// `limit` (the already-set aggregate ceiling) BEFORE anything is installed
+/// — every rejection here is a daemon-startup refusal, not a runtime
+/// surprise. REWORK (native review `01M2HWE7TBKTGZZGEKK19WM16J` against
+/// candidate `9e7bde7`) found the original version of this function
+/// insufficient on two counts, both fixed here:
+/// - A reserve total EQUAL TO the aggregate limit was accepted, leaving the
+///   general pool sized `0` (`general_limit = limit - reserved_total`).
+///   `HostVerificationAdmission::acquire` used to treat "general pool is
+///   `None`" as its disabled-cap sentinel, so this silently disabled ALL
+///   host admission fleet-wide instead of routing through the reserved
+///   lane — the "full-reservation bypass". Fixed by requiring the reserve
+///   total be STRICTLY LESS than the limit whenever any class has a
+///   positive reserve, so `general_limit` is always at least `1` whenever
+///   the aggregate is enabled — every check name NOT explicitly classified
+///   (the common case: an arbitrary future check name defaults to weight 1
+///   and no class) is thus always guaranteed a nonzero pool to eventually
+///   draw from.
+/// - A weight was validated only against the raw aggregate `limit`, never
+///   against the smaller pool it would actually draw from once class
+///   reserves are carved out. `aggregate=2, reserve.guard=1` (general pool
+///   1), `weight=2` on an unclassified check passed the old check
+///   (`2 <= 2`) but could never be admitted through a general pool sized 1
+///   — it would hang forever. Fixed by validating each weight against the
+///   MAX of the pools it could actually draw from: the general pool
+///   (`limit - reserved_total`), and — for a classified check — its own
+///   class's reserve.
+fn validate_host_admission_policy(
+    limit: u32,
+    check_weight: &HashMap<String, u32>,
+    check_class: &HashMap<String, String>,
+    class_reserve: &HashMap<String, u32>,
+) -> Result<(), String> {
+    for (name, weight) in check_weight {
+        if *weight == 0 {
+            return Err(format!(
+                "verification_admission_check_weight[{name:?}] must be at least 1, got 0"
+            ));
+        }
+    }
+    let reserved_total: u64 = class_reserve.values().map(|&v| u64::from(v)).sum();
+    if reserved_total > 0 && reserved_total >= u64::from(limit) {
+        return Err(format!(
+            "verification_admission_class_reserve totals {reserved_total}, which must be \
+             strictly less than the aggregate limit {limit} — every unclassified or \
+             fallback check needs at least 1 unit of general-pool capacity left over"
+        ));
+    }
+    if limit > 0 {
+        let general_limit = u64::from(limit) - reserved_total;
+        for (name, &weight) in check_weight {
+            let weight = u64::from(weight);
+            let class_reserve_limit = check_class
+                .get(name)
+                .and_then(|class| class_reserve.get(class))
+                .copied()
+                .map(u64::from)
+                .unwrap_or(0);
+            if weight > general_limit && weight > class_reserve_limit {
+                return Err(format!(
+                    "verification_admission_check_weight[{name:?}] = {weight} exceeds every \
+                     pool it could draw from (general pool {general_limit}, its own class \
+                     reserve {class_reserve_limit}); this check could never be admitted"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl HostVerificationAdmission {
     /// Set `[policy] verification_admission_aggregate_limit`. Applied once by
     /// `Daemon::new` from config — same pattern, and same
     /// restart-required-to-change contract, as
-    /// [`VerificationAdmission::set_limits`]. Replaces any existing
-    /// semaphore outright: safe in production (called exactly once, before
-    /// the daemon serves its first request) and otherwise only ever called
-    /// again by a test.
+    /// [`VerificationAdmission::set_limits`]. Replaces any existing general
+    /// pool outright: safe in production (called exactly once, before the
+    /// daemon serves its first request) and otherwise only ever called
+    /// again by a test. Also resets any previously configured P3.2
+    /// weight/class policy to empty — a bare limit change (this plain P3.1
+    /// entry point) must never leave a class-reserve total validated
+    /// against the OLD limit silently in effect against a smaller NEW one;
+    /// a caller that wants both calls [`set_class_policy`](Self::set_class_policy)
+    /// again afterward, as `Daemon::new` does.
     pub(crate) fn set_limit(&self, limit: u32) {
         self.limit.store(u64::from(limit), Ordering::Relaxed);
-        *self.semaphore.lock().unwrap() =
+        self.general_limit
+            .store(u64::from(limit), Ordering::Relaxed);
+        *self.general.lock().unwrap() =
             (limit > 0).then(|| Arc::new(tokio::sync::Semaphore::new(limit as usize)));
+        *self.classes.lock().unwrap() = HashMap::new();
+        *self.check_weight.lock().unwrap() = HashMap::new();
+        *self.check_class.lock().unwrap() = HashMap::new();
+    }
+
+    /// Set the P3.2 weighted/fair-progress policy — `[policy]
+    /// verification_admission_check_weight` / `_check_class` /
+    /// `_class_reserve` — validated against the aggregate limit
+    /// [`set_limit`](Self::set_limit) already installed. Must be called
+    /// AFTER `set_limit` (`Daemon::new` does so in that order). On success,
+    /// shrinks the general pool to `limit - sum(class_reserve)` and
+    /// installs one fresh dedicated semaphore per class with a positive
+    /// reserve. On failure, leaves the existing policy (the P3.1-only
+    /// general pool `set_limit` just installed, if this is the first call)
+    /// completely untouched — a rejected configuration never partially
+    /// applies.
+    pub(crate) fn set_class_policy(
+        &self,
+        check_weight: HashMap<String, u32>,
+        check_class: HashMap<String, String>,
+        class_reserve: HashMap<String, u32>,
+    ) -> Result<(), String> {
+        let limit = self.limit();
+        validate_host_admission_policy(limit, &check_weight, &check_class, &class_reserve)?;
+        let reserved_total: u32 = class_reserve.values().copied().sum();
+        let general_limit = limit - reserved_total;
+        let classes: HashMap<String, Arc<ReservedClass>> = class_reserve
+            .iter()
+            .filter(|(_, &reserve)| reserve > 0)
+            .map(|(name, &reserve)| {
+                (
+                    name.clone(),
+                    Arc::new(ReservedClass {
+                        semaphore: Arc::new(tokio::sync::Semaphore::new(reserve as usize)),
+                        limit: reserve,
+                        waiting: AtomicU64::new(0),
+                    }),
+                )
+            })
+            .collect();
+        self.general_limit
+            .store(u64::from(general_limit), Ordering::Relaxed);
+        *self.general.lock().unwrap() = (general_limit > 0)
+            .then(|| Arc::new(tokio::sync::Semaphore::new(general_limit as usize)));
+        *self.classes.lock().unwrap() = classes;
+        *self.check_weight.lock().unwrap() = check_weight;
+        *self.check_class.lock().unwrap() = check_class;
+        Ok(())
     }
 
     /// The configured aggregate ceiling. `0` means disabled.
@@ -2832,35 +3019,182 @@ impl HostVerificationAdmission {
         self.limit.load(Ordering::Relaxed) as u32
     }
 
-    /// Host permits currently checked out, for reporting only
-    /// (`Supervisor::host_verification_capacity_summary`) — never consulted
-    /// for admission itself. `0` whenever the limit is `0` (disabled).
-    pub(crate) fn executing(&self) -> u32 {
-        let limit = self.limit();
-        if limit == 0 {
-            return 0;
-        }
-        match self.semaphore.lock().unwrap().as_ref() {
-            Some(sem) => limit.saturating_sub(sem.available_permits() as u32),
-            None => 0,
-        }
+    /// The configured aggregate cost for `check_name` — its own weight if
+    /// set, else the default `1`. `pub(crate)`, not private: P4.1's
+    /// `release.rs` reads this directly to report the EFFECTIVE configured
+    /// weight in its build telemetry (`HostAdmissionBounds::weight`)
+    /// instead of a hardcoded constant, so that field stays accurate once
+    /// an operator actually configures `[policy]
+    /// verification_admission_check_weight."release-build:paired-rk-mcp"]`.
+    pub(crate) fn weight_for(&self, check_name: &str) -> u32 {
+        self.check_weight
+            .lock()
+            .unwrap()
+            .get(check_name)
+            .copied()
+            .unwrap_or(1)
     }
 
-    /// Requests currently waiting for a host permit, for reporting only.
+    fn class_for(&self, check_name: &str) -> Option<String> {
+        self.check_class.lock().unwrap().get(check_name).cloned()
+    }
+
+    /// Host permits currently checked out ACROSS the general pool and every
+    /// reserved class lane, for reporting only
+    /// (`Supervisor::host_verification_capacity_summary`) — never consulted
+    /// for admission itself. `0` whenever the limit is `0` (disabled). With
+    /// no class policy configured this is exactly the P3.1 general-pool
+    /// figure, unchanged.
+    pub(crate) fn executing(&self) -> u32 {
+        if self.limit() == 0 {
+            return 0;
+        }
+        let general_limit = self.general_limit.load(Ordering::Relaxed) as u32;
+        let general_executing = match self.general.lock().unwrap().as_ref() {
+            Some(sem) => general_limit.saturating_sub(sem.available_permits() as u32),
+            None => 0,
+        };
+        let reserved_executing: u32 = self
+            .classes
+            .lock()
+            .unwrap()
+            .values()
+            .map(|c| {
+                c.limit
+                    .saturating_sub(c.semaphore.available_permits() as u32)
+            })
+            .sum();
+        general_executing + reserved_executing
+    }
+
+    /// Requests currently waiting for a GENERAL-pool permit, for reporting
+    /// only — see [`waiting`](Self::waiting) field doc for why a reserved
+    /// class's own try-only lane never contributes here.
     pub(crate) fn waiting(&self) -> u32 {
         self.waiting.load(Ordering::Relaxed) as u32
     }
 
-    /// Acquire one host-wide permit, or `None` immediately when the
-    /// aggregate cap is disabled (limit `0`) — every caller must treat that
-    /// as "proceed unbounded", matching [`VerificationAdmission::acquire`]'s
-    /// own convention. The `waiting` counter is incremented only around the
-    /// actual await and decremented by a drop guard rather than inline code
-    /// after it, so a caller that cancels this future mid-wait (the overall
-    /// admission `tokio::time::timeout`, or `verify_repo_check`'s own
-    /// cancellation race) can never leak the count.
-    pub(crate) async fn acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let sem = self.semaphore.lock().unwrap().clone()?;
+    /// Per-class `{limit, executing, waiting}` snapshot, for reporting only
+    /// — the P3.2 half of `Supervisor::host_verification_capacity_summary`.
+    /// Empty when no class policy is configured. `waiting` counts ONLY the
+    /// reserved-lane BLOCKING fallback (see [`acquire`](Self::acquire)) —
+    /// a request still trying the fast non-blocking path, or one that fell
+    /// all the way through to the general pool, is not counted here.
+    pub(crate) fn class_summary(&self) -> Value {
+        let classes = self.classes.lock().unwrap();
+        let map: serde_json::Map<String, Value> = classes
+            .iter()
+            .map(|(name, c)| {
+                let executing = c
+                    .limit
+                    .saturating_sub(c.semaphore.available_permits() as u32);
+                let waiting = c.waiting.load(Ordering::Relaxed);
+                (
+                    name.clone(),
+                    json!({"limit": c.limit, "executing": executing, "waiting": waiting}),
+                )
+            })
+            .collect();
+        Value::Object(map)
+    }
+
+    /// Acquire this check's aggregate admission cost (its configured
+    /// weight, default 1), or `None` immediately when the aggregate cap is
+    /// disabled (`limit() == 0`) — every caller must treat that as "proceed
+    /// unbounded", matching [`VerificationAdmission::acquire`]'s own
+    /// convention. REWORK (native review `01M2HWE7TBKTGZZGEKK19WM16J`
+    /// against candidate `9e7bde7`): this checks [`limit`](Self::limit)
+    /// DIRECTLY as the disabled sentinel now — the earlier version instead
+    /// read "is the general pool `None`?", which was ALSO true whenever a
+    /// class policy reserved the entire aggregate (`general_limit == 0`),
+    /// silently disabling every check's admission, classified and
+    /// unclassified alike, despite a positive aggregate limit. That
+    /// specific degenerate state is now refused at config-validation time
+    /// (`validate_host_admission_policy` requires `reserved_total < limit`
+    /// whenever any class has a positive reserve) — so this early return
+    /// fires ONLY for the genuinely disabled case, and the general pool
+    /// looked up further down is thus guaranteed `Some` whenever this point
+    /// is reached at all.
+    ///
+    /// If `check_name` is a member of a fast-lane class (P3.2), this FIRST
+    /// tries a non-blocking, atomic `try_acquire_many_owned` against that
+    /// class's own dedicated reserve — never awaiting, so it can never
+    /// itself queue behind a general-pool request. A request whose weight
+    /// exceeds the class's own total reserve is never even tried against
+    /// it (it could never fit) and falls straight through to the general
+    /// pool below.
+    ///
+    /// If that fast try fails (the reserve is momentarily saturated) AND
+    /// this weight exceeds the general pool's own capacity — only possible
+    /// for a check accepted at startup because it fit its class's reserve
+    /// even though it doesn't fit the (deliberately smaller) general pool,
+    /// see `validate_host_admission_policy` — falling through to the
+    /// general pool would wait on capacity that pool can never actually
+    /// hold, hanging forever. This blocks on the check's OWN reserved lane
+    /// instead: still FIFO, still bounded by that lane's configured size,
+    /// counted in [`class_summary`](Self::class_summary)'s per-class
+    /// `waiting` (never the general pool's own `waiting`).
+    ///
+    /// Otherwise, falling through lands in the same bounded general-pool
+    /// queue every unclassified request already uses — a saturated fast
+    /// lane degrades to ordinary shared admission for any check whose
+    /// weight the general pool can actually satisfy.
+    ///
+    /// Both `waiting` counters (general and per-class) are incremented only
+    /// around their own blocking await and decremented by a drop guard
+    /// rather than inline code after it, so a caller that cancels this
+    /// future mid-wait (the overall admission `tokio::time::timeout`, or
+    /// `verify_repo_check`'s own cancellation race) can never leak either
+    /// count.
+    pub(crate) async fn acquire(
+        &self,
+        check_name: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if self.limit() == 0 {
+            return None;
+        }
+        let weight = self.weight_for(check_name);
+        let general_limit = self.general_limit.load(Ordering::Relaxed) as u32;
+        if let Some(class_name) = self.class_for(check_name) {
+            let reserved = self.classes.lock().unwrap().get(&class_name).cloned();
+            if let Some(reserved) = reserved {
+                if weight <= reserved.limit {
+                    if let Ok(permit) =
+                        Arc::clone(&reserved.semaphore).try_acquire_many_owned(weight)
+                    {
+                        return Some(permit);
+                    }
+                    if weight > general_limit {
+                        struct ClassWaitGuard<'a>(&'a AtomicU64);
+                        impl Drop for ClassWaitGuard<'_> {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        reserved.waiting.fetch_add(1, Ordering::Relaxed);
+                        let _class_wait_guard = ClassWaitGuard(&reserved.waiting);
+                        // A semaphore is only ever closed by `close()`,
+                        // which nothing here calls — this can never
+                        // actually return `Err`.
+                        return Some(
+                            Arc::clone(&reserved.semaphore)
+                                .acquire_many_owned(weight)
+                                .await
+                                .expect("reserved class semaphore is never closed"),
+                        );
+                    }
+                }
+            }
+        }
+        // Guaranteed `Some`: `self.limit() > 0` (checked above) and either
+        // no class has a positive reserve (`general_limit == limit`) or
+        // `validate_host_admission_policy` required `reserved_total <
+        // limit`, so `general_limit >= 1` either way — see this method's
+        // own doc for the full argument.
+        let general = self.general.lock().unwrap().clone().expect(
+            "general pool must be Some whenever the aggregate limit is nonzero: \
+             validate_host_admission_policy guarantees general_limit >= 1 in that case",
+        );
         struct WaitGuard<'a>(&'a AtomicU64);
         impl Drop for WaitGuard<'_> {
             fn drop(&mut self) {
@@ -2872,7 +3206,8 @@ impl HostVerificationAdmission {
         // A semaphore is only ever closed by `close()`, which nothing here
         // calls — this can never actually return `Err`.
         Some(
-            sem.acquire_owned()
+            general
+                .acquire_many_owned(weight)
                 .await
                 .expect("host verification admission semaphore is never closed"),
         )
@@ -3154,6 +3489,7 @@ mod tests {
                 id: "ordinary-workflow",
                 repo: "repo",
                 agent: "rat",
+                check_name: "",
                 dir: home.path(),
                 command: &resolved.command,
                 resolved: &resolved,
@@ -3773,5 +4109,160 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    // P3.2 (TKT-nasif-danob-sirok): `HostVerificationAdmission::set_class_policy`
+    // validation — fast, in-process unit tests (no daemon spin-up needed);
+    // the real admission/fair-progress journey lives in
+    // `crates/rk-daemon/tests/host_verification_weighted_fair.rs`.
+
+    #[test]
+    fn class_policy_with_no_limit_or_reserve_is_a_no_op_default() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(4);
+        host.set_class_policy(HashMap::new(), HashMap::new(), HashMap::new())
+            .unwrap();
+        assert_eq!(host.limit(), 4);
+        assert_eq!(host.executing(), 0);
+        assert_eq!(host.class_summary(), json!({}));
+    }
+
+    #[test]
+    fn class_policy_rejects_a_zero_weight() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(4);
+        let err = host
+            .set_class_policy(
+                HashMap::from([("flaky".to_string(), 0)]),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap_err();
+        assert!(err.contains("flaky"), "{err}");
+        assert!(err.contains('0'), "{err}");
+    }
+
+    #[test]
+    fn class_policy_rejects_a_weight_the_aggregate_limit_could_never_satisfy() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(2);
+        let err = host
+            .set_class_policy(
+                HashMap::from([("giant".to_string(), 3)]),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("giant") && err.contains('3') && err.contains('2'),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn class_policy_rejects_a_reserve_total_exceeding_the_aggregate_limit() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(2);
+        let err = host
+            .set_class_policy(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("guard".to_string(), 1), ("urgent".to_string(), 2)]),
+            )
+            .unwrap_err();
+        assert!(err.contains('3') && err.contains('2'), "{err}");
+        // A rejected policy must never partially apply: the general pool
+        // must still behave exactly as `set_limit(2)` alone left it.
+        assert_eq!(host.class_summary(), json!({}));
+    }
+
+    /// REWORK regression (native review `01M2HWE7TBKTGZZGEKK19WM16J`): a
+    /// reserve total EQUAL TO the aggregate limit was previously accepted,
+    /// driving `general_limit` to `0` and — because `acquire()` used to
+    /// treat "general pool is `None`" as its disabled-cap sentinel —
+    /// silently disabling ALL host admission fleet-wide, classified and
+    /// unclassified checks alike, despite a positive aggregate limit. Must
+    /// now be rejected at startup instead.
+    #[test]
+    fn class_policy_rejects_a_reserve_total_exactly_equal_to_the_aggregate_limit() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(1);
+        let err = host
+            .set_class_policy(
+                HashMap::new(),
+                HashMap::from([("quick".to_string(), "cheap".to_string())]),
+                HashMap::from([("cheap".to_string(), 1)]),
+            )
+            .unwrap_err();
+        assert!(err.contains('1'), "{err}");
+        assert_eq!(host.class_summary(), json!({}));
+    }
+
+    /// REWORK regression: a weight was previously validated only against
+    /// the raw aggregate limit, never against the smaller general pool it
+    /// would actually draw from once a class reserve is carved out.
+    /// `aggregate=2, reserve.guard=1` leaves a general pool of `1`; an
+    /// UNCLASSIFIED check weighted `2` passed the old check (`2 <= 2`) but
+    /// could never be admitted through a general pool sized `1` — it would
+    /// hang forever. Must now be rejected at startup.
+    #[test]
+    fn class_policy_rejects_an_unclassified_weight_exceeding_the_shrunken_general_pool() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(2);
+        let err = host
+            .set_class_policy(
+                HashMap::from([("heavy".to_string(), 2)]),
+                HashMap::new(),
+                HashMap::from([("guard".to_string(), 1)]),
+            )
+            .unwrap_err();
+        assert!(err.contains("heavy"), "{err}");
+    }
+
+    /// A CLASSIFIED check's weight is admissible as long as it fits EITHER
+    /// pool it could draw from — its own class reserve, even when that
+    /// exceeds the (correctly, deliberately) smaller general pool left
+    /// over for every unclassified/fallback check.
+    #[test]
+    fn class_policy_accepts_a_classified_weight_that_only_fits_its_own_reserve() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(3);
+        host.set_class_policy(
+            HashMap::from([("giant_guard".to_string(), 2)]),
+            HashMap::from([("giant_guard".to_string(), "guard".to_string())]),
+            HashMap::from([("guard".to_string(), 2)]),
+        )
+        .unwrap();
+        // general_limit = 3 - 2 = 1, strictly less than this check's own
+        // weight (2) — it could ONLY ever be admitted via its own
+        // 2-permit reserved lane, never through the general pool. Startup
+        // must accept this: it is genuinely admissible, just not via the
+        // fallback pool.
+        assert_eq!(
+            host.class_summary(),
+            json!({"guard": {"limit": 2, "executing": 0, "waiting": 0}})
+        );
+    }
+
+    #[test]
+    fn set_limit_resets_a_previously_configured_class_policy() {
+        let host = HostVerificationAdmission::default();
+        host.set_limit(2);
+        host.set_class_policy(
+            HashMap::new(),
+            HashMap::from([("quick".to_string(), "guard".to_string())]),
+            HashMap::from([("guard".to_string(), 1)]),
+        )
+        .unwrap();
+        assert_eq!(
+            host.class_summary(),
+            json!({"guard": {"limit": 1, "executing": 0, "waiting": 0}})
+        );
+
+        // A bare `set_limit` (the plain P3.1 entry point) must clear the
+        // stale class policy rather than leaving it validated against a
+        // limit that may since have shrunk.
+        host.set_limit(1);
+        assert_eq!(host.class_summary(), json!({}));
     }
 }

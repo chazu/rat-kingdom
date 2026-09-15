@@ -1323,6 +1323,25 @@ impl Supervisor {
         self.verification.host_admission.set_limit(limit);
     }
 
+    /// Set the P3.2 (TKT-nasif-danob-sirok) weighted/fair-progress policy —
+    /// `[policy] verification_admission_check_weight` / `_check_class` /
+    /// `_class_reserve`. MUST be called after
+    /// [`set_verification_admission_aggregate_limit`](Self::set_verification_admission_aggregate_limit)
+    /// — it validates against, and carves reserved fast lanes out of, the
+    /// limit that call just installed. `Daemon::new` does so in that order
+    /// and propagates a validation failure as a daemon-startup error, same
+    /// fail-closed convention as `crate::authority::AuthorityPolicy::from_config`.
+    pub fn set_verification_admission_class_policy(
+        &self,
+        check_weight: HashMap<String, u32>,
+        check_class: HashMap<String, String>,
+        class_reserve: HashMap<String, u32>,
+    ) -> Result<(), String> {
+        self.verification
+            .host_admission
+            .set_class_policy(check_weight, check_class, class_reserve)
+    }
+
     /// Acquire one bounded per-repo verification admission permit for `repo`.
     /// See [`crate::managed_verification::VerificationAdmission`] for what this bounds, the FIFO fairness
     /// guarantee, and why a daemon restart can never leak one.
@@ -1497,6 +1516,11 @@ impl Supervisor {
             "limit": limit,
             "executing": self.verification.host_admission.executing(),
             "waiting": self.verification.host_admission.waiting(),
+            // P3.2 (TKT-nasif-danob-sirok): per-fast-lane-class {limit,
+            // executing} snapshot, empty unless a class policy is
+            // configured — additive, so a P3.1-only deployment reads
+            // identically to before this field existed.
+            "classes": self.verification.host_admission.class_summary(),
         })
     }
 
