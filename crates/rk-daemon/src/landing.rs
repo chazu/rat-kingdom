@@ -417,6 +417,22 @@ const BARRIER_CEILING_PRE_MARKER: &str = "review-ceiling-pre-marker";
 /// caller not yet told. Armed only by `tests/review_ceiling_crash_barrier.rs`.
 const BARRIER_CEILING_POST_MARKER: &str = "review-ceiling-post-marker";
 
+/// [`crate::fault`] barrier name for the window the TKT-jonis-faror-zufuj
+/// production incident was cut off in: `advance_target` has already moved
+/// the target, but [`LandingPipeline::finalize_landed`] has not run, so
+/// neither the agent's merge pointer nor the ticket's delivery record has
+/// been written yet. A daemon parked here and then killed leaves exactly the
+/// durable `Landing` receipt the incident left behind, which the replacement
+/// daemon must recover through [`LandingPipeline::recover_completed_land`].
+///
+/// Like every other name in this module it is a `crate::fault` barrier, so
+/// it compiles to nothing outside `debug_assertions` and cannot be reached
+/// in a shipped binary; it is armed only by writing `fault-barrier` into a
+/// daemon's own home, which is how a test controls a daemon it started as a
+/// separate OS process. Armed only by
+/// `crates/rk-cli/tests/resumed_generation_successor_landing.rs`.
+const BARRIER_POST_TARGET_ADVANCE: &str = "landing-post-target-advance";
+
 /// Identity of the landing's escalation `need` tuple. Matches
 /// the retired landing workflow's `landing-report-stop`/
 /// `landing-report-unknown-verdict`/`landing-report-timeout` named checks,
@@ -4969,6 +4985,7 @@ impl LandingPipeline {
         entry: &LandingQueueEntry,
         result: LandedDelivery,
     ) -> rk_core::Result<LandingOutcome> {
+        crate::fault::barrier(&self.layout, BARRIER_POST_TARGET_ADVANCE).await;
         self.record_delivery(entry, &result).await?;
         Ok(LandingOutcome::Landed(result))
     }
@@ -9664,20 +9681,32 @@ workflow: {
         assert!(crate::tickets::is_delivered(&stored));
     }
 
-    /// TKT-jonis-faror-zufuj: reproduce and recover the confirmed production
-    /// incident through the REAL native landing pipeline (queue, gates,
-    /// `finalize_delivery`) — not a direct call. A SAME generation is
-    /// resumed and queues a genuine second delivery; native review/gate
-    /// advances the target (simulated here exactly like
-    /// `advanced_landing_reconciles_the_ticket_and_terminal_marker`, by
-    /// advancing `main` BEFORE finalization runs) and then the daemon
-    /// resumes past that interruption. Finalization must settle the
-    /// resumed generation's successor instead of busy-retrying a
-    /// merge-pointer conflict forever, and replaying the same already-landed
-    /// head after a restart must not duplicate the advance.
+    /// TKT-jonis-faror-zufuj, SEAM coverage: two successive deliveries under
+    /// one `source_spawn` settle through `LandingPipeline::drain_key` ->
+    /// `finalize_delivery` instead of busy-retrying a merge-pointer conflict
+    /// forever, and re-draining an already-landed head does not move the
+    /// pointer again.
+    ///
+    /// HONEST LIMITATIONS — this is a pipeline seam test, NOT a lifecycle
+    /// one, and deliberately says so in its name. Everything outside
+    /// `drain_key`/`finalize_delivery` here is a stand-in: the "resumed
+    /// generation" is a hand-built `AgentRecord` inserted straight into the
+    /// registry (no `agent.spawn`/`agent.respawn`, no provider session), the
+    /// second source is created with raw `git` calls rather than by a rat,
+    /// the target advance is applied by the test via `advance_target_to`,
+    /// the candidates route `doc-only` so no native reviewer ever runs, the
+    /// `Space` is in-memory, and the "replay" is a second in-process
+    /// `drain_key` call on the same live pipeline — not a daemon restart.
+    ///
+    /// The native lifecycle proof those stand-ins do not give lives in
+    /// `crates/rk-cli/tests/resumed_generation_successor_landing.rs`: a real
+    /// fake-harness rat over the wire, a real `agent.respawn` of the same
+    /// generation while its first delivery is still held in native review, a
+    /// native reviewer writing the verdict that permits the successor, and
+    /// two genuine durable daemon restarts around an interruption at
+    /// post-target-advance.
     #[tokio::test]
-    async fn resumed_generation_successor_lands_through_the_real_pipeline_and_replay_is_idempotent()
-    {
+    async fn successor_and_stale_replay_settle_through_the_pipeline_seam() {
         let home = tempfile::tempdir().unwrap();
         let repo_dir = tempfile::tempdir().unwrap();
         init_repo(repo_dir.path());
@@ -9713,8 +9742,9 @@ workflow: {
             .await
             .unwrap();
 
-        // The same-generation spawn that will be resumed after its first
-        // delivery lands — mirroring Skitter-16's real spawn/session pair.
+        // STAND-IN for the resumed generation: a hand-built completed
+        // record inserted straight into the registry. No spawn, no respawn,
+        // no provider session — the seam under test starts at the queue.
         let spawn = rk_core::id::SpawnId::new();
         let source: crate::agents::AgentRecord = serde_json::from_value(json!({
             "name": "Skitter", "spawn": spawn, "role": "rat", "harness": "fake",
@@ -9754,9 +9784,11 @@ workflow: {
             Some(first_commit.clone())
         );
 
-        // The SAME generation is resumed: the branch is recreated from the
-        // now-advanced `main` and carries a genuine second change, queued
-        // under the identical `source_spawn`.
+        // STAND-IN for the resumed generation's second source: the branch
+        // is recreated from the now-advanced `main` by raw `git` and carries
+        // a second change, queued under the identical `source_spawn`. What
+        // this genuinely exercises is that two distinct heads reach the
+        // queue under ONE `source_spawn`, not how they got there.
         git(repo_dir.path(), &["checkout", "-b", "feature", "main"]);
         std::fs::write(repo_dir.path().join("docs").join("note.md"), "v2\n").unwrap();
         git(repo_dir.path(), &["add", "."]);
@@ -9777,11 +9809,14 @@ workflow: {
             })
             .unwrap();
 
-        // Simulate native review/gate advancing the target BEFORE
-        // finalization runs, then an interruption (daemon rollover) right
-        // there — exactly `advanced_landing_reconciles_the_ticket_and_terminal_marker`'s
-        // pattern, and exactly the incident's own ordering: the branch had
-        // already advanced by the time `finalize_delivery` refused it.
+        // STAND-IN for a gate/review-authorized advance interrupted before
+        // finalization: the test advances the target itself and persists the
+        // claimed entry, exactly
+        // `advanced_landing_reconciles_the_ticket_and_terminal_marker`'s
+        // pattern. It reproduces the incident's ORDERING (the branch had
+        // already advanced by the time `finalize_delivery` refused it), not
+        // the native review/gate that produced it — these candidates are
+        // `doc-only`, so no reviewer runs at all.
         let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
         let candidate = match repo.prepare_merge("feature", "main").unwrap() {
             rk_git::PrepareOutcome::Prepared(candidate) => candidate,
@@ -9806,8 +9841,8 @@ workflow: {
         repo.discard_candidate(&candidate.candidate_ref).unwrap();
         repo.delete_branch("feature").unwrap();
 
-        // Resume past the interruption: finalization must settle the
-        // resumed generation's proven successor instead of conflicting.
+        // Drain again in the SAME process (not a restart): finalization
+        // must settle the proven successor instead of conflicting.
         let outcomes = pipeline.drain_key("docs-repo", "main").await.unwrap();
         let LandingOutcome::Landed(second) = &outcomes[0] else {
             panic!(
@@ -9837,8 +9872,8 @@ workflow: {
             "the ticket's delivery record must advance to the successor commit too"
         );
 
-        // Restart/replay: re-enqueuing and re-draining the SAME
-        // already-landed head must not duplicate the advance.
+        // Replay: re-enqueuing and re-draining the SAME already-landed head
+        // in this same live pipeline must not duplicate the advance.
         pipeline
             .enqueue(LandingQueueEntry {
                 repo_name: "docs-repo".into(),
@@ -9861,7 +9896,7 @@ workflow: {
                 .unwrap()
                 .merge_commit,
             Some(second_commit),
-            "replaying an already-landed head after a restart must not move the pointer again"
+            "replaying an already-landed head must not move the pointer again"
         );
     }
 
