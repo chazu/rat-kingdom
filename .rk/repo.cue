@@ -21,6 +21,16 @@ repo: {
 		maxDiffLines: 3000
 		reviewedTicketBbsContext: true
 		verificationHandoff: true
+		focusedChecks: [{
+			class: "rust"
+			paths: ["\\.rs$", "^Cargo\\.(toml|lock)$", "^crates/"]
+			checks: ["verify-changed"]
+		}]
+	}
+
+	release: {
+		integrationBranch: "integration/rk"
+		releaseTarget: "main"
 	}
 
 	// Regenerable build-artifact paths the daemon's worktree sweep reclaims.
