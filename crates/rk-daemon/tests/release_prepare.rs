@@ -1,14 +1,5 @@
-//! P6.1 (TKT-kogoj-lupun-gurab) end-to-end acceptance for `release.prepare`/
-//! `release.list`/`release.show`, through the real daemon RPC/public-command
-//! boundary — never by calling `rk_daemon::release`'s internals directly.
-//!
-//! The "recipe" under test really does invoke `cargo build --release -p
-//! rk-cli -p rk-mcp`, but against a tiny, dependency-free, two-package fixture
-//! workspace this file generates on the fly (packages literally named
-//! `rk-cli`/`rk-mcp`, producing `rk`/`rk-mcp` binaries — matching the one
-//! recipe `release::prepare` supports) rather than rebuilding the real
-//! multi-hundred-file rat-kingdom workspace. A release build of this fixture
-//! takes well under a second.
+//! Release prepare/list/show through a real daemon and a tiny dependency-free Cargo fixture.
+//! Tests cover immutable pairing, reuse, integrity, and publication/recovery boundaries.
 
 mod support;
 
@@ -34,12 +25,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A dependency-free two-package Cargo workspace: `rk-cli` (bin `rk`) prints
-/// `stamp` and exits 0 on any args (a real, cheap stand-in for `rk --help`'s
-/// "launches and exits cleanly" contract); `rk-mcp` (bin `rk-mcp`) speaks the
-/// same minimal `initialize` JSON-RPC handshake the real `rk-mcp` does,
-/// exiting cleanly on stdin EOF. Building this compiles in well under a
-/// second — no external crates, so no network/registry access either.
+/// A cheap paired Cargo workspace: CLI stamp and a minimal MCP initialize responder.
 fn write_fixture_source(dir: &Path, stamp: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -411,14 +397,7 @@ async fn unsupported_manifest_schema_is_refused() {
     assert!(err.to_string().contains("schema_version"), "{err}");
 }
 
-/// A publication/registry fault boundary (P6.1 correction, item 2): a
-/// `manifest.json` plus binaries that are perfectly self-consistent — the
-/// exact shape an attacker (or a bug) reusing a guessable, content-derived
-/// release-id path could plant — must never be trusted on its own say-so.
-/// Only a digest THIS daemon already durably committed to the registry
-/// counts as trust; deleting the registry's memory of a real prior
-/// preparation must make it fall back to quarantine-and-rebuild, not silent
-/// adoption.
+/// An internally consistent manifest without a prior registry digest must not be adopted.
 #[tokio::test]
 async fn self_consistent_manifest_without_a_registry_digest_is_quarantined_not_adopted() {
     let home = tempfile::tempdir().unwrap();
@@ -472,23 +451,4 @@ async fn self_consistent_manifest_without_a_registry_digest_is_quarantined_not_a
     );
 }
 
-// A real interruption-mid-build/restart/retry journey used to live here as
-// `interrupted_preparation_is_reported_and_recovers_on_retry_after_restart`,
-// driving the daemon in-process via `tokio::spawn(daemon.run())` and
-// "crashing" it with `JoinHandle::abort()`. That is unsound: `abort()` only
-// cancels the listener's own top-level task, while `Server::run`'s accept
-// loop spawns an INDEPENDENT task per connection — never a child of the
-// listener task — so the task actually running the in-flight
-// `release.prepare` call (and, through it, the real `cargo build` child it
-// owns) survives the abort untouched. Awaiting that same client's in-flight
-// `prepare` call after the "crash" then blocks behind the very build the
-// test means to interrupt, for up to `release::BUILD_TIMEOUT` (20 minutes) —
-// a fixture deadlock, not evidence of a slow compile.
-//
-// The corrected journey now lives in
-// `crates/rk-cli/tests/release_prepare_interruption.rs`, driving a real `rk`
-// subprocess daemon and interrupting it with a genuine `SIGKILL` — which
-// reaches every task the process was running, including the one holding the
-// in-flight build — then recovering through the ordinary
-// `Client::connect_or_spawn` stale-socket reclamation path a real restart
-// uses in the field.
+// Real process-death/restart/retry coverage lives in rk-cli/tests/release_prepare_interruption.rs.

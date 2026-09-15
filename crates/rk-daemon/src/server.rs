@@ -986,12 +986,7 @@ pub struct Daemon {
     /// checkpoints and idempotent ticket coalesce keys provide restart safety;
     /// this lock prevents concurrent operator retries racing those checkpoints.
     ticket_graph_apply_lock: tokio::sync::Mutex<()>,
-    /// Serializes `release.prepare` (P6.1): the recipe resets a single
-    /// persistent staging worktree per repo (`crate::release::run_recipe`),
-    /// which is not safe under concurrent use. Also doubles as the liveness
-    /// signal `crate::release::effective_status` reads via `try_lock` to
-    /// distinguish an in-flight build from a `Preparing` record a crash left
-    /// behind.
+    /// Serialize the shared release staging worktree; also expose in-flight preparation to reads.
     release_prepare_lock: tokio::sync::Mutex<()>,
     action_approvals: crate::action_approval::ActionApprovalStore,
     /// TKT-01M0E8PN9C41BWECGNW0990R3J: the durable orchestrator lease store
@@ -7952,20 +7947,9 @@ impl Daemon {
                 }
             }
         };
-        // Serializes concurrent prepares (the recipe resets a single
-        // persistent staging worktree per repo) and doubles as the liveness
-        // signal a `release.list`/`release.show` read uses to tell a build
-        // actually in flight from a `Preparing` record a crash left behind.
+        // Serialize staging access and expose preparation liveness to list/show.
         let _guard = self.release_prepare_lock.lock().await;
-        // Resolve the candidate EXACTLY ONCE, here, under the lock: `candidate`
-        // can be a mutable ref (a branch/tag), and this is the single frozen
-        // value used for BOTH the verification-proof lookup below and the
-        // actual build inside `release::prepare`. Resolving it a second time
-        // after queueing (an earlier draft resolved once here before the
-        // lock, for the lookup, then again inside `prepare` after acquiring
-        // it) would let a push to the branch in between attach one commit's
-        // proof reference to a manifest that actually describes a different
-        // commit.
+        // Freeze the mutable ref once under the lock for both proof lookup and building.
         let (resolved_commit, tree_sha) = {
             let repo_path = repo_path.clone();
             let candidate = params.candidate.clone();
@@ -7985,14 +7969,7 @@ impl Daemon {
                 }
             }
         };
-        // Read-only reference evidence: does this daemon already hold an
-        // exact-key managed-verification proof (or reusable landing-gate
-        // pass) for the "verify" check at this exact resolved commit? A pure
-        // tuple-scan read (`lookup_verification_proof`), never an execution —
-        // unlike `WorkflowEngine::verify_repo_check`, which `release.prepare`
-        // deliberately never calls, because on a cache miss THAT path
-        // executes the check. Best-effort: a repo with no "verify" check
-        // just yields `None` here.
+        // Look up existing exact-key proof only; a cache miss must never execute verification.
         let check = {
             let repo_path = repo_path.clone();
             let resolved_commit = resolved_commit.clone();
@@ -8011,21 +7988,13 @@ impl Daemon {
                 check.shared_cargo_target,
             )
             .lookup_verification_proof(&params.repo, &resolved_commit, &check)?;
-            // `lookup_verification_proof` itself returns only the matched
-            // tuple's `result` payload, not the tuple's own identity or the
-            // exact key it matched on — recompute the same digest
-            // independently (a pure function of repo/candidate/check, the
-            // same inputs `lookup_verification_proof` used internally) so a
-            // manifest reader can find and independently re-verify the exact
-            // durable proof this reference names, not just trust the copy.
+            // Retain the exact lookup key so consumers can independently trace the durable proof.
             let key = crate::managed_verification::verification_proof_key(
                 &params.repo,
                 &resolved_commit,
                 &check,
             );
-            // Carry the check identity/context alongside the proof itself so
-            // a manifest reader can trace exactly what this reference
-            // describes, rather than an opaque blob.
+            // Include the check context with its proof reference.
             Some(json!({
                 "check": {
                     "name": check.name,

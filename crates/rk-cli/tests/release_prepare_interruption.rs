@@ -1,60 +1,8 @@
-//! Genuine cross-process interruption/recovery proof for `release.prepare`
-//! (P6.1 correction, TKT-divah-duzuf-hajub): SIGKILL a real daemon *process*
-//! while it is genuinely blocked inside a real `cargo build`, bring a second
-//! real daemon process up over the same on-disk home through the ordinary
-//! `connect_or_spawn` stale-socket reclaim path, and prove recovery.
-//!
-//! # Why not `crates/rk-daemon/tests/release_prepare.rs`'s prior in-process attempt
-//!
-//! That version drove the daemon via `tokio::spawn(daemon.run())` inside the
-//! test process and "crashed" it with `JoinHandle::abort()`. `abort()` only
-//! cancels the listener's own top-level task; `Server::run`'s accept loop
-//! spawns an INDEPENDENT task per connection (never a child of the listener
-//! task), so the task actually running the in-flight `release.prepare` call —
-//! and, through it, the real `cargo build` child it owns — survives the
-//! abort untouched. Awaiting that same client's in-flight `prepare` call
-//! after the "crash" then blocks behind the very build the test means to
-//! interrupt, for up to `release::BUILD_TIMEOUT` (20 minutes): a hang, not a
-//! crash. A real `SIGKILL` of a real OS process has no such gap — the whole
-//! process, every one of its tasks, dies atomically. See
-//! `crates/rk-cli/tests/review_ceiling_crash_barrier.rs` for the same
-//! reasoning applied to a different daemon-owned transition, and
-//! `crates/rk-cli/tests/daemon_rollover.rs` for the same real-subprocess
-//! daemon pattern used here.
-//!
-//! # Bounded process ownership
-//!
-//! Every `rk` invocation below runs through [`bounded_output`] rather than a
-//! bare `Command::output()`: a stuck RPC (e.g. against a daemon this test
-//! just killed) must fail this test loudly within a fixed bound, never hang
-//! the suite. [`DaemonGuard`] SIGKILLs whichever daemon currently owns
-//! `home` when the test function returns — on the success path AND on a
-//! panicking assertion — so a failed assertion partway through can never
-//! leak a live daemon process (mirroring
-//! `review_ceiling_crash_barrier.rs`'s `DaemonGuard`/`kill_owning_daemon`).
-//!
-//! `DaemonGuard` alone is NOT enough to reap the real `cargo build` child:
-//! `release::run_recipe` spawns it with `.process_group(0)`, its own process
-//! group distinct from the daemon's — the whole reason it survives a real
-//! daemon SIGKILL as a genuine orphan for `reap_stale_managed_children` to
-//! find on the next daemon's startup (see the module doc above). SIGKILLing
-//! the daemon's own pid does not reach that separate group. On the
-//! successful path, starting daemon B naturally reaps it before this test's
-//! own assertions ever run. But if a panic strikes BEFORE daemon B ever
-//! starts (e.g. the build never reaches its barrier, or the pre-kill
-//! `Preparing` check never observes it), nothing would otherwise touch that
-//! orphaned group at all — and a panic can strike well BEFORE that, since
-//! `cargo`/`rustc` are already running inside the recipe's process group the
-//! moment the daemon spawns it, long before the fixture's own build-script
-//! barrier is ever reached. [`BuildGroupGuard`] closes that gap by keying off
-//! the daemon's OWN [`managed_children`] record (written the instant
-//! `run_recipe` spawns the child) rather than the build-script marker file,
-//! so ownership is captured as early as the daemon's bookkeeping allows.
-//! Once known, `Drop` re-validates the pid's live [`process_start_signature`]
-//! against what was recorded at discovery time — never signalling a bare pid
-//! number the OS may since have recycled for an unrelated process — before
-//! SIGKILLing that pid's whole process group. A no-op either way if the
-//! group is already gone (the ordinary already-reaped case).
+//! Real process-death and restart recovery for release.prepare.
+//! Aborting a listener task leaves per-connection builds alive, so this test SIGKILLs a daemon.
+//! Every RPC is bounded; RAII guards clean the daemon and separately owned build group.
+//! Capture build ownership from the daemon marker before the fixture barrier, and recheck the
+//! recorded process-start signature before signalling a group whose PID might be reused.
 
 use serde_json::Value;
 use std::cell::Cell;
@@ -66,10 +14,7 @@ use std::time::{Duration, Instant};
 /// generous against real host contention, but short enough that a genuinely
 /// stuck call fails the test instead of hanging it.
 const RPC_BOUND: Duration = Duration::from_secs(30);
-/// Bound for an `rk release prepare` call that actually runs the fixture's
-/// real (sub-second) `cargo build` — wider than [`RPC_BOUND`] to leave room
-/// for a cold `cargo` invocation on a loaded test runner, still far short of
-/// `release::BUILD_TIMEOUT`'s 20 minutes.
+/// Bound the small real fixture build while allowing startup on a loaded host.
 const PREPARE_BOUND: Duration = Duration::from_secs(90);
 
 fn rk(home: &Path) -> Command {
@@ -82,12 +27,7 @@ fn rk(home: &Path) -> Command {
     cmd
 }
 
-/// Run `cmd` to completion, killing it and panicking if it does not exit
-/// within `bound` — see the module doc's "Bounded process ownership"
-/// section. Stdout/stderr are drained concurrently with the wait (via
-/// `Child::wait_with_output` on a helper thread), so a chatty child can never
-/// deadlock this against a full pipe buffer the way polling `try_wait`
-/// without reading would.
+/// Drain output while waiting; kill and fail at the deadline without filling a pipe buffer.
 fn bounded_output(mut cmd: Command, bound: Duration) -> std::process::Output {
     let child = cmd
         .stdout(std::process::Stdio::piped())
@@ -131,12 +71,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A dependency-free two-package Cargo workspace — the same shape as
-/// `crates/rk-daemon/tests/release_prepare.rs`'s own fixture (kept
-/// independent rather than shared across crates; see that file's module doc
-/// for exactly what it builds and why building it is cheap): `rk-cli` (bin
-/// `rk`) prints a stamp and exits 0, `rk-mcp` (bin `rk-mcp`) speaks the same
-/// minimal `initialize` handshake the real `rk-mcp` does.
+/// Dependency-free paired Cargo fixture: CLI stamp and a minimal MCP initialize responder.
 fn write_fixture_source(dir: &Path, stamp: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -186,10 +121,7 @@ fn init_fixture_repo(dir: &Path, stamp: &str) {
     git(dir, &["commit", "-qm", "fixture v1"]);
 }
 
-/// A REAL Cargo build-script barrier: `rk-cli/build.rs` blocks (polling for a
-/// marker file's removal) before the crate compiles, writing its OWN pid to
-/// `started` first — a genuine, independent OS process, not an inference
-/// from the daemon's own bookkeeping.
+/// A real build-script process records its PID and blocks until its marker is removed.
 fn write_blocking_build_script(cli_dir: &Path, blocker: &Path, started: &Path) {
     let build_rs = format!(
         "fn main() {{\n    \
@@ -258,11 +190,7 @@ fn daemon_pid(home: &Path) -> Option<u32> {
         .map(|p| p as u32)
 }
 
-/// Bring a daemon up over `home` the way the field does — an ordinary RPC
-/// call through `Client::connect_or_spawn` — and return its pid. After a
-/// SIGKILL, this is the path that exercises `Server::run`'s stale-socket
-/// reclamation (it refuses to clobber a socket whose recorded pid is still
-/// alive, and only reclaims one whose owner is genuinely dead).
+/// Exercise ordinary connect_or_spawn and stale-socket reclaim after real daemon death.
 fn start_daemon(home: &Path) -> u32 {
     until("a daemon to come up over the home", || {
         let mut cmd = rk(home);
@@ -277,14 +205,8 @@ fn start_daemon(home: &Path) -> u32 {
     })
 }
 
-/// Kill whichever daemon currently owns `home`, unless it is this test
-/// process itself or `spare` (a pid this test already knows is dead and has
-/// no reason to signal again). Reads `home`'s pid file directly rather than
-/// round-tripping through `daemon status` — teardown must not depend on the
-/// very RPC path a failing test might be leaving in a bad state. Best-effort:
-/// a stale/unreadable pid file, or a `kill` that fails to spawn, just means
-/// nothing gets signalled — same reasoning as
-/// `review_ceiling_crash_barrier.rs`'s identical helper.
+/// Best-effort cleanup from the owned home pidfile, without relying on a responsive RPC.
+/// Never signal this test or the already-dead spare PID.
 fn kill_owning_daemon(home: &Path, spare: Option<u32>) {
     let Some(pid) = std::fs::read_to_string(home.join("rk.pid"))
         .ok()
@@ -302,11 +224,7 @@ fn kill_owning_daemon(home: &Path, spare: Option<u32>) {
     }
 }
 
-/// RAII teardown: SIGKILLs whichever daemon owns `home` when this guard
-/// drops, on both the success path and a panicking assertion. Declared
-/// *after* the `TempDir` it guards so it drops *before* that `TempDir`'s own
-/// destructor removes the directory (Rust drops locals in reverse
-/// declaration order) — the pid file must still exist when this reads it.
+/// Drop before the guarded TempDir so its pidfile still exists during daemon cleanup.
 struct DaemonGuard {
     home: std::path::PathBuf,
 }
@@ -317,12 +235,7 @@ impl Drop for DaemonGuard {
     }
 }
 
-/// SIGKILL the whole process group `pid` belongs to, not just `pid` itself —
-/// `release::run_recipe` spawns the real `cargo build` child with
-/// `.process_group(0)`, its own group, so cargo/rustc siblings do not die
-/// with any single member alone. Best-effort: a `ps` lookup that fails (the
-/// pid is already gone) or a group id of `0`/`1` (never a legitimate
-/// leader for a child this test spawned) means nothing to clean up.
+/// Kill the validated build process group, excluding missing or invalid group IDs.
 fn kill_process_group_of(pid: u32) {
     let Ok(out) = Command::new("ps")
         .args(["-o", "pgid=", "-p", &pid.to_string()])
@@ -341,11 +254,7 @@ fn kill_process_group_of(pid: u32) {
         .status();
 }
 
-/// The exact process-start-time signature `ps` reports for `pid` RIGHT NOW —
-/// the same value (and the same `ps -o lstart=` invocation) `rk_daemon`'s
-/// own `process_signature`/`ManagedChildMarker` records the instant it spawns
-/// a managed child. `None` covers both "no process is live at this pid" and
-/// "`ps` itself failed" — neither is something safe to compare against.
+/// Use the same live start-time signature as the daemon marker; errors return None.
 fn process_start_signature(pid: u32) -> Option<String> {
     let out = Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
@@ -358,19 +267,7 @@ fn process_start_signature(pid: u32) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// The pids currently recorded under `home`'s managed-children directory,
-/// each paired with its marker file's own recorded [`process_start_signature`]
-/// content — `crate::managed_verification::ManagedChildMarker` in production,
-/// written the instant `release::run_recipe` spawns the real `sh -c cargo
-/// build ...` child (`.process_group(0)`, its own process group) and removed
-/// the instant that child exits. This is the daemon's OWN durable record of
-/// the exact process it owns, not an inference from a marker file the
-/// fixture's build script writes minutes later — and carrying the recorded
-/// signature alongside the pid is what lets a later kill confirm it is still
-/// signalling the SAME process, not a stranger the OS recycled that exact
-/// pid for in the meantime (the same fail-closed identity check
-/// `reap_stale_managed_children` performs in production before ever
-/// signalling a marked pid).
+/// Read each daemon-owned child PID with its recorded start signature, not just its filename.
 fn managed_children(home: &Path) -> std::collections::BTreeMap<u32, String> {
     let dir = rk_core::paths::Layout::at(home).managed_children_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -386,18 +283,7 @@ fn managed_children(home: &Path) -> std::collections::BTreeMap<u32, String> {
         .collect()
 }
 
-/// RAII teardown for the real `cargo build` child's process group — see the
-/// module doc's "Bounded process ownership" section for why [`DaemonGuard`]
-/// alone cannot reach it. `owned` starts unset and is filled in with
-/// `(pid, recorded_signature)` via `Cell::set` as soon as this test observes
-/// the daemon's own [`managed_children`] record for the recipe child —
-/// BEFORE waiting on the fixture's own build-script barrier marker, which
-/// only appears well after `cargo`/`rustc` are already running inside that
-/// same process group. `Drop` re-checks [`process_start_signature`] against
-/// what was captured at discovery time before ever signalling: a pid whose
-/// live signature no longer matches is refused, never signalled on the
-/// strength of a bare recycled number. A panic before the recipe was ever
-/// spawned at all simply has nothing to clean up.
+/// Capture ownership before the fixture barrier; revalidate the start signature before cleanup.
 struct BuildGroupGuard {
     owned: Cell<Option<(u32, String)>>,
 }
@@ -426,10 +312,7 @@ impl Drop for TestChild {
 #[test]
 fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() {
     let home = tempfile::tempdir().unwrap();
-    // Declared right after `home`, so it drops right before `home`'s own
-    // destructor removes the directory — see `DaemonGuard`'s doc comment.
-    // Covers BOTH daemon A (if a panic strikes before the deliberate kill
-    // below) and daemon B (there is no other cleanup for it at all).
+    // Clean either daemon before the home directory is removed, including on panic.
     let _daemon_guard = DaemonGuard {
         home: home.path().to_path_buf(),
     };
@@ -502,17 +385,10 @@ fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() 
         "refusing to SIGKILL this test process"
     );
 
-    // Snapshot the daemon's own managed-children record BEFORE firing
-    // prepare, so the pid that appears afterward is unambiguously the new
-    // recipe child, not a leftover from the earlier harmless prepare above
-    // (which already exited and had its own marker removed by the time it
-    // returned).
+    // Snapshot prior markers so the new recipe child is identifiable.
     let managed_before = managed_children(home.path());
 
-    // Fire prepare on a detached process — it will block inside the real
-    // `cargo build` until `blocker` is removed. Owned by `TestChild` so a
-    // panic anywhere below still reaps it rather than leaking a process
-    // stuck talking to a home this test is about to tear down.
+    // Own the blocked prepare client so panic cleanup cannot leave it waiting on a dead daemon.
     let _prepare_child = TestChild(
         rk(home.path())
             .args([
@@ -529,11 +405,7 @@ fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() 
             .unwrap(),
     );
 
-    // Capture ownership of the recipe's process group as soon as the daemon
-    // itself records having spawned it — well BEFORE `cargo`/`rustc` reach
-    // the fixture's own build-script barrier below. This is what closes the
-    // pre-marker gap: `_build_group_guard` can now clean up the whole group
-    // even if a panic strikes before that barrier is ever reached.
+    // Capture the daemon marker before the build-script barrier to cover early failures.
     let (recipe_pid, recipe_signature) =
         until("the daemon to record its own owned recipe child", || {
             managed_children(home.path())
@@ -577,11 +449,7 @@ fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() 
          what crashed it"
     );
 
-    // THE kill: a real SIGKILL of a real daemon process. No Drop, no
-    // graceful shutdown, no hand-cleanup of the pid file or socket it leaves
-    // behind — unlike the prior in-process `handle.abort()` version, this
-    // reaches every task the process was running, including the one that
-    // owned the in-flight `release.prepare` call.
+    // Kill the actual daemon process and all its tasks; leave stale state for normal recovery.
     Command::new("kill")
         .args(["-9", &daemon_a.to_string()])
         .status()
@@ -618,11 +486,7 @@ fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() 
         .expect("the interrupted attempt must have its own registry entry");
     assert_eq!(interrupted["status"], "unknown", "{releases:?}");
 
-    // Confirmed original owned descendant gone: `reap_stale_managed_children`
-    // runs at the very start of `Daemon::run`, before it can serve a single
-    // request, so daemon B's own startup — already observed above via
-    // `start_daemon` — has already reaped the orphaned build-script child by
-    // this point.
+    // Daemon startup must have reaped the original owned build before serving requests.
     assert!(
         !process_alive(build_pid),
         "the orphaned build-script child must not survive daemon B's startup reap"
