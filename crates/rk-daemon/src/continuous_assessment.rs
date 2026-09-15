@@ -126,6 +126,7 @@ pub const RETIREMENT_TELEMETRY_IDENTITY: &str = "landing-need-retirement-run";
 pub const ASSESSMENT_RESULT_IDENTITY: &str = "continuous-assessment-result";
 
 const MAX_DISTINCT_RESOLVED_NEEDS: usize = 4096;
+const MAX_SEEN_EVENT_IDS: usize = 4096;
 const MAX_OBSERVED_CONFIG_REVISIONS: usize = 32;
 const MAX_OBSERVED_BUILDS: usize = 16;
 const MAX_SOURCE_REFERENCES: usize = 16;
@@ -280,15 +281,15 @@ pub struct Activation {
     pub installed_build: String,
     /// The source feature's own config revision
     /// (`landing_need_resolution::RetirementConfig::revision`) read at
-    /// activation time. A telemetry row observed with a LOWER revision than
-    /// this is unsupported provenance for this activation — evidence from a
-    /// configuration this window never actually bound to — and is rejected
-    /// (see [`AssessmentState::superseded_provenance_events`]), not silently
-    /// folded in. A row with an EQUAL or HIGHER revision (the feature was
-    /// reconfigured, e.g. off/on, during this window) is still accepted and
-    /// explicitly recorded in
-    /// [`AssessmentState::observed_feature_config_revisions`] — later drift
-    /// forward does not reset this window.
+    /// activation time. This binds the window to EXACTLY that revision: a
+    /// telemetry row observed with a DIFFERENT revision — lower (evidence
+    /// from before this window's configuration existed) or higher (the
+    /// feature was reconfigured during this window) — is unsupported
+    /// provenance and is rejected (see
+    /// [`AssessmentState::revision_mismatch_events`]), never silently
+    /// folded in either direction. Every observed revision, matched or not,
+    /// is still explicitly recorded in
+    /// [`AssessmentState::observed_feature_config_revisions`] for audit.
     pub source_feature_revision: u64,
     pub activated_by: String,
 }
@@ -303,45 +304,66 @@ pub struct AssessmentState {
     pub attempted_total: u64,
     pub skipped_total: u64,
     pub failed_total: u64,
-    /// The numerator: distinct resolved Need identities, deduplicated across
-    /// every consumed telemetry event. This — not a summed per-event
-    /// `resolved` counter — is the source of truth for "how many operations
-    /// actually resolved", because a retried/replayed pass over the SAME
-    /// still-standing Need (the exact crash-recovery case
-    /// `landing_need_resolution`'s own doc comment describes) legitimately
-    /// produces a SECOND telemetry event naming the SAME Need id; summing
-    /// counters would double-count it, while this set naturally does not.
+    /// The numerator: `sum(resolved)` over every consumed telemetry event,
+    /// exactly as the predeclared objective defines it. Two DISTINCT native
+    /// operation events may legitimately name the same Need (e.g. a genuine
+    /// retry); that is real observed work and both count here. Protection
+    /// against a data-pipeline REPLAY of the identical event is instead
+    /// [`seen_event_ids`](Self::seen_event_ids) below, keyed on the source
+    /// tuple's own native identity, not on which Need it names.
+    pub resolved_total: u64,
+    /// A SEPARATE minimum-sample signal, never the metric numerator: distinct
+    /// resolved Need identities seen across every consumed event. Repeated
+    /// bindings of the same Need cannot manufacture distinct successful work
+    /// for `minimum_distinct_resolved_needs_for_pass`.
     pub distinct_resolved_needs: BTreeSet<String>,
+    /// Set when a producer-truncated `resolved_bindings` list (or this
+    /// state's own bounded Need set) could not record complete evidence.
+    /// Sticky: once true, `assess` treats the whole window as carrying
+    /// unknown evidence.
     pub distinct_resolved_truncated: bool,
     pub observed_feature_config_revisions: BTreeSet<u64>,
     pub observed_builds: BTreeSet<String>,
     /// Telemetry rows that named this feature/identity but carried
     /// missing/non-numeric/inconsistent required counters (including a
     /// failed `attempted == resolved + skipped + failed` cross-check,
-    /// numeric overflow, or an incomplete `resolved_bindings` list for a
+    /// numeric overflow, a missing/empty `build` or unrecognized
+    /// `config_status`, or an incomplete `resolved_bindings` list for a
     /// non-truncated `resolved > 0` row). Never folded into `failed_total`
     /// (a producer error is not evidence the OPERATION failed) and never
     /// silently dropped either.
     pub malformed_events: u64,
-    /// Well-formed rows whose `config_revision` was LOWER than this
-    /// activation's own `source_feature_revision` — unsupported provenance
-    /// for this window, reported rather than counted as success.
-    pub superseded_provenance_events: u64,
+    /// Well-formed rows whose `config_revision` did not EXACTLY equal this
+    /// activation's own bound `source_feature_revision` — a later
+    /// reconfiguration must not silently widen or change this window's
+    /// scope any more than an older one may retroactively narrow it.
+    /// Reported rather than counted as success either way.
+    pub revision_mismatch_events: u64,
+    /// Native source tuple ids already folded into the totals above, for
+    /// this activation. Checked before any counters are updated so a
+    /// data-pipeline replay of the IDENTICAL source event can never count
+    /// operations (or failures) twice. Bounded; see
+    /// [`seen_event_ids_truncated`](Self::seen_event_ids_truncated).
+    pub seen_event_ids: BTreeSet<String>,
+    /// Set once `seen_event_ids` hits its bound: dedup can no longer be
+    /// proven for a new incoming id, so the window's evidence is no longer
+    /// fully trustworthy. Sticky, like `distinct_resolved_truncated`.
+    pub seen_event_ids_truncated: bool,
     /// Sticky: once true, [`assess`] always returns `Fail` for this
     /// activation.
     pub ever_failed: bool,
     /// Count of rows that passed every validation and were actually folded
     /// into the totals above (excludes `malformed_events` and
-    /// `superseded_provenance_events`). `0` is the precise signal for "no
-    /// valid evidence has been observed for this activation yet".
+    /// `revision_mismatch_events`). `0` is the precise signal for "no valid
+    /// evidence has been observed for this activation yet".
     pub events_consumed: u64,
     pub last_event_at: Option<DateTime<Utc>>,
     pub last_tick_at: Option<DateTime<Utc>>,
     pub last_tick_pages: usize,
     /// True when the journal held more matching rows beyond this tick's
-    /// bounded page budget — reported, never hidden, and used by [`assess`]
-    /// to cap an otherwise-`pass` result at `inconclusive` until a later
-    /// tick fully catches up.
+    /// bounded page budget — reported, never hidden. Reflects only the
+    /// MOST RECENT tick (self-resolving once a later tick fully catches
+    /// up), unlike the other sticky flags above.
     pub last_tick_truncated: bool,
     /// Most recent contributing telemetry event ids, bounded, for
     /// reproducibility references on the published assessment.
@@ -349,10 +371,6 @@ pub struct AssessmentState {
 }
 
 impl AssessmentState {
-    pub fn resolved_count(&self) -> u64 {
-        self.distinct_resolved_needs.len() as u64
-    }
-
     fn record_config_revision(&mut self, revision: u64) {
         if self.observed_feature_config_revisions.len() < MAX_OBSERVED_CONFIG_REVISIONS {
             self.observed_feature_config_revisions.insert(revision);
@@ -381,6 +399,24 @@ impl AssessmentState {
         if self.source_references.len() > MAX_SOURCE_REFERENCES {
             self.source_references.remove(0);
         }
+    }
+
+    /// `true` iff `id` is newly recorded and this event should be processed;
+    /// `false` iff `id` is a known duplicate and the caller must skip it
+    /// entirely. On bound overflow, still returns `true` (dropping known-good
+    /// data is its own failure mode) but sets
+    /// [`seen_event_ids_truncated`](Self::seen_event_ids_truncated) so
+    /// `assess` stops trusting the window's completeness.
+    fn record_seen_event(&mut self, id: &str) -> bool {
+        if self.seen_event_ids.contains(id) {
+            return false;
+        }
+        if self.seen_event_ids.len() >= MAX_SEEN_EVENT_IDS {
+            self.seen_event_ids_truncated = true;
+            return true;
+        }
+        self.seen_event_ids.insert(id.to_string());
+        true
     }
 }
 
@@ -749,11 +785,11 @@ pub fn disable(
 }
 
 /// Compute the deterministic verdict for the current accumulated state under
-/// `objective` as of `now`. `denominator = resolved + failed`, where
-/// `resolved` is [`AssessmentState::resolved_count`] (deduplicated distinct
-/// Need identities), matching the objective's declared metric while never
-/// letting a retried/replayed source occurrence inflate the numerator. See
-/// the module doc for the full verdict priority order.
+/// `objective` as of `now`. `numerator = resolved_total`, `denominator =
+/// resolved_total + failed_total` — the predeclared `sum(resolved)` /
+/// `sum(resolved + failed)` metric exactly, never redefined in terms of
+/// distinct Need identities (that stays a SEPARATE minimum-sample check).
+/// See the module doc for the full verdict priority order.
 pub fn assess(
     objective: &ObjectiveConfig,
     state: &AssessmentState,
@@ -767,17 +803,50 @@ pub fn assess(
                 .to_string(),
         );
     }
-    if state.events_consumed == 0 {
-        let reason = if state.malformed_events > 0 || state.superseded_provenance_events > 0 {
+    // Any known-incomplete or unknown evidence in the active window makes
+    // the window untrustworthy for a confident pass/fail/inconclusive claim
+    // — checked BEFORE the metric, and sticky for everything except the
+    // per-tick catch-up flag, so a success followed later by a malformed,
+    // mismatched, or truncated row still reports `unavailable`, not a stale
+    // `pass`.
+    if state.malformed_events > 0
+        || state.revision_mismatch_events > 0
+        || state.distinct_resolved_truncated
+        || state.seen_event_ids_truncated
+        || state.last_tick_truncated
+    {
+        let mut reasons = Vec::new();
+        if state.malformed_events > 0 {
+            reasons.push(format!("{} malformed row(s)", state.malformed_events));
+        }
+        if state.revision_mismatch_events > 0 {
+            reasons.push(format!(
+                "{} revision-mismatched row(s)",
+                state.revision_mismatch_events
+            ));
+        }
+        if state.distinct_resolved_truncated {
+            reasons.push("truncated resolution bindings".to_string());
+        }
+        if state.seen_event_ids_truncated {
+            reasons.push("dedup identity bound exceeded".to_string());
+        }
+        if state.last_tick_truncated {
+            reasons.push("catch-up incomplete this tick".to_string());
+        }
+        return (
+            Verdict::Unavailable,
             format!(
-                "{} malformed and {} provenance-rejected telemetry row(s) observed; no valid \
-                 in-scope evidence for this activation yet",
-                state.malformed_events, state.superseded_provenance_events
-            )
-        } else {
-            "no telemetry observed yet for this activation".to_string()
-        };
-        return (Verdict::Unavailable, reason);
+                "incomplete or unknown evidence in the active window: {}",
+                reasons.join(", ")
+            ),
+        );
+    }
+    if state.events_consumed == 0 {
+        return (
+            Verdict::Unavailable,
+            "no telemetry observed yet for this activation".to_string(),
+        );
     }
     if let Some(last_event_at) = state.last_event_at {
         let age = now.signed_duration_since(last_event_at);
@@ -793,8 +862,7 @@ pub fn assess(
             );
         }
     }
-    let resolved = state.resolved_count();
-    let denominator = resolved + state.failed_total;
+    let denominator = state.resolved_total + state.failed_total;
     if denominator == 0 {
         return (
             Verdict::Inconclusive,
@@ -811,16 +879,17 @@ pub fn assess(
             ),
         );
     }
-    if resolved < objective.minimum_distinct_resolved_needs_for_pass {
+    let distinct = state.distinct_resolved_needs.len() as u64;
+    if distinct < objective.minimum_distinct_resolved_needs_for_pass {
         return (
             Verdict::Inconclusive,
             format!(
-                "distinct resolved needs {resolved} below minimum {}",
+                "distinct resolved needs {distinct} below minimum {}",
                 objective.minimum_distinct_resolved_needs_for_pass
             ),
         );
     }
-    let ratio = resolved as f64 / denominator as f64;
+    let ratio = state.resolved_total as f64 / denominator as f64;
     if ratio < objective.required_ratio {
         return (
             Verdict::Inconclusive,
@@ -830,19 +899,11 @@ pub fn assess(
             ),
         );
     }
-    if state.last_tick_truncated {
-        return (
-            Verdict::Inconclusive,
-            "evaluator has not fully caught up to the source boundary this tick; deferring pass \
-             until fully caught up"
-                .to_string(),
-        );
-    }
     (
         Verdict::Pass,
         format!(
             "ratio {ratio:.4} >= required {:.4} over {denominator} observed operation(s), \
-             {resolved} distinct resolved need(s)",
+             {distinct} distinct resolved need(s)",
             objective.required_ratio
         ),
     )
@@ -920,16 +981,16 @@ pub fn tick(
         state.last_tick_truncated = truncated;
 
         let (verdict, reason) = assess(&objective, &state, now);
-        let resolved = state.resolved_count();
-        let denominator = resolved + state.failed_total;
+        let denominator = state.resolved_total + state.failed_total;
+        let distinct = state.distinct_resolved_needs.len() as u64;
         let meaningfully_changed = record
             .latest
             .as_ref()
             .map(|prior| {
                 prior.verdict != verdict
-                    || prior.numerator != resolved
+                    || prior.numerator != state.resolved_total
                     || prior.denominator != denominator
-                    || prior.distinct_resolved_needs != resolved
+                    || prior.distinct_resolved_needs != distinct
             })
             .unwrap_or(true);
 
@@ -949,9 +1010,9 @@ pub fn tick(
                     .copied()
                     .collect(),
                 cursor_range: (activation.activation_boundary, state.cursor),
-                numerator: resolved,
+                numerator: state.resolved_total,
                 denominator,
-                distinct_resolved_needs: resolved,
+                distinct_resolved_needs: distinct,
                 distinct_resolved_truncated: state.distinct_resolved_truncated,
                 published_at: now,
                 source_references: state.source_references.clone(),
@@ -1043,15 +1104,26 @@ pub fn sweep_due(space: &rk_space::Space, layout: &Layout, now: DateTime<Utc>) -
     ticked
 }
 
+/// Recognized `landing_need_resolution::RetirementConfig::status` values
+/// (`rk_core::bbs::ConfigStatus::as_str`), duplicated as a literal list
+/// rather than importing that type so a payload carrying anything else is
+/// visibly rejected here without this module needing to track every variant
+/// of a type it never otherwise touches.
+const KNOWN_CONFIG_STATUSES: &[&str] = &["explicit", "default_absent", "unreadable_fallback"];
+
 /// Validate and fold one telemetry tuple into `state`. Rejects (counts as
 /// `malformed_events`, never `failed_total`) a row with missing/non-numeric
 /// counters, a failed `attempted == resolved + skipped + failed` identity
-/// (including on overflow), or an incomplete `resolved_bindings` list for a
+/// (including on overflow), a missing/empty `build`, an unrecognized
+/// `config_status`, or an incomplete `resolved_bindings` list for a
 /// non-truncated `resolved > 0` row. Rejects (counts as
-/// `superseded_provenance_events`) a well-formed row whose `config_revision`
-/// is lower than `activation_source_feature_revision`. Only a row that
-/// clears every check increments `events_consumed` and folds into the
-/// running totals.
+/// `revision_mismatch_events`) a well-formed row whose `config_revision`
+/// does not EXACTLY equal `activation_source_feature_revision`. A row whose
+/// native tuple id has already been folded into this state (a
+/// data-pipeline replay of the identical source event) is skipped entirely
+/// — see [`AssessmentState::record_seen_event`]. Only a row that clears
+/// every check increments `events_consumed` and folds into the running
+/// totals.
 fn ingest_retirement_event(
     state: &mut AssessmentState,
     tuple: &Tuple,
@@ -1063,17 +1135,43 @@ fn ingest_retirement_event(
     {
         return;
     }
+    if !state.record_seen_event(&tuple.id.to_string()) {
+        // A known duplicate of an already-folded native event id: never
+        // recount its operations, failures, or malformed/mismatch status.
+        return;
+    }
     let attempted = payload.get("attempted").and_then(|v| v.as_u64());
     let resolved = payload.get("resolved").and_then(|v| v.as_u64());
     let skipped = payload.get("skipped").and_then(|v| v.as_u64());
     let failed = payload.get("failed").and_then(|v| v.as_u64());
     let config_revision = payload.get("config_revision").and_then(|v| v.as_u64());
-    let (Some(attempted), Some(resolved), Some(skipped), Some(failed), Some(config_revision)) =
-        (attempted, resolved, skipped, failed, config_revision)
+    let build = payload.get("build").and_then(|v| v.as_str());
+    let config_status = payload.get("config_status").and_then(|v| v.as_str());
+    let (
+        Some(attempted),
+        Some(resolved),
+        Some(skipped),
+        Some(failed),
+        Some(config_revision),
+        Some(build),
+        Some(config_status),
+    ) = (
+        attempted,
+        resolved,
+        skipped,
+        failed,
+        config_revision,
+        build,
+        config_status,
+    )
     else {
         state.malformed_events += 1;
         return;
     };
+    if build.is_empty() || !KNOWN_CONFIG_STATUSES.contains(&config_status) {
+        state.malformed_events += 1;
+        return;
+    }
     let Some(expected_attempted) = resolved
         .checked_add(skipped)
         .and_then(|s| s.checked_add(failed))
@@ -1085,8 +1183,12 @@ fn ingest_retirement_event(
         state.malformed_events += 1;
         return;
     }
-    if config_revision < activation_source_feature_revision {
-        state.superseded_provenance_events += 1;
+    // Explicit visibility for EVERY observed revision, matched or not —
+    // recorded before the match decision so a mismatch is never silently
+    // invisible.
+    state.record_config_revision(config_revision);
+    if config_revision != activation_source_feature_revision {
+        state.revision_mismatch_events += 1;
         return;
     }
     let bindings = payload.get("resolved_bindings").and_then(|v| v.as_array());
@@ -1111,21 +1213,24 @@ fn ingest_retirement_event(
         }
         resolved_ids = named;
     }
-    // Every check has passed: commit this event's effect.
+    // Every check has passed: commit this event's effect. `resolved_total`
+    // is the predeclared `sum(resolved)` metric itself — two DISTINCT
+    // native events may legitimately name the same Need, and both count
+    // here; only a replayed IDENTICAL tuple id (already excluded above)
+    // must never double count.
     state.attempted_total = state.attempted_total.saturating_add(attempted);
+    state.resolved_total = state.resolved_total.saturating_add(resolved);
     state.skipped_total = state.skipped_total.saturating_add(skipped);
     state.failed_total = state.failed_total.saturating_add(failed);
     if failed > 0 {
         state.ever_failed = true;
     }
-    state.record_config_revision(config_revision);
-    if let Some(build) = payload.get("build").and_then(|v| v.as_str()) {
-        state.record_build(build);
-    }
+    state.record_build(build);
     if bindings_truncated {
         state.distinct_resolved_truncated = true;
     }
     for need_id in resolved_ids {
+        // A SEPARATE minimum-sample signal only — never the metric itself.
         state.record_resolved_need(need_id);
     }
     state.last_event_at = Some(
@@ -1165,6 +1270,11 @@ fn result_tuple(repo: &str, castle: &str, assessment: &PublishedAssessment) -> T
 }
 
 #[cfg(test)]
+// Fixtures below build a base `AssessmentState`/`ObjectiveConfig` then
+// reassign only the one or two fields each test actually exercises, so the
+// field under test reads clearly against the untouched default — clearer
+// here than threading every field through a struct literal per test.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -1271,6 +1381,7 @@ mod tests {
         let mut state = AssessmentState::default();
         state.events_consumed = 1;
         state.last_event_at = Some(Utc::now());
+        state.resolved_total = 1;
         state.distinct_resolved_needs.insert("01ABC".into());
         let (verdict, _) = assess(&objective, &state, Utc::now());
         assert_eq!(verdict, Verdict::Pass);
@@ -1310,24 +1421,30 @@ mod tests {
         let mut state = AssessmentState::default();
         state.events_consumed = 1;
         state.last_event_at = Some(Utc::now());
+        // A high operation count, but only one distinct Need — the
+        // predeclared sum metric alone is satisfied; the SEPARATE
+        // distinct-Need minimum is not.
+        state.resolved_total = 5;
         state.distinct_resolved_needs.insert("01ABC".into());
         let (verdict, _) = assess(&objective, &state, Utc::now());
         assert_eq!(verdict, Verdict::Inconclusive);
     }
 
     #[test]
-    fn a_truncated_distinct_set_never_bypasses_the_minimum_check() {
+    fn truncated_bindings_are_unavailable_not_a_silent_minimum_bypass() {
         let mut objective = valid_objective();
         objective.minimum_distinct_resolved_needs_for_pass = 2;
         let mut state = AssessmentState::default();
         state.events_consumed = 1;
         state.last_event_at = Some(Utc::now());
+        state.resolved_total = 1;
         state.distinct_resolved_needs.insert("01ABC".into());
-        // A truncated flag with an observed count still below the minimum
-        // must NOT be treated as "probably satisfied".
+        // Truncated bindings are unknown/incomplete evidence: unavailable,
+        // never treated as "probably satisfies the minimum".
         state.distinct_resolved_truncated = true;
-        let (verdict, _) = assess(&objective, &state, Utc::now());
-        assert_eq!(verdict, Verdict::Inconclusive);
+        let (verdict, reason) = assess(&objective, &state, Utc::now());
+        assert_eq!(verdict, Verdict::Unavailable);
+        assert!(reason.contains("truncated"), "{reason}");
     }
 
     #[test]
@@ -1341,10 +1458,27 @@ mod tests {
     }
 
     #[test]
+    fn a_success_followed_by_malformed_telemetry_is_unavailable_not_pass() {
+        let objective = valid_objective();
+        let mut state = AssessmentState::default();
+        state.events_consumed = 1;
+        state.last_event_at = Some(Utc::now());
+        state.resolved_total = 1;
+        state.distinct_resolved_needs.insert("01ABC".into());
+        // A LATER malformed row must still make the CURRENT verdict
+        // unavailable, not conceal itself behind the earlier success.
+        state.malformed_events = 1;
+        let (verdict, reason) = assess(&objective, &state, Utc::now());
+        assert_eq!(verdict, Verdict::Unavailable);
+        assert!(reason.contains("malformed"), "{reason}");
+    }
+
+    #[test]
     fn stale_evidence_is_unavailable_even_with_a_clean_history() {
         let objective = valid_objective();
         let mut state = AssessmentState::default();
         state.events_consumed = 1;
+        state.resolved_total = 1;
         state.distinct_resolved_needs.insert("01ABC".into());
         state.last_event_at = Some(Utc::now() - ChronoDuration::seconds(3600));
         let (verdict, reason) = assess(&objective, &state, Utc::now());
@@ -1360,6 +1494,7 @@ mod tests {
         let objective = valid_objective();
         let mut state = AssessmentState::default();
         state.events_consumed = 1;
+        state.resolved_total = 1;
         state.distinct_resolved_needs.insert("01ABC".into());
         state.last_event_at = Some(Utc::now() - ChronoDuration::seconds(10));
         let (verdict, _) = assess(&objective, &state, Utc::now());
@@ -1367,16 +1502,81 @@ mod tests {
     }
 
     #[test]
-    fn truncated_tick_caps_an_otherwise_passing_result_at_inconclusive() {
+    fn truncated_tick_is_unavailable_not_a_silently_incomplete_pass() {
         let objective = valid_objective();
         let mut state = AssessmentState::default();
         state.events_consumed = 1;
         state.last_event_at = Some(Utc::now());
+        state.resolved_total = 1;
         state.distinct_resolved_needs.insert("01ABC".into());
         state.last_tick_truncated = true;
         let (verdict, reason) = assess(&objective, &state, Utc::now());
-        assert_eq!(verdict, Verdict::Inconclusive);
-        assert!(reason.contains("caught up"), "{reason}");
+        assert_eq!(verdict, Verdict::Unavailable);
+        assert!(reason.contains("catch-up"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_revision_mismatch_is_sticky_and_still_blocks_a_later_matched_tick() {
+        // `revision_mismatch_events` is sticky (see `assess`'s untrusted-
+        // evidence check): once a mismatched-revision row has been observed,
+        // a LATER tick that ingests only clean, exactly-matched-revision
+        // evidence does NOT clear the window back to trustworthy — the
+        // count is never reset, so `assess` keeps reporting `Unavailable`
+        // for this activation. (A prior version of this test asserted the
+        // opposite — that the mismatch was forgiven — without ever actually
+        // injecting one, via direct state construction rather than real
+        // event ingestion; this exercises the real boundary through
+        // `tick`/`Space` instead.)
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let space = rk_space::Space::open_in_memory().unwrap();
+        let repo = "fixture-repo";
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure(repo, valid_objective(), "operator")
+                .unwrap();
+            // Activation binds source_feature_revision = 1 EXACTLY.
+            registry
+                .activate(repo, &space, "build-1".into(), 1, "operator")
+                .unwrap();
+        }
+
+        // A mismatched-revision row first.
+        space
+            .out(well_formed_event_tuple_revision(
+                repo,
+                1,
+                0,
+                "01MISMATCH",
+                2,
+            ))
+            .unwrap();
+        let outcome1 = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
+        assert_eq!(outcome1.events_consumed, 0);
+        assert_eq!(outcome1.verdict, Verdict::Unavailable);
+
+        // A later tick observing ONLY matched-revision, complete, clean
+        // evidence — no NEW mismatch.
+        space
+            .out(well_formed_event_tuple_revision(repo, 1, 0, "01MATCHED", 1))
+            .unwrap();
+        let outcome2 = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
+        assert_eq!(outcome2.events_consumed, 1);
+
+        let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        let state = &registry.record(repo).unwrap().state;
+        assert_eq!(
+            state.revision_mismatch_events, 1,
+            "the past mismatch is retained, never reset by later clean evidence"
+        );
+        assert_eq!(state.resolved_total, 1);
+        assert_eq!(
+            outcome2.verdict,
+            Verdict::Unavailable,
+            "a past revision mismatch keeps the window untrustworthy even after later clean, \
+             exactly-matched-revision evidence"
+        );
     }
 
     fn well_formed_event_tuple(repo: &str, resolved: u64, failed: u64, need_id: &str) -> Tuple {
@@ -1442,7 +1642,7 @@ mod tests {
 
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
         let record = registry.record(repo).unwrap();
-        assert_eq!(record.state.resolved_count(), 1);
+        assert_eq!(record.state.resolved_total, 1);
         let latest = record.latest.as_ref().unwrap();
         assert_eq!(latest.verdict, Verdict::Pass);
         assert_eq!(latest.numerator, 1);
@@ -1491,7 +1691,7 @@ mod tests {
         let outcome2 = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
         assert_eq!(outcome2.events_consumed, 0);
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
-        assert_eq!(registry.record(repo).unwrap().state.resolved_count(), 1);
+        assert_eq!(registry.record(repo).unwrap().state.resolved_total, 1);
 
         // A late-arriving second event is picked up cumulatively, not
         // replacing the first.
@@ -1502,11 +1702,62 @@ mod tests {
         assert_eq!(outcome3.events_consumed, 1);
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
         let record = registry.record(repo).unwrap();
-        assert_eq!(record.state.resolved_count(), 2);
+        assert_eq!(record.state.resolved_total, 2);
+    }
+
+    #[test]
+    fn duplicate_native_event_ids_are_deduplicated_not_double_counted() {
+        // A data-pipeline replay of the IDENTICAL native tuple (same id)
+        // must never count its operation twice.
+        let mut state = AssessmentState::default();
+        let tuple = well_formed_event_tuple("fixture-repo", 1, 0, "01NEED");
+        let mut consumed = 0u64;
+        ingest_retirement_event(&mut state, &tuple, 1, &mut consumed);
+        ingest_retirement_event(&mut state, &tuple, 1, &mut consumed);
+        assert_eq!(
+            state.resolved_total, 1,
+            "a replayed identical native event id must not double count"
+        );
+        assert_eq!(consumed, 1);
+        assert_eq!(state.events_consumed, 1);
+    }
+
+    #[test]
+    fn two_distinct_operations_resolving_the_same_need_both_count_toward_the_metric() {
+        // Different native operation events may legitimately name the same
+        // Need (a genuine retry): both are real observed work and both
+        // count toward the predeclared sum(resolved) metric. The SEPARATE
+        // distinct-Need minimum is unaffected.
+        let mut state = AssessmentState::default();
+        let t1 = well_formed_event_tuple("fixture-repo", 1, 0, "01SAME");
+        let t2 = well_formed_event_tuple("fixture-repo", 1, 0, "01SAME");
+        let mut consumed = 0u64;
+        ingest_retirement_event(&mut state, &t1, 1, &mut consumed);
+        ingest_retirement_event(&mut state, &t2, 1, &mut consumed);
+        assert_eq!(state.resolved_total, 2, "both distinct operations count");
+        assert_eq!(
+            state.distinct_resolved_needs.len(),
+            1,
+            "the separate distinct-Need minimum is not inflated"
+        );
+        assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn seen_event_id_bound_overflow_is_reported_not_silently_dropped() {
+        let mut state = AssessmentState::default();
+        let mut consumed = 0u64;
+        for i in 0..(MAX_SEEN_EVENT_IDS + 5) {
+            let tuple = well_formed_event_tuple("fixture-repo", 1, 0, &format!("01N{i}"));
+            ingest_retirement_event(&mut state, &tuple, 1, &mut consumed);
+        }
+        assert!(state.seen_event_ids_truncated);
+        let (verdict, reason) = assess(&valid_objective(), &state, Utc::now());
+        assert_eq!(verdict, Verdict::Unavailable, "{reason}");
     }
 
     #[tokio::test]
-    async fn a_retried_pass_resolving_the_same_need_twice_does_not_inflate_the_numerator() {
+    async fn a_retried_pass_resolving_the_same_need_twice_via_real_tick() {
         let dir = tempfile::tempdir().unwrap();
         let layout = rk_core::paths::Layout::at(dir.path());
         let space = rk_space::Space::open_in_memory().unwrap();
@@ -1523,7 +1774,7 @@ mod tests {
         // Two SEPARATE telemetry events (as a crash-then-retry of the SAME
         // underlying retirement pass would produce, per
         // `landing_need_resolution`'s own crash-recovery doc comment) naming
-        // the SAME need_id.
+        // the SAME need_id — both genuinely happened, so both count.
         space
             .out(well_formed_event_tuple(repo, 1, 0, "01SAME"))
             .unwrap();
@@ -1536,10 +1787,15 @@ mod tests {
             "both events are validly consumed"
         );
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        let record = registry.record(repo).unwrap();
         assert_eq!(
-            registry.record(repo).unwrap().state.resolved_count(),
+            record.state.resolved_total, 2,
+            "two distinct native operations both count toward the predeclared sum metric"
+        );
+        assert_eq!(
+            record.state.distinct_resolved_needs.len(),
             1,
-            "the SAME Need resolved twice must count once toward the numerator"
+            "the separate distinct-Need minimum is not inflated"
         );
     }
 
@@ -1630,7 +1886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_revision_below_the_activation_baseline_is_rejected_as_superseded_provenance() {
+    async fn only_the_exact_bound_revision_is_counted_any_mismatch_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let layout = rk_core::paths::Layout::at(dir.path());
         let space = rk_space::Space::open_in_memory().unwrap();
@@ -1640,12 +1896,12 @@ mod tests {
             registry
                 .configure(repo, valid_objective(), "operator")
                 .unwrap();
-            // Activation binds source_feature_revision = 5.
+            // Activation binds source_feature_revision = 5 EXACTLY.
             registry
                 .activate(repo, &space, "build-1".into(), 5, "operator")
                 .unwrap();
         }
-        // A well-formed event from an OLDER (superseded) revision.
+        // An OLDER revision: rejected.
         space
             .out(well_formed_event_tuple_revision(repo, 1, 0, "01OLD", 3))
             .unwrap();
@@ -1654,16 +1910,37 @@ mod tests {
         assert_eq!(outcome.verdict, Verdict::Unavailable);
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
         let record = registry.record(repo).unwrap();
-        assert_eq!(record.state.superseded_provenance_events, 1);
-        assert_eq!(record.state.resolved_count(), 0);
+        assert_eq!(record.state.revision_mismatch_events, 1);
+        assert_eq!(record.state.resolved_total, 0);
+        // Every observed revision is still explicitly recorded, even a
+        // rejected one.
+        assert!(record.state.observed_feature_config_revisions.contains(&3));
 
-        // A later, equal-or-higher revision (the feature was reconfigured
-        // during the window) IS accepted.
+        // A NEWER revision (the feature was reconfigured mid-window) is
+        // ALSO rejected — only the EXACT bound revision counts.
         space
-            .out(well_formed_event_tuple_revision(repo, 1, 0, "01NEW", 5))
+            .out(well_formed_event_tuple_revision(repo, 1, 0, "01NEWER", 6))
             .unwrap();
         let outcome2 = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
-        assert_eq!(outcome2.events_consumed, 1);
+        assert_eq!(outcome2.events_consumed, 0);
+        let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        assert_eq!(
+            registry
+                .record(repo)
+                .unwrap()
+                .state
+                .revision_mismatch_events,
+            2
+        );
+
+        // Only the exact bound revision (5) is accepted.
+        space
+            .out(well_formed_event_tuple_revision(repo, 1, 0, "01EXACT", 5))
+            .unwrap();
+        let outcome3 = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
+        assert_eq!(outcome3.events_consumed, 1);
+        let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        assert_eq!(registry.record(repo).unwrap().state.resolved_total, 1);
     }
 
     #[test]
@@ -1934,13 +2211,15 @@ mod tests {
             handle.join().unwrap();
         }
         // The registry must still be validly readable (no torn/corrupt
-        // write survived), and the cursor must have advanced past every
-        // event with no double-counted resolution: the distinct-Need set
-        // dedups the numerator regardless of which racing tick's page
-        // happened to observe which event.
+        // write survived), and every one of the 20 genuinely distinct
+        // native events must be counted exactly once regardless of which
+        // racing tick's page happened to observe it — the per-event native
+        // identity dedup, not the registry lock alone, is what prevents a
+        // page observed by two racing ticks from double counting.
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
         let record = registry.record(repo).unwrap();
-        assert_eq!(record.state.resolved_count(), 20, "{record:?}");
+        assert_eq!(record.state.resolved_total, 20, "{record:?}");
+        assert_eq!(record.state.distinct_resolved_needs.len(), 20, "{record:?}");
         let published = space
             .scan(
                 &rk_core::tuple::Pattern::category(Category::Event)
