@@ -336,30 +336,103 @@ pub async fn connect_or_report(
     }
 }
 
-/// Start a daemon against `layout` and connect to it, retrying the whole
-/// start (not just the reconnect) on a transient loss of the singleton
-/// lock — reproduced under parallel `cargo test` load, where this same
-/// process can be running several other tests' daemons concurrently and one
-/// of them can still be a few OS scheduler ticks from fully releasing its
-/// `flock` when this one tries to bind. A plain reconnect loop can never
-/// recover from that: once `Daemon::run()` loses the race for the lock it
-/// returns immediately without ever listening, so nothing will ever answer
-/// the socket no matter how long `connect` polls it.
+/// Shared retry core of [`start_daemon`]/[`restart_daemon_over`]: retry a
+/// fresh `new_daemon` + spawn ONLY on the one specific, identified failure
+/// this exists to survive — `acquire_singleton_lock`'s own "already holds
+/// the lock" refusal (`server.rs`), observed under parallel `cargo test`
+/// load, where this same process can be running several other tests'
+/// daemons concurrently and one of them can still be a few OS scheduler
+/// ticks from fully releasing its `flock` when this one tries to bind. A
+/// plain reconnect loop can never recover from that: once `Daemon::run()`
+/// loses the race for the lock it returns immediately without ever
+/// listening, so nothing will ever answer the socket no matter how long
+/// `connect` polls it.
+///
+/// This does NOT establish, and must not be read as establishing, exactly
+/// WHY the lock is still held at that moment (a surviving descriptor, a
+/// not-yet-dropped task, or a genuinely separate process could each produce
+/// the identical symptom) — only that this specific, named refusal is
+/// observed and is the one condition worth a bounded retry. Any OTHER early
+/// exit — a bind failure, a config error, a panicked/cancelled task — is
+/// propagated immediately via `panic!` instead of being silently retried
+/// into an unhelpful "gave up after 20 attempts" message that would hide
+/// the real cause. `new_daemon` is called fresh on every attempt because a
+/// `Daemon` that failed to win the lock has already consumed itself
+/// (`run(self)`) — there is no daemon left to retry, and every failed
+/// attempt's task is already fully joined (not merely dropped) by the time
+/// this loop inspects its result, since the `Ok(...)` arms below only match
+/// once `&mut handle` has actually resolved. Only the FINAL, successful
+/// handle is returned alongside its `Client` — the caller owns that
+/// daemon's cleanup (e.g. `.abort()` at the end of a test that fakes a
+/// restart), exactly as it would if it had spawned it directly.
 #[allow(dead_code)]
-pub async fn start_daemon(layout: &Layout) -> Client {
+async fn start_daemon_retrying(
+    layout: &Layout,
+    mut new_daemon: impl FnMut() -> Daemon,
+) -> (Client, tokio::task::JoinHandle<rk_core::Result<()>>) {
     for _ in 0..20 {
-        let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-        let handle = tokio::spawn(daemon.run());
+        let daemon = new_daemon();
+        let mut handle = tokio::spawn(daemon.run());
         // A daemon that wins the bind runs its accept loop forever, so this
         // handle deliberately never resolves in the success case — the
         // timeout is just a generous grace window to catch the failure case,
         // which in every observed instance resolves in well under 50ms.
-        match tokio::time::timeout(Duration::from_millis(200), handle).await {
-            Err(_) => return connect(layout).await, // still running: bind succeeded
-            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await, // fast exit: retry
+        match tokio::time::timeout(Duration::from_millis(200), &mut handle).await {
+            Err(_) => return (connect(layout).await, handle), // still running: bind succeeded
+            Ok(Ok(Err(error))) if error.to_string().contains("already holds the lock") => {
+                tokio::time::sleep(Duration::from_millis(50)).await; // identified transient: retry
+            }
+            Ok(Ok(Err(error))) => {
+                panic!("daemon startup failed (not the identified lock-contention case): {error}")
+            }
+            Ok(Ok(Ok(()))) => {
+                panic!("daemon task exited cleanly before it ever bound the socket")
+            }
+            Ok(Err(join_error)) => {
+                panic!("daemon task panicked or was cancelled during startup: {join_error}")
+            }
         }
     }
     panic!("daemon repeatedly lost the singleton-lock race against {layout:?}");
+}
+
+/// Start a daemon against `layout` (an in-memory `Space` — no durable state
+/// survives a restart) and connect to it. See [`start_daemon_retrying`] for
+/// what this retries and why. The successful daemon's task is intentionally
+/// left unowned here (dropped with the runtime at test end), matching every
+/// existing caller of this function, which never needed to clean it up
+/// individually.
+#[allow(dead_code)]
+pub async fn start_daemon(layout: &Layout) -> Client {
+    let (client, _handle) = start_daemon_retrying(layout, || {
+        Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap()
+    })
+    .await;
+    client
+}
+
+/// Same identified-transient-refusal retry as [`start_daemon`], but over a
+/// genuinely ON-DISK `Daemon::new(layout, config)` — for a fixture that
+/// needs durable state (the landing queue, the registry) to actually
+/// survive the restart, which an in-memory `Space` cannot prove.
+///
+/// This is an IN-PROCESS durable-state fixture, faking a restart via
+/// `handle.abort()`/`.await` on the outgoing daemon rather than a real
+/// second OS process — it must not be read as physical-restart coverage
+/// (`crates/rk-cli/tests/resumed_generation_successor_landing.rs` has the
+/// genuine cross-process alternative when that distinction matters).
+/// Returns the successful replacement daemon's own `JoinHandle` alongside
+/// its `Client`, unlike [`start_daemon`]: a caller faking a restart
+/// typically already owns and cleans up the OUTGOING daemon's handle
+/// explicitly (`.abort()`/`.await`) and must do the same for this
+/// replacement at the end of its own test, rather than leaving it running
+/// unowned against a shared test binary's runtime.
+#[allow(dead_code)]
+pub async fn restart_daemon_over(
+    layout: &Layout,
+    config: &rk_core::config::Config,
+) -> (Client, tokio::task::JoinHandle<rk_core::Result<()>>) {
+    start_daemon_retrying(layout, || Daemon::new(layout.clone(), config).unwrap()).await
 }
 
 /// Seed a real durable generation before starting a synthetic-completion daemon.
