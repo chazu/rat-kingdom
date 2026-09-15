@@ -700,8 +700,12 @@ const FRAGMENT_COMPLETION_STEP3_HANDOFF: &str = "\
    description or a verified operator steer explicitly requires a
    pre-completion check beyond your focused checks, that explicit
    requirement still applies — this handoff removes only the DEFAULT
-   mandate. Say which focused check(s) and formatter you ran and their exit
-   status.
+   mandate. A Standing Convention above that describes HOW to correctly
+   invoke a check you DO run (e.g. stripping the RK_* spawn env before
+   `cargo test`) still applies exactly as written — that guidance is about
+   invocation hygiene, not about WHETHER to run the full suite, and does not
+   reinstate the full/default check this handoff already told you to skip.
+   Say which focused check(s) and formatter you ran and their exit status.
 ";
 
 const FRAGMENT_COMPLETION_TAIL: &str = "\
@@ -1308,6 +1312,46 @@ mod tests {
         ] {
             assert!(text.contains(needle), "handoff prompt missing {needle:?}");
         }
+    }
+
+    #[test]
+    fn handoff_step_3_resolves_conflict_with_a_full_suite_standing_convention() {
+        // A real fleet convention instructs every rat to run `cargo test
+        // --workspace` (with RK_* stripped) and is composed ABOVE the
+        // completion protocol via `render_conventions`. Without an explicit
+        // precedence rule, a worker reading top-to-bottom could read that as
+        // still mandating the full suite despite the handoff below it.
+        let mut with_handoff = ctx();
+        with_handoff.verification_handoff = true;
+        with_handoff.conventions = vec![
+            "Run the test suite with the RK_* spawn env stripped: env -u RK_AGENT \
+             -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE \
+             mise exec -- cargo test --workspace."
+                .to_string(),
+        ];
+        let text = render("rat", &with_handoff);
+        let conventions_pos = text
+            .find("## Standing conventions")
+            .expect("conventions section must be present");
+        let completion_pos = text
+            .find("## Completion protocol")
+            .expect("completion protocol must be present");
+        assert!(
+            conventions_pos < completion_pos,
+            "the standing convention renders above the completion protocol, \
+             which is exactly what makes the precedence rule necessary"
+        );
+        // Normalize whitespace: the fragment wraps across source lines with
+        // no `\` continuation, so a raw `contains` on a phrase spanning a
+        // wrap would spuriously fail on the embedded newline.
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("still applies exactly as written")
+                && normalized.contains("does not reinstate the full/default check"),
+            "handoff step 3 must explicitly resolve the apparent conflict with an \
+             above-the-fold full-suite standing convention, not just add a \
+             contradicting instruction below it:\n{text}"
+        );
     }
 
     #[test]
