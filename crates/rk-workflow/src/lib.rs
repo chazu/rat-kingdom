@@ -265,6 +265,16 @@ pub struct LandingPolicy {
     /// default) restores the pre-fix behavior exactly. Only applies when
     /// the spawn/resume/recovery actually carries a `ReviewContext`
     /// (i.e. it is a review); ordinary workers are unaffected either way.
+    ///
+    /// Like every other field on this policy, flipping it is digest-fenced
+    /// approved-commit activation, NOT an instant file toggle: a fresh
+    /// `repo.add` against an unregistered repo activates whatever
+    /// `.rk/repo.cue` says at that commit immediately, but changing it on an
+    /// ALREADY-registered repo only takes effect once
+    /// `rk repo onboard start/propose/approve/apply/activate` records the
+    /// new digest (`RepoRecord::activated_policy`,
+    /// `crates/rk-daemon/src/repos.rs`) — editing the file on disk alone
+    /// does nothing until that activation lands.
     #[serde(default, rename = "reviewedTicketBbsContext")]
     pub reviewed_ticket_bbs_context: bool,
 }

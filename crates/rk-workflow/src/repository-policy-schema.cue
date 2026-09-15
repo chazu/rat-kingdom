@@ -130,7 +130,11 @@ repo: #RepositoryPolicy
 	// task/role/spawn/attempt identity is untouched, and the existing
 	// cross-repo scope check still refuses a review binding naming a
 	// ticket outside this repo. false (the default) is the pre-fix
-	// behavior.
+	// behavior. Like the rest of this policy, changing it on an
+	// already-registered repo requires digest-fenced approved-commit
+	// activation (rk repo onboard start/propose/approve/apply/activate) —
+	// editing this file alone does not take effect until that activation
+	// lands.
 	reviewedTicketBbsContext: bool | *false
 }
 
