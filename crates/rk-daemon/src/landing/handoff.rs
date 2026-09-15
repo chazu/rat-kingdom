@@ -540,3 +540,222 @@ impl LandingPipeline {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    /// An existing-but-unreadable store must NOT come up looking like "no
+    /// fence engaged" — that is the silent-loss failure P7.1 cannot have.
+    #[test]
+    fn an_unreadable_store_records_a_load_failure_instead_of_reporting_no_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("landing-handoff.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        let store = HandoffFenceStore::load(&path);
+
+        assert!(
+            store.load_failure().is_some(),
+            "an unreadable store must record its failure, not silently start empty"
+        );
+        // It still reports no CURRENT record (there is genuinely nothing
+        // readable) — the point is that the failure travels alongside it, so
+        // `fence_status_json` can refuse to claim readiness.
+        assert!(store.current("repo").is_none());
+    }
+
+    /// The unreadable bytes are moved aside, never destroyed, so whatever an
+    /// operator had acknowledged stays recoverable by hand.
+    #[test]
+    fn the_first_write_after_a_failed_load_preserves_the_unreadable_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("landing-handoff.json");
+        std::fs::write(&path, b"{ corrupt bytes worth keeping").unwrap();
+        let store = HandoffFenceStore::load(&path);
+
+        store.request("repo", "operator", 600, at(0)).unwrap();
+
+        let quarantine = path.with_extension("json.corrupt");
+        assert_eq!(
+            std::fs::read(&quarantine).unwrap(),
+            b"{ corrupt bytes worth keeping",
+            "the prior unreadable record must be preserved verbatim"
+        );
+        assert!(
+            store.load_failure().is_none(),
+            "a successful rewrite clears the unavailable posture"
+        );
+        assert!(store.current("repo").unwrap().blocks_admission(at(1)));
+    }
+
+    /// Breaking the parent directory makes `persist` fail. A failed
+    /// `request` must leave NOTHING engaged: an in-memory-only fence would
+    /// silently vanish on the next restart.
+    #[test]
+    fn a_request_whose_write_fails_engages_no_fence_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the store's parent directory must be, so
+        // `create_dir_all` inside `persist` cannot succeed.
+        let blocked = dir.path().join("store");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let store = HandoffFenceStore::load(blocked.join("landing-handoff.json"));
+
+        let result = store.request("repo", "operator", 600, at(0));
+
+        assert!(result.is_err(), "the write must genuinely fail here");
+        assert!(
+            store.current("repo").is_none(),
+            "a failed request must roll back, leaving no fence engaged in memory either"
+        );
+    }
+
+    /// The mirror image: a failed `release` must leave the fence ENGAGED,
+    /// so a failed call never silently resumes admission that a restart
+    /// would then re-block.
+    #[test]
+    fn a_release_whose_write_fails_leaves_the_fence_engaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let path = store_dir.join("landing-handoff.json");
+        let store = HandoffFenceStore::load(&path);
+        let record = store.request("repo", "operator", 600, at(0)).unwrap();
+
+        // Break the directory out from under the store.
+        std::fs::remove_dir_all(&store_dir).unwrap();
+        std::fs::write(&store_dir, b"not a directory").unwrap();
+
+        let result = store.release("repo", "operator", record.generation, at(1));
+
+        assert!(result.is_err(), "the write must genuinely fail here");
+        assert!(
+            store.current("repo").unwrap().blocks_admission(at(2)),
+            "a failed release must leave the fence engaged, not half-released in memory"
+        );
+    }
+
+    /// An acknowledged fence is still engaged after a restart reloads the
+    /// store from disk — the durability the operator journey depends on.
+    #[test]
+    fn an_acknowledged_fence_survives_a_reload_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("landing-handoff.json");
+        let first = HandoffFenceStore::load(&path);
+        let record = first.request("repo", "operator", 600, at(0)).unwrap();
+        drop(first);
+
+        let reloaded = HandoffFenceStore::load(&path);
+
+        let after = reloaded.current("repo").expect("the fence must survive");
+        assert_eq!(after.holder, "operator");
+        assert_eq!(after.generation, record.generation);
+        assert!(after.blocks_admission(at(10)));
+        assert!(reloaded.load_failure().is_none());
+    }
+
+    /// A bounded deadline auto-lifts without an explicit release, and the
+    /// next holder takes over with a BUMPED generation — so an abandoned
+    /// request cannot wedge admission forever, and the previous holder's
+    /// stale release cannot touch the new fence.
+    #[test]
+    fn an_expired_fence_lifts_and_the_next_holder_bumps_the_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HandoffFenceStore::load(dir.path().join("landing-handoff.json"));
+        let first = store.request("repo", "operator-a", 60, at(0)).unwrap();
+        assert!(first.blocks_admission(at(59)));
+
+        // Past the deadline: no longer blocking, without anyone releasing it.
+        assert!(!first.blocks_admission(at(61)));
+
+        // A different holder may now take over.
+        let second = store.request("repo", "operator-b", 60, at(61)).unwrap();
+        assert_eq!(second.holder, "operator-b");
+        assert_eq!(
+            second.generation,
+            first.generation + 1,
+            "takeover must bump the generation so the prior holder is fenced off"
+        );
+
+        // The first holder's stale release cannot touch it.
+        assert!(
+            store
+                .release("repo", "operator-a", first.generation, at(62))
+                .is_err(),
+            "a superseded holder must not release the new fence"
+        );
+        assert!(store.current("repo").unwrap().blocks_admission(at(62)));
+    }
+
+    /// A live fence refuses a competing holder outright, and is idempotent
+    /// (deadline renewed, generation kept) for its own holder.
+    #[test]
+    fn a_live_fence_is_idempotent_for_its_holder_and_refuses_a_competitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HandoffFenceStore::load(dir.path().join("landing-handoff.json"));
+        let first = store.request("repo", "operator-a", 60, at(0)).unwrap();
+
+        assert!(
+            store.request("repo", "operator-b", 60, at(10)).is_err(),
+            "a competing holder must not steal a live fence"
+        );
+
+        let renewed = store.request("repo", "operator-a", 60, at(10)).unwrap();
+        assert_eq!(renewed.generation, first.generation);
+        assert_eq!(renewed.deadline_at, at(70), "the deadline must renew");
+
+        // Release is idempotent once it has genuinely happened.
+        store
+            .release("repo", "operator-a", renewed.generation, at(11))
+            .unwrap();
+        store
+            .release("repo", "operator-a", renewed.generation, at(12))
+            .unwrap();
+        assert!(!store.current("repo").unwrap().blocks_admission(at(13)));
+    }
+
+    /// Readiness is a three-dimensional claim. A managed run that holds NO
+    /// landing lane must still stop `ready` — the exact gap a bare
+    /// key-lock snapshot cannot see.
+    #[test]
+    fn managed_work_alone_is_enough_to_deny_readiness() {
+        let clear = ManagedWorkSnapshot::default();
+        assert!(clear.is_clear());
+
+        let verifying = ManagedWorkSnapshot {
+            runs: vec![crate::managed_verification::ManagedRunBlocker {
+                repo: "repo".into(),
+                kind: "verify",
+                agent: "Rummage-16".into(),
+            }],
+            release_prepare_in_flight: false,
+        };
+        assert!(
+            !verifying.is_clear(),
+            "an executing/queued managed verify run must deny readiness"
+        );
+        let rows = verifying.blocker_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["scope"], "repo");
+        assert_eq!(rows[0]["kind"], "verify");
+
+        let releasing = ManagedWorkSnapshot {
+            runs: Vec::new(),
+            release_prepare_in_flight: true,
+        };
+        assert!(
+            !releasing.is_clear(),
+            "an in-flight release prepare must deny readiness"
+        );
+        let rows = releasing.blocker_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["scope"], "daemon",
+            "the release-prepare lock is daemon-wide, and must say so"
+        );
+    }
+}

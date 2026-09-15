@@ -317,9 +317,10 @@ pub async fn fence_request(layout: &Layout, args: FenceRequestArgs, as_json: boo
     Ok(())
 }
 
-/// `rk fence-status` — read-only: state (`released`/`draining`/
-/// `ready`/`expired`), the exact `(repo, target)` keys still blocking
-/// readiness, and the fence's holder/generation/deadline.
+/// `rk fence-status` — read-only: state (`released`/`draining`/`ready`/
+/// `expired`/`unavailable`), the explicit `ready` safety boolean, every
+/// blocker still holding the repo (landing drain lanes AND managed
+/// verify/release work), and the fence's holder/generation/deadline.
 pub async fn fence_status(layout: &Layout, args: FenceStatusArgs, as_json: bool) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
     let repo = crate::repo_cmds::resolve_path(&mut client, &args.repo).await?;
@@ -329,14 +330,42 @@ pub async fn fence_status(layout: &Layout, args: FenceStatusArgs, as_json: bool)
     if as_json {
         println!("{result}");
     } else {
-        let blocking = result["blocking_keys"]
+        let state = result["state"].as_str().unwrap_or("?");
+        // `ready` is printed from its own boolean, never inferred from
+        // `state`, so an operator reading this line is reading the actual
+        // safety claim the daemon made.
+        let ready = result["ready"].as_bool().unwrap_or(false);
+        let keys = result["blocking_keys"].as_array().cloned().unwrap_or_default();
+        let managed = result["managed_blockers"]
             .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
+            .cloned()
+            .unwrap_or_default();
         println!(
-            "{repo}: state={} blocking_keys={blocking}",
-            result["state"].as_str().unwrap_or("?"),
+            "{repo}: state={state} ready={ready} blocking_keys={} managed_blockers={}",
+            keys.len(),
+            managed.len(),
         );
+        for key in &keys {
+            println!("  landing lane: {}", key.as_str().unwrap_or("?"));
+        }
+        // Printed individually rather than only counted: a managed
+        // verify/release run is invisible in `blocking_keys` (it holds no
+        // landing lane), so a bare count would leave an operator unable to
+        // tell WHAT is still holding the repo.
+        for blocker in &managed {
+            println!(
+                "  managed {} [{}]: {}",
+                blocker["kind"].as_str().unwrap_or("?"),
+                blocker["scope"].as_str().unwrap_or("?"),
+                blocker["agent"]
+                    .as_str()
+                    .or_else(|| blocker["detail"].as_str())
+                    .unwrap_or("?"),
+            );
+        }
+        if let Some(recovery) = result["recovery"].as_str() {
+            println!("  recovery: {recovery}");
+        }
     }
     Ok(())
 }
