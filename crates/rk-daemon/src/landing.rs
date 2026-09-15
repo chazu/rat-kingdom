@@ -5036,6 +5036,7 @@ impl LandingPipeline {
                 is_ticket.then_some(entry.task.as_str()),
                 &record,
                 entry.source_spawn,
+                crate::lifecycle::SuccessorPolicy::AdvanceOnDescendant,
             )
             .await
         {
@@ -9661,6 +9662,207 @@ workflow: {
             "landing is expected to delete the branch; the record is what survives"
         );
         assert!(crate::tickets::is_delivered(&stored));
+    }
+
+    /// TKT-jonis-faror-zufuj: reproduce and recover the confirmed production
+    /// incident through the REAL native landing pipeline (queue, gates,
+    /// `finalize_delivery`) — not a direct call. A SAME generation is
+    /// resumed and queues a genuine second delivery; native review/gate
+    /// advances the target (simulated here exactly like
+    /// `advanced_landing_reconciles_the_ticket_and_terminal_marker`, by
+    /// advancing `main` BEFORE finalization runs) and then the daemon
+    /// resumes past that interruption. Finalization must settle the
+    /// resumed generation's successor instead of busy-retrying a
+    /// merge-pointer conflict forever, and replaying the same already-landed
+    /// head after a restart must not duplicate the advance.
+    #[tokio::test]
+    async fn resumed_generation_successor_lands_through_the_real_pipeline_and_replay_is_idempotent()
+    {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs").join("note.md"), "v1\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: v1"]);
+        let head_sha_1 = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let ticket = pipeline
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: "resumed generation".into(),
+                body: None,
+                scope: Some("docs-repo".into()),
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        pipeline
+            .tickets
+            .set_status(&ticket.identity, "in_progress")
+            .await
+            .unwrap();
+
+        // The same-generation spawn that will be resumed after its first
+        // delivery lands — mirroring Skitter-16's real spawn/session pair.
+        let spawn = rk_core::id::SpawnId::new();
+        let source: crate::agents::AgentRecord = serde_json::from_value(json!({
+            "name": "Skitter", "spawn": spawn, "role": "rat", "harness": "fake",
+            "repo_name": "docs-repo", "repo_root": repo_dir.path(), "task": ticket.identity,
+            "branch": "feature", "target_branch": "main", "state": "completed",
+            "usage": rk_harness::TokenUsage::default(), "cost_usd": 0.0,
+            "created_at": Utc::now(), "updated_at": Utc::now(),
+        }))
+        .unwrap();
+        pipeline.supervisor.lock_registry().insert(source).unwrap();
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha: head_sha_1,
+                diff_class: "doc-only".into(),
+                task: ticket.identity.clone(),
+                source_spawn: Some(spawn),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline.drain_key("docs-repo", "main").await.unwrap();
+        let LandingOutcome::Landed(first) = &outcomes[0] else {
+            panic!("expected the first delivery to land, got {:?}", outcomes[0]);
+        };
+        let first_commit = first.merge_commit().to_string();
+        assert_eq!(
+            pipeline
+                .supervisor
+                .lock_registry()
+                .get("Skitter")
+                .unwrap()
+                .merge_commit,
+            Some(first_commit.clone())
+        );
+
+        // The SAME generation is resumed: the branch is recreated from the
+        // now-advanced `main` and carries a genuine second change, queued
+        // under the identical `source_spawn`.
+        git(repo_dir.path(), &["checkout", "-b", "feature", "main"]);
+        std::fs::write(repo_dir.path().join("docs").join("note.md"), "v2\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: v2"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha: rev_parse(repo_dir.path(), "feature"),
+                diff_class: "doc-only".into(),
+                task: ticket.identity.clone(),
+                source_spawn: Some(spawn),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Simulate native review/gate advancing the target BEFORE
+        // finalization runs, then an interruption (daemon rollover) right
+        // there — exactly `advanced_landing_reconciles_the_ticket_and_terminal_marker`'s
+        // pattern, and exactly the incident's own ordering: the branch had
+        // already advanced by the time `finalize_delivery` refused it.
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let candidate = match repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        let mut claimed = pipeline
+            .queue
+            .claim_next("docs-repo", "main")
+            .unwrap()
+            .unwrap();
+        claimed.candidate_sha = Some(candidate.commit.clone());
+        claimed.candidate_base = Some(candidate.base.clone());
+        claimed.candidate_ref = Some(candidate.candidate_ref.clone());
+        pipeline
+            .queue
+            .persist(&mut claimed, LandingEntryStatus::Landing)
+            .unwrap();
+        assert!(repo
+            .advance_target_to("main", &candidate.commit, &candidate.base)
+            .unwrap()
+            .advanced());
+        repo.discard_candidate(&candidate.candidate_ref).unwrap();
+        repo.delete_branch("feature").unwrap();
+
+        // Resume past the interruption: finalization must settle the
+        // resumed generation's proven successor instead of conflicting.
+        let outcomes = pipeline.drain_key("docs-repo", "main").await.unwrap();
+        let LandingOutcome::Landed(second) = &outcomes[0] else {
+            panic!(
+                "the resumed generation's successor must land, not conflict forever: {:?}",
+                outcomes[0]
+            );
+        };
+        let second_commit = second.merge_commit().to_string();
+        assert_ne!(second_commit, first_commit);
+        assert_eq!(
+            pipeline
+                .supervisor
+                .lock_registry()
+                .get("Skitter")
+                .unwrap()
+                .merge_commit,
+            Some(second_commit.clone()),
+            "a proven successor delivery must advance the agent pointer, not busy-retry"
+        );
+        let delivered = pipeline
+            .tickets
+            .delivery(&ticket.identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delivered.merge_commit, second_commit,
+            "the ticket's delivery record must advance to the successor commit too"
+        );
+
+        // Restart/replay: re-enqueuing and re-draining the SAME
+        // already-landed head must not duplicate the advance.
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha: second_commit.clone(),
+                diff_class: "doc-only".into(),
+                task: ticket.identity.clone(),
+                source_spawn: Some(spawn),
+                ..Default::default()
+            })
+            .unwrap();
+        let _ = pipeline.drain_key("docs-repo", "main").await;
+        assert_eq!(
+            pipeline
+                .supervisor
+                .lock_registry()
+                .get("Skitter")
+                .unwrap()
+                .merge_commit,
+            Some(second_commit),
+            "replaying an already-landed head after a restart must not move the pointer again"
+        );
     }
 
     /// An empty branch is not a delivery: a duplicate rat dispatched onto a

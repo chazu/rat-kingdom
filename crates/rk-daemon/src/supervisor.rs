@@ -6909,56 +6909,243 @@ impl Supervisor {
         task: Option<&str>,
         record: &crate::tickets::DeliveryRecord,
         exact_spawn: Option<rk_core::id::SpawnId>,
+        successor_policy: crate::lifecycle::SuccessorPolicy,
     ) -> rk_core::Result<()> {
+        use crate::lifecycle::MergePointerDecision;
+
+        // Resolve (and, for the ordinary cases, apply) the agent-side merge
+        // pointer BEFORE writing the ticket's delivery record. Previously the
+        // ticket was written first, unconditionally: a delivery that then
+        // failed the agent-pointer check (or, worse, a stale receipt replay
+        // that should have been a no-op) had already durably overwritten the
+        // ticket's delivery evidence with an unconfirmed or backward-rolling
+        // commit (TKT-jonis-faror-zufuj).
+        let conflict = {
+            let mut registry = self.lock_registry();
+            let decision = {
+                let agents = registry.list_all();
+                crate::lifecycle::resolve_merge_pointer(
+                    agents.into_iter(),
+                    repo_root,
+                    &record.branch,
+                    &record.target,
+                    &record.merge_commit,
+                    exact_spawn,
+                )
+            };
+            match decision {
+                MergePointerDecision::Set { agent } => {
+                    let commit = record.merge_commit.clone();
+                    registry.update(&agent, move |r| r.merge_commit = Some(commit))?;
+                    None
+                }
+                MergePointerDecision::AlreadyRecorded | MergePointerDecision::NoTarget => None,
+                MergePointerDecision::Conflict { agent, recorded } => Some((agent, recorded)),
+            }
+        };
+
+        if let Some((agent, recorded)) = conflict {
+            let proceed = self
+                .resolve_delivery_conflict(
+                    repo_root,
+                    repo_name,
+                    record,
+                    exact_spawn,
+                    successor_policy,
+                    (&agent, &recorded),
+                )
+                .await?;
+            if !proceed {
+                // A stale/late receipt replaying older evidence after a
+                // newer delivery already landed: a safe no-op. Neither the
+                // agent pointer nor the ticket's delivery record may move.
+                return Ok(());
+            }
+        }
+
         if let Some(task) = task {
             self.tickets.record_delivery(task, record).await?;
         }
-        use crate::lifecycle::MergePointerDecision;
-        let mut registry = self.lock_registry();
-        let decision = {
-            let agents = registry.list_all();
-            crate::lifecycle::resolve_merge_pointer(
-                agents.into_iter(),
-                repo_root,
-                &record.branch,
-                &record.target,
-                &record.merge_commit,
-                exact_spawn,
-            )
-        };
-        match decision {
-            MergePointerDecision::Set { agent } => {
-                let commit = record.merge_commit.clone();
-                registry.update(&agent, move |r| r.merge_commit = Some(commit))?;
-            }
-            MergePointerDecision::AlreadyRecorded | MergePointerDecision::NoTarget => {}
-            MergePointerDecision::Conflict { agent, recorded } => {
-                drop(registry);
+        Ok(())
+    }
+
+    /// Resolve a `MergePointerDecision::Conflict` for `finalize_delivery`.
+    /// Under [`crate::lifecycle::SuccessorPolicy::FailClosed`] this is
+    /// exactly the original behavior: emit the conflict event and fail.
+    /// Under `AdvanceOnDescendant`, use proven git ancestry between the
+    /// recorded and candidate commits to tell a genuine resumed-generation
+    /// successor delivery (advance) apart from a stale replay (silently
+    /// dropped, returns `Ok(false)`) and from a truly unrelated commit
+    /// (fails closed exactly as before). Returns `Ok(true)` when the caller
+    /// should proceed to record ticket delivery.
+    async fn resolve_delivery_conflict(
+        &self,
+        repo_root: &std::path::Path,
+        repo_name: &str,
+        record: &crate::tickets::DeliveryRecord,
+        exact_spawn: Option<rk_core::id::SpawnId>,
+        successor_policy: crate::lifecycle::SuccessorPolicy,
+        (agent, recorded): (&str, &str),
+    ) -> rk_core::Result<bool> {
+        use crate::lifecycle::{MergePointerDecision, SuccessorClassification};
+
+        let repo_path = repo_root.to_path_buf();
+        let recorded_owned = recorded.to_string();
+        let candidate_owned = record.merge_commit.clone();
+        let (recorded_is_ancestor, candidate_is_ancestor) =
+            blocking_io("finalize_delivery successor ancestry check", move || {
+                let repo = Repo::discover(&repo_path)?;
+                Ok((
+                    repo.is_ancestor(&recorded_owned, &candidate_owned),
+                    repo.is_ancestor(&candidate_owned, &recorded_owned),
+                ))
+            })
+            .await?;
+
+        match crate::lifecycle::classify_successor(
+            successor_policy,
+            recorded_is_ancestor,
+            candidate_is_ancestor,
+        ) {
+            SuccessorClassification::StaleReplay => {
                 self.emit_event(
                     repo_name,
-                    "delivery_merge_pointer_conflict",
+                    "delivery_merge_pointer_stale_replay",
                     json!({
-                        "agent": &agent,
-                        "recorded_merge_commit": &recorded,
-                        "candidate_merge_commit": &record.merge_commit,
+                        "agent": agent,
+                        "recorded_merge_commit": recorded,
+                        "stale_candidate_merge_commit": &record.merge_commit,
                         "branch": &record.branch,
                         "target": &record.target,
                         "text": format!(
-                            "agent {agent} already carries a different merge commit \
-                             ({recorded}) than this delivery's candidate ({}) — not \
-                             overwritten, needs manual reconciliation",
+                            "agent {agent} already advanced past this delivery's candidate \
+                             ({}) — an old receipt replaying after a newer one landed; not an \
+                             error, not applied",
                             record.merge_commit
                         ),
                     }),
                 );
-                return Err(rk_core::Error::other(format!(
-                    "agent {agent} already carries a different merge commit ({recorded}) than \
-                     this delivery's candidate ({}); refusing to overwrite",
-                    record.merge_commit
-                )));
+                Ok(false)
             }
+            SuccessorClassification::Advance => {
+                // The ancestry check above ran unlocked; apply as a
+                // compare-and-swap against the exact `recorded` value it was
+                // computed for, never as a raw write. If the registry moved
+                // in between, resolve once more and stop — never loop.
+                let mut registry = self.lock_registry();
+                let agents = registry.list_all();
+                let fresh = crate::lifecycle::resolve_merge_pointer(
+                    agents.into_iter(),
+                    repo_root,
+                    &record.branch,
+                    &record.target,
+                    &record.merge_commit,
+                    exact_spawn,
+                );
+                match fresh {
+                    MergePointerDecision::Conflict {
+                        agent: fresh_agent,
+                        recorded: fresh_recorded,
+                    } if fresh_recorded == recorded => {
+                        let commit = record.merge_commit.clone();
+                        registry.update(&fresh_agent, move |r| r.merge_commit = Some(commit))?;
+                        drop(registry);
+                        self.emit_event(
+                            repo_name,
+                            "delivery_merge_pointer_advanced",
+                            json!({
+                                "agent": &fresh_agent,
+                                "from_merge_commit": recorded,
+                                "to_merge_commit": &record.merge_commit,
+                                "branch": &record.branch,
+                                "target": &record.target,
+                                "text": format!(
+                                    "agent {fresh_agent} resumed and delivered a proven \
+                                     successor commit ({}) descending from its recorded merge \
+                                     pointer ({recorded}); advanced",
+                                    record.merge_commit
+                                ),
+                            }),
+                        );
+                        Ok(true)
+                    }
+                    MergePointerDecision::AlreadyRecorded => {
+                        drop(registry);
+                        Ok(true)
+                    }
+                    MergePointerDecision::Set { agent: fresh_agent } => {
+                        let commit = record.merge_commit.clone();
+                        registry.update(&fresh_agent, move |r| r.merge_commit = Some(commit))?;
+                        drop(registry);
+                        Ok(true)
+                    }
+                    MergePointerDecision::NoTarget => {
+                        drop(registry);
+                        Ok(true)
+                    }
+                    MergePointerDecision::Conflict {
+                        agent: fresh_agent,
+                        recorded: fresh_recorded,
+                    } => {
+                        // A concurrent writer already settled the pointer
+                        // onto something else between our unlocked ancestry
+                        // check and this re-resolution. Fail closed with the
+                        // fresh evidence rather than retrying.
+                        drop(registry);
+                        Err(self.delivery_conflict_error(
+                            repo_name,
+                            &record.merge_commit,
+                            &record.branch,
+                            &record.target,
+                            &fresh_agent,
+                            &fresh_recorded,
+                        ))
+                    }
+                }
+            }
+            SuccessorClassification::Unrelated => Err(self.delivery_conflict_error(
+                repo_name,
+                &record.merge_commit,
+                &record.branch,
+                &record.target,
+                agent,
+                recorded,
+            )),
         }
-        Ok(())
+    }
+
+    /// Emit the conflict event and build the matching error for a delivery
+    /// whose candidate commit could not be reconciled with the agent's
+    /// already-recorded merge pointer.
+    fn delivery_conflict_error(
+        &self,
+        repo_name: &str,
+        candidate: &str,
+        branch: &str,
+        target: &str,
+        agent: &str,
+        recorded: &str,
+    ) -> rk_core::Error {
+        self.emit_event(
+            repo_name,
+            "delivery_merge_pointer_conflict",
+            json!({
+                "agent": agent,
+                "recorded_merge_commit": recorded,
+                "candidate_merge_commit": candidate,
+                "branch": branch,
+                "target": target,
+                "text": format!(
+                    "agent {agent} already carries a different merge commit ({recorded}) than \
+                     this delivery's candidate ({candidate}) — not overwritten, needs manual \
+                     reconciliation",
+                ),
+            }),
+        );
+        rk_core::Error::other(format!(
+            "agent {agent} already carries a different merge commit ({recorded}) than this \
+             delivery's candidate ({candidate}); refusing to overwrite",
+        ))
     }
 
     fn recorded_fork_point(&self, repo_root: &std::path::Path, branch: &str) -> Option<String> {
@@ -7732,7 +7919,19 @@ impl Supervisor {
                 landed_at: chrono::Utc::now().to_rfc3339(),
             };
             if let Err(error) = self
-                .finalize_delivery(repo.root(), &repo_name, None, &record, source_spawn)
+                .finalize_delivery(
+                    repo.root(),
+                    &repo_name,
+                    None,
+                    &record,
+                    source_spawn,
+                    // `land_force` is a deliberately ungated operator escape
+                    // hatch (no native review/gate behind it), so a
+                    // conflicting pointer must keep failing closed onto
+                    // manual reconciliation rather than trusting git
+                    // ancestry to auto-advance it.
+                    crate::lifecycle::SuccessorPolicy::FailClosed,
+                )
                 .await
             {
                 warn!(repo = %repo_name, branch, %error, "forced landing merged but failed to derive its agent merge pointer");
@@ -10448,8 +10647,15 @@ mod respawn_tests {
                     target: "main".into(),
                     landed_at: chrono::Utc::now().to_rfc3339(),
                 };
-                sup.finalize_delivery(&repo_root, "repo", None, &delivery, spawn)
-                    .await
+                sup.finalize_delivery(
+                    &repo_root,
+                    "repo",
+                    None,
+                    &delivery,
+                    spawn,
+                    crate::lifecycle::SuccessorPolicy::FailClosed,
+                )
+                .await
             }));
         }
         let mut oks = 0;
@@ -10518,6 +10724,187 @@ mod respawn_tests {
             sup.lock_registry().get("worker1").unwrap().merge_commit,
             first_commit,
             "a conflicting pointer must fail closed, not overwrite the first delivery"
+        );
+    }
+
+    /// TKT-jonis-faror-zufuj bounded native successor/replay journey: a
+    /// resumed SAME generation delivers a genuine successor commit through
+    /// the native (gated) `AdvanceOnDescendant` policy, a later replay of
+    /// the now-superseded first commit is a safe no-op that never rolls
+    /// either projection (agent pointer or ticket delivery) backward, and a
+    /// truly unrelated candidate still fails closed exactly as before.
+    #[tokio::test]
+    async fn finalize_delivery_advances_a_proven_successor_and_drops_stale_replays() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let p = repo_dir.path();
+        git(p, &["checkout", "-b", "feature"]);
+        std::fs::write(p.join("f"), "1\n").unwrap();
+        git(p, &["commit", "-am", "c1"]);
+        git(p, &["checkout", "main"]);
+        git(p, &["merge", "--no-ff", "feature", "-m", "merge1"]);
+        let first_commit = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+
+        let sup = supervisor(home.path());
+        let canonical_root = Repo::discover(p).unwrap().root().to_path_buf();
+        let mut rec = record(&canonical_root, Some("feature"));
+        rec.name = "gen1".into();
+        let source_spawn = rec.spawn;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let ticket = sup
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: "test".into(),
+                body: None,
+                scope: None,
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        let task_id = ticket.identity.clone();
+
+        let advance = crate::lifecycle::SuccessorPolicy::AdvanceOnDescendant;
+        let first_record = crate::tickets::DeliveryRecord {
+            merge_commit: first_commit.clone(),
+            branch: "feature".into(),
+            target: "main".into(),
+            landed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        sup.finalize_delivery(
+            &canonical_root,
+            "repo",
+            Some(&task_id),
+            &first_record,
+            source_spawn,
+            advance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sup.lock_registry().get("gen1").unwrap().merge_commit,
+            Some(first_commit.clone())
+        );
+        assert_eq!(
+            sup.tickets
+                .delivery(&task_id)
+                .unwrap()
+                .unwrap()
+                .merge_commit,
+            first_commit
+        );
+
+        // The SAME generation is resumed and delivers a genuine successor: a
+        // real git descendant of the first merge commit.
+        git(p, &["checkout", "feature"]);
+        std::fs::write(p.join("f"), "2\n").unwrap();
+        git(p, &["commit", "-am", "c2"]);
+        git(p, &["checkout", "main"]);
+        git(p, &["merge", "--no-ff", "feature", "-m", "merge2"]);
+        let second_commit = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+        assert!(Repo::discover(p)
+            .unwrap()
+            .is_ancestor(&first_commit, &second_commit));
+
+        let second_record = crate::tickets::DeliveryRecord {
+            merge_commit: second_commit.clone(),
+            branch: "feature".into(),
+            target: "main".into(),
+            landed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        sup.finalize_delivery(
+            &canonical_root,
+            "repo",
+            Some(&task_id),
+            &second_record,
+            source_spawn,
+            advance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sup.lock_registry().get("gen1").unwrap().merge_commit,
+            Some(second_commit.clone()),
+            "a proven successor commit must advance the agent's merge pointer"
+        );
+        assert_eq!(
+            sup.tickets
+                .delivery(&task_id)
+                .unwrap()
+                .unwrap()
+                .merge_commit,
+            second_commit,
+            "a proven successor commit must advance the ticket's delivery record too"
+        );
+
+        // A late replay of the now-superseded FIRST receipt must be a safe
+        // no-op: it must not roll either the agent pointer or the ticket's
+        // delivery record backward.
+        sup.finalize_delivery(
+            &canonical_root,
+            "repo",
+            Some(&task_id),
+            &first_record,
+            source_spawn,
+            advance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sup.lock_registry().get("gen1").unwrap().merge_commit,
+            Some(second_commit.clone()),
+            "a stale receipt replay must not roll the agent pointer backward"
+        );
+        assert_eq!(
+            sup.tickets
+                .delivery(&task_id)
+                .unwrap()
+                .unwrap()
+                .merge_commit,
+            second_commit,
+            "a stale receipt replay must not roll the ticket's delivery record backward"
+        );
+
+        // A genuinely unrelated candidate (unresolvable in this repo, so
+        // ancestry cannot be established either way) must still fail closed,
+        // even under the permissive `AdvanceOnDescendant` policy.
+        let unrelated_record = crate::tickets::DeliveryRecord {
+            merge_commit: "0000000000000000000000000000000000dead".into(),
+            branch: "feature".into(),
+            target: "main".into(),
+            landed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let err = sup
+            .finalize_delivery(
+                &canonical_root,
+                "repo",
+                Some(&task_id),
+                &unrelated_record,
+                source_spawn,
+                advance,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            sup.lock_registry().get("gen1").unwrap().merge_commit,
+            Some(second_commit.clone()),
+            "an unrelated candidate must fail closed, not overwrite"
+        );
+        assert_eq!(
+            sup.tickets
+                .delivery(&task_id)
+                .unwrap()
+                .unwrap()
+                .merge_commit,
+            second_commit,
+            "a failed-closed conflict must never touch the ticket's delivery record"
         );
     }
 
