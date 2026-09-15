@@ -3874,10 +3874,12 @@ impl Supervisor {
         binding: &crate::bbs::ConsumerBinding,
     ) -> Option<rk_core::bbs::Briefing> {
         let task = task?;
+        let discovery = crate::bbs_discovery::resolve_for_brief(&self.layout, repo);
         match crate::bbs::brief(
             &self.space,
             &self.tickets,
             &crate::bbs::BriefParams::for_task(repo, task),
+            discovery,
         ) {
             Ok(mut briefing) => {
                 let capture = crate::bbs::record_exposure(

@@ -3316,7 +3316,9 @@ impl Daemon {
             "bbs.brief" => {
                 let result =
                     parse_params::<crate::bbs::BriefParams>(&req.params).and_then(|params| {
-                        crate::bbs::brief(&self.space, &self.tickets, &params)
+                        let discovery =
+                            crate::bbs_discovery::resolve_for_brief(&self.layout, &params.repo);
+                        crate::bbs::brief(&self.space, &self.tickets, &params, discovery)
                             .map_err(|e| e.to_string())
                     });
                 reply(match result {
@@ -3336,6 +3338,29 @@ impl Daemon {
                         briefing.exposure = capture.record;
                         Response::ok(id, json!(briefing))
                     }
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.discovery.show" => {
+                let result = parse_params::<crate::bbs_discovery::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::bbs_discovery::show(&self.layout, &params).map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.discovery.set" => {
+                let result = parse_params::<crate::bbs_discovery::SetParams>(&req.params).and_then(
+                    |params| {
+                        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                        crate::bbs_discovery::set(&self.layout, &repos, &req.caller, &params)
+                            .map_err(|e| e.to_string())
+                    },
+                );
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
                 })
             }
