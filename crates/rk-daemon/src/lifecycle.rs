@@ -49,6 +49,73 @@ pub(crate) enum MergePointerDecision {
     Conflict { agent: String, recorded: String },
 }
 
+/// How a `finalize_delivery` conflict (a resolved generation already
+/// carries a DIFFERENT merge commit than the candidate) should be treated
+/// — TKT-jonis-faror-zufuj. A resumed generation that legitimately delivers
+/// a second, later commit to the same branch/target looks identical, at the
+/// registry level, to two unrelated deliveries racing onto the same
+/// generation: both are "the recorded commit differs from the candidate."
+/// Only a delivery whose queue entry already passed this repository's
+/// native gate/review carries evidence strong enough to tell them apart via
+/// git ancestry; the operator's ungated `land_force` escape hatch does not,
+/// so it must keep failing closed onto explicit manual reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuccessorPolicy {
+    /// Any differing commit fails closed — used by `land_force`.
+    FailClosed,
+    /// A differing commit that is a proven git descendant of what's
+    /// recorded is accepted as this generation's next delivery; a
+    /// differing commit that what's recorded already descends from is a
+    /// stale/late receipt replay and is silently dropped. Used by the
+    /// native landing pipeline.
+    AdvanceOnDescendant,
+}
+
+/// What a `MergePointerDecision::Conflict` resolves to once the two
+/// commits' git ancestry is known. Pure and unit-testable: the caller
+/// supplies the two `is_ancestor` facts already computed against the repo,
+/// so this function itself does no I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SuccessorClassification {
+    /// The candidate is a proven git descendant of what's recorded: a
+    /// genuine successor delivery from the same, resumed generation.
+    Advance,
+    /// What's recorded is a proven git descendant of the candidate: the
+    /// candidate is an older, already-superseded receipt replaying late.
+    /// Never rolls a newer projection backward.
+    StaleReplay,
+    /// Neither commit is an ancestor of the other (or the policy forbids
+    /// classifying at all): unrelated histories claiming the same
+    /// generation. Fail closed exactly as the original Conflict behavior.
+    Unrelated,
+}
+
+/// Classify a `Conflict` using already-computed git ancestry facts.
+/// `recorded_is_ancestor_of_candidate` / `candidate_is_ancestor_of_recorded`
+/// come from `Repo::is_ancestor`, which treats equal revisions as mutually
+/// ancestral — but `resolve_merge_pointer` already routes an equal
+/// candidate to `AlreadyRecorded` before a `Conflict` is ever produced, so
+/// both true together does not arise here in practice.
+pub(crate) fn classify_successor(
+    policy: SuccessorPolicy,
+    recorded_is_ancestor_of_candidate: bool,
+    candidate_is_ancestor_of_recorded: bool,
+) -> SuccessorClassification {
+    match policy {
+        SuccessorPolicy::FailClosed => SuccessorClassification::Unrelated,
+        SuccessorPolicy::AdvanceOnDescendant => {
+            match (
+                recorded_is_ancestor_of_candidate,
+                candidate_is_ancestor_of_recorded,
+            ) {
+                (true, false) => SuccessorClassification::Advance,
+                (false, true) => SuccessorClassification::StaleReplay,
+                _ => SuccessorClassification::Unrelated,
+            }
+        }
+    }
+}
+
 /// Resolve which agent generation (if any) a delivery for `(repo_root,
 /// branch, target)` derives its merge pointer onto, and what to do about it.
 ///
@@ -238,6 +305,64 @@ mod tests {
                 exact_spawn,
             );
             assert_eq!(decision, expected, "case: {name}");
+        }
+    }
+
+    /// One row per distinct invariant `classify_successor` must uphold
+    /// (TKT-jonis-faror-zufuj): `FailClosed` never advances or drops
+    /// anything regardless of ancestry, and `AdvanceOnDescendant` tells a
+    /// genuine resumed-generation successor apart from a stale replay and
+    /// from a truly unrelated commit using only the two ancestry facts.
+    #[test]
+    fn classify_successor_decisions() {
+        let cases: [(&str, SuccessorPolicy, bool, bool, SuccessorClassification); 6] = [
+            (
+                "fail-closed never advances even on a proven descendant",
+                SuccessorPolicy::FailClosed,
+                true,
+                false,
+                SuccessorClassification::Unrelated,
+            ),
+            (
+                "fail-closed never treats an ancestor candidate as stale either",
+                SuccessorPolicy::FailClosed,
+                false,
+                true,
+                SuccessorClassification::Unrelated,
+            ),
+            (
+                "a candidate descending from the recorded commit advances",
+                SuccessorPolicy::AdvanceOnDescendant,
+                true,
+                false,
+                SuccessorClassification::Advance,
+            ),
+            (
+                "a candidate the recorded commit already descends from is a stale replay",
+                SuccessorPolicy::AdvanceOnDescendant,
+                false,
+                true,
+                SuccessorClassification::StaleReplay,
+            ),
+            (
+                "neither ancestor of the other is unrelated",
+                SuccessorPolicy::AdvanceOnDescendant,
+                false,
+                false,
+                SuccessorClassification::Unrelated,
+            ),
+            (
+                "both ancestors of each other (unreachable in practice) fails closed, not advances",
+                SuccessorPolicy::AdvanceOnDescendant,
+                true,
+                true,
+                SuccessorClassification::Unrelated,
+            ),
+        ];
+
+        for (name, policy, recorded_is_ancestor, candidate_is_ancestor, expected) in cases {
+            let got = classify_successor(policy, recorded_is_ancestor, candidate_is_ancestor);
+            assert_eq!(got, expected, "case: {name}");
         }
     }
 }
