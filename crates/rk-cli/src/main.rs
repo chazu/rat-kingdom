@@ -1513,7 +1513,7 @@ async fn main() -> Result<()> {
                 })?;
             let mut client = Client::connect_or_spawn(&layout).await?;
             let mut params = serde_json::Map::new();
-            params.insert("repo".into(), json!(repo));
+            params.insert("repo".into(), json!(repo.clone()));
             if let Some(check) = check {
                 params.insert("check".into(), json!(check));
             }
@@ -1532,6 +1532,13 @@ async fn main() -> Result<()> {
                     "verify: {} (exit {exit})",
                     result["verdict"].as_str().unwrap_or("?"),
                 );
+                if let Some(id) = result["failure_receipt_id"].as_str() {
+                    println!(
+                        "failure receipt: {id} (rk scan artifact {repo} verification-failure-receipt --search {id})"
+                    );
+                } else if let Some(err) = result["failure_receipt_error"].as_str() {
+                    eprintln!("warning: failure receipt not persisted: {err}");
+                }
             }
             if exit != 0 {
                 std::process::exit(exit.clamp(1, 255) as i32);
