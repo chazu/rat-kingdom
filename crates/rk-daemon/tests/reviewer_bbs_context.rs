@@ -310,8 +310,10 @@ async fn policy_on_exposes_reviewed_ticket_evidence_without_leaking_foreign_scop
         })),
     )
     .await;
-    let reviewer_primed =
-        git_out(repo.path(), &["show", &format!("{reviewer_branch}:primed.txt")]);
+    let reviewer_primed = git_out(
+        repo.path(),
+        &["show", &format!("{reviewer_branch}:primed.txt")],
+    );
     assert!(
         reviewer_primed.contains("ACCEPTANCE CAVEAT"),
         "reviewed-ticket evidence must reach the reviewer's briefing:\n{reviewer_primed}"
@@ -326,7 +328,8 @@ async fn policy_on_exposes_reviewed_ticket_evidence_without_leaking_foreign_scop
         "telemetry must keep the reviewer's OWN task distinct from the reviewed ticket it queried"
     );
     assert_eq!(
-        reviewer_exposure["payload"]["reviewed_ticket_bbs_context"], true
+        reviewer_exposure["payload"]["reviewed_ticket_bbs_context"],
+        true
     );
     assert_eq!(
         reviewer_exposure["payload"]["agent"], reviewer_name,
@@ -361,14 +364,8 @@ async fn policy_on_exposes_reviewed_ticket_evidence_without_leaking_foreign_scop
     // (3) An ordinary (non-reviewer) worker with no ReviewContext is
     // structurally unaffected by the setting: it is still briefed on its
     // own task.
-    let (_worker_name, worker_branch) = spawn_and_wait(
-        &mut client,
-        repo.path(),
-        &original_ticket,
-        "rat",
-        None,
-    )
-    .await;
+    let (_worker_name, worker_branch) =
+        spawn_and_wait(&mut client, repo.path(), &original_ticket, "rat", None).await;
     let worker_primed = git_out(
         repo.path(),
         &["show", &format!("{worker_branch}:primed.txt")],
