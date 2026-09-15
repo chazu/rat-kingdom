@@ -2548,6 +2548,44 @@ impl LandingPipeline {
         if let Some(recovered) = self.recover_completed_batch(&entries, &repo).await? {
             return Ok(recovered);
         }
+        // Every entry sharing this batch shares the SAME (repo_name, target)
+        // work key (`pending_keys`/`drain_key`), so one check against
+        // `entries[0]` speaks for the whole cohort — mirroring
+        // `process_entry`'s single-entry `quarantine_invalid_target` guard,
+        // which this batch path (reached only for a multi-entry, all
+        // doc-only/trivial, non-capacity-admission-split cohort) never had.
+        // Deliberately placed AFTER `recover_completed_batch`, not before:
+        // that call's own `is_ancestor` check against a target ref that no
+        // longer resolves simply returns `None` rather than recovering, so
+        // checking target validity first would risk quarantining a batch
+        // whose target branch was deleted only AFTER a completed land —
+        // relabeling already-landed work as invalid instead of preserving
+        // its receipt recovery. Reached here, target absence is unresolved
+        // either way: for a fresh cohort about to call `prepare_merge_batch`
+        // (which hard-errors "merge target does not exist" instead of
+        // returning an ordinary `PrepareOutcome`, hot-looping the drain
+        // cycle forever) or for an already-prepared cohort about to reuse a
+        // persisted candidate below without ever re-checking the target.
+        if matches!(repo.branch_exists_checked(&entries[0].target), Ok(false)) {
+            let mut outcomes = Vec::with_capacity(entries.len());
+            for entry in entries {
+                // The representative check above decided we're in this
+                // branch, but each entry still needs its OWN durable
+                // quarantine evidence (`archive_quarantine` embeds the full
+                // entry, and `find_quarantine`'s idempotency probe is keyed
+                // per source/task) — and its own re-check, since the target
+                // becoming valid again between the check above and here,
+                // though vanishingly rare, must fall through to ordinary
+                // processing rather than lose the row.
+                let outcome = match self.quarantine_invalid_target(&entry, &repo)? {
+                    Some(outcome) => outcome,
+                    None => self.process_entry(&entry).await?,
+                };
+                self.queue.remove(&entry)?;
+                outcomes.push((entry, outcome));
+            }
+            return Ok(outcomes);
+        }
         let gates = self.gate_config(&repo)?;
 
         let branch_names: Vec<String> = entries.iter().map(|e| e.branch.clone()).collect();
@@ -19202,6 +19240,130 @@ checks: [
             .unwrap()
             .unwrap();
         assert!(matches!(landed, LandingOutcome::Landed(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_target_is_quarantined_for_a_multi_entry_batch_and_does_not_hot_loop() {
+        // TKT-kujab-momum-vazug's singleton fix left the batch counterpart
+        // unguarded (artifact 01M2H73K4N7TQGQ5JXEWE5T9T4's own
+        // `not_in_scope` note): a detached commit persisted as `target` can
+        // never receive `prepare_merge_batch`'s merge, which hard-errors
+        // "merge target does not exist" instead of returning an ordinary
+        // `PrepareOutcome` -- hot-looping the drain cycle forever on
+        // `process_batch`'s true multi-entry path (two doc-only entries
+        // sharing one target) exactly as the singleton path used to.
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        let detached_sha = rev_parse(repo_dir.path(), "main");
+        for (branch, file) in [("feature-a", "a.md"), ("feature-b", "b.md")] {
+            git(repo_dir.path(), &["checkout", "main"]);
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::write(repo_dir.path().join(file), format!("{branch}\n")).unwrap();
+            git(repo_dir.path(), &["add", file]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+        }
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open(&home.path().join("test-space.db")).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        for branch in ["feature-a", "feature-b"] {
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: "docs-repo".into(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: branch.into(),
+                    target: detached_sha.clone(),
+                    head_sha: rev_parse(repo_dir.path(), branch),
+                    diff_class: "doc-only".into(),
+                    task: format!("deliver-{branch}"),
+                    keep_branch: true,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let entries = pipeline
+            .queue
+            .claim_batch("docs-repo", &detached_sha, 8)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let outcomes = pipeline.process_batch(entries).await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes
+            .iter()
+            .all(|(_, o)| matches!(o, LandingOutcome::Quarantined(_))));
+        for (entry, _) in &outcomes {
+            pipeline.queue.remove(entry).unwrap();
+        }
+        assert!(pipeline
+            .queue
+            .scan_current("docs-repo", Some(&detached_sha))
+            .unwrap()
+            .is_empty());
+
+        let quarantines = space
+            .scan(&Pattern::category(Category::Event).identity("landing_queue_quarantine"))
+            .unwrap();
+        assert_eq!(
+            quarantines.len(),
+            2,
+            "each batch member earns its own durably-bound quarantine evidence, not one shared record"
+        );
+        for q in &quarantines {
+            assert!(q.payload["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not an existing branch"));
+            assert_eq!(q.payload["entry"]["target"], detached_sha);
+        }
+
+        // Restart must replay the settled verdict rather than repeat work:
+        // the entries already left the active queue, so a redrain of the
+        // (now-empty) key is a no-op, and no duplicate evidence is written.
+        drop(pipeline);
+        let space = Space::open(&home.path().join("test-space.db")).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let outcomes = pipeline
+            .drain_key("docs-repo", &detached_sha)
+            .await
+            .unwrap();
+        assert!(outcomes.is_empty());
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("landing_queue_quarantine"))
+                .unwrap()
+                .len(),
+            2,
+            "restart did not duplicate quarantine evidence"
+        );
+
+        // A separate, valid target is unaffected: the same two branches
+        // still land as an ordinary batch through the same repo/pipeline.
+        for branch in ["feature-a", "feature-b"] {
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: "docs-repo".into(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: branch.into(),
+                    target: "main".into(),
+                    head_sha: rev_parse(repo_dir.path(), branch),
+                    diff_class: "doc-only".into(),
+                    task: format!("deliver-{branch}-retry"),
+                    keep_branch: true,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let outcomes = pipeline.drain_key("docs-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, LandingOutcome::Landed(_))));
     }
 
     #[tokio::test]
