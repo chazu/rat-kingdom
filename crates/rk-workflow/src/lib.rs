@@ -250,6 +250,33 @@ pub struct LandingPolicy {
     /// suite by default.
     #[serde(default, rename = "focusedChecks")]
     pub focused_checks: Vec<FocusedCheckRule>,
+    /// Whether a native reviewer's BBS briefing is queried against the
+    /// ACTUAL ticket under review (`ReviewContext::task`, daemon-owned —
+    /// see `LandingPipeline::dispatch_review`/`launch_shadow_review` in
+    /// `crates/rk-daemon/src/landing.rs`) instead of the reviewer's own
+    /// synthetic spawn task (e.g. `candidate-review-TKT-...`), which never
+    /// resolves to a ticket and so always surfaces zero BBS entries even
+    /// when the reviewed ticket has relevant findings/artifacts. Purely a
+    /// choice of BBS query target: the reviewer's own task/role/spawn/
+    /// attempt identity (`RK_TASK`, `ConsumerBinding`, telemetry) is always
+    /// the true reviewer's, never the reviewed ticket's, and
+    /// `bbs::brief`'s existing cross-repo scope check still refuses a
+    /// review binding naming a ticket outside this repo. `false` (the
+    /// default) restores the pre-fix behavior exactly. Only applies when
+    /// the spawn/resume/recovery actually carries a `ReviewContext`
+    /// (i.e. it is a review); ordinary workers are unaffected either way.
+    ///
+    /// Like every other field on this policy, flipping it is digest-fenced
+    /// approved-commit activation, NOT an instant file toggle: a fresh
+    /// `repo.add` against an unregistered repo activates whatever
+    /// `.rk/repo.cue` says at that commit immediately, but changing it on an
+    /// ALREADY-registered repo only takes effect once
+    /// `rk repo onboard start/propose/approve/apply/activate` records the
+    /// new digest (`RepoRecord::activated_policy`,
+    /// `crates/rk-daemon/src/repos.rs`) — editing the file on disk alone
+    /// does nothing until that activation lands.
+    #[serde(default, rename = "reviewedTicketBbsContext")]
+    pub reviewed_ticket_bbs_context: bool,
 }
 
 /// One `LandingPolicy::focused_checks` rule: a changed-path (or named-class)
@@ -299,6 +326,7 @@ impl Default for LandingPolicy {
             review_death_retry_jitter_pct: default_review_death_retry_jitter_pct(),
             protected_targets: default_protected_targets(),
             focused_checks: Vec::new(),
+            reviewed_ticket_bbs_context: false,
         }
     }
 }
