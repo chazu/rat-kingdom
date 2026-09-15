@@ -827,6 +827,14 @@ triggers: [
 /// interrupted gate — completes immediately, so restart-recovery marches
 /// through the once-real hold with no lingering timing dependency.
 ///
+/// The hold's own bound (60s) is deliberately LONGER than the check's own
+/// declared 30s `timeout` below, not shorter: if either the kill or the
+/// recovery this test exercises ever silently failed to happen, the first
+/// attempt must surface that as a genuine timed-out check FAILURE, not
+/// quietly finish its sleep and report an untruthful success — a bound
+/// shorter than the declared timeout would let exactly that defect hide
+/// behind an ordinary-looking pass.
+///
 /// The first attempt also drops its own real shell pid (`$$`) into `shared`
 /// before holding — `.process_group(0)`
 /// (`managed_verification.rs::spawn_check_child`) makes this pid its own
@@ -845,7 +853,7 @@ checks: [
 ]
 "#,
         cue_command(&format!(
-            r#"if [ -f "{shared}/held" ]; then exit 0; fi; echo $$ > "{shared}/verify.pid"; touch "{shared}/held"; sleep 10"#,
+            r#"if [ -f "{shared}/held" ]; then exit 0; fi; echo $$ > "{shared}/verify.pid"; touch "{shared}/held"; sleep 60"#,
             shared = shared.display()
         ))
     )
@@ -1093,6 +1101,13 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
         process_alive(verify_pid),
         "the verify check's real child must be running before the mid-gate kill below"
     );
+    // Captured once here, independent of `OwnedCheckCleanup`'s own copy —
+    // this is the identity the post-A-death assertion below re-checks, not
+    // a cleanup mechanism.
+    let verify_signature = process_signature(verify_pid).expect(
+        "the verify check's real child must have an observable start+command signature \
+         immediately after it is confirmed alive",
+    );
     // Panic-safety net (see `OwnedCheckCleanup` doc comment) for the
     // remainder of this test — a no-op on the successful path. The unique
     // fixture path (not just the "verify.pid" filename every invocation of
@@ -1181,6 +1196,28 @@ async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_withou
     assert!(
         !process_alive(pid_a as i32),
         "daemon A's own OS process must be genuinely dead once reaped"
+    );
+
+    // Confirm the captured orphan's identity AND liveness in THIS exact
+    // window — after A is physically reaped, before B is even spawned —
+    // not just before the kill and again sometime after B starts. Without
+    // this, a later process_alive-eventually-false observation could be
+    // explained by ordinary post-kill scheduling noise or a coincidence in
+    // timing rather than by daemon B's own recovery actually reclaiming a
+    // genuine live orphan; this closes that gap directly.
+    assert!(
+        process_alive(verify_pid),
+        "the mid-gate verify check's real process {verify_pid} must still be alive immediately \
+         after daemon A is reaped and before daemon B starts — a genuine orphan, not something \
+         that already exited on its own"
+    );
+    assert_eq!(
+        process_signature(verify_pid).as_deref(),
+        Some(verify_signature.as_str()),
+        "the process at pid {verify_pid} immediately after daemon A's death must still be the \
+         SAME process (matching start-time+command signature) captured at gate-start — a \
+         different identity here would mean the pid was recycled, not that the genuine orphan \
+         survived"
     );
 
     // Both candidates survived the kill, durably queued in FIFO order —
