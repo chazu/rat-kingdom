@@ -173,7 +173,7 @@ pub fn validate_automation(
     })?;
     let target = session.worktree.join(&proposal.target_path);
     let started_at = Utc::now();
-    let result = validate_automation_file(&target, kind);
+    let result = validate_automation_file(&target, proposal);
     let finished_at = Utc::now();
     let target_digest = file_digest(&target)?;
     let (passed, output_summary, unresolved_risks) = match result {
@@ -351,13 +351,7 @@ fn validate_target(path: &Path, proposal: &OnboardingProposal) -> rk_core::Resul
         }
         return Ok(());
     }
-    let kind = proposal.automation_kind().ok_or_else(|| {
-        rk_core::Error::other(format!(
-            "proposal {} has no supported validation contract",
-            proposal.id
-        ))
-    })?;
-    validate_automation_file(path, kind).map(|_| ())
+    validate_automation_file(path, proposal).map(|_| ())
 }
 
 /// Accept the proposal's exact reviewed tree, or a descendant made solely by
@@ -447,11 +441,19 @@ fn validate_contract(path: &Path, contract: &OnboardingNamedCheck) -> rk_core::R
 
 pub(crate) fn validate_automation_file(
     path: &Path,
-    kind: OnboardingAutomationKind,
+    proposal: &OnboardingProposal,
 ) -> rk_core::Result<String> {
+    let kind = proposal.automation_kind().ok_or_else(|| {
+        rk_core::Error::other(format!(
+            "proposal {} has no supported automation validation contract",
+            proposal.id
+        ))
+    })?;
     let source = std::fs::read_to_string(path)
         .map_err(|error| rk_core::Error::other(format!("read {}: {error}", path.display())))?;
-    crate::onboarding::reject_cue_imports(&source).map_err(rk_core::Error::other)?;
+    if kind != OnboardingAutomationKind::CiWorkflow {
+        crate::onboarding::reject_cue_imports(&source).map_err(rk_core::Error::other)?;
+    }
     match kind {
         OnboardingAutomationKind::RepositoryPolicy => {
             rk_workflow::load_repository_policy_str(&source)?;
@@ -514,7 +516,177 @@ pub(crate) fn validate_automation_file(
                 hooks.len()
             ))
         }
+        OnboardingAutomationKind::CheckRegistry => {
+            let contract = proposal.named_check.as_ref().ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "proposal {} has no digest-bound named_check contract",
+                    proposal.id
+                ))
+            })?;
+            let check = validate_contract(path, contract)?;
+            Ok(format!(
+                "named check `{}` contract validated for {}",
+                check.name,
+                path.display()
+            ))
+        }
+        OnboardingAutomationKind::CiWorkflow => validate_ci_workflow_str(&source),
     }
+}
+
+/// Bounded, dependency-free structural check for a GitHub Actions CI
+/// workflow file. This is not a YAML parser and does not run the workflow;
+/// it only proves the file has the shape a CI workflow needs (top-level
+/// `on:`/`jobs:` keys, at least one job declaring `runs-on:` and `steps:`),
+/// so a regular-file existence check cannot stand in for CI validation. The
+/// actual maintained recipe invocation a job runs is reviewed separately.
+/// Real YAML syntax validation (via `serde_yaml_ng`, an in-process,
+/// statically-linked parser — no external tool-availability contract to fail
+/// open on) plus bounded, per-job structural and value-shape checks. This
+/// does not implement GitHub Actions semantics or run the workflow; it only
+/// proves the parsed document has the shape the prepared CI companion uses:
+/// a top-level `on:` trigger key with a nonempty event name/list/mapping, a
+/// non-empty `jobs:` mapping, and every declared job (checked on its own,
+/// not by scanning the whole `jobs:` section for the right substrings)
+/// declaring both a nonempty `runs-on:` (a runner label or list of labels)
+/// and a nonempty `steps:` list of `run:`/`uses:` steps. Any other shape is
+/// refused explicitly rather than accepted as validated structure. The
+/// actual maintained recipe invocation a job runs is reviewed separately.
+fn validate_ci_workflow_str(source: &str) -> rk_core::Result<String> {
+    if source.trim().is_empty() {
+        return Err(rk_core::Error::other("CI workflow file is empty"));
+    }
+    let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(source).map_err(|error| {
+        rk_core::Error::other(format!("CI workflow file is not valid YAML: {error}"))
+    })?;
+    let root = document.as_mapping().ok_or_else(|| {
+        rk_core::Error::other("CI workflow file must be a YAML mapping at its top level")
+    })?;
+
+    // `serde_yaml_ng`'s scalar resolution (see its `de::parse_bool`) only
+    // recognizes `true`/`True`/`TRUE` and `false`/`False`/`FALSE` as
+    // booleans, not the wider YAML 1.1 `on`/`off`/`yes`/`no` set some other
+    // readers implement — so with this parser an unquoted `on:` really does
+    // parse as the string key `"on"`. Require that real key rather than
+    // inventing an alternate spelling that would accept a literal `true:`.
+    let on_value = root.get("on").ok_or_else(|| {
+        rk_core::Error::other("CI workflow file has no top-level `on:` trigger key")
+    })?;
+    validate_trigger_shape(on_value)?;
+
+    let jobs_value = root
+        .get("jobs")
+        .ok_or_else(|| rk_core::Error::other("CI workflow file has no top-level `jobs:` key"))?;
+    let jobs = jobs_value.as_mapping().ok_or_else(|| {
+        rk_core::Error::other("CI workflow file's `jobs:` key must be a mapping of job id to job")
+    })?;
+    if jobs.is_empty() {
+        return Err(rk_core::Error::other(
+            "CI workflow file's `jobs:` key declares no jobs",
+        ));
+    }
+    for (job_id, job) in jobs {
+        let job_id = job_id_label(job_id);
+        let job = job.as_mapping().ok_or_else(|| {
+            rk_core::Error::other(format!("CI workflow job `{job_id}` must be a mapping"))
+        })?;
+        validate_runs_on_shape(&job_id, job.get("runs-on"))?;
+        validate_steps_shape(&job_id, job.get("steps"))?;
+    }
+    Ok(format!(
+        "CI workflow YAML parsed and structurally validated: on/jobs present, {} job(s) each declaring a supported runs-on/steps shape",
+        jobs.len()
+    ))
+}
+
+fn job_id_label(value: &serde_yaml_ng::Value) -> String {
+    value.as_str().map(str::to_string).unwrap_or_else(|| {
+        serde_yaml_ng::to_string(value)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    })
+}
+
+fn nonempty_str(value: &serde_yaml_ng::Value) -> bool {
+    matches!(value, serde_yaml_ng::Value::String(text) if !text.trim().is_empty())
+}
+
+/// `on:` must be a nonempty event name, a nonempty list of event names, or a
+/// nonempty event mapping — the three shapes the prepared CI companion and
+/// ordinary GitHub Actions workflows use. `null`, an empty collection, or a
+/// non-string/non-collection scalar is refused rather than accepted.
+fn validate_trigger_shape(value: &serde_yaml_ng::Value) -> rk_core::Result<()> {
+    let supported = match value {
+        serde_yaml_ng::Value::Sequence(items) => {
+            !items.is_empty() && items.iter().all(nonempty_str)
+        }
+        serde_yaml_ng::Value::Mapping(map) => !map.is_empty(),
+        other => nonempty_str(other),
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(rk_core::Error::other(
+            "CI workflow file's `on:` trigger must be a nonempty event name, list of event names, or event mapping",
+        ))
+    }
+}
+
+/// `runs-on:` must be a nonempty runner label (a string, matrix expressions
+/// like `${{ matrix.os }}` included) or a nonempty list of labels. `null`,
+/// a bare boolean/number, or an empty value is refused: presence of the key
+/// alone is not a validated shape.
+fn validate_runs_on_shape(
+    job_id: &str,
+    value: Option<&serde_yaml_ng::Value>,
+) -> rk_core::Result<()> {
+    let supported = match value {
+        Some(serde_yaml_ng::Value::Sequence(items)) => {
+            !items.is_empty() && items.iter().all(nonempty_str)
+        }
+        Some(other) => nonempty_str(other),
+        None => false,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(rk_core::Error::other(format!(
+            "CI workflow job `{job_id}` must declare `runs-on:` as a nonempty runner label or list of labels"
+        )))
+    }
+}
+
+/// `steps:` must be a nonempty sequence, and every step in it a mapping
+/// declaring a nonempty `run:` or `uses:` — the two step shapes the
+/// prepared CI companion and ordinary GitHub Actions jobs use. A step that
+/// is not a mapping, or one with neither key nonempty, is refused.
+fn validate_steps_shape(job_id: &str, value: Option<&serde_yaml_ng::Value>) -> rk_core::Result<()> {
+    let Some(serde_yaml_ng::Value::Sequence(steps)) = value else {
+        return Err(rk_core::Error::other(format!(
+            "CI workflow job `{job_id}` must declare `steps:` as a nonempty list of steps"
+        )));
+    };
+    if steps.is_empty() {
+        return Err(rk_core::Error::other(format!(
+            "CI workflow job `{job_id}` must declare `steps:` as a nonempty list of steps"
+        )));
+    }
+    for (index, step) in steps.iter().enumerate() {
+        let step = step.as_mapping().ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "CI workflow job `{job_id}` step {index} must be a mapping"
+            ))
+        })?;
+        let run_ok = step.get("run").is_some_and(nonempty_str);
+        let uses_ok = step.get("uses").is_some_and(nonempty_str);
+        if !run_ok && !uses_ok {
+            return Err(rk_core::Error::other(format!(
+                "CI workflow job `{job_id}` step {index} must declare a nonempty `run:` or `uses:`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn automation_validator(kind: OnboardingAutomationKind) -> &'static str {
@@ -526,6 +698,8 @@ fn automation_validator(kind: OnboardingAutomationKind) -> &'static str {
             "rk_workflow::load_schedules_str + rk_daemon::cron::Cron::parse"
         }
         OnboardingAutomationKind::Hook => "rk_workflow::load_hooks_str",
+        OnboardingAutomationKind::CheckRegistry => "onboarding_apply::validate_contract",
+        OnboardingAutomationKind::CiWorkflow => "onboarding_apply::validate_ci_workflow_str",
     }
 }
 
@@ -725,6 +899,176 @@ enum ExecutionOutcome {
     Completed(Output),
     TimedOut,
     SpawnFailure(String),
+}
+
+#[cfg(test)]
+mod ci_workflow_tests {
+    use super::validate_ci_workflow_str;
+
+    const VALID: &str = r#"
+name: CI
+on:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: mise run verify
+"#;
+
+    #[test]
+    fn accepts_a_well_formed_workflow() {
+        let summary = validate_ci_workflow_str(VALID).unwrap();
+        assert!(summary.contains("1 job"), "{summary}");
+    }
+
+    #[test]
+    fn rejects_an_empty_file() {
+        let error = validate_ci_workflow_str("   \n").unwrap_err().to_string();
+        assert!(error.contains("empty"), "{error}");
+    }
+
+    #[test]
+    fn rejects_invalid_yaml_syntax() {
+        // An unterminated flow sequence, followed by an otherwise ordinary
+        // job: a text scanner sees the `on:`/`jobs:`/`runs-on:`/`steps:`
+        // substrings at the right indentation and would wrongly accept
+        // this; a real parser must reject it as a syntax error.
+        let source = "on: [push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("not valid YAML"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_missing_on_key() {
+        let source = "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("`on:`"), "{error}");
+    }
+
+    #[test]
+    fn accepts_the_real_unquoted_on_key() {
+        // `serde_yaml_ng`'s bool resolution only covers true/false spellings
+        // (see its `de::parse_bool`), so a real workflow's unquoted `on:`
+        // parses as the string key `"on"` with this parser, not a boolean.
+        let summary = validate_ci_workflow_str(VALID).unwrap();
+        assert!(summary.contains("on/jobs present"), "{summary}");
+    }
+
+    #[test]
+    fn rejects_a_literal_true_key_as_a_stand_in_for_on() {
+        // A `true:` key is not a real GitHub Actions trigger key spelling;
+        // it must not be accepted as an alternate way to write `on:`.
+        let source = "true:\n  push: {}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("`on:`"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_empty_on_trigger() {
+        let source =
+            "on:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("`on:` trigger"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_null_runs_on() {
+        let source =
+            "on: push\njobs:\n  test:\n    runs-on: null\n    steps:\n      - run: echo ok\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("runs-on"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_boolean_steps_value() {
+        let source = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: false\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("steps"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_step_with_neither_run_nor_uses() {
+        let source =
+            "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: noop\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("run:") && error.contains("uses:"), "{error}");
+    }
+
+    #[test]
+    fn accepts_a_matrix_runs_on_expression_and_a_uses_step() {
+        // The prepared CI companion's ordinary shape: a matrix expression
+        // string for `runs-on:` and a `uses:` step alongside `run:` steps.
+        let source = "on:\n  push: {}\njobs:\n  test:\n    runs-on: \"${{ matrix.os }}\"\n    steps:\n      - uses: actions/checkout@v4\n      - run: mise run verify\n";
+        let summary = validate_ci_workflow_str(source).unwrap();
+        assert!(summary.contains("1 job"), "{summary}");
+    }
+
+    #[test]
+    fn rejects_a_missing_jobs_key() {
+        let source = "on:\n  push: {}\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("`jobs:`"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_job_missing_runs_on_or_steps() {
+        let source = "on:\n  push: {}\njobs:\n  test:\n    steps: []\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("runs-on"), "{error}");
+    }
+
+    #[test]
+    fn rejects_runs_on_and_steps_split_across_different_jobs() {
+        // Two jobs, each individually incomplete: one has only `runs-on:`,
+        // the other only `steps:`. A global "does this string occur
+        // somewhere in the jobs section" check wrongly accepts this; each
+        // job must be checked on its own.
+        let source = "on:\n  push: {}\njobs:\n  build:\n    runs-on: ubuntu-latest\n  test:\n    steps: []\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(
+            error.contains("job `build`") || error.contains("job `test`"),
+            "{error}"
+        );
+        assert!(
+            error.contains("runs-on") || error.contains("steps"),
+            "{error}"
+        );
+    }
+
+    /// Exact adversarial input from the reviewed reproduction
+    /// (`ci-invalid-yaml-example.yml`): an unterminated flow sequence
+    /// followed by an otherwise ordinary job.
+    #[test]
+    fn rejects_the_reviewed_unterminated_flow_sequence_reproduction() {
+        let source = "on: [unterminated\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(error.contains("not valid YAML"), "{error}");
+    }
+
+    /// Exact adversarial input from the reviewed reproduction
+    /// (`ci-split-invalid-jobs-example.yml`): `runs-on` on one job, `steps`
+    /// on a different job, neither job complete on its own.
+    #[test]
+    fn rejects_the_reviewed_split_jobs_reproduction() {
+        let source = "on: push\njobs:\n  first:\n    runs-on: ubuntu-latest\n  second:\n    steps:\n      - run: echo ok\n";
+        let error = validate_ci_workflow_str(source).unwrap_err().to_string();
+        assert!(
+            error.contains("job `first`") || error.contains("job `second`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn regular_file_existence_alone_is_not_ci_validation() {
+        // A file that exists, is non-empty, and is valid YAML, but has none
+        // of the required structure, must still be refused.
+        let error = validate_ci_workflow_str("just some text\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("YAML mapping"), "{error}");
+    }
 }
 
 #[cfg(all(test, unix))]
