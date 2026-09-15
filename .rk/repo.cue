@@ -20,6 +20,7 @@ repo: {
 	landing: {
 		maxDiffLines: 3000
 		reviewedTicketBbsContext: true
+		verificationHandoff: true
 	}
 
 	// Regenerable build-artifact paths the daemon's worktree sweep reclaims.
