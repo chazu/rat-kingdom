@@ -296,6 +296,8 @@ pub enum OnboardingAutomationKind {
     Trigger,
     Schedule,
     Hook,
+    CheckRegistry,
+    CiWorkflow,
 }
 
 impl std::fmt::Display for OnboardingAutomationKind {
@@ -306,8 +308,22 @@ impl std::fmt::Display for OnboardingAutomationKind {
             Self::Trigger => "trigger",
             Self::Schedule => "schedule",
             Self::Hook => "hook",
+            Self::CheckRegistry => "check_registry",
+            Self::CiWorkflow => "ci_workflow",
         })
     }
+}
+
+/// `.github/workflows/<name>.yml` (or `.yaml`), directly under the workflows
+/// directory — the one shape a CI proposal's target must have to be a
+/// supported activation target rather than an inert repo file.
+pub(crate) fn is_ci_workflow_target(target: &str) -> bool {
+    const PREFIX: &str = ".github/workflows/";
+    target.strip_prefix(PREFIX).is_some_and(|rest| {
+        !rest.is_empty()
+            && !rest.contains('/')
+            && (rest.ends_with(".yml") || rest.ends_with(".yaml"))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,6 +534,12 @@ impl OnboardingProposal {
         match (self.kind, self.target_path.as_str()) {
             (OnboardingProposalKind::RepoFile, ".rk/repo.cue") => {
                 Some(OnboardingAutomationKind::RepositoryPolicy)
+            }
+            (OnboardingProposalKind::RepoFile, ".rk/checks.cue") => {
+                Some(OnboardingAutomationKind::CheckRegistry)
+            }
+            (OnboardingProposalKind::RepoFile, target) if is_ci_workflow_target(target) => {
+                Some(OnboardingAutomationKind::CiWorkflow)
             }
             (OnboardingProposalKind::WorkflowActivation, _) => {
                 Some(OnboardingAutomationKind::Workflow)
@@ -917,5 +939,56 @@ mod tests {
             "onboarder".into(),
         )
         .is_err());
+    }
+
+    fn plain_repo_file_draft(target_path: &str) -> OnboardingProposalDraft {
+        OnboardingProposalDraft {
+            kind: OnboardingProposalKind::RepoFile,
+            title: "Add a repo file".into(),
+            evidence: vec!["reviewed by hand".into()],
+            target_path: target_path.into(),
+            action: OnboardingProposalAction::WriteRepoFile,
+            diff: format!("--- /dev/null\n+++ b/{target_path}\n"),
+            risk: OnboardingProposalRisk::Low,
+            verification: vec!["reviewed manually".into()],
+            named_check: None,
+        }
+    }
+
+    fn proposal(draft: OnboardingProposalDraft) -> OnboardingProposal {
+        OnboardingProposal::new(
+            "onb-one".into(),
+            "repo-one".into(),
+            "tree-one".into(),
+            draft,
+            "onboarder".into(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn automation_kind_recognizes_check_registry_and_ci_workflow_targets() {
+        assert_eq!(
+            proposal(draft()).automation_kind(),
+            Some(OnboardingAutomationKind::CheckRegistry)
+        );
+        assert_eq!(
+            proposal(plain_repo_file_draft(".github/workflows/ci.yml")).automation_kind(),
+            Some(OnboardingAutomationKind::CiWorkflow)
+        );
+        assert_eq!(
+            proposal(plain_repo_file_draft(".github/workflows/release.yaml")).automation_kind(),
+            Some(OnboardingAutomationKind::CiWorkflow)
+        );
+        // A nested subdirectory and an unrelated file are not the recognized
+        // CI shape, so they remain inert repo files with no activation route.
+        assert_eq!(
+            proposal(plain_repo_file_draft(".github/workflows/nested/ci.yml")).automation_kind(),
+            None
+        );
+        assert_eq!(
+            proposal(plain_repo_file_draft("README.md")).automation_kind(),
+            None
+        );
     }
 }
