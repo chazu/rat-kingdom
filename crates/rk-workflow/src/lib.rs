@@ -277,6 +277,28 @@ pub struct LandingPolicy {
     /// does nothing until that activation lands.
     #[serde(default, rename = "reviewedTicketBbsContext")]
     pub reviewed_ticket_bbs_context: bool,
+    /// Worker verification handoff (TKT-hisag-nubaf-kugon): when true, an
+    /// ordinary "rat" spawn's completion protocol assigns it only its
+    /// focused checks and formatter, and tells it NOT to also run a second
+    /// full/named acceptance check (e.g. `rk verify`) before `rk done` — the
+    /// repository's own automatic native landing route is the authoritative
+    /// acceptance gate for the exact merge candidate. The daemon only ever
+    /// composes this into a spawn's prompt when the flag is set AND the
+    /// spawn is actually routed to a live native landing pipeline
+    /// (`delivery.mode` is `merge`/`merge-push` and a `LandingPipeline` is
+    /// registered) — a repo with this flag set but `delivery.mode:
+    /// push-branch`/`pr`, or no registered pipeline, keeps the unmodified
+    /// mandatory-self-verify prompt, because there is no automatic gate to
+    /// hand the check to. Reviewer/foreman spawns, and any resume/recovery
+    /// of a non-"rat" role, are never affected regardless of this setting.
+    /// Defaults `false`: an unactivated or opted-out repo sees no prompt
+    /// change from today. Like every other field here, flipping it is
+    /// digest-fenced approved-commit activation (see
+    /// `reviewed_ticket_bbs_context` above) — King/operator owns that
+    /// activation step; a worker cannot self-activate this by editing
+    /// `.rk/repo.cue`.
+    #[serde(default, rename = "verificationHandoff")]
+    pub verification_handoff: bool,
 }
 
 /// One `LandingPolicy::focused_checks` rule: a changed-path (or named-class)
@@ -327,6 +349,7 @@ impl Default for LandingPolicy {
             protected_targets: default_protected_targets(),
             focused_checks: Vec::new(),
             reviewed_ticket_bbs_context: false,
+            verification_handoff: false,
         }
     }
 }
@@ -3026,8 +3049,24 @@ checks: [
         assert_eq!(policy.landing.review_max_wait, "45m");
         assert_eq!(policy.landing.shadow_review_model, "");
         assert_eq!(policy.landing.shadow_review_harness, "");
+        assert!(!policy.landing.verification_handoff);
         assert_eq!(policy.release.integration_branch, "");
         assert_eq!(policy.release.release_target, "");
+    }
+
+    #[test]
+    fn repository_policy_loads_verification_handoff() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                landing: {
+                    verificationHandoff: true
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert!(policy.landing.verification_handoff);
     }
 
     #[test]

@@ -137,6 +137,20 @@ repo: #RepositoryPolicy
 	// editing this file alone does not take effect until that activation
 	// lands.
 	reviewedTicketBbsContext: bool | *false
+	// Worker verification handoff: when true, an ordinary "rat" spawn's
+	// completion protocol assigns it only its focused checks/formatter and
+	// tells it not to also run a second full/named acceptance check (e.g.
+	// rk verify) before rk done — this repo's own automatic native landing
+	// route is the authoritative acceptance gate for the exact merge
+	// candidate. Only composed into a prompt when the flag is set AND the
+	// spawn is actually routed to a live native merge/merge-push landing
+	// pipeline; reviewer/foreman spawns are never affected. false (the
+	// default) is today's unmodified mandatory-self-verify behavior. Like
+	// the rest of this policy, changing it on an already-registered repo
+	// requires digest-fenced approved-commit activation (rk repo onboard
+	// start/propose/approve/apply/activate) — editing this file alone does
+	// not take effect until that activation lands.
+	verificationHandoff: bool | *false
 }
 
 #FocusedCheckRule: {

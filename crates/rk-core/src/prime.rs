@@ -44,6 +44,18 @@ pub struct PrimeContext {
     /// restricted harnesses that cannot safely receive a general-purpose shell
     /// solely to run `rk done`.
     pub harness_terminal_completion: bool,
+    /// This repo has opted into verification handoff for THIS spawn
+    /// (`LandingPolicy::verification_handoff`, gated by the caller to an
+    /// ordinary "rat" spawn with an actually-live native merge/merge-push
+    /// landing route — never a standalone generation, missing delivery
+    /// route, or reviewer/foreman role). When true, step 3 of the
+    /// completion protocol assigns the worker only its focused checks and
+    /// formatter, and leaves final acceptance to the native landing gate
+    /// instead of a second self-invoked full/named check. `render` still
+    /// only honors this for role `"rat"`, regardless of what the caller
+    /// sets it to, so a mis-set context on another role cannot silently
+    /// weaken its mandatory verification text.
+    pub verification_handoff: bool,
 }
 
 /// A repo-owned named verification check rendered into a worker's prompt.
@@ -599,7 +611,7 @@ Before finishing, run the final integration check on `RK_BRANCH`, summarize the
 completed and unresolved items, and run `rk done \"<summary>\"`. STOP after that.
 ";
 
-const FRAGMENT_COMPLETION: &str = "\
+const FRAGMENT_COMPLETION_HEAD: &str = "\
 ## Completion protocol (mandatory, in order)
 
 This sequence is mandatory for every generation UNLESS a control message
@@ -629,6 +641,9 @@ absent a verified instruction saying so, run the sequence below in full.
    start a long verification run, and never end a turn, with the work sitting
    uncommitted in your worktree. Amend or add commits as verification forces
    changes.
+";
+
+const FRAGMENT_COMPLETION_STEP3_STANDARD: &str = "\
 3. Verify with the project's documented verification entrypoint. Before choosing
    commands, inspect the repository's own instructions and configuration (for
    example its README, agent guidance, task runner, or named check). If the task
@@ -661,6 +676,35 @@ absent a verified instruction saying so, run the sequence below in full.
    `rk done` on it. Say which command you ran and what exit status it gave.
    If no documented entrypoint exists, report that gap as an obstacle or need
    instead of guessing.
+";
+
+/// Step 3 substitute used only when [`PrimeContext::verification_handoff`] is
+/// active for this spawn — an opt-in `LandingPolicy::verification_handoff`
+/// repo with an actually-live native merge/merge-push landing route, and only
+/// ever composed for role `"rat"` (see [`fragment_completion`]).
+const FRAGMENT_COMPLETION_STEP3_HANDOFF: &str = "\
+3. This repository has opted into verification handoff for ordinary workers:
+   run your FOCUSED checks and formatter only — the ones scoped to what you
+   changed (see Repository verification checks above; prefer a named
+   `verify-changed`-style check over the full `verify` when one is declared).
+   Do NOT also run `rk verify`, the repo's full/default named check, or any
+   other duplicate acceptance pass before `rk done`. This repository's
+   existing automatic native landing route is the authoritative acceptance
+   gate for the exact merge candidate: it runs its own full check after you
+   commit and complete, through the same bounded per-repo admission queue —
+   running it again yourself here only occupies a second worker slot behind
+   a check you do not own and races the landing pipeline's own queue. This
+   handoff does not grant you completion or landing authority, does not
+   fabricate a check pass, and does not bypass any repo gate — it only moves
+   WHO runs the acceptance check, not whether it runs. If your task
+   description or a verified operator steer explicitly requires a
+   pre-completion check beyond your focused checks, that explicit
+   requirement still applies — this handoff removes only the DEFAULT
+   mandate. Say which focused check(s) and formatter you ran and their exit
+   status.
+";
+
+const FRAGMENT_COMPLETION_TAIL: &str = "\
 4. Never `rk done` on a build you broke. If you hit a pre-existing failure that
    is unrelated to your change, do NOT fix it inline (peers on other branches
    will race you) — file a ticket and record it as an artifact
@@ -686,6 +730,19 @@ absent a verified instruction saying so, run the sequence below in full.
    optional and never replaces filing a ticket for a problem. Then run
    `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
 ";
+
+/// Compose the completion protocol, substituting step 3's text when this
+/// spawn has verification handoff active. `handoff` must already be gated by
+/// the caller (see [`PrimeContext::verification_handoff`]) — this function
+/// applies whatever it is given without re-checking role or policy.
+fn fragment_completion(handoff: bool) -> String {
+    let step3 = if handoff {
+        FRAGMENT_COMPLETION_STEP3_HANDOFF
+    } else {
+        FRAGMENT_COMPLETION_STEP3_STANDARD
+    };
+    format!("{FRAGMENT_COMPLETION_HEAD}{step3}{FRAGMENT_COMPLETION_TAIL}")
+}
 
 /// Compose the active fleet conventions into a binding "Standing conventions"
 /// section, or `None` when there are none. Kept separate so `render` stays a
@@ -889,7 +946,11 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
             out.push('\n');
             out.push_str(FRAGMENT_GIT_SAFETY);
             out.push('\n');
-            out.push_str(FRAGMENT_COMPLETION);
+            // Foreman always gets the standard step 3, never the handoff
+            // variant: it directs other rats' work rather than running
+            // checks itself, and verification_handoff is scoped to role
+            // "rat" only.
+            out.push_str(&fragment_completion(false));
         }
         "reviewer" => {
             if let Some(review) = &ctx.review {
@@ -945,7 +1006,11 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
             out.push('\n');
             out.push_str(FRAGMENT_GIT_SAFETY);
             out.push('\n');
-            out.push_str(FRAGMENT_COMPLETION);
+            // Reviewer always gets the standard step 3, never the handoff
+            // variant: a reviewer's own verdict artifact is a distinct
+            // acceptance signal from the check verification_handoff hands
+            // off, and verification_handoff is scoped to role "rat" only.
+            out.push_str(&fragment_completion(false));
         }
         _ => {
             out.push_str(FRAGMENT_SINGLE_TASK);
@@ -960,7 +1025,14 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
             out.push('\n');
             out.push_str(FRAGMENT_GIT_SAFETY);
             out.push('\n');
-            out.push_str(FRAGMENT_COMPLETION);
+            // Only role "rat" ever honors verification_handoff, regardless
+            // of what a caller sets it to — this default arm also renders
+            // "verifier" and any other non-explicit role, neither of which
+            // should ever have its default acceptance mandate silently
+            // weakened.
+            out.push_str(&fragment_completion(
+                role == "rat" && ctx.verification_handoff,
+            ));
         }
     }
     // Preserve the placeholder for operator-side/template rendering when no
@@ -986,6 +1058,7 @@ mod tests {
             conventions: Vec::new(),
             verification_checks: Vec::new(),
             harness_terminal_completion: false,
+            verification_handoff: false,
         }
     }
 
@@ -1208,6 +1281,58 @@ mod tests {
                 "{role} prompt must require reporting the command and its exit status"
             );
         }
+    }
+
+    #[test]
+    fn rat_role_with_handoff_swaps_step_3_text() {
+        let mut with_handoff = ctx();
+        with_handoff.verification_handoff = true;
+        let text = render("rat", &with_handoff);
+        assert!(
+            text.contains("This repository has opted into verification handoff"),
+            "rat prompt with verification_handoff must carry the handoff step 3"
+        );
+        assert!(
+            text.contains("Do NOT also run `rk verify`"),
+            "handoff step 3 must forbid a duplicate acceptance run"
+        );
+        assert!(
+            !text.contains("Verify with the project's documented verification entrypoint"),
+            "handoff step 3 must replace, not append to, the standard mandate"
+        );
+        // The rest of the completion protocol (steps 1-2, 4-6) is unaffected.
+        for needle in [
+            "Prove you can LAND before you produce anything",
+            "Never `rk done` on a build you broke",
+            "Prove the branch carries the work before you signal",
+        ] {
+            assert!(text.contains(needle), "handoff prompt missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn reviewer_and_foreman_ignore_handoff_flag() {
+        for role in ["reviewer", "foreman"] {
+            let mut with_handoff = ctx();
+            with_handoff.verification_handoff = true;
+            let text = render(role, &with_handoff);
+            assert!(
+                text.contains("Verify with the project's documented verification entrypoint"),
+                "{role} must keep the mandatory standard step 3 even when \
+                 verification_handoff is set on its context"
+            );
+            assert!(
+                !text.contains("This repository has opted into verification handoff"),
+                "{role} must never receive the handoff step 3 text"
+            );
+        }
+    }
+
+    #[test]
+    fn rat_role_without_handoff_keeps_standard_step_3() {
+        let text = render("rat", &ctx());
+        assert!(text.contains("Verify with the project's documented verification entrypoint"));
+        assert!(!text.contains("This repository has opted into verification handoff"));
     }
 
     #[test]
