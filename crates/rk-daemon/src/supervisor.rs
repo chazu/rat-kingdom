@@ -8706,12 +8706,18 @@ impl Supervisor {
     /// resulting `Exited` and terminalize the record as `Failed` before it
     /// ever reaches the successor, which is a genuine behavior change from
     /// the pre-existing, tested rollover contract, not a hardening of it.
-    /// Reviewers carry no such contract: their own recovery
-    /// (review-death detection / a bounded replacement dispatch) does not
-    /// key off `state == "orphaned"`, so signalling them here is safe and is
-    /// the actual incident this ticket follows up on (BBS finding
+    /// Reviewers carry no such contract by default — their `Exited` would
+    /// terminalize the same way `Failed`, routing recovery into the landing
+    /// pipeline's bounded-replacement dispatch instead of resuming this
+    /// generation — so [`orphan_for_owned_shutdown`](Self::orphan_for_owned_shutdown)
+    /// is called on each of these BEFORE it is signalled
+    /// (TKT-ravig-kumob-timuh), pre-empting that with the exact same
+    /// `Orphaned` disposition the successor's `orphan_live_agents` sweep
+    /// would have given a rat — see that method's own doc for why this is
+    /// genuine recovery, not merely routing around the crash arm. The
+    /// original incident this ticket follows up on is BBS finding
     /// 01M2HWNZA7V4WCSRTJ04XYN7ES: a live REVIEWER reaped incidentally, not a
-    /// live rat).
+    /// live rat.
     pub(crate) fn live_reviewer_session_controls(&self) -> Vec<(String, SessionControl)> {
         let reviewer_names: std::collections::HashSet<String> = self
             .lock_registry()
@@ -8725,6 +8731,34 @@ impl Supervisor {
             .filter(|(name, _)| reviewer_names.contains(*name))
             .map(|(name, control)| (name.clone(), control.clone()))
             .collect()
+    }
+
+    /// TKT-ravig-kumob-timuh: transition a still-live generation straight to
+    /// [`Orphaned`](AgentState::Orphaned) — the exact disposition
+    /// `on_daemon_started`'s `orphan_live_agents` sweep gives a rat whose
+    /// process died while the daemon itself was down — but done HERE, on the
+    /// originating daemon, before this generation's process is signalled by
+    /// `shut_down_owned_reviewer_processes` in `server.rs`. Ordering is the
+    /// whole point: called before `control.kill()`, so by the time the
+    /// resulting `Exited` event reaches `handle_event`, `r.state.is_live()`
+    /// is already false and its crash arm (`state -> Failed`, `crashed =
+    /// true`, a synthesized "process exited" result) never fires — the
+    /// record stays exactly `Orphaned`, `pid` cleared, `cost_usd`/`usage`/
+    /// `review` untouched, ready for the SAME `respawn_generation` /
+    /// `respawn_sweep` / `abandoned()`-patience contract already proven for a
+    /// rat, rather than falling into the landing pipeline's review-death
+    /// bounded-replacement dispatch (a new generation, a new $0 budget
+    /// window, a re-authored `review_attempt`). A record that has already
+    /// raced to some OTHER terminal state on its own between enumeration and
+    /// this call is left alone — this only ever narrows a live state to
+    /// `Orphaned`, never widens it.
+    pub(crate) fn orphan_for_owned_shutdown(&self, name: &str) {
+        let _ = self.lock_registry().update(name, |r| {
+            if r.state.is_live() {
+                r.state = AgentState::Orphaned;
+                r.pid = None;
+            }
+        });
     }
 
     fn lock_attempts(
