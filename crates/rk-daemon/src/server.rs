@@ -2925,6 +2925,52 @@ impl Daemon {
                 Vec::new()
             }
         };
+        // Bounded, storage-side-capped read of native landing outcomes
+        // (`landing::LandingPipeline::mark_processed`'s `landing_processed`
+        // markers) for the additive `native_delivery` scorecard section.
+        // `scan_newest_limited` pushes scope+limit into SQL before any
+        // payload is materialized (module doc), so this cost is the page,
+        // not the journal; request one extra row to detect truncation
+        // without guessing, matching `inbox_value`'s idiom above. Despite the
+        // method's name, its order is descending tuple id (ULID mint order),
+        // not persistence sequence or wall clock — `factory_analytics`'s
+        // reduction over these rows is order-independent and reports this
+        // page's bound honestly rather than as "newest".
+        let native_delivery_pattern = Pattern::category(Category::Event)
+            .identity(crate::landing::LANDING_PROCESSED_IDENTITY)
+            .scope(repo.clone());
+        let native_delivery = match self
+            .space
+            .scan_newest_limited(&native_delivery_pattern, MAX_SCAN_TUPLES.saturating_add(1))
+        {
+            Ok(mut rows) => {
+                let scanned = rows.len().min(MAX_SCAN_TUPLES);
+                let truncated = rows.len() > MAX_SCAN_TUPLES;
+                rows.truncate(MAX_SCAN_TUPLES);
+                let events = rows
+                    .into_iter()
+                    .filter(|event| in_window(event.created_at.timestamp_millis()))
+                    .collect();
+                crate::factory_analytics::NativeDeliveryInputs {
+                    events,
+                    scanned,
+                    limit: MAX_SCAN_TUPLES,
+                    truncated,
+                    available: true,
+                    read_warning: None,
+                }
+            }
+            Err(error) => crate::factory_analytics::NativeDeliveryInputs {
+                events: Vec::new(),
+                scanned: 0,
+                limit: MAX_SCAN_TUPLES,
+                truncated: false,
+                available: false,
+                read_warning: Some(format!(
+                    "source_family_read_failed: NativeLandingDelivery unavailable: {error}"
+                )),
+            },
+        };
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
@@ -2936,6 +2982,7 @@ impl Daemon {
             reviewer_verdicts,
             runtime_unavailable,
             read_warnings,
+            native_delivery,
         }
     }
 
@@ -3269,7 +3316,9 @@ impl Daemon {
             "bbs.brief" => {
                 let result =
                     parse_params::<crate::bbs::BriefParams>(&req.params).and_then(|params| {
-                        crate::bbs::brief(&self.space, &self.tickets, &params)
+                        let discovery =
+                            crate::bbs_discovery::resolve_for_brief(&self.layout, &params.repo);
+                        crate::bbs::brief(&self.space, &self.tickets, &params, discovery)
                             .map_err(|e| e.to_string())
                     });
                 reply(match result {
@@ -3289,6 +3338,29 @@ impl Daemon {
                         briefing.exposure = capture.record;
                         Response::ok(id, json!(briefing))
                     }
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.discovery.show" => {
+                let result = parse_params::<crate::bbs_discovery::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::bbs_discovery::show(&self.layout, &params).map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.discovery.set" => {
+                let result = parse_params::<crate::bbs_discovery::SetParams>(&req.params).and_then(
+                    |params| {
+                        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                        crate::bbs_discovery::set(&self.layout, &repos, &req.caller, &params)
+                            .map_err(|e| e.to_string())
+                    },
+                );
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
                 })
             }
@@ -10704,11 +10776,23 @@ impl Daemon {
             session_generation.clone(),
             params.message,
         );
-        if let Err(e) =
-            crate::steer::enqueue(&self.space, &record.repo_name, &envelope, &self.castle)
-        {
-            return Response::err(req.id, codes::INTERNAL, e.to_string());
-        }
+        // `Supervisor::steer_envelope` now owns the durable journal write
+        // itself (`admit_steer(..., durable: true)`, wired to
+        // `crate::steer::enqueue`), reserving-and-journaling-and-sending as
+        // one admission decision. This RPC must NOT also call `enqueue`:
+        // doing so here, before this call, as an earlier version did, durably
+        // journaled every request unconditionally — including one about to
+        // be refused for a terminal/stale-generation/wrong-harness/saturated
+        // reason. That left a permanently un-acknowledged pending message in
+        // storage indistinguishable from one genuinely in flight when the
+        // daemon crashed, and `publish_launch`/`track_session`'s
+        // restart-replay would then silently replay it onto whatever session
+        // a later `rk respawn` of the SAME agent name launched — reopening
+        // exactly what the rejection was for. Journaling only ever inside a
+        // successful admission means a rejected request leaves no durable
+        // trace to be replayed by anything, ever, and an accepted one is
+        // journaled before it is sent, never after — see `admit_steer`'s doc
+        // comment for why that direction matters too.
         match self
             .supervisor
             .steer_envelope(&params.name, &envelope)
@@ -12380,12 +12464,13 @@ struct BlockingParams {
 }
 
 fn repository_head(path: &std::path::Path) -> rk_core::Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
         .arg(path)
         .args(["rev-parse", "HEAD"])
-        .env("LC_ALL", "C")
-        .output()?;
+        .env("LC_ALL", "C");
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let output = cmd.output()?;
     if !output.status.success() {
         return Err(rk_core::Error::other(format!(
             "cannot resolve repository HEAD for {}: {}",
@@ -12404,12 +12489,12 @@ fn repository_head(path: &std::path::Path) -> rk_core::Result<String> {
 /// can be inferred at registration time. Returns `None` when the path is not a
 /// repo or has no such remote — host inference is best-effort, never fatal.
 fn repo_remote_url(path: &std::path::Path, remote: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C"])
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-C"])
         .arg(path)
-        .args(["remote", "get-url", remote])
-        .output()
-        .ok()?;
+        .args(["remote", "get-url", remote]);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -12674,13 +12759,13 @@ fn touches_protected_path(
 fn grep_matches(files: &[String], pattern: &str) -> Option<bool> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("grep")
-        .args(["-qE", pattern])
+    let mut cmd = Command::new("grep");
+    cmd.args(["-qE", pattern])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = writeln!(stdin, "{}", files.join("\n"));
     }

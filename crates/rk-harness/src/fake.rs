@@ -192,6 +192,209 @@ mod tests {
         assert!(exited);
     }
 
+    /// TKT-bikuz-kumuz-zutit's production-boundary regression: `FakeHarness::
+    /// launch` is the exact same entry point (`Harness::launch` ->
+    /// `runner::launch`) every real harness (Claude, Codex, jcode, maki)
+    /// goes through, so this exercises the actual wiring rather than
+    /// `rk_core::exec::close_extra_fds` in isolation. A pipe deliberately
+    /// left open (no `FD_CLOEXEC`) in THIS process stands in for the
+    /// original incident's `git` invocation, caught mid-`pipe()`-then-
+    /// `fcntl()` by a concurrent, unrelated spawn — here, this exact
+    /// harness launch. The spawned bash process must not see it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_harness_launch_does_not_inherit_an_unrelated_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("fd-check");
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (leak_r, leak_w) = (fds[0], fds[1]);
+
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "RK_FAKE_HARNESS_CMD".to_string(),
+            format!(
+                "if test -e /dev/fd/{leak_w}; then echo leaked > {marker}; else echo clean > {marker}; fi",
+                marker = shell_escape(&marker),
+            ),
+        );
+        let mut session = FakeHarness
+            .launch(&LaunchSpec {
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+        while session.events.recv().await.is_some() {}
+
+        unsafe {
+            libc::close(leak_r);
+            libc::close(leak_w);
+        }
+
+        let seen = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            seen.trim(),
+            "clean",
+            "the real FakeHarness::launch path leaked an unrelated parent descriptor into the spawned harness"
+        );
+    }
+
+    /// Companion to the leak test above, reproducing the ORIGINAL incident's
+    /// exact shape rather than a scenario the fix would pass trivially: a
+    /// real `git` child's captured stdout, wired to a pipe this test still
+    /// owns a write-end copy of, with an unrelated harness launched WHILE
+    /// that copy is still open — the only moment a leak into the harness
+    /// could actually happen. Launching the harness first (an earlier draft
+    /// of this test did) creates no such window: the harness has already
+    /// fully exec'd before the pipe even exists, so it passes whether or not
+    /// the fix works. The harness is parked on a release-file busy-wait
+    /// (not a fixed `sleep`) so "still alive at the EOF check" is verified
+    /// via its actual pid, not inferred from a timing coincidence, and it is
+    /// released and reaped in every outcome — including a failed assertion
+    /// — so this test can't leave it running past itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_output_reaches_eof_while_an_unrelated_harness_stays_alive() {
+        use std::os::unix::io::FromRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "rat@example.com"],
+            &["config", "user.name", "Rat"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo_dir.join("f"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-m", "init"]] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+
+        // A real `git` child, its stdout wired directly to `w` — the exact
+        // captured-output shape `git_in` produces (see rk-git), reproduced
+        // with the real binary. `close_extra_fds` here mirrors production;
+        // it must not disturb the explicit stdout wiring below (fd 1 after
+        // its own dup2), only fds it didn't set up on purpose.
+        let w_for_git = unsafe { libc::dup(w) };
+        assert!(w_for_git >= 0);
+        let mut git_cmd = std::process::Command::new("git");
+        git_cmd.args(["-C", repo_dir.to_str().unwrap(), "log", "--oneline"]);
+        unsafe {
+            git_cmd.stdout(std::process::Stdio::from_raw_fd(w_for_git));
+        }
+        rk_core::exec::close_extra_fds(&mut git_cmd);
+        let mut git_child = git_cmd.spawn().unwrap();
+        // `Command` itself still owns `w_for_git` after `spawn()`: for a
+        // `Stdio::Fd` above fd 2, std passes it to the child as a bare raw
+        // fd number to `dup2` (`ChildStdio::Explicit`), never taking
+        // ownership, so `git_cmd`'s own `stdout` field keeps it open in
+        // THIS process until `git_cmd` is dropped. Left alive, that is a
+        // second, self-inflicted writer on `w` that would keep it "open"
+        // long after the real `w` is closed below — not a leak into any
+        // other process, just this test failing to release its own handle.
+        drop(git_cmd);
+
+        // The harness is launched HERE, while this test still holds its own
+        // copy of `w` open — the only window in which a leak into the
+        // harness's spawned bash process could occur.
+        let release = dir.path().join("release");
+        let diag = dir.path().join("diag");
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "RK_FAKE_HARNESS_CMD".to_string(),
+            format!(
+                "if test -e /dev/fd/{w}; then echo leaked > {diag}; else echo clean > {diag}; fi; while [ ! -f {release} ]; do sleep 0.05; done",
+                diag = shell_escape(&diag),
+                release = shell_escape(&release)
+            ),
+        );
+        let mut session = FakeHarness
+            .launch(&LaunchSpec {
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+        let harness_pid = session.pid.expect("fake harness reports its pid") as i32;
+
+        // Wait for the harness's own /dev/fd check (a direct assertion,
+        // independent of the EOF inference below) to actually run before
+        // moving on.
+        for _ in 0..40 {
+            if diag.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Now close this test's own copy of `w` and let git exit (closing
+        // its copy too). If the harness leaked a copy, `w` still has a live
+        // writer and the read below never sees EOF.
+        unsafe { libc::close(w) };
+        git_child.wait().unwrap();
+
+        let read_result = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut file = unsafe { std::fs::File::from_raw_fd(r) };
+            tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf).map(|_| buf)
+            })
+            .await
+            .unwrap()
+        })
+        .await;
+
+        // Confirmed still alive at the moment of the check, not inferred
+        // from a `sleep` that might coincidentally still be running: the
+        // harness is parked on a release file this test hasn't written yet.
+        let alive_at_check = still_running(harness_pid).is_some();
+
+        // Release and reap the harness in every outcome, success or panic
+        // below, before any assertion can leave it running past this test.
+        let _ = std::fs::write(&release, "go");
+        let _ = session.control.kill().await;
+        while session.events.recv().await.is_some() {}
+
+        assert!(
+            alive_at_check,
+            "the harness must still have been running at the moment of the EOF check, or this proves nothing about a still-alive leaker"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&diag).unwrap_or_default().trim(),
+            "clean",
+            "the harness's own /dev/fd check must confirm it never saw the leaked descriptor"
+        );
+        let output = read_result.expect(
+            "captured output must reach EOF promptly even while an unrelated harness is \
+             confirmed still alive — a leaked descriptor would hang this read forever",
+        );
+        assert!(
+            String::from_utf8_lossy(&output.unwrap()).contains("init"),
+            "sanity: the real git child's output must still have come through correctly"
+        );
+    }
+
     /// A chatty child writing far more stderr than the event channel's
     /// capacity (256) as fast as possible must never be allowed to block on
     /// the channel filling up: that would stop the drain task from calling

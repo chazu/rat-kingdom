@@ -1236,6 +1236,13 @@ impl<'a> ManagedVerification<'a> {
         for (name, value) in env {
             child_command.env(name, value);
         }
+        // See rk_core::exec::close_extra_fds: a captured-output pipe
+        // created elsewhere in the daemon (a concurrent `git` call, another
+        // check, a harness launch) can be caught between `pipe()` and its
+        // own close-on-exec setup by this exact spawn; without this, this
+        // check's child could inherit it and keep that pipe's read side
+        // from ever seeing EOF (TKT-bikuz-kumuz-zutit).
+        rk_core::exec::close_extra_fds(child_command.as_std_mut());
         let child = child_command.spawn().map_err(|e| {
             rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
         })?;
@@ -1830,10 +1837,10 @@ pub(crate) struct ProcessTableRow {
 /// falls back to signalling only the root process group it already knew
 /// about, same as before this tree-walk existed.
 pub(crate) fn live_process_table() -> Vec<ProcessTableRow> {
-    let Ok(output) = std::process::Command::new("ps")
-        .args(["-Ao", "pid=,ppid=,pgid=,stat=,comm="])
-        .output()
-    else {
+    let mut cmd = std::process::Command::new("ps");
+    cmd.args(["-Ao", "pid=,ppid=,pgid=,stat=,comm="]);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let Ok(output) = cmd.output() else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -2133,10 +2140,10 @@ impl Drop for ManagedChildMarker {
 /// identically by every caller (nothing to compare against, so no confident
 /// answer either way).
 pub(crate) fn process_signature(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("ps");
+    cmd.args(["-o", "lstart=", "-p", &pid.to_string()]);
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2498,23 +2505,20 @@ pub(crate) fn extract_failing_tests(stdout: &str) -> Vec<String> {
 /// the repo's common root, not necessarily this specific linked worktree) —
 /// `git -C <dir>` is exactly the worktree under test.
 pub(crate) async fn clean_candidate_sha(dir: &Path) -> Option<String> {
-    let status = tokio::process::Command::new("git")
+    let mut status_cmd = tokio::process::Command::new("git");
+    status_cmd
         .arg("-C")
         .arg(dir)
-        .args(["status", "--porcelain"])
-        .output()
-        .await
-        .ok()?;
+        .args(["status", "--porcelain"]);
+    rk_core::exec::close_extra_fds(status_cmd.as_std_mut());
+    let status = status_cmd.output().await.ok()?;
     if !status.status.success() || !status.stdout.is_empty() {
         return None;
     }
-    let head = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .await
-        .ok()?;
+    let mut head_cmd = tokio::process::Command::new("git");
+    head_cmd.arg("-C").arg(dir).args(["rev-parse", "HEAD"]);
+    rk_core::exec::close_extra_fds(head_cmd.as_std_mut());
+    let head = head_cmd.output().await.ok()?;
     if !head.status.success() {
         return None;
     }

@@ -62,6 +62,48 @@ mod factory_analytics_cli {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    /// A genuine `landing_processed` marker, written the same way
+    /// `landing::LandingPipeline::mark_processed` does, via the operator-only
+    /// `space.out` RPC (an `operator` caller, unlike an agent, may write
+    /// `Furniture`-lifecycle tuples — see `Server::handle_out`). Exercises the
+    /// real `factory.scorecards` native-delivery read end-to-end through the
+    /// CLI, not a hand-built fixture struct.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_landing_processed(
+        client: &mut Client,
+        repo: &str,
+        branch: &str,
+        head_sha: &str,
+        target: &str,
+        task: &str,
+        outcome: &str,
+        target_head: Option<&str>,
+    ) {
+        client
+            .call(
+                "space.out",
+                json!({
+                    "category": "event",
+                    "scope": repo,
+                    "identity": "landing_processed",
+                    "instance": "daemon",
+                    "lifecycle": "furniture",
+                    "payload": {
+                        "branch": branch,
+                        "target": target,
+                        "target_head": target_head,
+                        "head_sha": head_sha,
+                        "task": task,
+                        "outcome": outcome,
+                        "admission_hold": Value::Null,
+                        "admission_recovery": Value::Null,
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scorecards_json_uses_global_flag_and_read_only_envelope() {
         let (_home, layout, handle) = daemon().await;
@@ -137,6 +179,110 @@ mod factory_analytics_cli {
         assert!(text.contains("## Warnings"));
         assert!(text.contains("Phase4CiSignal"));
         let mut client = connect(&layout).await;
+        client.call("stop", json!({})).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scorecards_json_reports_native_delivery_from_real_landing_processed_markers() {
+        let (_home, layout, handle) = daemon().await;
+        let mut client = connect(&layout).await;
+        write_landing_processed(
+            &mut client,
+            "rat-kingdom",
+            "feature-landed",
+            "sha-landed",
+            "main",
+            "TKT-LANDED",
+            "landed",
+            Some("merge-abc"),
+        )
+        .await;
+        write_landing_processed(
+            &mut client,
+            "rat-kingdom",
+            "feature-held",
+            "sha-held",
+            "main",
+            "TKT-HELD",
+            "gate-held",
+            None,
+        )
+        .await;
+
+        let result = json_success(run_with_layout(
+            &layout,
+            &["--json", "factory", "scorecards", "--repo", "rat-kingdom"],
+        ));
+        let nd = &result["native_delivery"];
+        assert_eq!(nd["schema_version"], json!(1));
+        assert_eq!(nd["available"], json!(true));
+        assert_eq!(nd["source"], json!("landing_processed"));
+        assert_eq!(nd["delivered_edges"], json!(1));
+        assert_eq!(nd["no_delivery_observed"]["gate_held"], json!(1));
+        assert_eq!(nd["observed_incidents"]["gate_held"], json!(1));
+        assert_eq!(nd["coverage"]["order"], json!("id_desc"));
+        assert_eq!(nd["coverage"]["may_hide_delivery"], json!(false));
+
+        client.call("stop", json!({})).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scorecards_markdown_shows_native_delivery_with_scoped_non_delivery_wording() {
+        let (_home, layout, handle) = daemon().await;
+        let mut client = connect(&layout).await;
+        write_landing_processed(
+            &mut client,
+            "rat-kingdom",
+            "feature-landed",
+            "sha-landed",
+            "main",
+            "TKT-LANDED",
+            "landed",
+            Some("merge-abc"),
+        )
+        .await;
+        write_landing_processed(
+            &mut client,
+            "rat-kingdom",
+            "feature-held",
+            "sha-held",
+            "main",
+            "TKT-HELD",
+            "gate-held",
+            None,
+        )
+        .await;
+
+        let output = run_with_layout(&layout, &["factory", "scorecards", "--repo", "rat-kingdom"]);
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("## Native Delivery"),
+            "missing native delivery section:\n{text}"
+        );
+        assert!(
+            text.contains("bounded read: only this section is capped/windowed"),
+            "must state only this section's read is bounded, not the whole response:\n{text}"
+        );
+        assert!(
+            text.contains("delivered_edges=1"),
+            "must show the real landed marker's delivery edge:\n{text}"
+        );
+        assert!(
+            text.contains("no_delivery_observed") && text.contains("gate_held=1"),
+            "must use the coverage-relative bucket name, not an absolute 'never_delivered' claim:\n{text}"
+        );
+        assert!(
+            text.contains("may_hide_delivery=false"),
+            "an unwindowed, untruncated read must say its coverage is complete:\n{text}"
+        );
+        assert!(
+            !text.contains("never_delivered"),
+            "renamed bucket must not leave the old absolute-sounding name behind:\n{text}"
+        );
+
         client.call("stop", json!({})).await.unwrap();
         handle.await.unwrap().unwrap();
     }

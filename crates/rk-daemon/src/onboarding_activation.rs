@@ -272,13 +272,13 @@ fn require_clean(path: &Path) -> rk_core::Result<()> {
 }
 
 fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> bool {
-    Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(path)
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .env("LC_ALL", "C")
-        .status()
-        .is_ok_and(|status| status.success())
+        .env("LC_ALL", "C");
+    rk_core::exec::close_extra_fds(&mut cmd);
+    cmd.status().is_ok_and(|status| status.success())
 }
 
 fn file_digest(path: &Path) -> rk_core::Result<String> {
@@ -297,12 +297,10 @@ fn git_text(path: &Path, args: &[&str]) -> rk_core::Result<String> {
 }
 
 fn git_output(path: &Path, args: &[&str]) -> rk_core::Result<Output> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(path).args(args).env("LC_ALL", "C");
+    rk_core::exec::close_extra_fds(&mut cmd);
+    let output = cmd.output()?;
     if output.status.success() {
         Ok(output)
     } else {
