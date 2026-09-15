@@ -1213,6 +1213,20 @@ fn write_manifest_new(path: &Path, manifest: &ReleaseManifest) -> rk_core::Resul
     Ok(())
 }
 
+/// Deterministic release id for `(repo, resolved_commit, recipe)` at the
+/// current [`RECIPE_REVISION`], without touching the registry or building
+/// anything. Lets a read-only caller (`release.status`) check whether a
+/// given commit already has a recorded release without ever calling
+/// [`prepare`] itself.
+pub fn id_for(repo: &str, resolved_commit: &str, recipe: &str) -> String {
+    release_id(&compute_input_key(
+        repo,
+        resolved_commit,
+        recipe,
+        RECIPE_REVISION,
+    ))
+}
+
 pub fn list(layout: &Layout, repo: Option<&str>) -> rk_core::Result<Vec<ReleaseIndexEntry>> {
     Ok(ReleaseRegistry::load(&registry_path(layout))?.list(repo))
 }
