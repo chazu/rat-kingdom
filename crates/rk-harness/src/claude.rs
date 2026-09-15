@@ -114,15 +114,38 @@ impl Harness for ClaudeHarness {
     }
 }
 
-/// Wrap a trusted control envelope as a stream-json user message line. The
-/// metadata is carried beside the text so repository/tool output can never
-/// manufacture an equivalent control frame.
+/// Wrap a trusted control envelope as a stream-json user message line.
+///
+/// The `metadata`/`rk_control` fields are transport-side bookkeeping for the
+/// daemon and adapter; the installed Claude CLI boundary was never proven to
+/// forward them to the model (TKT-hibif-ruboj-nizif) — the one part of this
+/// line the model reliably sees is `message.content[].text`. For a message
+/// with a real sender (an operator/foreman `rk steer`, not an internal daemon
+/// nudge — see [`ControlEnvelope::system`]), prepend a plain header carrying
+/// the envelope's own `message_id`/`sender`/`resume_generation`. This header
+/// is NOT a secret and proves nothing by itself — identical text can be, and
+/// is expected to be, copyable into a repository file, tool output, or BBS
+/// post. What makes it useful is that the worker's system prompt
+/// (`rk_core::prime`'s steer-verification section) tells it to check the
+/// `message_id` against the daemon's own durable record via `rk
+/// control-verify` before treating the claim as authentic — a lookup scoped
+/// to the calling agent's own authenticated identity and current session
+/// generation, which a copy sitting in untrusted text cannot pass on someone
+/// else's behalf or after that agent has moved on to a new generation.
 fn control_message_line(envelope: &ControlEnvelope) -> String {
+    let text = if envelope.sender == "rk-daemon" {
+        envelope.text.clone()
+    } else {
+        format!(
+            "[rk-control message_id={} sender={} generation={}]\n{}",
+            envelope.message_id, envelope.sender, envelope.resume_generation, envelope.text
+        )
+    };
     json!({
         "type": "user",
         "message": {
             "role": "user",
-            "content": [{"type": "text", "text": envelope.text}],
+            "content": [{"type": "text", "text": text}],
         },
         "metadata": {"rk_control": envelope},
         "rk_control": envelope,
@@ -728,14 +751,33 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
         let line = control_message_line(&envelope);
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["type"], "user");
+        let text = v["message"]["content"][0]["text"]
+            .as_str()
+            .expect("text block");
         assert_eq!(
-            v["message"]["content"][0]["text"],
-            "please also run the tests"
+            text,
+            "[rk-control message_id=msg-1 sender=operator generation=spawn-1]\n\
+             please also run the tests"
         );
         assert_eq!(v["rk_control"]["schema"], "rk.control.v1");
         assert_eq!(v["rk_control"]["message_id"], "msg-1");
         assert_eq!(v["metadata"]["rk_control"]["sender"], "operator");
         assert!(!line.contains('\n'), "must be a single line");
+    }
+
+    /// The header is informational, not a secret and not proof by itself —
+    /// see the doc comment on `control_message_line`. It must still be
+    /// absent from an internal daemon nudge, which never claims operator
+    /// authority in the first place.
+    #[test]
+    fn internal_daemon_nudge_carries_no_control_header() {
+        let envelope = ControlEnvelope::system("Whisker", "the harness reconnected");
+        let line = control_message_line(&envelope);
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            v["message"]["content"][0]["text"],
+            "the harness reconnected"
+        );
     }
 
     #[test]
