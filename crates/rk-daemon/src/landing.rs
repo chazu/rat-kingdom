@@ -12660,8 +12660,8 @@ workflow: {
     /// `implementation_lane_refuses_admission_rather_than_silently_lose_durable_queue_order`
     /// (both supervisor.rs tests) — neither touched by this change either.
     #[tokio::test]
-    async fn terminal_rework_refusal_releases_its_lane_wait_and_preserves_an_active_waiters_priority()
-     {
+    async fn terminal_rework_refusal_releases_its_lane_wait_and_preserves_an_active_waiters_priority(
+    ) {
         let home = tempfile::tempdir().unwrap();
         let (repo_dir, head_sha, _main_before) = review_candidate_repo();
         // Register the tempdir root as "code-repo" in `repos.json` so

@@ -1919,8 +1919,11 @@ impl Supervisor {
         // reclaiming the same ticket) so the durable wait queue holds this
         // logical request's place in line instead of minting a fresh entry
         // per attempt — see `Registry::try_reserve_lane_wip`/`LaneWaiter`.
-        let lane_wait_key =
-            lane_wait_key(&params.role, &params.task, params.workflow_instance.as_deref());
+        let lane_wait_key = lane_wait_key(
+            &params.role,
+            &params.task,
+            params.workflow_instance.as_deref(),
+        );
         let name = {
             let mut reg = self.lock_registry();
             if !reg.try_reserve_wip(fleet_wip_cap) {
@@ -8603,7 +8606,10 @@ impl Supervisor {
     ) {
         let lane = crate::agents::Lane::for_role(role);
         let key = lane_wait_key(role, task, workflow_instance);
-        if let Err(e) = self.lock_registry().abandon_lane_wait(repo_name, lane, &key) {
+        if let Err(e) = self
+            .lock_registry()
+            .abandon_lane_wait(repo_name, lane, &key)
+        {
             tracing::error!(
                 repo = repo_name, lane = lane.tag(), key = %key, error = %e,
                 "failed to release an abandoned lane-wait reservation for a terminal dispatch"
