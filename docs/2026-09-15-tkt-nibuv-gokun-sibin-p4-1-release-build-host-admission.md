@@ -82,26 +82,40 @@ unaccepted P3.2 commit.
   genuinely competes for the identical semaphore instance — an operator
   watching that field already sees release-build occupancy alongside every
   named check's, with no change to that RPC's own shape.
-- **Ownership/cancellation**: unchanged. `release.prepare`'s existing
-  process-wide `release_prepare_lock` single-flight, persistent staging
-  worktree reuse, and durable `Preparing → Prepared/Failed` state machine
-  are untouched — this adds one bounded `await` before the build subprocess
-  spawns, nothing else. `release.prepare` had no caller-disconnect
-  cancellation before this change (a dropped RPC connection does not
-  interrupt an in-flight build; confirmed by inspection — no
-  `ManagedVerificationRuns`-style registration exists in `release.rs`) and
-  still doesn't; this ticket preserves that pre-existing behavior rather
-  than introducing new cancellation semantics, per its own instruction to
-  "coordinate lifecycle interfaces instead of creating another shutdown
-  controller." No detached live builder outlives its own permit: the
-  permit is a plain `OwnedSemaphorePermit` dropped via ordinary Rust scope
-  rules on every exit path (success, build failure, admission timeout, or
-  the enclosing future itself being dropped).
+- **Ownership/cancellation**: `release.prepare`'s existing process-wide
+  `release_prepare_lock` single-flight, persistent staging worktree reuse,
+  and durable `Preparing → Prepared/Failed` state machine are untouched.
+  What did change, after review found the initial cut's RAII-only argument
+  insufficient: `release.prepare` previously had NO caller-disconnect
+  cancellation at all — it bypassed `dispatch_watching_disconnect`
+  entirely (verified by inspection: no `ManagedVerificationRuns`
+  registration existed in `release.rs`), so a disconnected caller's build,
+  queued or executing, kept running unobserved. `server.rs` now routes
+  `release.prepare` through `dispatch_watching_disconnect` alongside
+  `verify.run`, registering with the SAME `ManagedVerificationRuns`
+  registry keyed on the identical `verify_request_key` — no new
+  release-specific cancellation registry, coordinating through the
+  existing generic mechanism rather than building another shutdown
+  controller. `handle_release_prepare` races the `prepare()` future
+  against the registry's explicit `watch::Receiver` cancel signal in a
+  `tokio::select!`; the disconnect signal is explicit (computed from
+  `dispatch_watching_disconnect`'s own socket-readable probe, not inferred
+  from a future merely being dropped for some unrelated reason). When
+  cancel wins, the `prepare()` future is abandoned without being polled
+  again — its `ProcessGroupGuard` (owned deep inside `run_recipe`'s
+  `collect_child_output` call, the exact guard `verify.run`'s own
+  cancellation already relies on) and its `HostVerificationAdmission`
+  permit are both plain locals of that abandoned future, so both release
+  via ordinary Rust drop; the `release_prepare_lock` guard drops the same
+  way. A cancelled build's release entry is exposed by the pre-existing
+  `effective_status` (stale `Preparing` + a now-free lock → `Unknown`)
+  rather than lying about it forever — no new failure-state plumbing was
+  needed for this either.
 
 ## Evidence
 
 - New tests: `crates/rk-daemon/tests/release_prepare.rs::host_admission`
-  (3 tests, real daemon + real tiny two-package Cargo fixture, reusing that
+  (5 tests, real daemon + real tiny two-package Cargo fixture, reusing that
   file's existing dependency-free fixture rather than rebuilding a whole
   project):
   - `disabled_by_default_ignores_a_saturated_aggregate_cap` — a release
@@ -119,10 +133,25 @@ unaccepted P3.2 commit.
   - `enabled_with_aggregate_cap_disabled_never_waits` — the switch being on
     has no effect while the aggregate cap itself stays at its `0` default,
     matching every named check's own documented behavior.
-- Regression: the full pre-existing `release_prepare.rs` suite (10 tests)
-  and the full P3.1 `host_verification_aggregate_cap.rs` suite (5 tests)
-  pass unchanged. `cargo test -p rk-core -p rk-daemon --lib` (1058 unit
-  tests combined) passes unchanged. `cargo clippy -p rk-daemon -p rk-core
+  - `cancelling_a_queued_release_build_releases_the_wait_without_falsely_settling` —
+    disconnecting a caller while its build is genuinely queued for the
+    aggregate permit (a checker's barrier check on a different repo still
+    holds it throughout) drops the aggregate `waiting` count back to `0`
+    and the release entry is reported `unknown`, never `prepared`.
+  - `cancelling_an_executing_release_build_kills_its_owned_child_and_releases_the_permit` —
+    a `build.rs` baked into the fixture's `rk-cli` package (own pid to a
+    marker file, blocks on an explicit release file, same barrier
+    technique as the P3.1 suite's named-check checks, applied to a REAL
+    `cargo build` step) proves a real OS pid dies (`kill -0` polling, never
+    inferred from daemon bookkeeping) after disconnecting mid-build, the
+    permit drains to `0`, and the entry never settles `prepared`.
+- Regression: the full pre-existing `release_prepare.rs` suite (10 tests),
+  the full P3.1 `host_verification_aggregate_cap.rs` suite (5 tests), and
+  the full `managed_verification_cancel_e2e.rs` suite (11 tests, covering
+  `verify.run`'s own pre-existing cancellation paths through the now-shared
+  `dispatch_watching_disconnect`/`ManagedVerificationRuns` machinery) pass
+  unchanged. `cargo test -p rk-core -p rk-daemon --lib` (1058 unit tests
+  combined) passes unchanged. `cargo clippy -p rk-daemon -p rk-core
   --all-targets -- -D warnings` is clean. `cargo fmt --check` is clean on
   every file this ticket touched.
 
@@ -143,16 +172,25 @@ that would simply start reflecting a configured value instead. This slice
 does not import the unaccepted P3.2 commit and does not claim weighted
 routing works today.
 
+P3.2's own candidate was independently found to have a confirmed native
+capacity bypass (BBS finding `01M2HWAQ60BB3Q26Q7E50S33VV`: aggregate
+limit 1 with a class reserve of 1 admitted two simultaneously-live
+marker-held checks) and is under independent review as of this writing —
+one more reason this slice does not depend on or import it. Nothing here
+assumes that candidate lands unchanged, or at all.
+
 ## Scope explicitly NOT covered here
 
 - General experiment/recipe migration beyond the one `paired-rk-mcp` route
   (parent P4 track).
-- Weighted-class admission for the release build (blocked on P3.2 landing
-  on `main`; see compatibility point above).
-- New caller-disconnect cancellation for `release.prepare` (pre-existing
-  gap, out of this ticket's scope — coordinating with Munch-16's separate
-  daemon-shutdown-during-active-review work, `TKT-karut-jaraf-hivur`,
-  rather than building a second shutdown controller).
+- Weighted-class admission for the release build (blocked on a corrected
+  P3.2 landing on `main`; see compatibility point above).
+- Daemon-shutdown-time cleanup of an in-flight release build — distinct
+  from the caller-disconnect cancellation this ticket DID add above.
+  Coordinating with Munch-16's separate daemon-shutdown-during-active-review
+  work (`TKT-karut-jaraf-hivur`) rather than building a second shutdown
+  controller; that work is scoped to the landing-gate review-wait loop and
+  does not touch `release.rs` today.
 - A dedicated fixture proving the 30-minute `ADMISSION_WAIT_TIMEOUT` itself
   fires — the underlying `tokio::time::timeout` wrapping a
   `Semaphore::acquire_owned` future is the same primitive P3.1's own
