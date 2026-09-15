@@ -47,11 +47,14 @@
 //! `cargo`/`rustc` are already running inside the recipe's process group the
 //! moment the daemon spawns it, long before the fixture's own build-script
 //! barrier is ever reached. [`BuildGroupGuard`] closes that gap by keying off
-//! the daemon's OWN [`managed_child_pids`] record (written the instant
+//! the daemon's OWN [`managed_children`] record (written the instant
 //! `run_recipe` spawns the child) rather than the build-script marker file,
 //! so ownership is captured as early as the daemon's bookkeeping allows.
-//! Once known, it SIGKILLs that pid's whole process group on drop — a no-op
-//! if the group is already gone (the ordinary already-reaped case).
+//! Once known, `Drop` re-validates the pid's live [`process_start_signature`]
+//! against what was recorded at discovery time — never signalling a bare pid
+//! number the OS may since have recycled for an unrelated process — before
+//! SIGKILLing that pid's whole process group. A no-op either way if the
+//! group is already gone (the ordinary already-reaped case).
 
 use serde_json::Value;
 use std::cell::Cell;
@@ -338,41 +341,73 @@ fn kill_process_group_of(pid: u32) {
         .status();
 }
 
-/// The pids currently recorded under `home`'s managed-children directory —
-/// `crate::managed_verification::ManagedChildMarker` in production, written
-/// the instant `release::run_recipe` spawns the real `sh -c cargo build ...`
-/// child (`.process_group(0)`, its own process group) and removed the
-/// instant that child exits. This is the daemon's OWN durable record of the
-/// exact process it owns, not an inference from a marker file the fixture's
-/// build script writes minutes later.
-fn managed_child_pids(home: &Path) -> std::collections::BTreeSet<u32> {
+/// The exact process-start-time signature `ps` reports for `pid` RIGHT NOW —
+/// the same value (and the same `ps -o lstart=` invocation) `rk_daemon`'s
+/// own `process_signature`/`ManagedChildMarker` records the instant it spawns
+/// a managed child. `None` covers both "no process is live at this pid" and
+/// "`ps` itself failed" — neither is something safe to compare against.
+fn process_start_signature(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The pids currently recorded under `home`'s managed-children directory,
+/// each paired with its marker file's own recorded [`process_start_signature`]
+/// content — `crate::managed_verification::ManagedChildMarker` in production,
+/// written the instant `release::run_recipe` spawns the real `sh -c cargo
+/// build ...` child (`.process_group(0)`, its own process group) and removed
+/// the instant that child exits. This is the daemon's OWN durable record of
+/// the exact process it owns, not an inference from a marker file the
+/// fixture's build script writes minutes later — and carrying the recorded
+/// signature alongside the pid is what lets a later kill confirm it is still
+/// signalling the SAME process, not a stranger the OS recycled that exact
+/// pid for in the meantime (the same fail-closed identity check
+/// `reap_stale_managed_children` performs in production before ever
+/// signalling a marked pid).
+fn managed_children(home: &Path) -> std::collections::BTreeMap<u32, String> {
     let dir = rk_core::paths::Layout::at(home).managed_children_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Default::default();
     };
     entries
         .flatten()
-        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(|e| {
+            let pid = e.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let recorded = std::fs::read_to_string(e.path()).ok()?.trim().to_string();
+            (!recorded.is_empty()).then_some((pid, recorded))
+        })
         .collect()
 }
 
 /// RAII teardown for the real `cargo build` child's process group — see the
 /// module doc's "Bounded process ownership" section for why [`DaemonGuard`]
-/// alone cannot reach it. `owned_pid` starts unset and is filled in via
-/// `Cell::set` as soon as this test observes the daemon's own
-/// [`managed_child_pids`] record for the recipe child — BEFORE waiting on
-/// the fixture's own build-script barrier marker, which only appears well
-/// after `cargo`/`rustc` are already running inside that same process group.
-/// `Drop` reads whatever was captured by then, so a panic before the recipe
-/// was ever spawned at all simply has nothing to clean up.
+/// alone cannot reach it. `owned` starts unset and is filled in with
+/// `(pid, recorded_signature)` via `Cell::set` as soon as this test observes
+/// the daemon's own [`managed_children`] record for the recipe child —
+/// BEFORE waiting on the fixture's own build-script barrier marker, which
+/// only appears well after `cargo`/`rustc` are already running inside that
+/// same process group. `Drop` re-checks [`process_start_signature`] against
+/// what was captured at discovery time before ever signalling: a pid whose
+/// live signature no longer matches is refused, never signalled on the
+/// strength of a bare recycled number. A panic before the recipe was ever
+/// spawned at all simply has nothing to clean up.
 struct BuildGroupGuard {
-    owned_pid: Cell<Option<u32>>,
+    owned: Cell<Option<(u32, String)>>,
 }
 
 impl Drop for BuildGroupGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.owned_pid.get() {
-            kill_process_group_of(pid);
+        if let Some((pid, recorded)) = self.owned.take() {
+            if process_start_signature(pid).as_deref() == Some(recorded.as_str()) {
+                kill_process_group_of(pid);
+            }
         }
     }
 }
@@ -402,7 +437,7 @@ fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() 
     // `BuildGroupGuard`'s doc comment for why this is needed alongside
     // `_daemon_guard` rather than instead of it.
     let _build_group_guard = BuildGroupGuard {
-        owned_pid: Cell::new(None),
+        owned: Cell::new(None),
     };
     disable_disk_floor(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
@@ -472,7 +507,7 @@ fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() 
     // recipe child, not a leftover from the earlier harmless prepare above
     // (which already exited and had its own marker removed by the time it
     // returned).
-    let managed_before = managed_child_pids(home.path());
+    let managed_before = managed_children(home.path());
 
     // Fire prepare on a detached process — it will block inside the real
     // `cargo build` until `blocker` is removed. Owned by `TestChild` so a
@@ -499,13 +534,15 @@ fn interrupted_preparation_is_reported_and_recovers_after_a_real_daemon_death() 
     // the fixture's own build-script barrier below. This is what closes the
     // pre-marker gap: `_build_group_guard` can now clean up the whole group
     // even if a panic strikes before that barrier is ever reached.
-    let recipe_pid = until("the daemon to record its own owned recipe child", || {
-        managed_child_pids(home.path())
-            .difference(&managed_before)
-            .next()
-            .copied()
-    });
-    _build_group_guard.owned_pid.set(Some(recipe_pid));
+    let (recipe_pid, recipe_signature) =
+        until("the daemon to record its own owned recipe child", || {
+            managed_children(home.path())
+                .into_iter()
+                .find(|(pid, _)| !managed_before.contains_key(pid))
+        });
+    _build_group_guard
+        .owned
+        .set(Some((recipe_pid, recipe_signature)));
 
     // Wait for the real build-script child to signal it's actually running.
     let build_pid = until("the real owned build to reach the barrier", || {

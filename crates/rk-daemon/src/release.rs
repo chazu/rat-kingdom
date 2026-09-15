@@ -900,14 +900,15 @@ enum BlobObservation {
 /// coerced to `Absent`.
 fn read_blob_at(repo_path: &Path, sha: &str, rel_path: &str) -> BlobObservation {
     let spec = format!("{sha}:{rel_path}");
-    match std::process::Command::new("git")
+    let mut cat_file_cmd = std::process::Command::new("git");
+    cat_file_cmd
         .arg("-C")
         .arg(repo_path)
         .arg("cat-file")
         .arg("-e")
-        .arg(&spec)
-        .output()
-    {
+        .arg(&spec);
+    rk_core::exec::close_extra_fds(&mut cat_file_cmd);
+    match cat_file_cmd.output() {
         Ok(out) if out.status.code() == Some(0) => {}
         Ok(out)
             if out.status.code() == Some(128)
@@ -928,13 +929,10 @@ fn read_blob_at(repo_path: &Path, sha: &str, rel_path: &str) -> BlobObservation 
             ))
         }
     }
-    match std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .arg("show")
-        .arg(&spec)
-        .output()
-    {
+    let mut show_cmd = std::process::Command::new("git");
+    show_cmd.arg("-C").arg(repo_path).arg("show").arg(&spec);
+    rk_core::exec::close_extra_fds(&mut show_cmd);
+    match show_cmd.output() {
         Ok(out) if out.status.success() => BlobObservation::Present(out.stdout),
         Ok(out) => BlobObservation::Unavailable(format!(
             "git show {spec} exited {:?} even though cat-file confirmed it exists: {}",
@@ -1085,6 +1083,12 @@ async fn run_recipe(
         .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS.to_string())
         .env("CARGO_INCREMENTAL", "0")
         .process_group(0);
+    // See `rk_core::exec::close_extra_fds`: a captured-output pipe
+    // (`stdout`/`stderr` above are both `Stdio::piped()`) created on macOS is
+    // born without close-on-exec, so a concurrent spawn elsewhere in this
+    // process can race a fork into that window and inherit a live copy —
+    // exactly the leaked-pipe hang TKT-bikuz-kumuz-zutit diagnosed.
+    rk_core::exec::close_extra_fds(command.as_std_mut());
     let child = command.spawn().map_err(|e| {
         rk_core::Error::other(format!("release build: failed to spawn recipe: {e}"))
     })?;
@@ -1247,6 +1251,10 @@ async fn run_smoke_check(
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
+    // See `rk_core::exec::close_extra_fds`'s doc comment: this spawn also
+    // captures stdout/stderr via `Stdio::piped()`, the same leaked-pipe
+    // hang shape `run_recipe`'s build spawn is guarded against above.
+    rk_core::exec::close_extra_fds(command.as_std_mut());
     let mut child = command.spawn().map_err(|e| {
         rk_core::Error::other(format!(
             "release smoke check for {name}: failed to spawn: {e}"
