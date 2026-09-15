@@ -8671,6 +8671,22 @@ impl Supervisor {
         }
     }
 
+    /// Snapshot of every currently owned, live agent/check `SessionControl`,
+    /// keyed by agent name. An entry only exists here between a launch
+    /// publishing its control handle and that same generation's `Exited`
+    /// event removing it (`handle_event`'s `Exited` arm), so this is
+    /// precisely "the exact owned process tree" right now — never a
+    /// deliberately stopped/held generation, which has already been removed.
+    /// TKT-rohib-rukaf-sizak: the only consumer is `Server::run`'s graceful
+    /// shutdown, which signals and bounded-joins this snapshot instead of
+    /// leaving `Child::kill_on_drop` to reap it incidentally.
+    pub(crate) fn live_session_controls(&self) -> Vec<(String, SessionControl)> {
+        self.lock_controls()
+            .iter()
+            .map(|(name, control)| (name.clone(), control.clone()))
+            .collect()
+    }
+
     fn lock_attempts(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<rk_core::id::SpawnId, AttemptWatch>> {
@@ -10085,6 +10101,55 @@ mod respawn_tests {
         assert!(
             marker_content.contains("ADMITTED_STEER_PAYLOAD"),
             "the marker must record the actual steer text delivered, got: {marker_content:?}"
+        );
+    }
+
+    /// TKT-rohib-rukaf-sizak: `live_session_controls` is the exact snapshot
+    /// `Server::run`'s graceful-shutdown owned-process sweep signs off on —
+    /// it must return every currently tracked live control, each of them
+    /// genuinely killable and bounded-joinable, and the map must be empty
+    /// again once `Exited` retires it (`handle_event`'s `Exited` arm calls
+    /// `lock_controls().remove(name)`).
+    #[tokio::test]
+    async fn live_session_controls_snapshots_exactly_the_currently_tracked_live_controls() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        assert!(
+            sup.live_session_controls().is_empty(),
+            "a fresh supervisor owns nothing yet"
+        );
+
+        let mut env = HashMap::new();
+        env.insert("RK_FAKE_HARNESS_CMD".into(), "sleep 300".to_string());
+        let session = make_harness("fake")
+            .unwrap()
+            .launch(&LaunchSpec {
+                cwd: repo.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            session.control.clone(),
+        );
+
+        let owned = sup.live_session_controls();
+        assert_eq!(
+            owned
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Nibble"],
+            "must snapshot exactly the one currently tracked live control"
+        );
+        let (_, control) = owned.into_iter().next().unwrap();
+        control.kill().await.unwrap();
+        assert!(
+            control.wait_exited(std::time::Duration::from_secs(5)).await,
+            "the snapshot's control must be the real, killable, joinable session control"
         );
     }
 

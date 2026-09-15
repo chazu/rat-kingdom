@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 
 /// Versioned, daemon-authenticated control input.  This is deliberately a
 /// different value from assistant/tool/stderr output: adapters must carry it
@@ -240,6 +241,13 @@ pub struct HarnessSession {
 pub struct SessionControl {
     steer_tx: Option<mpsc::Sender<ControlEnvelope>>,
     kill_tx: mpsc::Sender<KillSignal>,
+    /// Flips to `true` once the task that owns this session's `Child` has
+    /// observed `child.wait()` resolve — i.e. the OS process is physically
+    /// gone, not merely that a signal was sent to it. TKT-rohib-rukaf-sizak:
+    /// a graceful daemon shutdown needs this to prove deliberate cleanup
+    /// rather than relying on `Child::kill_on_drop` reaping the process as
+    /// an incidental side effect of runtime teardown.
+    exited: watch::Receiver<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -364,6 +372,17 @@ impl SessionControl {
             .send(KillSignal::Hard)
             .await
             .map_err(|_| rk_core::Error::other("session is no longer running"))
+    }
+
+    /// Await this session's actual OS process exit — not that a signal was
+    /// sent, that the owning task observed `child.wait()` resolve — bounded
+    /// by `timeout`. Returns `true` if exit was confirmed within the bound,
+    /// `false` on timeout; never hangs past it. Returns immediately if the
+    /// process had already exited before this was called.
+    pub async fn wait_exited(&self, timeout: Duration) -> bool {
+        let mut exited = self.exited.clone();
+        let result = tokio::time::timeout(timeout, exited.wait_for(|done| *done)).await;
+        result.is_ok()
     }
 }
 
@@ -690,6 +709,7 @@ pub(crate) mod runner {
         let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
         let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
         let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
+        let (exited_tx, exited_rx) = watch::channel(false);
 
         let mut parse = wiring.parse;
         let steer_line = wiring.steer_line;
@@ -822,6 +842,11 @@ pub(crate) mod runner {
                 }
             };
             group_guard.disarm();
+            // The process is physically gone the instant `child.wait()`
+            // resolves above — signal that now rather than after the
+            // stderr-drain join below, which is diagnostic best-effort and
+            // must never delay a caller bounded-waiting on real exit.
+            let _ = exited_tx.send(true);
             // Join the stderr drain before publishing `Exited`: it sends on a
             // clone of the same channel from an independent task, so without
             // this the final stderr line(s) can race `Exited` onto the wire
@@ -846,6 +871,7 @@ pub(crate) mod runner {
             control: SessionControl {
                 steer_tx: steer_line.map(|_| steer_tx),
                 kill_tx,
+                exited: exited_rx,
             },
             pid,
         })
@@ -879,6 +905,7 @@ pub(crate) mod runner {
         let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
         let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
         let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
+        let (exited_tx, exited_rx) = watch::channel(false);
         let mut parse = wiring.parse;
         let resume_command = resume.command;
 
@@ -1029,6 +1056,7 @@ pub(crate) mod runner {
                                     error: "Codex resumed session exited before confirming control application".into(),
                                 }).await;
                             }
+                            let _ = exited_tx.send(true);
                             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                             return;
                         };
@@ -1056,6 +1084,7 @@ pub(crate) mod runner {
                                 attempt: 0,
                                 error: "Codex session could not resume because no session id was established".into(),
                             }).await;
+                            let _ = exited_tx.send(true);
                             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                             return;
                         };
@@ -1076,6 +1105,7 @@ pub(crate) mod runner {
                                 attempt: 0,
                                 error: "Codex session resume process could not be started".into(),
                             }).await;
+                            let _ = exited_tx.send(true);
                             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                             return;
                         };
@@ -1090,6 +1120,7 @@ pub(crate) mod runner {
                                     attempt: 0,
                                     error: "Codex session resume stdout was unavailable".into(),
                                 }).await;
+                                let _ = exited_tx.send(true);
                                 let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                                 return;
                             }
@@ -1121,6 +1152,7 @@ pub(crate) mod runner {
             control: SessionControl {
                 steer_tx: Some(steer_tx),
                 kill_tx,
+                exited: exited_rx,
             },
             pid,
         })
@@ -1134,10 +1166,12 @@ mod session_control_tests {
     fn control_with_capacity(capacity: usize) -> (SessionControl, mpsc::Receiver<ControlEnvelope>) {
         let (steer_tx, steer_rx) = mpsc::channel(capacity);
         let (kill_tx, _kill_rx) = mpsc::channel(1);
+        let (_exited_tx, exited_rx) = watch::channel(false);
         (
             SessionControl {
                 steer_tx: Some(steer_tx),
                 kill_tx,
+                exited: exited_rx,
             },
             steer_rx,
         )

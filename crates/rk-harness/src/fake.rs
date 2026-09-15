@@ -145,6 +145,48 @@ mod tests {
         assert!(saw_exit);
     }
 
+    /// TKT-rohib-rukaf-sizak: `SessionControl::wait_exited` must distinguish
+    /// "a signal was sent" from "the process is physically gone" — a
+    /// graceful daemon shutdown's owned-process join depends on this, not
+    /// just on `kill()`/`hard_kill()` returning once the signal is enqueued.
+    #[tokio::test]
+    async fn wait_exited_reports_false_while_alive_and_true_once_the_process_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("RK_FAKE_HARNESS_CMD".to_string(), "sleep 300".to_string());
+        let mut session = FakeHarness
+            .launch(&LaunchSpec {
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(
+            !session
+                .control
+                .wait_exited(Duration::from_millis(100))
+                .await,
+            "must time out (not hang, not falsely report exit) while the process is alive"
+        );
+
+        session.control.kill().await.unwrap();
+        assert!(
+            session.control.wait_exited(Duration::from_secs(5)).await,
+            "must confirm exit once the owning task observes child.wait() resolve"
+        );
+        // Already-exited: a second, independent call (as a bounded-join loop
+        // over multiple owned processes would make concurrently) must return
+        // immediately without waiting out its own bound again.
+        assert!(session.control.wait_exited(Duration::from_millis(50)).await);
+
+        while let Some(event) = session.events.recv().await {
+            if matches!(event, HarnessEvent::Exited { .. }) {
+                break;
+            }
+        }
+    }
+
     /// A starved/misconfigured harness that writes nothing to stdout (no
     /// `Started`/`Completed` — exactly the silent zero-token death this exists
     /// to diagnose) still surfaces what it said on stderr.

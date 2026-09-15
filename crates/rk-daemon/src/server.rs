@@ -2360,6 +2360,25 @@ impl Daemon {
             }
         }
 
+        // Explicitly join the landing pipeline's detached background-drain
+        // continuations before touching owned OS processes below — these are
+        // plain async loops, not process trees, and joining them first lets
+        // any `process_entry` review wait they are mid-cycle on notice the
+        // shutdown signal already sent above rather than racing it.
+        // `daemon.landing.get()` (not `daemon.landing()`) so a daemon that
+        // never touched the landing pipeline does not spuriously construct
+        // one just to shut it down.
+        if let Some(landing) = daemon.landing.get() {
+            landing
+                .join_background_drains(LANDING_BACKGROUND_DRAIN_GRACE)
+                .await;
+        }
+
+        // Deliberate owned-process shutdown (TKT-rohib-rukaf-sizak): see
+        // `shut_down_owned_processes`'s own doc comment for the full
+        // rationale and the incidental-`kill_on_drop` gap this replaces.
+        shut_down_owned_processes(&daemon.supervisor).await;
+
         // Remove the socket/pid files only if they are still OURS — a newer
         // daemon may have already bound a fresh socket at the same path, and
         // unlinking it would strand that daemon unreachable.
@@ -13828,6 +13847,105 @@ async fn wait_for_shutdown_signal(term: &mut Option<Signal>, int: &mut Option<Si
             int.recv().await;
         }
         (None, None) => std::future::pending().await,
+    }
+}
+
+/// A graceful stop's grace window for an owned agent/check process to exit
+/// after `SessionControl::kill` (SIGTERM) before escalating to
+/// `hard_kill` (SIGKILL). Generous relative to an ordinary CLI turn winding
+/// down (writing a final transcript line, closing a subprocess) but nowhere
+/// near `GateConfig::review_max_wait` — the whole point is that this no
+/// longer blocks `Server::run`'s own shutdown the way a live review wait
+/// used to (TKT-karut-jaraf-hivur).
+const OWNED_PROCESS_GRACEFUL_GRACE: Duration = Duration::from_secs(10);
+/// The shorter bound given to actually confirm exit once `hard_kill`
+/// (SIGKILL) has been sent — a process that survives THIS is not going to
+/// exit on its own, so there is nothing more to wait for.
+const OWNED_PROCESS_HARD_KILL_GRACE: Duration = Duration::from_secs(5);
+/// Bound for joining the landing pipeline's detached background-drain
+/// continuations (`LandingPipeline::spawn_background_drain`) — these are
+/// plain async loops making durable-store calls, not OS processes, so a
+/// much shorter bound than the owned-process grace above is enough.
+const LANDING_BACKGROUND_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// TKT-rohib-rukaf-sizak: on a graceful stop, deliberately signal and
+/// bounded-join every currently owned live agent/check process instead of
+/// leaving `rk-harness`'s pre-existing `Child::kill_on_drop(true)` to reap
+/// it as an incidental side effect of this task tree tearing down once
+/// `Server::run` can actually return promptly (see
+/// `crates/rk-cli/tests/bounded_daemon_stop_with_active_review.rs`, BBS
+/// finding 01M2HWNZA7V4WCSRTJ04XYN7ES). `kill()` (SIGTERM) is tried first —
+/// harnesses treat it as a request to shut down cleanly
+/// (`SessionControl::kill`'s own doc) — with `hard_kill()` (SIGKILL)
+/// reserved for whatever is still alive past the graceful grace window,
+/// mirroring `SessionControl::hard_kill`'s documented escalation order. A
+/// generation that survives even that bound is left for `kill_on_drop` as
+/// the final backstop, exactly as before this change — nothing here weakens
+/// that guarantee, it only makes the ordinary case deliberate instead of
+/// incidental.
+///
+/// No separate recovery path is built here: an owned process signalled this
+/// way exits without ever publishing a `Completed` event, which
+/// `Supervisor::handle_event`'s existing `Exited` arm already treats as an
+/// ordinary crash/kill (state -> `Failed`, `pid` cleared, managed
+/// verification for it cancelled). The next daemon generation's existing
+/// respawn/recovery sweep resumes it exactly as it would any other crash —
+/// same-generation recovery, no extra replacement budget or reset.
+async fn shut_down_owned_processes(supervisor: &crate::supervisor::Supervisor) {
+    let owned = supervisor.live_session_controls();
+    if owned.is_empty() {
+        return;
+    }
+    info!(
+        count = owned.len(),
+        "signalling owned agent/check processes for graceful stop"
+    );
+    for (_, control) in &owned {
+        let _ = control.kill().await;
+    }
+    let mut graceful: tokio::task::JoinSet<(String, rk_harness::SessionControl, bool)> =
+        tokio::task::JoinSet::new();
+    for (name, control) in owned {
+        graceful.spawn(async move {
+            let exited = control.wait_exited(OWNED_PROCESS_GRACEFUL_GRACE).await;
+            (name, control, exited)
+        });
+    }
+    let mut stragglers = Vec::new();
+    while let Some(result) = graceful.join_next().await {
+        match result {
+            Ok((name, _, true)) => debug!(agent = %name, "owned process confirmed exit"),
+            Ok((name, control, false)) => stragglers.push((name, control)),
+            Err(e) => warn!(error = %e, "owned-process shutdown join task panicked"),
+        }
+    }
+    if stragglers.is_empty() {
+        return;
+    }
+    warn!(
+        count = stragglers.len(),
+        "escalating to SIGKILL for owned processes still alive past the graceful grace window"
+    );
+    for (_, control) in &stragglers {
+        let _ = control.hard_kill().await;
+    }
+    let mut hard: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
+    for (name, control) in stragglers {
+        hard.spawn(async move {
+            let exited = control.wait_exited(OWNED_PROCESS_HARD_KILL_GRACE).await;
+            (name, exited)
+        });
+    }
+    while let Some(result) = hard.join_next().await {
+        match result {
+            Ok((name, true)) => debug!(agent = %name, "owned process confirmed exit after SIGKILL"),
+            Ok((name, false)) => warn!(
+                agent = %name,
+                "owned process still not confirmed exited after SIGKILL; leaving it to \
+                 process teardown"
+            ),
+            Err(e) => warn!(error = %e, "owned-process hard-kill join task panicked"),
+        }
     }
 }
 
