@@ -1,16 +1,16 @@
 //! TKT-karut-jaraf-hivur: genuine cross-*process* proof that a graceful
-//! daemon stop physically exits its OS process while a real reviewer child
-//! process is still alive and mid-review, and that the SAME orphaned
-//! reviewer process completes its review for real against the replacement
-//! daemon.
+//! `rk daemon stop` makes the OLD daemon's real OS process exit within a
+//! bound while a real reviewer child process is still alive and mid-review,
+//! and that the durable candidate state it leaves behind is exactly what it
+//! was before the stop — never a fabricated/forced settlement invented just
+//! to exit fast.
 //!
 //! `crates/rk-daemon/tests/bounded_shutdown_with_active_review.rs` proves the
 //! logical half of this fix (`LandingPipeline::await_primary_verdict` races
 //! its poll against the daemon's shutdown signal) but does so with both
 //! "daemons" as `tokio::spawn`ed futures inside one test process — there is
 //! no second OS process to exit, so it cannot stand as proof of physical PID
-//! exit, owned-child survival, or a genuine cross-process reconnect. This
-//! file is that missing half, built the same way
+//! exit. This file is that missing half, built the same way
 //! `review_ceiling_crash_barrier.rs` proves its own cross-process daemon
 //! crash: real `rk` subprocesses, `Client::connect_or_spawn` auto-starting
 //! the daemon exactly as the field does, and a real `kill -0`-checked PID.
@@ -19,18 +19,28 @@
 //! fixture uses an ordinary graceful `rk daemon stop` while a real reviewer
 //! subprocess is genuinely alive and blocked on a marker file — the exact
 //! shape of the confirmed production incident (one live native reviewer,
-//! zero executing checks). It then proves three things the operator asked
-//! to see kept honest rather than silently assumed:
+//! zero executing checks). It proves two things, and is explicit about a
+//! third it does NOT prove, kept honest rather than silently assumed:
 //! 1. the OLD daemon's real OS pid actually exits within a bound (not "the
 //!    RPC replied", not "a tokio task returned" — `kill -0` on the process
 //!    lists this test observed via `rk daemon status`);
-//! 2. the reviewer's own OS process survives that stop untouched — this fix
-//!    does not kill or join it, only stops the daemon from *waiting* on it
-//!    (`LandingPipeline`'s shutdown field never touches process ownership);
-//! 3. that same orphaned reviewer process, once released, delivers its
-//!    verdict through its ordinary `rk out artifact` route against the
-//!    REPLACEMENT daemon — a genuine reconnect across the restart, not a
-//!    verdict the test fabricates on the reviewer's behalf.
+//! 2. the durable candidate state a restart resumes from is untouched by
+//!    that stop — still an in-flight, resumable status, and no forced
+//!    review-ceiling settlement was ever written for it, just to make
+//!    shutdown fast;
+//! 3. it does NOT prove the reviewer's own OS process survives the stop or
+//!    reconnects to the replacement daemon to deliver its own verdict. This
+//!    fixture's own comments below the stop record a real, separate finding
+//!    (published to BBS, filed as follow-up TKT-rohib-rukaf-sizak): the
+//!    pre-existing `Child::kill_on_drop(true)` in `crates/rk-harness/src/lib.rs`
+//!    reaps that reviewer's process as an incidental side effect of the
+//!    surrounding runtime tearing down, observed on every run during
+//!    development — this fix does not touch that at all. What actually
+//!    resumes the candidate below is an INJECTED verdict, built from the
+//!    review context this test captured off the original daemon's own
+//!    binding before the stop, standing in for a real reviewer's report. It
+//!    is never presented as, and must never be read as, proof of the
+//!    reviewer process itself surviving and reconnecting.
 //!
 //! What this file does NOT claim, matching the BBS contract published
 //! alongside this fix (finding 01M2HTJ67JK3XCMX89KFQWG5A7): it does not
@@ -546,13 +556,16 @@ fn graceful_stop_physically_exits_behind_a_live_reviewer_process_and_resumes_rev
     );
 
     // Release the marker: IF the original reviewer's real process survived
-    // (see the finding above — empirically it does not always, because of
-    // `kill_on_drop`), this lets it deliver its verdict through its ordinary
+    // the stop, this would let it deliver its verdict through its ordinary
     // `rk out artifact` route, using the review context env the daemon
-    // bound it with before the stop — the reconnect-after-restart boundary,
-    // the reviewer's own subprocess talking to a daemon it was never
-    // spawned by. This is genuinely exercised whenever the original
-    // survives (observed on some runs); recorded here rather than assumed.
+    // bound it with before the stop — a genuine reconnect-after-restart.
+    // In practice, across every run observed during development, it does
+    // NOT survive: `kill_on_drop` (module doc point 3, follow-up
+    // TKT-rohib-rukaf-sizak) reaps it before this file gets anywhere near
+    // this line. This write is kept because it costs nothing and remains
+    // correct if that ever changes, but this test does not claim, and must
+    // not be read as claiming, that the reconnect below is what actually
+    // happens — see the fallback immediately below instead.
     std::fs::write(home_path.join("release-reviewer"), "").unwrap();
 
     let mut landed_via_reconnect = false;
@@ -629,12 +642,16 @@ fn graceful_stop_physically_exits_behind_a_live_reviewer_process_and_resumes_rev
          after the restart"
     );
 
-    // At most two reviewer generations ever: one if the original survived
-    // `kill_on_drop` (see the comment above) and reconnected, two if it was
-    // reaped and the existing review-death-retry path dispatched exactly one
-    // bounded replacement — never more, which is what would indicate
-    // `dispatch_review`'s idempotent re-entry for a SURVIVING instance had
-    // actually spawned a duplicate instead of resolving to the existing one.
+    // At most two reviewer generations ever. The normal case observed by
+    // this test is exactly one: the fallback above injects a verdict
+    // directly rather than dispatching any reviewer itself, so it never
+    // creates a second generation on its own. A second is still tolerated
+    // (never asserted against) only because the daemon's own review-death
+    // detection could independently race ahead of that injection and
+    // dispatch one bounded replacement first — never more than that, which
+    // is what would indicate `dispatch_review`'s idempotent re-entry for a
+    // SURVIVING instance had actually spawned a duplicate instead of
+    // resolving to the existing one.
     let agents = json_stdout(
         &rk(&home_path)
             .args(["--json", "list", "--all"])
