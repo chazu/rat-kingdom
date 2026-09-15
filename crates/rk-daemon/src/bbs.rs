@@ -386,7 +386,7 @@ pub fn record_exposure(
         // whether the config revision below is a confirmed repo setting or
         // an unreadable-registry fallback (`ranking_config_status`) — never
         // collapsed into a bare "0 means unconfigured" revision number.
-        "build": rk_core::version::BUILD_VERSION,
+        "build": rk_core::version::build_version(),
         "ranking_variant": briefing.ranking_variant.as_str(),
         "ranking_config_revision": briefing.ranking_config_revision,
         "ranking_config_status": briefing.ranking_config_status.as_str(),
@@ -968,7 +968,7 @@ pub fn export(space: &Space, params: &ExportParams) -> rk_core::Result<serde_jso
         "schema_version": 1,
         "kind": "bbs.export",
         "repo": params.repo,
-        "build": rk_core::version::BUILD_VERSION,
+        "build": rk_core::version::build_version(),
         "captured_at": chrono::Utc::now().to_rfc3339(),
         // The ordering claim this surface exists to make, spelled exactly as
         // the accepted S3 capture contract names it. A consumer that does not

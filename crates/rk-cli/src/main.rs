@@ -1018,6 +1018,12 @@ fn init_tracing(config: &Config) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Must run before anything below reads `rk_core::version::build_version()`
+    // / `build_sha()` — including inside `rk-daemon`, which this process runs
+    // in-process as `rk daemon run`. `RK_BUILD_SHA` is this crate's own
+    // compile-time env var, stamped by `crates/rk-cli/build.rs`.
+    rk_core::version::init_build_sha(env!("RK_BUILD_SHA"));
+
     let cli = Cli::parse();
     let layout = Layout::discover()?;
     let config = Config::load(&layout.config_file())?;

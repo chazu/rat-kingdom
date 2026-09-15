@@ -211,7 +211,7 @@ impl Client {
             method: method.to_string(),
             auth: self.auth_token.clone(),
             caller: self.caller.clone(),
-            client_version: Some(rk_core::version::BUILD_VERSION.into()),
+            client_version: Some(rk_core::version::build_version().into()),
             params,
         };
         let mut line = serde_json::to_vec(&req)?;
@@ -255,7 +255,8 @@ static VERSION_WARNED: AtomicBool = AtomicBool::new(false);
 /// a mismatch, since every build carrying this code stamps every response.
 fn warn_on_version_mismatch(server_version: Option<&str>) {
     let remote = server_version.unwrap_or("an unstamped build (predates this handshake)");
-    let Some(warning) = rk_core::version::mismatch_warning(rk_core::version::BUILD_VERSION, remote)
+    let Some(warning) =
+        rk_core::version::mismatch_warning(rk_core::version::build_version(), remote)
     else {
         return;
     };
