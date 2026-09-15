@@ -3584,6 +3584,117 @@ impl Daemon {
                     Err(error) => Response::err(id, codes::BAD_PARAMS, error),
                 })
             }
+            "bbs.assessment.show" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::show(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.status" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::status(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.latest" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::latest(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.configure" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::ConfigureParams>(&req.params)
+                        .and_then(|params| {
+                            let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                            crate::continuous_assessment::configure(
+                                &self.layout,
+                                &repos,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.activate" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::ActivateParams>(&req.params)
+                        .and_then(|params| {
+                            crate::continuous_assessment::activate(
+                                &self.layout,
+                                &self.space,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.disable" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::DisableParams>(&req.params)
+                        .and_then(|params| {
+                            crate::continuous_assessment::disable(
+                                &self.layout,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.tick" => {
+                let result = parse_params::<crate::continuous_assessment::TickParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::tick(
+                            &self.space,
+                            &self.layout,
+                            &params.repo,
+                            "daemon",
+                            chrono::Utc::now(),
+                        )
+                        .map(|outcome| {
+                            serde_json::json!({
+                                "repo": params.repo,
+                                "pages_processed": outcome.pages_processed,
+                                "events_consumed": outcome.events_consumed,
+                                "truncated": outcome.truncated,
+                                "verdict": outcome.verdict,
+                                "published": outcome.published,
+                            })
+                        })
+                        .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
             "bbs.show" => {
                 let result = req.params["id"]
                     .as_str()
