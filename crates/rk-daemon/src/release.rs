@@ -646,6 +646,57 @@ fn upsert_entry(
     Ok(entry)
 }
 
+/// Durably publish a freshly-built manifest and return the resulting
+/// `Prepared` registry entry. This is the ONE place that performs the
+/// digest-before-publication sequence `prepare`'s crash-recovery design
+/// depends on — commit the digest of what is ABOUT to be published, durably,
+/// BEFORE publishing it (the trust anchor a later crash-recovery read relies
+/// on — see `prepare`'s `manifest_path.is_file()` branch), then publish
+/// `manifest.json`, then promote the registry entry to `Prepared`. Still
+/// `Preparing` after the first write: the file doesn't exist at its trusted
+/// path yet. If the caller dies between these writes, a later `prepare` call
+/// finds `manifest.json` already written (by `write_manifest_new`) with a
+/// digest that matches what this function already committed, and adopts it;
+/// if it finds `manifest.json` missing entirely, it just re-runs the recipe,
+/// because a `Preparing` status commits to nothing being published yet
+/// either way.
+///
+/// `prepare` calls this directly, and its own fault-boundary unit test
+/// (`publication_failure_after_a_committed_digest_leaves_no_false_prepared_state`)
+/// calls it too — deliberately the SAME function, not a hand-copy of its
+/// steps, so a regression that reorders or drops one of these writes is
+/// caught by exercising the real production path, not a test-local
+/// reimplementation of it.
+fn publish_prepared_release(
+    registry_path: &Path,
+    id: &str,
+    params: &PrepareParams,
+    input_key: &str,
+    release_dir: &Path,
+    manifest: &ReleaseManifest,
+) -> rk_core::Result<ReleaseIndexEntry> {
+    let digest = manifest_digest(manifest);
+    upsert_entry(
+        registry_path,
+        id,
+        params,
+        input_key,
+        ReleaseStatus::Preparing,
+        None,
+        Some(digest.clone()),
+    )?;
+    write_manifest_new(&release_dir.join("manifest.json"), manifest)?;
+    upsert_entry(
+        registry_path,
+        id,
+        params,
+        input_key,
+        ReleaseStatus::Prepared,
+        None,
+        Some(digest),
+    )
+}
+
 /// Prepare (or idempotently return) one immutable paired release.
 ///
 /// Callers MUST serialize concurrent calls (the daemon does this with a
@@ -799,36 +850,13 @@ pub async fn prepare(layout: &Layout, params: PrepareParams) -> rk_core::Result<
     .await
     {
         Ok(manifest) => {
-            // Commit the digest of what is ABOUT to be published, durably,
-            // BEFORE publishing it — the trust anchor a later crash-recovery
-            // read relies on (see the `manifest_path.is_file()` branch
-            // above). Still `Preparing`: the file doesn't exist at its
-            // trusted path yet. If the daemon dies between this write and
-            // the next one, a later `prepare` call finds `manifest.json`
-            // already written (by `write_manifest_new`, below) with a digest
-            // that matches what THIS write already committed, and adopts it;
-            // if it finds `manifest.json` missing entirely, it just re-runs
-            // the recipe, because a `Preparing` status commits to nothing
-            // being published yet either way.
-            let digest = manifest_digest(&manifest);
-            upsert_entry(
+            let entry = publish_prepared_release(
                 &registry_path,
                 &id,
                 &params,
                 &input_key,
-                ReleaseStatus::Preparing,
-                None,
-                Some(digest.clone()),
-            )?;
-            write_manifest_new(&release_dir.join("manifest.json"), &manifest)?;
-            let entry = upsert_entry(
-                &registry_path,
-                &id,
-                &params,
-                &input_key,
-                ReleaseStatus::Prepared,
-                None,
-                Some(digest),
+                &release_dir,
+                &manifest,
             )?;
             Ok(PrepareOutcome {
                 entry,
@@ -1559,6 +1587,67 @@ mod tests {
             checks: Vec::new(),
             created_at: Utc::now(),
         }
+    }
+
+    /// A publication/registry boundary fault (P6.1 correction, item 2): the
+    /// exact crash window `prepare`'s doc comments describe is "the registry
+    /// already durably committed this manifest's digest, but
+    /// `manifest.json` was never published". Exercised here by calling
+    /// [`publish_prepared_release`] directly — the SAME function `prepare`
+    /// calls, not a hand copy of its steps — so a regression that reorders
+    /// or drops one of its internal writes is caught by this test, not just
+    /// one that happens to match a separately-maintained copy of the
+    /// sequence. The registry must be left showing the honest, recoverable
+    /// state (`Preparing`, digest committed) — never a `Prepared` with
+    /// nothing published to back it, and never a partial `manifest.json` at
+    /// the trusted path.
+    #[test]
+    fn publication_failure_after_a_committed_digest_leaves_no_false_prepared_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("releases.json");
+        let manifest = sample_manifest();
+        let digest = manifest_digest(&manifest);
+        let params = PrepareParams {
+            repo_name: manifest.repo.clone(),
+            repo_path: "/tmp/r".into(),
+            requested: "main".into(),
+            resolved_commit: manifest.source.resolved_commit.clone(),
+            tree_sha: manifest.source.tree_sha.clone(),
+            recipe: manifest.recipe.clone(),
+            known_verification: None,
+        };
+
+        // Fault injection: the release directory this manifest is supposed
+        // to publish into was never created, so `publish_prepared_release`'s
+        // internal `write_manifest_new` call must fail loudly rather than
+        // silently no-op or leave a false `Prepared` behind.
+        let release_dir = dir.path().join("releases").join(&manifest.id);
+        let manifest_path = release_dir.join("manifest.json");
+        let result = publish_prepared_release(
+            &registry_path,
+            &manifest.id,
+            &params,
+            "key",
+            &release_dir,
+            &manifest,
+        );
+        assert!(
+            result.is_err(),
+            "publishing into a missing directory must fail loudly, not silently succeed"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "no partial manifest may be left at the trusted path"
+        );
+
+        // The registry's durable state reflects exactly the first write this
+        // function performs (digest committed, still `Preparing`) and never
+        // reaches the final promotion to `Prepared` — proving the ORDER, not
+        // just that some error was returned.
+        let reg = ReleaseRegistry::load(&registry_path).unwrap();
+        let entry = reg.get(&manifest.id).unwrap();
+        assert_eq!(entry.status, ReleaseStatus::Preparing);
+        assert_eq!(entry.manifest_digest.as_deref(), Some(digest.as_str()));
     }
 
     #[test]
