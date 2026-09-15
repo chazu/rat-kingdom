@@ -12,6 +12,21 @@
 //! Extending to a second objective or source is a new, explicit slice, not a
 //! config knob here.
 //!
+//! # Copy/paste companion
+//!
+//! ```text
+//! rk bbs assessment configure --repo rat-kingdom --objective first-production-objective-v1.json
+//! rk bbs assessment activate  --repo rat-kingdom
+//! rk bbs assessment status    --repo rat-kingdom   # cursor/counters, read-only
+//! rk bbs assessment latest    --repo rat-kingdom   # last published verdict, read-only
+//! rk bbs assessment disable   --repo rat-kingdom   # retains all prior evidence
+//! ```
+//! No `tick` call is required in production: once `activate`d, the daemon's
+//! own bounded sweep (see `sweep_due`, wired into `Server::run`) advances the
+//! evaluator on the objective's own `evaluation_cadence_seconds`, resuming
+//! from the durable checkpoint across a daemon restart. `bbs.assessment.tick`
+//! remains available for tests and manual inspection but is never required.
+//!
 //! Config shape mirrors `crate::landing_need_resolution` and
 //! `crate::bbs_discovery`: one JSON-file-backed registry, mutated only
 //! through validated operations, resolved fresh on every read. Unlike those
@@ -19,7 +34,11 @@
 //! the latest published assessment, because the whole point of this feature
 //! is to accumulate state across ticks — but every mutation still goes
 //! through the same atomic tmp-then-rename write those modules use, so a
-//! crash mid-write never corrupts the file.
+//! crash mid-write never corrupts the file. Every mutating operation
+//! (`configure`/`activate`/`disable`/`tick`) additionally holds an
+//! in-process, per-registry-file lock ([`with_registry_lock`]) for its whole
+//! load-mutate-persist span, so a concurrent RPC and a concurrent scheduler
+//! sweep can never race a lost update onto the same `.json.tmp` path.
 //!
 //! # Incremental evaluation
 //!
@@ -31,28 +50,61 @@
 //! totals — so a crash between "read a page" and "persist the checkpoint"
 //! reprocesses that same page from the old cursor exactly once, never loses
 //! it and never double-counts a page that was already durably checkpointed.
+//! The published result tuple is written via `Space::reinforce` under a
+//! fixed per-repo identity (never `Space::out`), so a crash between writing
+//! that tuple and persisting the checkpoint — which would otherwise recompute
+//! and republish the identical assessment on the next tick — upserts the
+//! same live tuple in place instead of appending a duplicate.
+//!
+//! [`sweep_due`] is the autonomous half: called on a bounded internal
+//! cadence by `Server::run` (never by an operator), it loads the registry
+//! once, selects every repo whose activation is live AND whose own
+//! `evaluation_cadence_seconds` has elapsed since its last tick, and ticks
+//! each. A disabled repo (`activation: None`) is never selected, so
+//! `disable` stops future evaluation immediately — not just future manual
+//! ticks.
 //!
 //! # Verdicts
 //!
 //! Computed in [`assess`] from the accumulated [`AssessmentState`] and the
-//! active [`ObjectiveConfig`]: `pass`, `fail`, `inconclusive`, `unavailable`.
-//! A single observed `failed > 0` sets a STICKY `ever_failed` flag in the
-//! persisted state — once true, the verdict is `fail` forever for this
-//! activation, surviving a daemon restart or an unrelated binary release
-//! (`docs/2026-09-13-continuous-validation-promotion.md` 7.2: "A new release
-//! cannot reset an ongoing feature's evaluation clock or discard its
-//! failures"; "known failure cannot become pass through restart or version
-//! churn"). A malformed telemetry payload is NOT sticky: it marks that one
-//! tick `unavailable` (never fabricates a zero), but a later tick with clean
-//! evidence can still reach `pass`/`fail`/`inconclusive` on its own merits.
+//! active [`ObjectiveConfig`], in priority order:
+//! 1. `ever_failed` (sticky: any observed `failed > 0`, ever) → always `fail`,
+//!    surviving a daemon restart or an unrelated binary release
+//!    (`docs/2026-09-13-continuous-validation-promotion.md` 7.2: "a new
+//!    release cannot reset an ongoing feature's evaluation clock or discard
+//!    its failures"; "known failure cannot become pass through restart or
+//!    version churn").
+//! 2. Zero valid telemetry rows ever consumed (`events_consumed == 0`) →
+//!    `unavailable` — "missing telemetry", never fabricated into a zero. This
+//!    is distinct from "zero operations": a repo that has observed valid,
+//!    well-formed telemetry where every candidate was legitimately skipped
+//!    (`resolved == 0 && failed == 0` but `events_consumed > 0`) is
+//!    `inconclusive`, not `unavailable` — the pipe is known-good, there is
+//!    just nothing to report yet.
+//! 3. The most recent valid telemetry is older than
+//!    `objective.source_freshness_seconds` → `unavailable` ("stale
+//!    evidence") — a caught-up clean history must not silently conceal a gone
+//!    quiet source.
+//! 4. `resolved + failed` below `minimum_denominator`, or distinct resolved
+//!    Needs below `minimum_distinct_resolved_needs_for_pass` → `inconclusive`.
+//!    A truncated distinct set is never used to bypass this check — it is
+//!    only ever a true undercount, so if it were sufcient it would already
+//!    show as sufficient without the bypass.
+//! 5. The evaluator has not fully caught up to the source boundary this tick
+//!    (`last_tick_truncated`) → capped at `inconclusive`, never `pass`: an
+//!    un-scanned tail could hold a failure this window has not seen yet.
+//! 6. Otherwise `pass` iff `resolved / (resolved + failed) >=
+//!    required_ratio`, else `inconclusive`.
 
-use crate::landing_need_resolution;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Tuple};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::landing_need_resolution;
 
 /// The only objective this slice understands. A config naming any other
 /// value is rejected outright — see [`ObjectiveConfig::validate`].
@@ -65,7 +117,9 @@ pub const SUPPORTED_OBJECTIVE_VERSION: u32 = 1;
 /// is a deliberate, visible break here too.
 pub const RETIREMENT_TELEMETRY_IDENTITY: &str = "landing-need-retirement-run";
 
-/// Identity this module writes its own published assessments under.
+/// Identity this module writes its own published assessments under. Fixed
+/// per repo so [`space.reinforce`] upserts one live "current assessment"
+/// tuple per `(repo, castle)` rather than appending a growing history.
 /// `Category::Event` is never scanned by `bbs::brief` (only
 /// `Claim`/`Need`/`Artifact` are), so continuous assessment telemetry can
 /// never crowd a real finding or artifact out of a briefing.
@@ -81,6 +135,35 @@ const MAX_PAGES_PER_TICK: usize = 16;
 const MAX_CADENCE_SECONDS: u64 = 3600;
 const MAX_FRESHNESS_SECONDS: u64 = 86_400;
 const MAX_TICKS_TO_REFLECT: u64 = 100;
+
+/// Process-wide, per-registry-file locks. A `Mutex` (not an flock) is
+/// sufficient and correct: this registry is daemon-private
+/// (`<home>/continuous-assessment.json`), touched only from within this one
+/// process — by RPC handler threads and the scheduler sweep — never shared
+/// across processes the way the singleton daemon socket/pid files are.
+fn registry_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|e| e.into_inner());
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Run `f` while holding the exclusive in-process lock for `path`'s
+/// registry. Every mutating entry point (`configure`/`activate`/`disable`/
+/// `tick`) wraps its ENTIRE load-mutate-persist span in this, so a
+/// concurrent RPC call and a concurrent scheduler sweep can never
+/// interleave two independent load/persist cycles against the same file.
+fn with_registry_lock<T>(
+    path: &Path,
+    f: impl FnOnce() -> rk_core::Result<T>,
+) -> rk_core::Result<T> {
+    let lock = registry_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,8 +195,9 @@ pub struct ObjectiveConfig {
     /// `outcomes.fail`).
     pub minimum_denominator: u64,
     /// A `pass` also requires at least this many DISTINCT resolved Need
-    /// identities — repeated bindings of the same Need cannot manufacture
-    /// distinct successful work.
+    /// identities — repeated bindings of the same Need (including a
+    /// retried/replayed pass re-resolving it) cannot manufacture distinct
+    /// successful work.
     pub minimum_distinct_resolved_needs_for_pass: u64,
     pub evaluation_cadence_seconds: u64,
     pub maximum_source_to_assessment_ticks: u64,
@@ -196,8 +280,15 @@ pub struct Activation {
     pub installed_build: String,
     /// The source feature's own config revision
     /// (`landing_need_resolution::RetirementConfig::revision`) read at
-    /// activation time, recorded for provenance even though later drift in
-    /// that revision does not reset this window.
+    /// activation time. A telemetry row observed with a LOWER revision than
+    /// this is unsupported provenance for this activation — evidence from a
+    /// configuration this window never actually bound to — and is rejected
+    /// (see [`AssessmentState::superseded_provenance_events`]), not silently
+    /// folded in. A row with an EQUAL or HIGHER revision (the feature was
+    /// reconfigured, e.g. off/on, during this window) is still accepted and
+    /// explicitly recorded in
+    /// [`AssessmentState::observed_feature_config_revisions`] — later drift
+    /// forward does not reset this window.
     pub source_feature_revision: u64,
     pub activated_by: String,
 }
@@ -210,27 +301,47 @@ pub struct AssessmentState {
     /// Last consumed `Space::persistence_page` commit sequence for this repo.
     pub cursor: u64,
     pub attempted_total: u64,
-    pub resolved_total: u64,
     pub skipped_total: u64,
     pub failed_total: u64,
+    /// The numerator: distinct resolved Need identities, deduplicated across
+    /// every consumed telemetry event. This — not a summed per-event
+    /// `resolved` counter — is the source of truth for "how many operations
+    /// actually resolved", because a retried/replayed pass over the SAME
+    /// still-standing Need (the exact crash-recovery case
+    /// `landing_need_resolution`'s own doc comment describes) legitimately
+    /// produces a SECOND telemetry event naming the SAME Need id; summing
+    /// counters would double-count it, while this set naturally does not.
     pub distinct_resolved_needs: BTreeSet<String>,
     pub distinct_resolved_truncated: bool,
     pub observed_feature_config_revisions: BTreeSet<u64>,
     pub observed_builds: BTreeSet<String>,
     /// Telemetry rows that named this feature/identity but carried
-    /// missing/non-numeric required counters. Never folded into
-    /// `failed_total` (a producer error is not evidence the OPERATION
-    /// failed) and never silently dropped either.
+    /// missing/non-numeric/inconsistent required counters (including a
+    /// failed `attempted == resolved + skipped + failed` cross-check,
+    /// numeric overflow, or an incomplete `resolved_bindings` list for a
+    /// non-truncated `resolved > 0` row). Never folded into `failed_total`
+    /// (a producer error is not evidence the OPERATION failed) and never
+    /// silently dropped either.
     pub malformed_events: u64,
+    /// Well-formed rows whose `config_revision` was LOWER than this
+    /// activation's own `source_feature_revision` — unsupported provenance
+    /// for this window, reported rather than counted as success.
+    pub superseded_provenance_events: u64,
     /// Sticky: once true, [`assess`] always returns `Fail` for this
     /// activation.
     pub ever_failed: bool,
+    /// Count of rows that passed every validation and were actually folded
+    /// into the totals above (excludes `malformed_events` and
+    /// `superseded_provenance_events`). `0` is the precise signal for "no
+    /// valid evidence has been observed for this activation yet".
     pub events_consumed: u64,
     pub last_event_at: Option<DateTime<Utc>>,
     pub last_tick_at: Option<DateTime<Utc>>,
     pub last_tick_pages: usize,
     /// True when the journal held more matching rows beyond this tick's
-    /// bounded page budget — reported, never hidden.
+    /// bounded page budget — reported, never hidden, and used by [`assess`]
+    /// to cap an otherwise-`pass` result at `inconclusive` until a later
+    /// tick fully catches up.
     pub last_tick_truncated: bool,
     /// Most recent contributing telemetry event ids, bounded, for
     /// reproducibility references on the published assessment.
@@ -238,6 +349,10 @@ pub struct AssessmentState {
 }
 
 impl AssessmentState {
+    pub fn resolved_count(&self) -> u64 {
+        self.distinct_resolved_needs.len() as u64
+    }
+
     fn record_config_revision(&mut self, revision: u64) {
         if self.observed_feature_config_revisions.len() < MAX_OBSERVED_CONFIG_REVISIONS {
             self.observed_feature_config_revisions.insert(revision);
@@ -252,7 +367,9 @@ impl AssessmentState {
     }
 
     fn record_resolved_need(&mut self, need_id: &str) {
-        if self.distinct_resolved_needs.len() >= MAX_DISTINCT_RESOLVED_NEEDS {
+        if self.distinct_resolved_needs.len() >= MAX_DISTINCT_RESOLVED_NEEDS
+            && !self.distinct_resolved_needs.contains(need_id)
+        {
             self.distinct_resolved_truncated = true;
             return;
         }
@@ -269,7 +386,7 @@ impl AssessmentState {
 
 /// A deterministic, reproducible published verdict — never mutated in place;
 /// each meaningful change writes a new one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublishedAssessment {
     pub verdict: Verdict,
     pub reason: String,
@@ -339,6 +456,13 @@ impl AssessmentRegistry {
 
     pub fn record(&self, repo: &str) -> Option<&AssessmentRecord> {
         self.repos.get(repo)
+    }
+
+    /// Every configured/activated repo, for the scheduler sweep. Read-only.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &AssessmentRecord)> {
+        self.repos
+            .iter()
+            .map(|(repo, record)| (repo.as_str(), record))
     }
 
     fn persist(&self) -> rk_core::Result<()> {
@@ -453,9 +577,13 @@ impl AssessmentRegistry {
         Ok(record)
     }
 
-    /// Persist an updated `state`/`latest` for `repo` after a tick, without
-    /// disturbing `objective`/`activation`/`revision`. The one mutation path
-    /// [`tick`] uses.
+    /// Persist an updated `state` (and, only when a publish just actually
+    /// succeeded, `latest`) for `repo` after a tick, without disturbing
+    /// `objective`/`activation`/`revision`. The one mutation path [`tick`]
+    /// uses. `latest` is deliberately `Option<Option<..>>`-shaped by the
+    /// caller: passing `None` here means "no new publish this tick, leave
+    /// the existing `latest` exactly as it is" (including "leave it stale
+    /// because the reinforce write just failed, so the next tick retries").
     fn save_progress(
         &mut self,
         repo: &str,
@@ -467,8 +595,8 @@ impl AssessmentRegistry {
             .get_mut(repo)
             .ok_or_else(|| rk_core::Error::other(format!("repo '{repo}' vanished mid-tick")))?;
         record.state = state;
-        if latest.is_some() {
-            record.latest = latest;
+        if let Some(latest) = latest {
+            record.latest = Some(latest);
         }
         self.persist()
     }
@@ -566,12 +694,15 @@ pub fn configure(
             params.repo
         )));
     }
-    let mut registry = AssessmentRegistry::load(&registry_path(layout))?;
-    let record = registry.configure(&params.repo, params.objective.clone(), caller)?;
+    let path = registry_path(layout);
+    let record = with_registry_lock(&path, || {
+        let mut registry = AssessmentRegistry::load(&path)?;
+        registry.configure(&params.repo, params.objective.clone(), caller)
+    })?;
     let mut value = describe(&params.repo, &record);
     value["rollover_required"] = serde_json::json!(false);
     value["rollover_note"] = serde_json::json!(
-        "applied on the next assessment.tick for this repo; no daemon restart is required."
+        "applied on the next scheduled or manual tick for this repo; no daemon restart is required."
     );
     Ok(value)
 }
@@ -586,14 +717,17 @@ pub fn activate(
 ) -> rk_core::Result<serde_json::Value> {
     let source_feature_revision =
         landing_need_resolution::resolve_for_repo(layout, &params.repo).revision;
-    let mut registry = AssessmentRegistry::load(&registry_path(layout))?;
-    let record = registry.activate(
-        &params.repo,
-        space,
-        rk_core::version::build_version().to_string(),
-        source_feature_revision,
-        caller,
-    )?;
+    let path = registry_path(layout);
+    let record = with_registry_lock(&path, || {
+        let mut registry = AssessmentRegistry::load(&path)?;
+        registry.activate(
+            &params.repo,
+            space,
+            rk_core::version::build_version().to_string(),
+            source_feature_revision,
+            caller,
+        )
+    })?;
     Ok(describe(&params.repo, &record))
 }
 
@@ -602,8 +736,11 @@ pub fn disable(
     caller: &str,
     params: &DisableParams,
 ) -> rk_core::Result<serde_json::Value> {
-    let mut registry = AssessmentRegistry::load(&registry_path(layout))?;
-    let record = registry.disable(&params.repo, caller)?;
+    let path = registry_path(layout);
+    let record = with_registry_lock(&path, || {
+        let mut registry = AssessmentRegistry::load(&path)?;
+        registry.disable(&params.repo, caller)
+    })?;
     let mut value = describe(&params.repo, &record);
     value["retained_note"] = serde_json::json!(
         "prior evidence, checkpoint and last assessment are retained and still readable"
@@ -612,19 +749,16 @@ pub fn disable(
 }
 
 /// Compute the deterministic verdict for the current accumulated state under
-/// `objective`. `denominator = resolved + failed`, matching the objective's
-/// declared metric exactly.
-pub fn assess(objective: &ObjectiveConfig, state: &AssessmentState) -> (Verdict, String) {
-    if state.malformed_events > 0 && state.resolved_total == 0 && state.failed_total == 0 {
-        return (
-            Verdict::Unavailable,
-            format!(
-                "{} telemetry row(s) carried missing/non-numeric required counters and no valid \
-                 evidence has been observed yet",
-                state.malformed_events
-            ),
-        );
-    }
+/// `objective` as of `now`. `denominator = resolved + failed`, where
+/// `resolved` is [`AssessmentState::resolved_count`] (deduplicated distinct
+/// Need identities), matching the objective's declared metric while never
+/// letting a retried/replayed source occurrence inflate the numerator. See
+/// the module doc for the full verdict priority order.
+pub fn assess(
+    objective: &ObjectiveConfig,
+    state: &AssessmentState,
+    now: DateTime<Utc>,
+) -> (Verdict, String) {
     if state.ever_failed {
         return (
             Verdict::Fail,
@@ -633,7 +767,41 @@ pub fn assess(objective: &ObjectiveConfig, state: &AssessmentState) -> (Verdict,
                 .to_string(),
         );
     }
-    let denominator = state.resolved_total + state.failed_total;
+    if state.events_consumed == 0 {
+        let reason = if state.malformed_events > 0 || state.superseded_provenance_events > 0 {
+            format!(
+                "{} malformed and {} provenance-rejected telemetry row(s) observed; no valid \
+                 in-scope evidence for this activation yet",
+                state.malformed_events, state.superseded_provenance_events
+            )
+        } else {
+            "no telemetry observed yet for this activation".to_string()
+        };
+        return (Verdict::Unavailable, reason);
+    }
+    if let Some(last_event_at) = state.last_event_at {
+        let age = now.signed_duration_since(last_event_at);
+        let horizon = ChronoDuration::seconds(objective.source_freshness_seconds as i64);
+        if age > horizon {
+            return (
+                Verdict::Unavailable,
+                format!(
+                    "most recent valid telemetry is {}s old, exceeding source_freshness_seconds {}",
+                    age.num_seconds(),
+                    objective.source_freshness_seconds
+                ),
+            );
+        }
+    }
+    let resolved = state.resolved_count();
+    let denominator = resolved + state.failed_total;
+    if denominator == 0 {
+        return (
+            Verdict::Inconclusive,
+            "valid telemetry observed but zero resolved/failed operations so far (all skipped)"
+                .to_string(),
+        );
+    }
     if denominator < objective.minimum_denominator {
         return (
             Verdict::Inconclusive,
@@ -643,41 +811,44 @@ pub fn assess(objective: &ObjectiveConfig, state: &AssessmentState) -> (Verdict,
             ),
         );
     }
-    let distinct = state.distinct_resolved_needs.len() as u64;
-    // A truncated distinct set is only ever an undercount, so treat it as a
-    // known lower bound that can still satisfy the minimum.
-    if distinct < objective.minimum_distinct_resolved_needs_for_pass
-        && !state.distinct_resolved_truncated
-    {
+    if resolved < objective.minimum_distinct_resolved_needs_for_pass {
         return (
             Verdict::Inconclusive,
             format!(
-                "distinct resolved needs {distinct} below minimum {}",
+                "distinct resolved needs {resolved} below minimum {}",
                 objective.minimum_distinct_resolved_needs_for_pass
             ),
         );
     }
-    let ratio = state.resolved_total as f64 / denominator as f64;
-    if ratio >= objective.required_ratio {
-        (
-            Verdict::Pass,
-            format!(
-                "ratio {ratio:.4} >= required {:.4} over {denominator} observed operation(s), \
-                 {distinct} distinct resolved need(s)",
-                objective.required_ratio
-            ),
-        )
-    } else {
-        (
+    let ratio = resolved as f64 / denominator as f64;
+    if ratio < objective.required_ratio {
+        return (
             Verdict::Inconclusive,
             format!(
                 "ratio {ratio:.4} below required {:.4}",
                 objective.required_ratio
             ),
-        )
+        );
     }
+    if state.last_tick_truncated {
+        return (
+            Verdict::Inconclusive,
+            "evaluator has not fully caught up to the source boundary this tick; deferring pass \
+             until fully caught up"
+                .to_string(),
+        );
+    }
+    (
+        Verdict::Pass,
+        format!(
+            "ratio {ratio:.4} >= required {:.4} over {denominator} observed operation(s), \
+             {resolved} distinct resolved need(s)",
+            objective.required_ratio
+        ),
+    )
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct TickOutcome {
     pub pages_processed: usize,
     pub events_consumed: u64,
@@ -688,8 +859,10 @@ pub struct TickOutcome {
 
 /// Advance one repo's evaluator by up to `objective.maximum_pages_per_tick`
 /// bounded pages, starting from the durably saved cursor. Pure and
-/// synchronous — safe to call from a blocking RPC handler or a test, with an
-/// injectable `now` so tests never need a real wall-clock wait.
+/// synchronous — safe to call from a blocking RPC handler, the scheduler
+/// sweep, or a test, with an injectable `now` so tests never need a real
+/// wall-clock wait. Holds this repo's registry-file lock for its whole
+/// duration (see [`with_registry_lock`]).
 pub fn tick(
     space: &rk_space::Space,
     layout: &Layout,
@@ -697,135 +870,251 @@ pub fn tick(
     castle: &str,
     now: DateTime<Utc>,
 ) -> rk_core::Result<TickOutcome> {
-    let mut registry = AssessmentRegistry::load(&registry_path(layout))?;
-    let record = registry
-        .record(repo)
-        .cloned()
-        .ok_or_else(|| rk_core::Error::other(format!("repo '{repo}' has no assessment record")))?;
-    let objective = record.objective.clone().ok_or_else(|| {
-        rk_core::Error::other(format!("repo '{repo}' has no configured objective"))
-    })?;
-    if record.activation.is_none() {
-        return Err(rk_core::Error::other(format!(
-            "assessment is not activated for repo '{repo}'"
-        )));
-    }
-    let mut state = record.state;
-
-    let mut pin: Option<u64> = None;
-    let mut pages_processed = 0usize;
-    let mut events_consumed_this_tick = 0u64;
-    let mut truncated = false;
-    for _ in 0..objective.maximum_pages_per_tick {
-        let page = space.persistence_page(repo, Some(state.cursor), objective.page_limit, pin)?;
-        pin = Some(page.boundary);
-        pages_processed += 1;
-        for (_, tuple) in &page.entries {
-            if tuple.category != Category::Event || tuple.identity != RETIREMENT_TELEMETRY_IDENTITY
-            {
-                continue;
-            }
-            ingest_retirement_event(&mut state, tuple, &mut events_consumed_this_tick);
-        }
-        state.cursor = page.next_cursor;
-        if !page.more {
-            truncated = false;
-            break;
-        }
-        truncated = true;
-    }
-    state.last_tick_at = Some(now);
-    state.last_tick_pages = pages_processed;
-    state.last_tick_truncated = truncated;
-
-    let (verdict, reason) = assess(&objective, &state);
-    let denominator = state.resolved_total + state.failed_total;
-    let meaningfully_changed = record
-        .latest
-        .as_ref()
-        .map(|prior| {
-            prior.verdict != verdict
-                || prior.numerator != state.resolved_total
-                || prior.denominator != denominator
-                || prior.distinct_resolved_needs != state.distinct_resolved_needs.len() as u64
-        })
-        .unwrap_or(true);
-
-    let mut published = false;
-    let mut latest_to_persist = None;
-    if meaningfully_changed {
-        let assessment = PublishedAssessment {
-            verdict,
-            reason,
-            objective_id: objective.objective_id.clone(),
-            objective_version: objective.objective_version,
-            config_revision: record.revision,
-            observed_builds: state.observed_builds.iter().cloned().collect(),
-            observed_feature_config_revisions: state
-                .observed_feature_config_revisions
-                .iter()
-                .copied()
-                .collect(),
-            cursor_range: (
-                record
-                    .activation
-                    .as_ref()
-                    .map(|a| a.activation_boundary)
-                    .unwrap_or(0),
-                state.cursor,
-            ),
-            numerator: state.resolved_total,
-            denominator,
-            distinct_resolved_needs: state.distinct_resolved_needs.len() as u64,
-            distinct_resolved_truncated: state.distinct_resolved_truncated,
-            published_at: now,
-            source_references: state.source_references.clone(),
+    let path = registry_path(layout);
+    with_registry_lock(&path, || {
+        let mut registry = AssessmentRegistry::load(&path)?;
+        let record = registry.record(repo).cloned().ok_or_else(|| {
+            rk_core::Error::other(format!("repo '{repo}' has no assessment record"))
+        })?;
+        let objective = record.objective.clone().ok_or_else(|| {
+            rk_core::Error::other(format!("repo '{repo}' has no configured objective"))
+        })?;
+        let Some(activation) = record.activation.clone() else {
+            return Err(rk_core::Error::other(format!(
+                "assessment is not activated for repo '{repo}'"
+            )));
         };
-        if let Err(error) = space.out(result_tuple(repo, castle, &assessment)) {
-            tracing::warn!(%error, repo, "continuous-assessment: result telemetry write failed; checkpoint unaffected");
-        } else {
-            published = true;
-        }
-        latest_to_persist = Some(assessment);
-    }
+        let mut state = record.state;
 
-    registry.save_progress(repo, state, latest_to_persist)?;
-    Ok(TickOutcome {
-        pages_processed,
-        events_consumed: events_consumed_this_tick,
-        truncated,
-        verdict,
-        published,
+        let mut pin: Option<u64> = None;
+        let mut pages_processed = 0usize;
+        let mut events_consumed_this_tick = 0u64;
+        let mut truncated = false;
+        for _ in 0..objective.maximum_pages_per_tick {
+            let page =
+                space.persistence_page(repo, Some(state.cursor), objective.page_limit, pin)?;
+            pin = Some(page.boundary);
+            pages_processed += 1;
+            for (_, tuple) in &page.entries {
+                if tuple.category != Category::Event
+                    || tuple.identity != RETIREMENT_TELEMETRY_IDENTITY
+                {
+                    continue;
+                }
+                ingest_retirement_event(
+                    &mut state,
+                    tuple,
+                    activation.source_feature_revision,
+                    &mut events_consumed_this_tick,
+                );
+            }
+            state.cursor = page.next_cursor;
+            if !page.more {
+                truncated = false;
+                break;
+            }
+            truncated = true;
+        }
+        state.last_tick_at = Some(now);
+        state.last_tick_pages = pages_processed;
+        state.last_tick_truncated = truncated;
+
+        let (verdict, reason) = assess(&objective, &state, now);
+        let resolved = state.resolved_count();
+        let denominator = resolved + state.failed_total;
+        let meaningfully_changed = record
+            .latest
+            .as_ref()
+            .map(|prior| {
+                prior.verdict != verdict
+                    || prior.numerator != resolved
+                    || prior.denominator != denominator
+                    || prior.distinct_resolved_needs != resolved
+            })
+            .unwrap_or(true);
+
+        let mut published = false;
+        let mut latest_to_persist = None;
+        if meaningfully_changed {
+            let assessment = PublishedAssessment {
+                verdict,
+                reason,
+                objective_id: objective.objective_id.clone(),
+                objective_version: objective.objective_version,
+                config_revision: record.revision,
+                observed_builds: state.observed_builds.iter().cloned().collect(),
+                observed_feature_config_revisions: state
+                    .observed_feature_config_revisions
+                    .iter()
+                    .copied()
+                    .collect(),
+                cursor_range: (activation.activation_boundary, state.cursor),
+                numerator: resolved,
+                denominator,
+                distinct_resolved_needs: resolved,
+                distinct_resolved_truncated: state.distinct_resolved_truncated,
+                published_at: now,
+                source_references: state.source_references.clone(),
+            };
+            // `reinforce`, not `out`: this upserts the ONE live tuple keyed
+            // on (category, scope=repo, identity, instance=castle), so a
+            // crash between this write succeeding and `save_progress` below
+            // persisting the checkpoint — which would otherwise recompute
+            // and re-attempt the IDENTICAL publish on the next tick —
+            // reinforces the same tuple in place instead of appending a
+            // duplicate published result.
+            match space.reinforce(result_tuple(repo, castle, &assessment)) {
+                Ok(_) => {
+                    published = true;
+                    latest_to_persist = Some(assessment);
+                }
+                Err(error) => {
+                    // Deliberately do NOT persist `latest` here: leaving the
+                    // OLD `latest` in place means the next tick's
+                    // `meaningfully_changed` comparison (against this same
+                    // still-stale `record.latest`) is true again, so
+                    // publication is retried rather than silently dropped.
+                    tracing::warn!(%error, repo, "continuous-assessment: result publish failed; will retry next tick");
+                }
+            }
+        }
+
+        registry.save_progress(repo, state, latest_to_persist)?;
+        Ok(TickOutcome {
+            pages_processed,
+            events_consumed: events_consumed_this_tick,
+            truncated,
+            verdict,
+            published,
+        })
     })
 }
 
-fn ingest_retirement_event(state: &mut AssessmentState, tuple: &Tuple, consumed: &mut u64) {
+/// Every repo whose activation is live and whose own
+/// `evaluation_cadence_seconds` has elapsed since its last tick (or which has
+/// never ticked at all). Read-only; does not itself advance anything.
+fn due_repos(layout: &Layout, now: DateTime<Utc>) -> rk_core::Result<Vec<String>> {
+    let registry = AssessmentRegistry::load(&registry_path(layout))?;
+    let mut due = Vec::new();
+    for (repo, record) in registry.entries() {
+        let Some(objective) = &record.objective else {
+            continue;
+        };
+        if record.activation.is_none() {
+            continue;
+        }
+        let is_due = match record.state.last_tick_at {
+            None => true,
+            Some(last) => {
+                now.signed_duration_since(last)
+                    >= ChronoDuration::seconds(objective.evaluation_cadence_seconds as i64)
+            }
+        };
+        if is_due {
+            due.push(repo.to_string());
+        }
+    }
+    Ok(due)
+}
+
+/// The autonomous half of evaluation: called on a bounded internal cadence by
+/// `Server::run` (see the background sweep loop there), never by an
+/// operator. Ticks every currently-due, currently-activated repo and returns
+/// how many were actually advanced. A single repo's failure is logged and
+/// never blocks the others. No agents, no King wake — this only ever calls
+/// the same pure [`tick`] the RPC path calls.
+pub fn sweep_due(space: &rk_space::Space, layout: &Layout, now: DateTime<Utc>) -> usize {
+    let due = match due_repos(layout, now) {
+        Ok(due) => due,
+        Err(error) => {
+            tracing::warn!(%error, "continuous-assessment: failed to read registry for scheduled sweep");
+            return 0;
+        }
+    };
+    let mut ticked = 0;
+    for repo in due {
+        match tick(space, layout, &repo, "daemon", now) {
+            Ok(_) => ticked += 1,
+            Err(error) => {
+                tracing::warn!(%error, repo, "continuous-assessment: scheduled tick failed")
+            }
+        }
+    }
+    ticked
+}
+
+/// Validate and fold one telemetry tuple into `state`. Rejects (counts as
+/// `malformed_events`, never `failed_total`) a row with missing/non-numeric
+/// counters, a failed `attempted == resolved + skipped + failed` identity
+/// (including on overflow), or an incomplete `resolved_bindings` list for a
+/// non-truncated `resolved > 0` row. Rejects (counts as
+/// `superseded_provenance_events`) a well-formed row whose `config_revision`
+/// is lower than `activation_source_feature_revision`. Only a row that
+/// clears every check increments `events_consumed` and folds into the
+/// running totals.
+fn ingest_retirement_event(
+    state: &mut AssessmentState,
+    tuple: &Tuple,
+    activation_source_feature_revision: u64,
+    consumed: &mut u64,
+) {
     let payload = &tuple.payload;
     if payload.get("feature").and_then(|v| v.as_str()) != Some(landing_need_resolution::FEATURE_ID)
     {
         return;
     }
-    let counters = [
-        payload.get("attempted").and_then(|v| v.as_u64()),
-        payload.get("resolved").and_then(|v| v.as_u64()),
-        payload.get("skipped").and_then(|v| v.as_u64()),
-        payload.get("failed").and_then(|v| v.as_u64()),
-    ];
+    let attempted = payload.get("attempted").and_then(|v| v.as_u64());
+    let resolved = payload.get("resolved").and_then(|v| v.as_u64());
+    let skipped = payload.get("skipped").and_then(|v| v.as_u64());
+    let failed = payload.get("failed").and_then(|v| v.as_u64());
     let config_revision = payload.get("config_revision").and_then(|v| v.as_u64());
-    let (Some(attempted), Some(resolved), Some(skipped), Some(failed)) =
-        (counters[0], counters[1], counters[2], counters[3])
+    let (Some(attempted), Some(resolved), Some(skipped), Some(failed), Some(config_revision)) =
+        (attempted, resolved, skipped, failed, config_revision)
     else {
         state.malformed_events += 1;
         return;
     };
-    let Some(config_revision) = config_revision else {
+    let Some(expected_attempted) = resolved
+        .checked_add(skipped)
+        .and_then(|s| s.checked_add(failed))
+    else {
         state.malformed_events += 1;
         return;
     };
-    state.attempted_total += attempted;
-    state.resolved_total += resolved;
-    state.skipped_total += skipped;
-    state.failed_total += failed;
+    if expected_attempted != attempted {
+        state.malformed_events += 1;
+        return;
+    }
+    if config_revision < activation_source_feature_revision {
+        state.superseded_provenance_events += 1;
+        return;
+    }
+    let bindings = payload.get("resolved_bindings").and_then(|v| v.as_array());
+    let bindings_truncated = payload
+        .get("resolved_bindings_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut resolved_ids: Vec<&str> = Vec::new();
+    if resolved > 0 {
+        let named: Vec<&str> = bindings
+            .map(|b| {
+                b.iter()
+                    .filter_map(|entry| entry.get("need_id").and_then(|v| v.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !bindings_truncated && (named.len() as u64) < resolved {
+            // Incomplete required bindings for a non-truncated resolved
+            // count: cannot trust which Needs actually resolved.
+            state.malformed_events += 1;
+            return;
+        }
+        resolved_ids = named;
+    }
+    // Every check has passed: commit this event's effect.
+    state.attempted_total = state.attempted_total.saturating_add(attempted);
+    state.skipped_total = state.skipped_total.saturating_add(skipped);
+    state.failed_total = state.failed_total.saturating_add(failed);
     if failed > 0 {
         state.ever_failed = true;
     }
@@ -833,19 +1122,11 @@ fn ingest_retirement_event(state: &mut AssessmentState, tuple: &Tuple, consumed:
     if let Some(build) = payload.get("build").and_then(|v| v.as_str()) {
         state.record_build(build);
     }
-    if payload
-        .get("resolved_bindings_truncated")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
+    if bindings_truncated {
         state.distinct_resolved_truncated = true;
     }
-    if let Some(bindings) = payload.get("resolved_bindings").and_then(|v| v.as_array()) {
-        for binding in bindings {
-            if let Some(need_id) = binding.get("need_id").and_then(|v| v.as_str()) {
-                state.record_resolved_need(need_id);
-            }
-        }
+    for need_id in resolved_ids {
+        state.record_resolved_need(need_id);
     }
     state.last_event_at = Some(
         state
@@ -966,10 +1247,21 @@ mod tests {
     }
 
     #[test]
-    fn zero_observations_is_inconclusive() {
+    fn zero_valid_events_is_unavailable_not_inconclusive() {
         let objective = valid_objective();
         let state = AssessmentState::default();
-        let (verdict, _) = assess(&objective, &state);
+        let (verdict, _) = assess(&objective, &state, Utc::now());
+        assert_eq!(verdict, Verdict::Unavailable);
+    }
+
+    #[test]
+    fn valid_all_skipped_telemetry_is_inconclusive_not_unavailable() {
+        let objective = valid_objective();
+        let mut state = AssessmentState::default();
+        state.events_consumed = 1;
+        state.last_event_at = Some(Utc::now());
+        // resolved == 0 && failed == 0: legitimately nothing to report yet.
+        let (verdict, _) = assess(&objective, &state, Utc::now());
         assert_eq!(verdict, Verdict::Inconclusive);
     }
 
@@ -977,9 +1269,10 @@ mod tests {
     fn a_single_resolved_need_is_pass_at_ratio_one() {
         let objective = valid_objective();
         let mut state = AssessmentState::default();
-        state.resolved_total = 1;
+        state.events_consumed = 1;
+        state.last_event_at = Some(Utc::now());
         state.distinct_resolved_needs.insert("01ABC".into());
-        let (verdict, _) = assess(&objective, &state);
+        let (verdict, _) = assess(&objective, &state, Utc::now());
         assert_eq!(verdict, Verdict::Pass);
     }
 
@@ -988,9 +1281,11 @@ mod tests {
         let mut objective = valid_objective();
         objective.minimum_denominator = 10;
         let mut state = AssessmentState::default();
+        state.events_consumed = 1;
+        state.last_event_at = Some(Utc::now());
         state.failed_total = 1;
         state.ever_failed = true;
-        let (verdict, _) = assess(&objective, &state);
+        let (verdict, _) = assess(&objective, &state, Utc::now());
         assert_eq!(verdict, Verdict::Fail);
     }
 
@@ -998,12 +1293,13 @@ mod tests {
     fn ever_failed_is_sticky_even_after_later_clean_events() {
         let objective = valid_objective();
         let mut state = AssessmentState::default();
+        state.events_consumed = 1;
+        state.last_event_at = Some(Utc::now());
         state.ever_failed = true;
-        state.resolved_total = 100;
         state.distinct_resolved_needs.insert("01ABC".into());
         // failed_total could even be back at 0 if a later tick only observed
         // clean events, but `ever_failed` must still win.
-        let (verdict, _) = assess(&objective, &state);
+        let (verdict, _) = assess(&objective, &state, Utc::now());
         assert_eq!(verdict, Verdict::Fail);
     }
 
@@ -1012,9 +1308,25 @@ mod tests {
         let mut objective = valid_objective();
         objective.minimum_distinct_resolved_needs_for_pass = 2;
         let mut state = AssessmentState::default();
-        state.resolved_total = 5; // same Need resolved 5 times somehow
+        state.events_consumed = 1;
+        state.last_event_at = Some(Utc::now());
         state.distinct_resolved_needs.insert("01ABC".into());
-        let (verdict, _) = assess(&objective, &state);
+        let (verdict, _) = assess(&objective, &state, Utc::now());
+        assert_eq!(verdict, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn a_truncated_distinct_set_never_bypasses_the_minimum_check() {
+        let mut objective = valid_objective();
+        objective.minimum_distinct_resolved_needs_for_pass = 2;
+        let mut state = AssessmentState::default();
+        state.events_consumed = 1;
+        state.last_event_at = Some(Utc::now());
+        state.distinct_resolved_needs.insert("01ABC".into());
+        // A truncated flag with an observed count still below the minimum
+        // must NOT be treated as "probably satisfied".
+        state.distinct_resolved_truncated = true;
+        let (verdict, _) = assess(&objective, &state, Utc::now());
         assert_eq!(verdict, Verdict::Inconclusive);
     }
 
@@ -1023,17 +1335,67 @@ mod tests {
         let objective = valid_objective();
         let mut state = AssessmentState::default();
         state.malformed_events = 3;
-        let (verdict, _) = assess(&objective, &state);
+        let (verdict, reason) = assess(&objective, &state, Utc::now());
         assert_eq!(verdict, Verdict::Unavailable);
+        assert!(reason.contains("malformed"), "{reason}");
+    }
+
+    #[test]
+    fn stale_evidence_is_unavailable_even_with_a_clean_history() {
+        let objective = valid_objective();
+        let mut state = AssessmentState::default();
+        state.events_consumed = 1;
+        state.distinct_resolved_needs.insert("01ABC".into());
+        state.last_event_at = Some(Utc::now() - ChronoDuration::seconds(3600));
+        let (verdict, reason) = assess(&objective, &state, Utc::now());
+        assert_eq!(verdict, Verdict::Unavailable);
+        assert!(
+            reason.contains("stale") || reason.contains("exceeding"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn fresh_clean_evidence_within_horizon_still_passes() {
+        let objective = valid_objective();
+        let mut state = AssessmentState::default();
+        state.events_consumed = 1;
+        state.distinct_resolved_needs.insert("01ABC".into());
+        state.last_event_at = Some(Utc::now() - ChronoDuration::seconds(10));
+        let (verdict, _) = assess(&objective, &state, Utc::now());
+        assert_eq!(verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn truncated_tick_caps_an_otherwise_passing_result_at_inconclusive() {
+        let objective = valid_objective();
+        let mut state = AssessmentState::default();
+        state.events_consumed = 1;
+        state.last_event_at = Some(Utc::now());
+        state.distinct_resolved_needs.insert("01ABC".into());
+        state.last_tick_truncated = true;
+        let (verdict, reason) = assess(&objective, &state, Utc::now());
+        assert_eq!(verdict, Verdict::Inconclusive);
+        assert!(reason.contains("caught up"), "{reason}");
     }
 
     fn well_formed_event_tuple(repo: &str, resolved: u64, failed: u64, need_id: &str) -> Tuple {
+        well_formed_event_tuple_revision(repo, resolved, failed, need_id, 1)
+    }
+
+    fn well_formed_event_tuple_revision(
+        repo: &str,
+        resolved: u64,
+        failed: u64,
+        need_id: &str,
+        config_revision: u64,
+    ) -> Tuple {
         landing_need_resolution::telemetry_event(
             repo,
             "test-castle",
             &landing_need_resolution::RetirementConfig {
                 enabled: true,
-                revision: 1,
+                revision: config_revision,
                 status: rk_core::bbs::ConfigStatus::Explicit,
             },
             &landing_need_resolution::RetirementOutcome {
@@ -1080,12 +1442,21 @@ mod tests {
 
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
         let record = registry.record(repo).unwrap();
-        assert_eq!(record.state.resolved_total, 1);
-        assert_eq!(record.state.distinct_resolved_needs.len(), 1);
+        assert_eq!(record.state.resolved_count(), 1);
         let latest = record.latest.as_ref().unwrap();
         assert_eq!(latest.verdict, Verdict::Pass);
         assert_eq!(latest.numerator, 1);
         assert_eq!(latest.denominator, 1);
+
+        let published = space
+            .scan(
+                &rk_core::tuple::Pattern::category(Category::Event)
+                    .scope(repo)
+                    .identity(ASSESSMENT_RESULT_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert_eq!(published[0].payload["verdict"], "pass");
     }
 
     #[tokio::test]
@@ -1120,7 +1491,7 @@ mod tests {
         let outcome2 = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
         assert_eq!(outcome2.events_consumed, 0);
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
-        assert_eq!(registry.record(repo).unwrap().state.resolved_total, 1);
+        assert_eq!(registry.record(repo).unwrap().state.resolved_count(), 1);
 
         // A late-arriving second event is picked up cumulatively, not
         // replacing the first.
@@ -1131,12 +1502,11 @@ mod tests {
         assert_eq!(outcome3.events_consumed, 1);
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
         let record = registry.record(repo).unwrap();
-        assert_eq!(record.state.resolved_total, 2);
-        assert_eq!(record.state.distinct_resolved_needs.len(), 2);
+        assert_eq!(record.state.resolved_count(), 2);
     }
 
-    #[test]
-    fn malformed_counters_are_reported_not_counted_as_failed() {
+    #[tokio::test]
+    async fn a_retried_pass_resolving_the_same_need_twice_does_not_inflate_the_numerator() {
         let dir = tempfile::tempdir().unwrap();
         let layout = rk_core::paths::Layout::at(dir.path());
         let space = rk_space::Space::open_in_memory().unwrap();
@@ -1150,8 +1520,44 @@ mod tests {
                 .activate(repo, &space, "build-1".into(), 1, "operator")
                 .unwrap();
         }
-        // A malformed telemetry row: right identity/category, but the
-        // counters are not numbers.
+        // Two SEPARATE telemetry events (as a crash-then-retry of the SAME
+        // underlying retirement pass would produce, per
+        // `landing_need_resolution`'s own crash-recovery doc comment) naming
+        // the SAME need_id.
+        space
+            .out(well_formed_event_tuple(repo, 1, 0, "01SAME"))
+            .unwrap();
+        space
+            .out(well_formed_event_tuple(repo, 1, 0, "01SAME"))
+            .unwrap();
+        let outcome = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
+        assert_eq!(
+            outcome.events_consumed, 2,
+            "both events are validly consumed"
+        );
+        let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        assert_eq!(
+            registry.record(repo).unwrap().state.resolved_count(),
+            1,
+            "the SAME Need resolved twice must count once toward the numerator"
+        );
+    }
+
+    #[tokio::test]
+    async fn attempted_not_matching_resolved_plus_skipped_plus_failed_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let space = rk_space::Space::open_in_memory().unwrap();
+        let repo = "fixture-repo";
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure(repo, valid_objective(), "operator")
+                .unwrap();
+            registry
+                .activate(repo, &space, "build-1".into(), 1, "operator")
+                .unwrap();
+        }
         space
             .out(
                 Tuple::new(
@@ -1161,22 +1567,107 @@ mod tests {
                     "test-castle".to_string(),
                     serde_json::json!({
                         "feature": landing_need_resolution::FEATURE_ID,
-                        "attempted": "not-a-number",
+                        "build": "x",
+                        "config_revision": 1,
+                        "attempted": 5,
+                        "resolved": 1,
+                        "skipped": 1,
+                        "failed": 1,
                     }),
                 )
                 .with_lifecycle(Lifecycle::Furniture),
             )
             .unwrap();
         let outcome = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
-        assert_eq!(outcome.verdict, Verdict::Unavailable);
+        assert_eq!(outcome.events_consumed, 0);
         let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
         let record = registry.record(repo).unwrap();
         assert_eq!(record.state.malformed_events, 1);
         assert_eq!(record.state.failed_total, 0);
     }
 
+    #[tokio::test]
+    async fn incomplete_bindings_for_a_nontruncated_resolved_row_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let space = rk_space::Space::open_in_memory().unwrap();
+        let repo = "fixture-repo";
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure(repo, valid_objective(), "operator")
+                .unwrap();
+            registry
+                .activate(repo, &space, "build-1".into(), 1, "operator")
+                .unwrap();
+        }
+        space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    repo.to_string(),
+                    RETIREMENT_TELEMETRY_IDENTITY,
+                    "test-castle".to_string(),
+                    serde_json::json!({
+                        "feature": landing_need_resolution::FEATURE_ID,
+                        "build": "x",
+                        "config_revision": 1,
+                        "attempted": 2,
+                        "resolved": 2,
+                        "skipped": 0,
+                        "failed": 0,
+                        "resolved_bindings": [{"need_id": "01ONLY"}],
+                        "resolved_bindings_truncated": false,
+                    }),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+        let outcome = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
+        assert_eq!(outcome.events_consumed, 0);
+        let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        assert_eq!(registry.record(repo).unwrap().state.malformed_events, 1);
+    }
+
+    #[tokio::test]
+    async fn a_revision_below_the_activation_baseline_is_rejected_as_superseded_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let space = rk_space::Space::open_in_memory().unwrap();
+        let repo = "fixture-repo";
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure(repo, valid_objective(), "operator")
+                .unwrap();
+            // Activation binds source_feature_revision = 5.
+            registry
+                .activate(repo, &space, "build-1".into(), 5, "operator")
+                .unwrap();
+        }
+        // A well-formed event from an OLDER (superseded) revision.
+        space
+            .out(well_formed_event_tuple_revision(repo, 1, 0, "01OLD", 3))
+            .unwrap();
+        let outcome = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
+        assert_eq!(outcome.events_consumed, 0);
+        assert_eq!(outcome.verdict, Verdict::Unavailable);
+        let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        let record = registry.record(repo).unwrap();
+        assert_eq!(record.state.superseded_provenance_events, 1);
+        assert_eq!(record.state.resolved_count(), 0);
+
+        // A later, equal-or-higher revision (the feature was reconfigured
+        // during the window) IS accepted.
+        space
+            .out(well_formed_event_tuple_revision(repo, 1, 0, "01NEW", 5))
+            .unwrap();
+        let outcome2 = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
+        assert_eq!(outcome2.events_consumed, 1);
+    }
+
     #[test]
-    fn a_missing_source_with_no_events_yet_is_inconclusive() {
+    fn a_missing_source_with_no_events_yet_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let layout = rk_core::paths::Layout::at(dir.path());
         let space = rk_space::Space::open_in_memory().unwrap();
@@ -1192,7 +1683,7 @@ mod tests {
         }
         let outcome = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
         assert_eq!(outcome.events_consumed, 0);
-        assert_eq!(outcome.verdict, Verdict::Inconclusive);
+        assert_eq!(outcome.verdict, Verdict::Unavailable);
     }
 
     #[test]
@@ -1221,7 +1712,7 @@ mod tests {
             outcome.events_consumed, 0,
             "pre-activation event must not retroactively satisfy new exposure"
         );
-        assert_eq!(outcome.verdict, Verdict::Inconclusive);
+        assert_eq!(outcome.verdict, Verdict::Unavailable);
     }
 
     #[test]
@@ -1317,6 +1808,208 @@ mod tests {
         }
         let outcome = tick(&space, &layout, repo, "test-castle", Utc::now()).unwrap();
         assert_eq!(outcome.events_consumed, 0);
-        assert_eq!(outcome.verdict, Verdict::Inconclusive);
+        assert_eq!(outcome.verdict, Verdict::Unavailable);
+    }
+
+    #[test]
+    fn due_repos_selects_a_never_ticked_active_repo_and_skips_disabled_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let space = rk_space::Space::open_in_memory().unwrap();
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure("active-repo", valid_objective(), "operator")
+                .unwrap();
+            registry
+                .activate("active-repo", &space, "build-1".into(), 1, "operator")
+                .unwrap();
+            registry
+                .configure("disabled-repo", valid_objective(), "operator")
+                .unwrap();
+            // Never activated.
+        }
+        let due = due_repos(&layout, Utc::now()).unwrap();
+        assert_eq!(due, vec!["active-repo".to_string()]);
+    }
+
+    #[test]
+    fn due_repos_waits_out_the_declared_cadence_between_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let space = rk_space::Space::open_in_memory().unwrap();
+        let repo = "fixture-repo";
+        let now = Utc::now();
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure(repo, valid_objective(), "operator")
+                .unwrap();
+            registry
+                .activate(repo, &space, "build-1".into(), 1, "operator")
+                .unwrap();
+        }
+        tick(&space, &layout, repo, "test-castle", now).unwrap();
+        // Immediately after a tick, not yet due again (cadence is 30s).
+        assert!(due_repos(&layout, now + ChronoDuration::seconds(5))
+            .unwrap()
+            .is_empty());
+        // Past the cadence, due again.
+        assert_eq!(
+            due_repos(&layout, now + ChronoDuration::seconds(31)).unwrap(),
+            vec![repo.to_string()]
+        );
+    }
+
+    #[test]
+    fn sweep_due_autonomously_advances_an_activated_repo_with_no_manual_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let space = rk_space::Space::open_in_memory().unwrap();
+        let repo = "fixture-repo";
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure(repo, valid_objective(), "operator")
+                .unwrap();
+            registry
+                .activate(repo, &space, "build-1".into(), 1, "operator")
+                .unwrap();
+        }
+        space
+            .out(well_formed_event_tuple(repo, 1, 0, "01NEED"))
+            .unwrap();
+        // Note: `tick` is never called directly here.
+        let ticked = sweep_due(&space, &layout, Utc::now());
+        assert_eq!(ticked, 1);
+        let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        assert_eq!(
+            registry
+                .record(repo)
+                .unwrap()
+                .latest
+                .as_ref()
+                .unwrap()
+                .verdict,
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn concurrent_ticks_on_the_same_repo_never_corrupt_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let store_path = dir.path().join("space.db");
+        let space = rk_space::Space::open(&store_path).unwrap();
+        let repo = "fixture-repo";
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure(repo, valid_objective(), "operator")
+                .unwrap();
+            registry
+                .activate(repo, &space, "build-1".into(), 1, "operator")
+                .unwrap();
+        }
+        for i in 0..20 {
+            space
+                .out(well_formed_event_tuple(repo, 1, 0, &format!("01N{i}")))
+                .unwrap();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let space = space.clone();
+                let layout = layout.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..5 {
+                        let _ = tick(&space, &layout, repo, "test-castle", Utc::now());
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        // The registry must still be validly readable (no torn/corrupt
+        // write survived), and the cursor must have advanced past every
+        // event with no double-counted resolution: the distinct-Need set
+        // dedups the numerator regardless of which racing tick's page
+        // happened to observe which event.
+        let registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+        let record = registry.record(repo).unwrap();
+        assert_eq!(record.state.resolved_count(), 20, "{record:?}");
+        let published = space
+            .scan(
+                &rk_core::tuple::Pattern::category(Category::Event)
+                    .scope(repo)
+                    .identity(ASSESSMENT_RESULT_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(
+            published.len(),
+            1,
+            "reinforce must upsert one live result tuple even under concurrent republishing: {published:?}"
+        );
+    }
+
+    #[test]
+    fn a_forced_republish_of_the_identical_assessment_upserts_rather_than_duplicates() {
+        // Exercises the exact crash window the atomicity finding named:
+        // `space.reinforce` for the result succeeds, but the checkpoint
+        // persist that would normally prevent a second identical publish
+        // never lands (simulated here by clearing `latest` back to `None`
+        // after a successful tick, forcing `meaningfully_changed` to be
+        // true again on the next tick with byte-identical content).
+        let dir = tempfile::tempdir().unwrap();
+        let layout = rk_core::paths::Layout::at(dir.path());
+        let space = rk_space::Space::open_in_memory().unwrap();
+        let repo = "fixture-repo";
+        {
+            let mut registry = AssessmentRegistry::load(&registry_path(&layout)).unwrap();
+            registry
+                .configure(repo, valid_objective(), "operator")
+                .unwrap();
+            registry
+                .activate(repo, &space, "build-1".into(), 1, "operator")
+                .unwrap();
+        }
+        space
+            .out(well_formed_event_tuple(repo, 1, 0, "01NEED"))
+            .unwrap();
+        let now = Utc::now();
+        tick(&space, &layout, repo, "test-castle", now).unwrap();
+
+        let path = registry_path(&layout);
+        {
+            let mut registry = AssessmentRegistry::load(&path).unwrap();
+            let record = registry.record(repo).unwrap().clone();
+            registry.save_progress(repo, record.state, None).unwrap();
+            // Force-clear `latest` directly to simulate "the checkpoint that
+            // would have recorded this publish never landed".
+            let mut raw: BTreeMap<String, AssessmentRecord> =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            raw.get_mut(repo).unwrap().latest = None;
+            std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        }
+
+        // Same cursor, same data: the recomputed assessment is byte-for-byte
+        // identical to the one already reinforced above.
+        tick(&space, &layout, repo, "test-castle", now).unwrap();
+
+        let published = space
+            .scan(
+                &rk_core::tuple::Pattern::category(Category::Event)
+                    .scope(repo)
+                    .identity(ASSESSMENT_RESULT_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(
+            published.len(),
+            1,
+            "a forced re-publish of identical content must upsert, never duplicate: {published:?}"
+        );
     }
 }
