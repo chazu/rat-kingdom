@@ -27,6 +27,7 @@ hex.workspace = true
 sha2.workspace = true
 libc.workspace = true
 rand.workspace = true
+serde_yaml_ng = "0.10"
 
 [features]
 # Builds `rk-fixture-done`, the fake harness's stand-in for `rk done`. Off in a

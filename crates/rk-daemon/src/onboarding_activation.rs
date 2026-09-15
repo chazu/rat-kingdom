@@ -48,7 +48,7 @@ pub fn contract(
     }
     if proposal.automation_kind().is_none() {
         return Err(rk_core::Error::other(format!(
-            "proposal {} is not a workflow, trigger, or schedule activation",
+            "proposal {} is not a supported automation activation target",
             proposal.id
         )));
     }
@@ -198,12 +198,7 @@ pub fn ensure_activation(
             contract.target_digest
         )));
     }
-    validate_automation_file(
-        &target,
-        proposal
-            .automation_kind()
-            .expect("automation kind checked by contract"),
-    )?;
+    validate_automation_file(&target, proposal)?;
     require_clean(&session.repo_path)?;
     Ok(ActivationEvidence {
         registered_commit,
