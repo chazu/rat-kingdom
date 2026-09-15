@@ -517,15 +517,32 @@ mod host_admission {
     const POLL_DEADLINE: Duration = Duration::from_secs(15);
     const POLL_INTERVAL: Duration = Duration::from_millis(30);
 
+    /// A real `cargo build`'s `build.rs` can take meaningfully longer than an
+    /// instant shell barrier to even reach its first statement (the pid
+    /// write) when the host is busy compiling/running the rest of the
+    /// workspace concurrently — cargo must resolve the fixture workspace,
+    /// compile `build.rs` itself, and wait for a free job slot, all before
+    /// that write ever happens. That startup wait is a property of host
+    /// contention, not of this daemon's cancellation path, so it gets its own
+    /// more generous deadline rather than stretching [`POLL_DEADLINE`], which
+    /// stays tight so it keeps proving genuine cancellation speed once a
+    /// build is actually underway (killing an already-running child and
+    /// observing the permit release are not compile-bound).
+    const BUILD_STARTUP_DEADLINE: Duration = Duration::from_secs(90);
+
     async fn wait_for_start(path: &Path) {
-        let deadline = Instant::now() + POLL_DEADLINE;
+        wait_for_start_within(path, POLL_DEADLINE).await;
+    }
+
+    async fn wait_for_start_within(path: &Path, budget: Duration) {
+        let deadline = Instant::now() + budget;
         loop {
             if path.exists() {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "check never started (no pid file at {}) within {POLL_DEADLINE:?}",
+                "check never started (no pid file at {}) within {budget:?}",
                 path.display()
             );
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -896,8 +913,10 @@ mod host_admission {
 
         // Wait for the build to genuinely reach its barrier — real
         // compilation underway, not merely admitted — and for the aggregate
-        // permit to show as held.
-        wait_for_start(&pid_path(shared.path(), "build")).await;
+        // permit to show as held. Real `cargo build` startup gets its own
+        // wider budget (BUILD_STARTUP_DEADLINE); everything after this point
+        // proves cancellation speed and stays on the tight POLL_DEADLINE.
+        wait_for_start_within(&pid_path(shared.path(), "build"), BUILD_STARTUP_DEADLINE).await;
         poll_status_until(
             &mut client,
             "the release build occupies the one aggregate permit",
