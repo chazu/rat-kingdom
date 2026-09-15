@@ -3452,6 +3452,23 @@ impl ManagedVerificationRuns {
             }
         }
     }
+
+    /// Cancel EVERY currently registered run, regardless of owning agent or
+    /// request — the daemon-shutdown case (TKT-rohib-rukaf-sizak). Unlike
+    /// [`Self::cancel_agent`]/[`Self::cancel_request`], which scope a signal
+    /// meant for one generation or one dying connection, a graceful stop
+    /// must not leave ANY managed check subprocess running behind it, nor
+    /// leave whatever awaited it (the landing pipeline's own `run_cycle`, a
+    /// workflow's `run` step) blocked on that check's own timeout instead of
+    /// noticing shutdown promptly. Each cancelled run's own `tokio::select!`
+    /// (`verify_repo_check`) still drops its `run_fut` and releases its
+    /// `ManagedRegistration` exactly as an ordinary single-run cancellation
+    /// does — this only widens WHO gets signalled, not the mechanism.
+    pub(crate) fn cancel_all(&self, reason: &'static str) {
+        for run in self.runs.lock().unwrap().values() {
+            let _ = run.cancel.send(Some(reason));
+        }
+    }
 }
 
 #[cfg(test)]

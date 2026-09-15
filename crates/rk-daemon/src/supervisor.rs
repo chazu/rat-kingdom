@@ -1443,6 +1443,16 @@ impl Supervisor {
         self.verification.runs.cancel_request(request_key, reason);
     }
 
+    /// Cancel EVERY currently registered managed verification run — the
+    /// daemon-shutdown case (TKT-rohib-rukaf-sizak). Agent harness sessions
+    /// ([`Self::live_session_controls`]) and managed check subprocesses are
+    /// both "owned processes" a graceful stop must not leave running behind
+    /// it or hold shutdown open behind, but they are tracked in two
+    /// completely separate registries — this is the check half.
+    pub(crate) fn cancel_all_managed_verification(&self, reason: &'static str) {
+        self.verification.runs.cancel_all(reason);
+    }
+
     /// Set `[policy] implementation_admission_limit` / `_by_repo`. Applied by
     /// `Daemon::new` from config, same pattern as
     /// [`set_verification_admission_limits`](Supervisor::set_verification_admission_limits).
@@ -9025,6 +9035,86 @@ impl Supervisor {
         }
     }
 
+    /// Snapshot of every currently owned, live REVIEWER `SessionControl`,
+    /// keyed by agent name — deliberately NOT every live session. An entry
+    /// only exists here between a launch publishing its control handle and
+    /// that same generation's `Exited` event removing it (`handle_event`'s
+    /// `Exited` arm), so this is precisely "the exact owned reviewer process
+    /// tree" right now — never a deliberately stopped/held generation, which
+    /// has already been removed.
+    ///
+    /// Scoped to `role == "reviewer"` on purpose (TKT-rohib-rukaf-sizak
+    /// acceptance correction): an ordinary `"rat"` generation still `Running`
+    /// when a graceful stop/`rk daemon rollover` fires depends on being left
+    /// EXACTLY as `kill_on_drop`'s incidental teardown always left it — its
+    /// harness process dies, but the still-alive daemon's own per-agent
+    /// `handle_event` loop never gets to observe or process that `Exited`
+    /// event, so the durable record stays frozen mid-life for the successor
+    /// daemon's `on_daemon_started`/`orphan_live_agents` sweep to correctly
+    /// reclassify as `Orphaned` — the exact state `rk daemon rollover`'s own
+    /// `agent.respawn` reconciliation (and `agent_archive.rs`'s
+    /// `live_and_orphaned_records_are_never_archived`) requires. Signalling
+    /// and bounded-JOINING a rat here — waiting for its confirmed exit while
+    /// this daemon's own event-consumer loop is still very much alive and
+    /// listening — lets that SAME daemon's `handle_event` observe the
+    /// resulting `Exited` and terminalize the record as `Failed` before it
+    /// ever reaches the successor, which is a genuine behavior change from
+    /// the pre-existing, tested rollover contract, not a hardening of it.
+    /// Reviewers carry no such contract by default — their `Exited` would
+    /// terminalize the same way `Failed`, routing recovery into the landing
+    /// pipeline's bounded-replacement dispatch instead of resuming this
+    /// generation — so [`orphan_for_owned_shutdown`](Self::orphan_for_owned_shutdown)
+    /// is called on each of these BEFORE it is signalled
+    /// (TKT-ravig-kumob-timuh), pre-empting that with the exact same
+    /// `Orphaned` disposition the successor's `orphan_live_agents` sweep
+    /// would have given a rat — see that method's own doc for why this is
+    /// genuine recovery, not merely routing around the crash arm. The
+    /// original incident this ticket follows up on is BBS finding
+    /// 01M2HWNZA7V4WCSRTJ04XYN7ES: a live REVIEWER reaped incidentally, not a
+    /// live rat.
+    pub(crate) fn live_reviewer_session_controls(&self) -> Vec<(String, SessionControl)> {
+        let reviewer_names: std::collections::HashSet<String> = self
+            .lock_registry()
+            .list_all()
+            .into_iter()
+            .filter(|r| r.role == "reviewer")
+            .map(|r| r.name.clone())
+            .collect();
+        self.lock_controls()
+            .iter()
+            .filter(|(name, _)| reviewer_names.contains(*name))
+            .map(|(name, control)| (name.clone(), control.clone()))
+            .collect()
+    }
+
+    /// TKT-ravig-kumob-timuh: transition a still-live generation straight to
+    /// [`Orphaned`](AgentState::Orphaned) — the exact disposition
+    /// `on_daemon_started`'s `orphan_live_agents` sweep gives a rat whose
+    /// process died while the daemon itself was down — but done HERE, on the
+    /// originating daemon, before this generation's process is signalled by
+    /// `shut_down_owned_reviewer_processes` in `server.rs`. Ordering is the
+    /// whole point: called before `control.kill()`, so by the time the
+    /// resulting `Exited` event reaches `handle_event`, `r.state.is_live()`
+    /// is already false and its crash arm (`state -> Failed`, `crashed =
+    /// true`, a synthesized "process exited" result) never fires — the
+    /// record stays exactly `Orphaned`, `pid` cleared, `cost_usd`/`usage`/
+    /// `review` untouched, ready for the SAME `respawn_generation` /
+    /// `respawn_sweep` / `abandoned()`-patience contract already proven for a
+    /// rat, rather than falling into the landing pipeline's review-death
+    /// bounded-replacement dispatch (a new generation, a new $0 budget
+    /// window, a re-authored `review_attempt`). A record that has already
+    /// raced to some OTHER terminal state on its own between enumeration and
+    /// this call is left alone — this only ever narrows a live state to
+    /// `Orphaned`, never widens it.
+    pub(crate) fn orphan_for_owned_shutdown(&self, name: &str) {
+        let _ = self.lock_registry().update(name, |r| {
+            if r.state.is_live() {
+                r.state = AgentState::Orphaned;
+                r.pid = None;
+            }
+        });
+    }
+
     fn lock_attempts(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<rk_core::id::SpawnId, AttemptWatch>> {
@@ -10501,6 +10591,81 @@ mod respawn_tests {
         assert!(
             marker_content.contains("ADMITTED_STEER_PAYLOAD"),
             "the marker must record the actual steer text delivered, got: {marker_content:?}"
+        );
+    }
+
+    /// TKT-rohib-rukaf-sizak: `live_session_controls` is the exact snapshot
+    /// `Server::run`'s graceful-shutdown owned-process sweep signs off on —
+    /// it must return every currently tracked live control, each of them
+    /// genuinely killable and bounded-joinable, and the map must be empty
+    /// again once `Exited` retires it (`handle_event`'s `Exited` arm calls
+    /// `lock_controls().remove(name)`).
+    #[tokio::test]
+    async fn live_reviewer_session_controls_snapshots_only_reviewer_role_live_controls() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        assert!(
+            sup.live_reviewer_session_controls().is_empty(),
+            "a fresh supervisor owns nothing yet"
+        );
+
+        fn launch_sleeping_session() -> rk_harness::HarnessSession {
+            let mut env = HashMap::new();
+            env.insert("RK_FAKE_HARNESS_CMD".into(), "sleep 300".to_string());
+            make_harness("fake")
+                .unwrap()
+                .launch(&LaunchSpec {
+                    cwd: std::env::temp_dir(),
+                    env,
+                    ..Default::default()
+                })
+                .unwrap()
+        }
+
+        // An ordinary rat: tracked in `controls` exactly like a reviewer, but
+        // must NOT appear in this snapshot (TKT-rohib-rukaf-sizak acceptance
+        // correction) — signalling it here would break `rk daemon
+        // rollover`'s park-then-`agent.respawn` contract.
+        let mut rat = record(repo.path(), None);
+        rat.name = "Whisker".into();
+        rat.role = "rat".into();
+        rat.state = AgentState::Running;
+        sup.lock_registry().insert(rat).unwrap();
+        let rat_session = launch_sleeping_session();
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Whisker",
+            rat_session.control,
+        );
+
+        // The reviewer this snapshot exists for.
+        let mut reviewer = record(repo.path(), None);
+        reviewer.name = "Nibble".into();
+        reviewer.role = "reviewer".into();
+        reviewer.state = AgentState::Running;
+        sup.lock_registry().insert(reviewer).unwrap();
+        let reviewer_session = launch_sleeping_session();
+        sup.track_session(
+            &mut sup.lock_session_tokens(),
+            "Nibble",
+            reviewer_session.control.clone(),
+        );
+
+        let owned = sup.live_reviewer_session_controls();
+        assert_eq!(
+            owned
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Nibble"],
+            "must snapshot only the reviewer-role control, excluding the tracked rat"
+        );
+        let (_, control) = owned.into_iter().next().unwrap();
+        control.kill().await.unwrap();
+        assert!(
+            control.wait_exited(std::time::Duration::from_secs(5)).await,
+            "the snapshot's control must be the real, killable, joinable session control"
         );
     }
 

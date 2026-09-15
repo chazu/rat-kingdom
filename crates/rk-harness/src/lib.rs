@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 
 /// Versioned, daemon-authenticated control input.  This is deliberately a
 /// different value from assistant/tool/stderr output: adapters must carry it
@@ -240,6 +241,13 @@ pub struct HarnessSession {
 pub struct SessionControl {
     steer_tx: Option<mpsc::Sender<ControlEnvelope>>,
     kill_tx: mpsc::Sender<KillSignal>,
+    /// Flips to `true` once the task that owns this session's `Child` has
+    /// observed `child.wait()` resolve — i.e. the OS process is physically
+    /// gone, not merely that a signal was sent to it. TKT-rohib-rukaf-sizak:
+    /// a graceful daemon shutdown needs this to prove deliberate cleanup
+    /// rather than relying on `Child::kill_on_drop` reaping the process as
+    /// an incidental side effect of runtime teardown.
+    exited: watch::Receiver<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -364,6 +372,27 @@ impl SessionControl {
             .send(KillSignal::Hard)
             .await
             .map_err(|_| rk_core::Error::other("session is no longer running"))
+    }
+
+    /// Await this session's actual OS process exit — not that a signal was
+    /// sent, that the owning task observed `child.wait()` resolve — bounded
+    /// by `timeout`. Returns `true` if exit was confirmed within the bound,
+    /// `false` on timeout; never hangs past it. Returns immediately if the
+    /// process had already exited before this was called.
+    pub async fn wait_exited(&self, timeout: Duration) -> bool {
+        let mut exited = self.exited.clone();
+        // `wait_for` resolves `Err(RecvError)`, not a hang, if the sender is
+        // dropped while the watched value is still `false` — e.g. the owning
+        // task panics or is aborted before it ever observes `child.wait()`
+        // resolve. That is the channel closing with NOTHING confirmed, not
+        // proof the process exited; only an inner `Ok` (which `wait_for` only
+        // ever returns once the predicate matched, i.e. the value is `true`)
+        // is a genuine confirmed exit. `result.is_ok()` on the OUTER
+        // `timeout` alone would accept that `Err` as if it were a success —
+        // this must check both layers, not just that the timeout itself
+        // didn't elapse.
+        let result = tokio::time::timeout(timeout, exited.wait_for(|done| *done)).await;
+        matches!(result, Ok(Ok(_)))
     }
 }
 
@@ -690,6 +719,7 @@ pub(crate) mod runner {
         let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
         let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
         let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
+        let (exited_tx, exited_rx) = watch::channel(false);
 
         let mut parse = wiring.parse;
         let steer_line = wiring.steer_line;
@@ -822,6 +852,11 @@ pub(crate) mod runner {
                 }
             };
             group_guard.disarm();
+            // The process is physically gone the instant `child.wait()`
+            // resolves above — signal that now rather than after the
+            // stderr-drain join below, which is diagnostic best-effort and
+            // must never delay a caller bounded-waiting on real exit.
+            let _ = exited_tx.send(true);
             // Join the stderr drain before publishing `Exited`: it sends on a
             // clone of the same channel from an independent task, so without
             // this the final stderr line(s) can race `Exited` onto the wire
@@ -846,6 +881,7 @@ pub(crate) mod runner {
             control: SessionControl {
                 steer_tx: steer_line.map(|_| steer_tx),
                 kill_tx,
+                exited: exited_rx,
             },
             pid,
         })
@@ -879,6 +915,7 @@ pub(crate) mod runner {
         let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
         let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
         let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
+        let (exited_tx, exited_rx) = watch::channel(false);
         let mut parse = wiring.parse;
         let resume_command = resume.command;
 
@@ -1029,6 +1066,7 @@ pub(crate) mod runner {
                                     error: "Codex resumed session exited before confirming control application".into(),
                                 }).await;
                             }
+                            let _ = exited_tx.send(true);
                             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                             return;
                         };
@@ -1056,6 +1094,7 @@ pub(crate) mod runner {
                                 attempt: 0,
                                 error: "Codex session could not resume because no session id was established".into(),
                             }).await;
+                            let _ = exited_tx.send(true);
                             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                             return;
                         };
@@ -1076,6 +1115,7 @@ pub(crate) mod runner {
                                 attempt: 0,
                                 error: "Codex session resume process could not be started".into(),
                             }).await;
+                            let _ = exited_tx.send(true);
                             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                             return;
                         };
@@ -1090,6 +1130,7 @@ pub(crate) mod runner {
                                     attempt: 0,
                                     error: "Codex session resume stdout was unavailable".into(),
                                 }).await;
+                                let _ = exited_tx.send(true);
                                 let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                                 return;
                             }
@@ -1121,6 +1162,7 @@ pub(crate) mod runner {
             control: SessionControl {
                 steer_tx: Some(steer_tx),
                 kill_tx,
+                exited: exited_rx,
             },
             pid,
         })
@@ -1134,13 +1176,35 @@ mod session_control_tests {
     fn control_with_capacity(capacity: usize) -> (SessionControl, mpsc::Receiver<ControlEnvelope>) {
         let (steer_tx, steer_rx) = mpsc::channel(capacity);
         let (kill_tx, _kill_rx) = mpsc::channel(1);
+        let (_exited_tx, exited_rx) = watch::channel(false);
         (
             SessionControl {
                 steer_tx: Some(steer_tx),
                 kill_tx,
+                exited: exited_rx,
             },
             steer_rx,
         )
+    }
+
+    /// TKT-rohib-rukaf-sizak acceptance correction (finding
+    /// `exit-watch-closed-is-not-confirmed-exit`): `control_with_capacity`
+    /// drops its `exited` sender immediately, while the watched value is
+    /// still `false` — modeling the owning runner task aborting/panicking
+    /// before it ever observes `child.wait()` resolve. The old
+    /// implementation read the OUTER `tokio::time::timeout`'s `Ok` alone,
+    /// which is also `Ok` when the INNER `wait_for` resolves `Err` on a
+    /// closed-while-false channel — a false positive that would have
+    /// reported a process as confirmed-exited on nothing but the channel
+    /// going away. Only an actually observed `true` may report confirmed
+    /// exit.
+    #[tokio::test]
+    async fn wait_exited_does_not_confirm_exit_when_the_watch_closes_before_reporting_true() {
+        let (control, _steer_rx) = control_with_capacity(1);
+        assert!(
+            !control.wait_exited(Duration::from_millis(200)).await,
+            "a closed watch that never reported true must not be read as confirmed exit"
+        );
     }
 
     /// The core contract `Supervisor::admit_steer` (rk-daemon) depends on: a

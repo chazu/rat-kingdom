@@ -1590,6 +1590,14 @@ pub(crate) struct LandingPipeline {
     /// `Server::run`'s shutdown `join_next`) open for up to
     /// `GateConfig::review_max_wait`, not the accept loop's own bound.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Handles for every still-running [`Self::spawn_background_drain`]
+    /// continuation, so a graceful daemon shutdown can explicitly join them
+    /// (TKT-rohib-rukaf-sizak) instead of leaving them to be aborted
+    /// incidentally when the process's own runtime tears down — the exact
+    /// gap `spawn_background_drain`'s own doc comment flags as remaining
+    /// work. Drained (not just read) by [`Self::join_background_drains`],
+    /// so a handle is joined at most once.
+    background_drains: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// One decision [`LandingPipeline::gate_worktree_sweep_once`] made about a
@@ -1634,6 +1642,7 @@ impl LandingPipeline {
             handoff,
             admission_gates: Mutex::new(HashMap::new()),
             shutdown: None,
+            background_drains: Mutex::new(Vec::new()),
         }
     }
 
@@ -2056,17 +2065,16 @@ impl LandingPipeline {
     /// `run_cycle` poll retries the entry left in place, same as
     /// `process_next`'s documented restart-safety.
     ///
-    /// Known, assessed residual gap (Munch-16 finding `01M2HTJ67JK3XCMX89KFQWG5A7`
-    /// on TKT-karut-jaraf-hivur, reviewed against this exact shape): this
-    /// bare `tokio::spawn` is not registered in `Server::run`'s
-    /// `background_tasks` `JoinSet`, so a graceful daemon stop does not
-    /// explicitly join it — it stops only because process exit tears the
-    /// runtime down, or (once TKT-karut-jaraf-hivur's `LandingPipeline`
-    /// shutdown field lands) because its own `process_entry` review waits
-    /// bail on that signal. No correctness risk on its own — restart-safety
-    /// already covers an aborted mid-`process_entry` state — but whoever
-    /// lands both branches together should decide whether this needs an
-    /// explicit `JoinSet` handle instead of accepting process-exit-abort.
+    /// Formerly a bare, untracked `tokio::spawn` (Munch-16 finding
+    /// `01M2HTJ67JK3XCMX89KFQWG5A7` on TKT-karut-jaraf-hivur flagged this as
+    /// remaining work): a graceful daemon stop did not explicitly join it,
+    /// relying only on process exit tearing the runtime down or the review
+    /// wait's own shutdown bail. TKT-rohib-rukaf-sizak: the handle is now
+    /// pushed onto `background_drains` and explicitly bounded-joined by
+    /// [`Self::join_background_drains`] from `Server::run`'s shutdown
+    /// sequence — restart-safety was always sufficient for correctness on
+    /// its own (an aborted mid-`process_entry` state resumes fine), this
+    /// just makes the stop deliberate rather than incidental.
     fn spawn_background_drain(
         self: &Arc<Self>,
         guard: tokio::sync::OwnedMutexGuard<()>,
@@ -2074,7 +2082,7 @@ impl LandingPipeline {
         target: String,
     ) {
         let pipeline = Arc::clone(self);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _guard = guard;
             loop {
                 // P7.1 handoff fence: same re-check as `drain_key` and
@@ -2121,6 +2129,43 @@ impl LandingPipeline {
                 }
             }
         });
+        match self.background_drains.lock() {
+            Ok(mut drains) => {
+                drains.retain(|h| !h.is_finished());
+                drains.push(handle);
+            }
+            Err(poisoned) => poisoned.into_inner().push(handle),
+        }
+    }
+
+    /// Explicitly join every still-running background-drain continuation
+    /// ([`Self::spawn_background_drain`]) within `deadline`, rather than
+    /// leaving it for the daemon process's own runtime teardown to abort
+    /// incidentally (TKT-rohib-rukaf-sizak). Called once, from
+    /// `Server::run`'s graceful-shutdown sequence. A drain still running
+    /// past `deadline` is left running rather than aborted — restart-safety
+    /// covers an interrupted mid-`process_entry` state either way, and
+    /// aborting mid-write here has no advantage over letting it finish.
+    pub(crate) async fn join_background_drains(&self, deadline: Duration) {
+        let handles: Vec<_> = match self.background_drains.lock() {
+            Ok(mut drains) => std::mem::take(&mut *drains),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let mut joins: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        for handle in handles {
+            joins.spawn(async move {
+                if tokio::time::timeout(deadline, handle).await.is_err() {
+                    warn!(
+                        "landing pipeline: background drain still running past the \
+                         graceful-stop bound; leaving it to finish on its own"
+                    );
+                }
+            });
+        }
+        while joins.join_next().await.is_some() {}
     }
 
     /// Shared result shape for a caller learning its own work key's outcome
@@ -15552,6 +15597,19 @@ checks: [
                 .unwrap()
                 .is_empty(),
             "both candidates must be retired from the active queue once the drain completes"
+        );
+
+        // TKT-rohib-rukaf-sizak: `spawn_background_drain`'s handoff must be
+        // tracked, not a bare untracked `tokio::spawn` — proven by actually
+        // joining its handle now that the drain above has finished. A
+        // generous bound that must return immediately (the task is already
+        // done), never by timing out.
+        pipeline
+            .join_background_drains(Duration::from_secs(5))
+            .await;
+        assert!(
+            pipeline.background_drains.lock().unwrap().is_empty(),
+            "join_background_drains must drain the tracked handle list"
         );
     }
 
