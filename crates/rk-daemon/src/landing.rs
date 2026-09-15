@@ -12599,6 +12599,182 @@ workflow: {
         );
     }
 
+    fn rat_spawn_params(repo: &Path, task: &str) -> crate::supervisor::SpawnParams {
+        crate::supervisor::SpawnParams {
+            repo: repo.display().to_string(),
+            task: task.into(),
+            prompt: None,
+            role: "rat".into(),
+            coordination: None,
+            harness: Some("fake".into()),
+            parent: None,
+            base: None,
+            review: None,
+            model: None,
+            permission_mode: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+            profile: None,
+            resolved_profile: None,
+        }
+    }
+
+    /// TKT-minak-mogiz-lizun: the confirmed FIFO stale-refusal defect — a
+    /// terminally refused automatic rework dispatch (`dispatch-refused`,
+    /// never auto-retried by this pipeline) must relinquish its OWN exact
+    /// lane-wait reservation the moment `route_rework`'s real spawn attempt
+    /// is refused, not park at the FIFO queue head for the full
+    /// `LANE_WAIT_STALE_SECS` (600s) crash-fallback window — otherwise a
+    /// free slot stays unusable by every other waiter behind it, which is
+    /// exactly the production symptom this ticket reproduced (limit 2,
+    /// occupied 0, waiting 2, a fresh spawn still refused).
+    ///
+    /// Exercised through the real dispatch path — `route_rework`'s actual
+    /// `supervisor.spawn_async` call and its `Err` branch — via a genuine
+    /// lane-capacity refusal (`set_implementation_admission_limits`), never
+    /// `set_dispatch_paused` (which is refused before `try_reserve_lane_wip`
+    /// is ever reached and so could never exercise this fix). This proves
+    /// the integration point landing.rs wires up, not just the
+    /// `Registry::abandon_lane_wait` primitive in isolation.
+    ///
+    /// Also proves the fix is exactly scoped: an unrelated, actively-queued
+    /// waiter ahead of the rework ticket in the SAME repo/lane keeps both
+    /// its queue position and its own durable reservation untouched, and is
+    /// admitted normally once real capacity frees — no 600s wait on either
+    /// side, and no real sleep in this test (capacity frees by an explicit
+    /// state update, matching the established fake-harness-race pattern
+    /// `implementation_lane_admits_the_longest_waiting_request_first` uses).
+    ///
+    /// Out of scope here (pre-existing, unchanged by this fix, already
+    /// covered elsewhere): `abandon_lane_wait` takes only `(repo, lane,
+    /// key)`, no attempt token, so it cannot itself fence a stale retry of
+    /// the SAME key under a NEW attempt — that discrimination is
+    /// `evict_stale_lane_waiters`'s `last_seen`-vs-`requested_at` job,
+    /// untouched by this change and covered by
+    /// `active_lane_waiter_persists_heartbeat_across_a_long_wait` (agents.rs
+    /// tests). Restart durability of the wait queue is
+    /// `implementation_lane_wait_order_survives_a_restart`, and fail-closed
+    /// persistence-failure handling is
+    /// `implementation_lane_refuses_admission_rather_than_silently_lose_durable_queue_order`
+    /// (both supervisor.rs tests) — neither touched by this change either.
+    #[tokio::test]
+    async fn terminal_rework_refusal_releases_its_lane_wait_and_preserves_an_active_waiters_priority()
+     {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        // Register the tempdir root as "code-repo" in `repos.json` so
+        // `Supervisor::repository_name` (what the real `spawn_async` call
+        // inside `route_rework` resolves its lane key from) agrees with
+        // `review_candidate_entry`'s hardcoded `repo_name` — exactly the
+        // invariant production relies on (every `LandingQueueEntry` is built
+        // from `self.supervisor.repository_name(&repo)` itself, never a
+        // separately-chosen name). Without this the test's own two repo-name
+        // sources would silently diverge, which is not a real defect.
+        activate_repository_policy(
+            home.path(),
+            repo_dir.path(),
+            rk_workflow::RepositoryPolicy::default(),
+        );
+        let repo_name = "code-repo".to_string();
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .supervisor
+            .set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
+
+        // Saturate the repo's one-slot implementation lane with an unrelated
+        // live agent so every admission attempt below is refused purely on
+        // lane capacity.
+        let occupying = pipeline
+            .supervisor
+            .spawn_async(rat_spawn_params(repo_dir.path(), "occupying-task"), 0)
+            .await
+            .unwrap();
+        let pin_occupying_running = || {
+            pipeline
+                .supervisor
+                .lock_registry()
+                .update(&occupying.name, |r| {
+                    r.state = crate::agents::AgentState::Running
+                })
+                .unwrap();
+        };
+        pin_occupying_running();
+
+        // A distinct, unrelated caller is already durably queued AHEAD of
+        // the rework dispatch below — the "live, actively retrying waiter"
+        // whose FIFO priority and reservation this fix must never disturb.
+        let active_params = rat_spawn_params(repo_dir.path(), "active-live-waiter");
+        let active_refusal = pipeline
+            .supervisor
+            .spawn_async(active_params.clone(), 0)
+            .await;
+        assert!(
+            matches!(&active_refusal, Err(e) if e.to_string() == crate::supervisor::IMPLEMENTATION_LANE_REFUSED),
+            "{active_refusal:?}"
+        );
+        pin_occupying_running();
+
+        // Drive the real dispatch path: the pipeline's own `route_rework`
+        // attempts the correction spawn, which the still-saturated lane
+        // refuses.
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], LandingOutcome::ReworkFiled(_)));
+
+        let markers = scoped_tuples(&space, Category::Event, REWORK_DISPATCH_IDENTITY);
+        assert!(
+            markers
+                .iter()
+                .any(|m| m.payload["state"] == "dispatch-refused"),
+            "the rework dispatch must have hit the real lane-capacity refusal: {markers:?}"
+        );
+
+        // The critical assertion: right after the real dispatch-refused
+        // withhold, the rework's own reservation is gone but the
+        // independent active waiter's is untouched — exactly one waiter
+        // left, not zero (over-cleared) and not two (never cleared).
+        let (waiting, _) = pipeline
+            .supervisor
+            .lock_registry()
+            .lane_wait_stats(&repo_name, crate::agents::Lane::Implementation);
+        assert_eq!(
+            waiting, 1,
+            "the rework's own lane-wait reservation must be released on its terminal refusal, \
+             while the unrelated active waiter's stays queued"
+        );
+
+        // Free the only occupied slot — no clock advance, no 600s wait.
+        pipeline
+            .supervisor
+            .lock_registry()
+            .update(&occupying.name, |r| {
+                r.state = crate::agents::AgentState::Completed
+            })
+            .unwrap();
+
+        let active_retry = pipeline.supervisor.spawn_async(active_params, 0).await;
+        assert!(
+            active_retry.is_ok(),
+            "the active waiter must be admitted immediately once capacity frees, unblocked by \
+             the abandoned rework reservation that used to sit ahead of it in the FIFO queue \
+             until LANE_WAIT_STALE_SECS: {active_retry:?}"
+        );
+        let (waiting_after, _) = pipeline
+            .supervisor
+            .lock_registry()
+            .lane_wait_stats(&repo_name, crate::agents::Lane::Implementation);
+        assert_eq!(waiting_after, 0);
+    }
+
     #[tokio::test]
     async fn dispatching_marker_without_spawn_survives_restart_as_one_human_gate() {
         let home = tempfile::tempdir().unwrap();
