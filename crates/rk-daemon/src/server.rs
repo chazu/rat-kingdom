@@ -2451,7 +2451,11 @@ impl Daemon {
                     codes::FORBIDDEN,
                     format!("{} is not authorized for {}", req.caller, req.method),
                 )),
-                Ok(req) if req.method == "verify.run" || req.method == "release.prepare" => {
+                Ok(req)
+                    if req.method == "verify.run"
+                        || req.method == "release.prepare"
+                        || req.method == "release.select" =>
+                {
                     self.dispatch_watching_disconnect(req, &mut read, conn_id)
                         .await
                 }
@@ -4079,6 +4083,7 @@ impl Daemon {
                 })
             }
             "release.prepare" => reply(self.handle_release_prepare(req, conn_id).await),
+            "release.select" => reply(self.handle_release_select(req, conn_id).await),
             "release.list" => reply(self.handle_release_list(req)),
             "release.show" => reply(self.handle_release_show(req)),
             "ticket.new" => reply(self.handle_ticket_new(req).await),
@@ -8057,7 +8062,26 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
-        let repo_path = {
+        self.run_release_prepare(req, conn_id, params.repo, params.candidate, params.recipe)
+            .await
+    }
+
+    /// P5.1 (`TKT-ratik-rivam-jadud`): resolve the repo's activated
+    /// `release.integrationBranch` to its current head and select it as the
+    /// candidate, instead of requiring an operator-supplied `--candidate`.
+    /// Everything past candidate resolution is byte-for-byte the same code
+    /// path `release.prepare` already uses — the same content-addressed
+    /// identity, admission wiring, and cancellation — so a later integration
+    /// commit can never mutate an already-selected candidate: it simply
+    /// resolves to a different commit and thus a different, separately
+    /// immutable release id. `release.list`/`release.show` are the existing
+    /// observation surface for a selected candidate; this adds no new one.
+    async fn handle_release_select(&self, req: Request, conn_id: u64) -> Response {
+        let params: ReleaseSelectParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let policy = {
             let reg = match self.repos.lock() {
                 Ok(r) => r,
                 Err(_) => {
@@ -8065,7 +8089,10 @@ impl Daemon {
                 }
             };
             match reg.get(&params.repo) {
-                Some(record) => record.path.clone(),
+                Some(record) => match record.effective_policy() {
+                    Ok(policy) => policy,
+                    Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+                },
                 None => {
                     return Response::err(
                         req.id,
@@ -8075,12 +8102,57 @@ impl Daemon {
                 }
             }
         };
+        let integration_branch = policy.release.integration_branch.trim();
+        let release_target = policy.release.release_target.trim();
+        if integration_branch.is_empty() || release_target.is_empty() {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!(
+                    "repository '{}' has no activated release role (repo.release.integrationBranch \
+                     and repo.release.releaseTarget); configure both and activate via `rk repo \
+                     onboard`, or use release.prepare with an explicit --candidate",
+                    params.repo
+                ),
+            );
+        }
+        let candidate = integration_branch.to_string();
+        self.run_release_prepare(req, conn_id, params.repo, candidate, params.recipe)
+            .await
+    }
+
+    async fn run_release_prepare(
+        &self,
+        req: Request,
+        conn_id: u64,
+        repo: String,
+        candidate: String,
+        recipe: String,
+    ) -> Response {
+        let repo_path = {
+            let reg = match self.repos.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned")
+                }
+            };
+            match reg.get(&repo) {
+                Some(record) => record.path.clone(),
+                None => {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!("unknown repository: {repo}"),
+                    )
+                }
+            }
+        };
         // Serialize staging access and expose preparation liveness to list/show.
         let _guard = self.release_prepare_lock.lock().await;
         // Freeze the mutable ref once under the lock for both proof lookup and building.
         let (resolved_commit, tree_sha) = {
             let repo_path = repo_path.clone();
-            let candidate = params.candidate.clone();
+            let candidate = candidate.clone();
             match tokio::task::spawn_blocking(move || {
                 crate::release::resolve_candidate(&repo_path, &candidate)
             })
@@ -8115,10 +8187,10 @@ impl Daemon {
                 self.supervisor.verification_resources(),
                 check.shared_cargo_target,
             )
-            .lookup_verification_proof(&params.repo, &resolved_commit, &check)?;
+            .lookup_verification_proof(&repo, &resolved_commit, &check)?;
             // Retain the exact lookup key so consumers can independently trace the durable proof.
             let key = crate::managed_verification::verification_proof_key(
-                &params.repo,
+                &repo,
                 &resolved_commit,
                 &check,
             );
@@ -8162,12 +8234,12 @@ impl Daemon {
         let prepare_fut = crate::release::prepare(
             &self.layout,
             crate::release::PrepareParams {
-                repo_name: params.repo,
+                repo_name: repo,
                 repo_path,
-                requested: params.candidate,
+                requested: candidate,
                 resolved_commit,
                 tree_sha,
-                recipe: params.recipe,
+                recipe,
                 known_verification,
             },
             release_admission,
@@ -13032,6 +13104,13 @@ struct ReleasePrepareParams {
 
 fn default_release_recipe() -> String {
     crate::release::RECIPE_PAIRED_RK_MCP.to_string()
+}
+
+#[derive(Deserialize)]
+struct ReleaseSelectParams {
+    repo: String,
+    #[serde(default = "default_release_recipe")]
+    recipe: String,
 }
 
 #[derive(Deserialize)]

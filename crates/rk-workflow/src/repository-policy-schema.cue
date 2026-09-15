@@ -11,6 +11,7 @@ repo: #RepositoryPolicy
 	landing: #LandingPolicy | *{}
 	reap: #ReapPolicy | *{}
 	phaseLatency: #PhaseLatencyPolicy | *{}
+	release: #ReleasePolicy | *{}
 }
 
 #WorkPolicy: {
@@ -178,4 +179,17 @@ repo: #RepositoryPolicy
 // one.
 #ReapPolicy: {
 	artifactPaths: [...string] | *[]
+}
+
+// INTEGRATION/RELEASE ROLES (P5.1, TKT-ratik-rivam-jadud): names the rolling
+// branch integrated deliveries land on and the protected branch a later
+// immutable release snapshot targets, instead of inferring either from
+// branch-naming convention. Both empty (the default) disables the role split
+// entirely — zero behavior change for a repo that has not opted in. Setting
+// only one of the two fields fails activation rather than silently looking
+// active. releaseTarget must also appear in landing.protectedTargets — an
+// immutable release snapshot always targets a genuinely protected edge.
+#ReleasePolicy: {
+	integrationBranch: string | *""
+	releaseTarget: string | *""
 }
