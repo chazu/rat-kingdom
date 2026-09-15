@@ -8976,15 +8976,16 @@ impl Daemon {
 
     /// Front-gate for `rk spawn`: lets the CLI resolve the SAME effective
     /// landing target `agent.spawn` would use — a caller-supplied `--base`,
-    /// or (when omitted) the policy-derived delivery default — and confirm
+    /// or (when omitted) the policy-derived spawn default for the caller's
+    /// role, integration routing included — and confirm
     /// it names a real local branch, not a bare commit that would later be
     /// persisted as an unmergeable landing target. This must cover the
     /// no-`--base` case too: the CLI flips a dispatched ticket to
     /// `in_progress` before calling `agent.spawn` regardless of whether
     /// `--base` was given, so checking only an explicit base would still
     /// leave a policy-derived-but-invalid default free to mark the ticket
-    /// `in_progress` before `Supervisor::spawn_async`'s own (authoritative,
-    /// role-agnostic) re-check refuses the spawn.
+    /// `in_progress` before `Supervisor::spawn_async`'s own (authoritative)
+    /// re-check refuses the spawn.
     ///
     /// `method_policy` grants this `FOREMAN_CHILD`, same as `agent.spawn`
     /// itself: a foreman's own `rk spawn` for a delegated child must pass
@@ -9012,14 +9013,19 @@ impl Daemon {
                     &repo,
                     params.base.as_deref(),
                 )?;
-                return supervisor.resolve_landing_target(&repo, Some(&branch), None);
+                return supervisor.resolve_landing_target(&repo, &params.role, Some(&branch), None);
             }
             let repo_policy = if params.role == crate::onboarding_sessions::ONBOARDER_ROLE {
                 None
             } else {
                 Some(supervisor.repository_policy(&repo)?)
             };
-            supervisor.resolve_landing_target(&repo, params.base.as_deref(), repo_policy.as_ref())
+            supervisor.resolve_landing_target(
+                &repo,
+                &params.role,
+                params.base.as_deref(),
+                repo_policy.as_ref(),
+            )
         })
         .await;
         match result {

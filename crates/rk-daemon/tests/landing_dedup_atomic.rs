@@ -759,10 +759,14 @@ checks: [
     std::fs::remove_file(layout.socket_path()).ok();
 
     // Daemon B: a fresh `Daemon::new` over the SAME on-disk home, with the
-    // SAME installed trigger rediscovered off disk.
-    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
-    let handle_b = tokio::spawn(daemon_b.run());
-    let mut client = connect(&layout).await;
+    // SAME installed trigger rediscovered off disk. `restart_daemon_over`
+    // (not a bare `Daemon::new` + `connect`) retries the whole start on the
+    // identified transient "already holds the lock" refusal this exact
+    // abort-based fake restart still observably hits — reproduced directly
+    // under this test at roughly a 1-in-10 rate before this fix (any OTHER
+    // startup failure still panics immediately; see its doc comment). This
+    // is an in-process durable-state fixture, not physical-restart coverage.
+    let (mut client, handle_b) = support::restart_daemon_over(&layout, &config).await;
 
     assert!(
         wait_until_queue_empty(&mut client, &repo_name, 300).await,

@@ -95,8 +95,23 @@ sort -u "$affected_file" -o "$affected_file"
 echo "verify-changed: affected packages"
 sed 's/^/  - /' "$affected_file"
 
+# verify_jobs bounds build parallelism (`--jobs`) and test process
+# concurrency (`--test-threads`) explicitly, the same fixed-constant approach
+# `verify-full.sh` documents at length (its own comment above `verify_jobs=4`
+# — not an env override, for the same untrusted/mistaken-caller-landing-in-a-
+# gate reasoning). This is the PRODUCTION supported configuration for this
+# script: 2, half of `verify-full.sh`'s 4, because this script's own affected-
+# package selection already narrows what it builds/tests relative to a full
+# workspace run, so it is a lighter concurrent share of the same host.
+verify_jobs=2
+
+strip_rk_spawn_env=(
+	-u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE
+	-u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT
+)
+
 # Package names are Cargo identifiers and therefore contain no shell spaces.
 # shellcheck disable=SC2046
-cargo clippy $(awk '{ printf "-p %s ", $0 }' "$affected_file") --all-targets -- -D warnings
+cargo clippy $(awk '{ printf "-p %s ", $0 }' "$affected_file") --all-targets --jobs "$verify_jobs" -- -D warnings
 # shellcheck disable=SC2046
-env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE -u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT cargo nextest run $(awk '{ printf "-p %s ", $0 }' "$affected_file") --no-fail-fast
+env "${strip_rk_spawn_env[@]}" cargo nextest run $(awk '{ printf "-p %s ", $0 }' "$affected_file") --no-fail-fast --build-jobs "$verify_jobs" --test-threads "$verify_jobs"

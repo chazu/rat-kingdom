@@ -1263,9 +1263,20 @@ pub(crate) enum LandingEdgeClass {
     /// `WorkflowEngine::lookup_verification_proof` already lets a reviewer's
     /// later `verify.run` on this exact candidate sha skip re-running it).
     ProtectedFinal,
-    /// `target` is not a protected/final target — an inner child-to-parent
-    /// edge. Runs only the checks `GateConfig::focused_checks` selects for
-    /// this candidate's changed paths; never the full suite by default.
+    /// `target` is this repo's activated `release.integrationBranch` — an
+    /// opted-in edge that MUST never land unchecked (see
+    /// [`select_integration_checks`]): full coverage of every changed path by
+    /// a named `focusedChecks` check runs just those checks; anything short
+    /// of full coverage (no rules configured, a partially-covered changeset,
+    /// or a matching rule that names zero checks) conservatively falls back
+    /// to the full `check_name` check instead of the generic [`Self::Inner`]
+    /// edge's "run nothing beyond the policy gates" default.
+    Integration,
+    /// `target` is not a protected/final target and not the activated
+    /// release-integration branch — an ordinary inner child-to-parent edge.
+    /// Runs only the checks `GateConfig::focused_checks` selects for this
+    /// candidate's changed paths (by ANY matching rule, not full coverage);
+    /// never the full suite by default. Unchanged by this policy's addition.
     Inner,
 }
 
@@ -1273,9 +1284,64 @@ impl LandingEdgeClass {
     fn as_str(self) -> &'static str {
         match self {
             LandingEdgeClass::ProtectedFinal => "protected-final",
+            LandingEdgeClass::Integration => "integration",
             LandingEdgeClass::Inner => "inner",
         }
     }
+}
+
+/// Selection outcome for the release-integration edge
+/// ([`LandingEdgeClass::Integration`]). Unlike the generic inner edge's
+/// [`select_focused_checks`] (selected the moment ANY rule matches ANY
+/// changed path), this edge requires every changed path be covered by at
+/// least one matching rule that names at least one check — a rule matching
+/// only SOME of the changeset is exactly the "one known path does not
+/// establish coverage of all changed inputs" gap this ticket closes.
+/// [`Self::Fallback`] carries why full coverage was not established, for the
+/// caller's conservative full-check fallback.
+enum IntegrationCheckSelection {
+    /// Every changed path is covered. May still carry an empty check list —
+    /// vacuously covered, either because there were no changed paths at all
+    /// or because every covering rule named zero checks for them.
+    Covered(Vec<String>, Vec<String>),
+    Fallback(String),
+}
+
+/// Resolve `LandingPolicy::focused_checks` against `changed_paths` for the
+/// release-integration edge specifically (see [`IntegrationCheckSelection`]).
+/// A path is "covered" only by a rule that BOTH matches it (or declares no
+/// `paths`, an unconditional catch-all) AND names at least one check — a
+/// matching rule with an empty `checks` list is the "invalid matching rule"
+/// this ticket's acceptance calls out and must not count as coverage.
+fn select_integration_checks(
+    rules: &[rk_workflow::FocusedCheckRule],
+    changed_paths: &[String],
+) -> IntegrationCheckSelection {
+    if rules.is_empty() {
+        return IntegrationCheckSelection::Fallback(
+            "no focusedChecks rules are configured for this repo".to_string(),
+        );
+    }
+    let uncovered: Vec<&str> = changed_paths
+        .iter()
+        .filter(|path| {
+            let single = [(*path).clone()];
+            !rules.iter().any(|rule| {
+                !rule.checks.is_empty()
+                    && (rule.paths.is_empty()
+                        || rule.paths.iter().any(|p| ere_matches_any(p, &single)))
+            })
+        })
+        .map(String::as_str)
+        .collect();
+    if !uncovered.is_empty() {
+        return IntegrationCheckSelection::Fallback(format!(
+            "changed path(s) not covered by any focusedChecks rule naming a check: {}",
+            uncovered.join(", ")
+        ));
+    }
+    let (selected, reasons) = select_focused_checks(rules, changed_paths);
+    IntegrationCheckSelection::Covered(selected, reasons)
 }
 
 /// Whether POSIX ERE `pattern` matches any line of `paths` — evaluated
@@ -1392,6 +1458,15 @@ pub(crate) struct GateConfig {
     /// check-list rules an INNER edge (`target` not in `protected_targets`)
     /// selects from instead of running the full `check_name` check.
     pub(crate) focused_checks: Vec<rk_workflow::FocusedCheckRule>,
+    /// RELEASE-INTEGRATION BRANCH (`RepositoryPolicy::release.integrationBranch`):
+    /// empty when this repo's release role is not activated (`Supervisor`'s
+    /// existing behavior — see [`LandingEdgeClass::Inner`]). When non-empty
+    /// and it names `target`, this edge is [`LandingEdgeClass::Integration`]
+    /// instead of `Inner`, even though it is (by construction —
+    /// `validate_repository_policy` requires `releaseTarget` to be a
+    /// `protectedTargets` entry distinct from `integrationBranch`) never
+    /// also a protected-final target.
+    pub(crate) release_integration_branch: String,
 }
 
 impl Default for GateConfig {
@@ -1406,6 +1481,7 @@ impl Default for GateConfig {
             review_max_wait: Duration::from_secs(45 * 60),
             protected_targets: vec!["main".into()],
             focused_checks: Vec::new(),
+            release_integration_branch: String::new(),
             // Deliberately OFF in this bare default, unlike every other field
             // here: `gate_config` never reads these two from `Default` (it
             // takes them straight off the resolved `LandingPolicy`, whose own
@@ -1696,7 +1772,9 @@ impl LandingPipeline {
     /// `focused_checks` selects (both repo.cue-configurable, see
     /// [`LandingEdgeClass`]).
     fn gate_config(&self, repo: &rk_git::Repo) -> rk_core::Result<GateConfig> {
-        let policy = self.supervisor.repository_policy(repo)?.landing;
+        let repo_policy = self.supervisor.repository_policy(repo)?;
+        let release_integration_branch = repo_policy.release.integration_branch.clone();
+        let policy = repo_policy.landing;
         let defaults = GateConfig::default();
         Ok(GateConfig {
             check_name: defaults.check_name,
@@ -1713,6 +1791,7 @@ impl LandingPipeline {
             shadow_review_harness: policy.shadow_review_harness,
             protected_targets: policy.protected_targets,
             focused_checks: policy.focused_checks,
+            release_integration_branch,
         })
     }
 
@@ -8290,10 +8369,31 @@ impl LandingPipeline {
             ),
         ];
 
+        // Every check env below carries `RK_VERIFY_BASE` alongside the
+        // existing `RK_CHECK_TARGET`: `scripts/verify-changed.sh` (the
+        // `verify-changed` named check) has always read `RK_VERIFY_BASE` for
+        // its own diff base, defaulting to `origin/main` when unset — a
+        // default that silently diffs against the wrong branch on any edge
+        // whose target isn't `main`. This binds that script's base to the
+        // SAME immutable target/candidate every other gate is already pinned
+        // to (this function's `target` param; the worktree HEAD is pinned to
+        // `tested_sha` by the caller), so "defaulting to origin/main" can
+        // never test a different diff than the one this edge actually gates.
+        // Purely additive: a check that never reads `RK_VERIFY_BASE` is
+        // unaffected.
+        let bound_env = |target: &str| {
+            vec![
+                ("RK_CHECK_TARGET".to_string(), target.to_string()),
+                ("RK_VERIFY_BASE".to_string(), target.to_string()),
+            ]
+        };
+
         let is_protected_final = gates.protected_targets.iter().any(|t| t == target);
+        let is_release_integration = !gates.release_integration_branch.is_empty()
+            && gates.release_integration_branch == target;
         let (edge_class, full_check_required, reason) = if is_protected_final {
             let verify = find(&gates.check_name)?;
-            checks.push((verify, Vec::new(), gates.gate_timeout));
+            checks.push((verify, bound_env(target), gates.gate_timeout));
             (
                 LandingEdgeClass::ProtectedFinal,
                 true,
@@ -8303,6 +8403,47 @@ impl LandingPipeline {
                     gates.check_name
                 ),
             )
+        } else if is_release_integration {
+            match select_integration_checks(&gates.focused_checks, changed_paths) {
+                IntegrationCheckSelection::Covered(selected, reasons) if !selected.is_empty() => {
+                    for check_name in &selected {
+                        let check = find(check_name)?;
+                        checks.push((check, bound_env(target), gates.gate_timeout));
+                    }
+                    (
+                        LandingEdgeClass::Integration,
+                        false,
+                        format!(
+                            "target `{target}` is this repo's activated release-integration \
+                             branch; every changed path is covered, running policy-selected \
+                             focused checks: {}",
+                            reasons.join("; ")
+                        ),
+                    )
+                }
+                IntegrationCheckSelection::Covered(_, _) => (
+                    LandingEdgeClass::Integration,
+                    false,
+                    format!(
+                        "target `{target}` is this repo's activated release-integration branch; \
+                         no changed path required a named check beyond protected-paths/diff-scope"
+                    ),
+                ),
+                IntegrationCheckSelection::Fallback(why) => {
+                    let verify = find(&gates.check_name)?;
+                    checks.push((verify, bound_env(target), gates.gate_timeout));
+                    (
+                        LandingEdgeClass::Integration,
+                        true,
+                        format!(
+                            "target `{target}` is this repo's activated release-integration \
+                             branch; {why} — an integration edge never lands unchecked, falling \
+                             back to the full `{}` check",
+                            gates.check_name
+                        ),
+                    )
+                }
+            }
         } else {
             let (selected, reasons) = select_focused_checks(&gates.focused_checks, changed_paths);
             if selected.is_empty() {
@@ -8317,11 +8458,7 @@ impl LandingPipeline {
             } else {
                 for check_name in &selected {
                     let check = find(check_name)?;
-                    checks.push((
-                        check,
-                        vec![("RK_CHECK_TARGET".to_string(), target.to_string())],
-                        gates.gate_timeout,
-                    ));
+                    checks.push((check, bound_env(target), gates.gate_timeout));
                 }
                 (
                     LandingEdgeClass::Inner,
@@ -19246,6 +19383,333 @@ checks: [
         assert_eq!(plans[1].payload["edge_class"], "protected-final");
         assert_eq!(plans[1].payload["full_check_required"], true);
         assert!(!plans[1].payload["proof_key"].is_null());
+    }
+
+    // --- TKT-dijid-noruj-pirab: the release-integration edge never lands
+    // unchecked (see `LandingEdgeClass::Integration`/`select_integration_checks`) ---
+
+    /// `RepositoryPolicy` activating BOTH the P5.1 release role (`integration`
+    /// -> `main`) and a `focusedChecks` rule scoped to `feature.rs` — the
+    /// activation example this ticket's acceptance calls for. `checks_from`
+    /// lets each test vary which rule (if any) exists without repeating the
+    /// whole struct literal.
+    fn release_role_policy(
+        focused_checks: Vec<rk_workflow::FocusedCheckRule>,
+    ) -> rk_workflow::RepositoryPolicy {
+        rk_workflow::RepositoryPolicy {
+            landing: rk_workflow::LandingPolicy {
+                protected_targets: vec!["main".into()],
+                focused_checks,
+                ..Default::default()
+            },
+            release: rk_workflow::ReleasePolicy {
+                integration_branch: "integration".into(),
+                release_target: "main".into(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn feature_rs_rule(checks: Vec<&str>) -> rk_workflow::FocusedCheckRule {
+        rk_workflow::FocusedCheckRule {
+            paths: vec![r"feature\.rs$".into()],
+            class: "feature".into(),
+            checks: checks.into_iter().map(String::from).collect(),
+        }
+    }
+
+    /// Two branches, `main` and `integration`, both created before any
+    /// candidate exists, plus a `child` branch off `integration` carrying one
+    /// commit that touches `changed_file` — the shared setup every test below
+    /// starts from. Returns `child`'s head sha.
+    fn setup_integration_edge_candidate(repo_dir: &Path, changed_files: &[&str]) -> String {
+        git(repo_dir, &["checkout", "-b", "integration"]);
+        git(repo_dir, &["checkout", "-b", "child"]);
+        for file in changed_files {
+            std::fs::write(repo_dir.join(file), "fn x() {}\n").unwrap();
+        }
+        git(repo_dir, &["add", "."]);
+        git(repo_dir, &["commit", "-m", "feat: add feature"]);
+        let child_head = rev_parse(repo_dir, "child");
+        git(repo_dir, &["checkout", "integration"]);
+        child_head
+    }
+
+    #[tokio::test]
+    async fn integration_edge_with_full_path_coverage_runs_only_focused_checks() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let marker_dir = tempfile::tempdir().unwrap();
+        let lint_marker = marker_dir.path().join("lint-ran");
+        let verify_marker = marker_dir.path().join("verify-ran");
+        let checks = format!(
+            r#"checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "lint-check", command: "echo x >> '{lint}'", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{verify}'", timeout: "30s"}},
+]
+"#,
+            lint = lint_marker.display(),
+            verify = verify_marker.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+        activate_repository_policy(
+            home.path(),
+            repo_dir.path(),
+            release_role_policy(vec![feature_rs_rule(vec!["lint-check"])]),
+        );
+        let child_head = setup_integration_edge_candidate(repo_dir.path(), &["feature.rs"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "release-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "child".into(),
+                target: "integration".into(),
+                head_sha: child_head,
+                diff_class: "doc-only".into(),
+                task: "add feature".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline
+            .drain_key("release-repo", "integration")
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0], LandingOutcome::Landed(_)),
+            "{:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lint_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "every changed path is covered, so only the focused check should run"
+        );
+        assert!(
+            !verify_marker.exists(),
+            "full coverage must never fall back to the full check"
+        );
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].payload["edge_class"], "integration");
+        assert_eq!(plans[0].payload["full_check_required"], false);
+        assert_eq!(
+            plans[0].payload["selected_checks"],
+            json!([
+                "landing-protected-paths",
+                "landing-diff-scope",
+                "lint-check"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_edge_with_no_focused_checks_falls_back_to_the_full_check() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let marker_dir = tempfile::tempdir().unwrap();
+        let verify_marker = marker_dir.path().join("verify-ran");
+        let checks = format!(
+            r#"checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{verify}'", timeout: "30s"}},
+]
+"#,
+            verify = verify_marker.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+        // No focusedChecks rules configured at all — this repo activated the
+        // release role but never named a check for its integration edge.
+        activate_repository_policy(home.path(), repo_dir.path(), release_role_policy(vec![]));
+        let child_head = setup_integration_edge_candidate(repo_dir.path(), &["feature.rs"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "release-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "child".into(),
+                target: "integration".into(),
+                head_sha: child_head,
+                diff_class: "doc-only".into(),
+                task: "add feature".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline
+            .drain_key("release-repo", "integration")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcomes[0], LandingOutcome::Landed(_)),
+            "{:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&verify_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "an unconfigured integration edge must conservatively run the full check, never \
+             land unchecked"
+        );
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(plans[0].payload["edge_class"], "integration");
+        assert_eq!(plans[0].payload["full_check_required"], true);
+    }
+
+    #[tokio::test]
+    async fn integration_edge_with_partially_covered_changed_paths_falls_back_to_the_full_check() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let marker_dir = tempfile::tempdir().unwrap();
+        let lint_marker = marker_dir.path().join("lint-ran");
+        let verify_marker = marker_dir.path().join("verify-ran");
+        let checks = format!(
+            r#"checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "lint-check", command: "echo x >> '{lint}'", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{verify}'", timeout: "30s"}},
+]
+"#,
+            lint = lint_marker.display(),
+            verify = verify_marker.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+        // The one rule only covers `feature.rs`; the candidate below also
+        // touches `other.rs`, which no rule names a check for.
+        activate_repository_policy(
+            home.path(),
+            repo_dir.path(),
+            release_role_policy(vec![feature_rs_rule(vec!["lint-check"])]),
+        );
+        let child_head =
+            setup_integration_edge_candidate(repo_dir.path(), &["feature.rs", "other.rs"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "release-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "child".into(),
+                target: "integration".into(),
+                head_sha: child_head,
+                diff_class: "doc-only".into(),
+                task: "add feature".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline
+            .drain_key("release-repo", "integration")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcomes[0], LandingOutcome::Landed(_)),
+            "{:?}",
+            outcomes[0]
+        );
+        assert!(
+            !lint_marker.exists(),
+            "a partially-covered changeset must fall back to the full check, not run a mix of \
+             the partial focused check and nothing for the uncovered path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&verify_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "one known covered path must not establish coverage of the whole changeset"
+        );
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(plans[0].payload["edge_class"], "integration");
+        assert_eq!(plans[0].payload["full_check_required"], true);
+    }
+
+    /// Binds `scripts/verify-changed.sh`'s own `RK_VERIFY_BASE` diff base to
+    /// the SAME target every other gate is already pinned to, on every edge
+    /// class that schedules a real check — not just the new integration edge.
+    /// A check that never reads the variable is unaffected; this only proves
+    /// it is actually set to `entry.target`, never left to default to
+    /// `origin/main`.
+    #[tokio::test]
+    async fn selected_checks_receive_rk_verify_base_bound_to_the_candidate_target() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let marker_dir = tempfile::tempdir().unwrap();
+        let base_marker = marker_dir.path().join("base-seen");
+        let checks = format!(
+            r#"checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "lint-check", command: "printf '%s' \"$RK_VERIFY_BASE\" >> '{marker}'", timeout: "30s"}},
+]
+"#,
+            marker = base_marker.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+        activate_repository_policy(
+            home.path(),
+            repo_dir.path(),
+            release_role_policy(vec![feature_rs_rule(vec!["lint-check"])]),
+        );
+        let child_head = setup_integration_edge_candidate(repo_dir.path(), &["feature.rs"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "release-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "child".into(),
+                target: "integration".into(),
+                head_sha: child_head,
+                diff_class: "doc-only".into(),
+                task: "add feature".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline
+            .drain_key("release-repo", "integration")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcomes[0], LandingOutcome::Landed(_)),
+            "{:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&base_marker).unwrap(),
+            "integration",
+            "RK_VERIFY_BASE must be bound to this candidate's actual target, not left to \
+             verify-changed.sh's own origin/main default"
+        );
     }
 
     #[tokio::test]

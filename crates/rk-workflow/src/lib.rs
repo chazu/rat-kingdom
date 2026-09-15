@@ -570,6 +570,32 @@ impl RepositoryPolicy {
         }
     }
 
+    /// The branch a NEWLY spawned worker forks from when the caller gave no
+    /// explicit `--base` — `current_branch` is whatever the discovered repo
+    /// happens to have checked out. When this repo's release role is
+    /// activated (`release.integrationBranch`/`release.releaseTarget` both
+    /// set — `validate_repository_policy` already requires
+    /// `delivery.target == "agent-base"` in that case, so an unbased worker's
+    /// eventual delivery follows this same fork point automatically), an
+    /// ordinary implementation worker with no explicit base routes to the
+    /// integration branch instead of whatever the repo's working copy
+    /// happens to have checked out — that IS the opted-in "run useful
+    /// integration work while a release is frozen" behavior this policy
+    /// exists for. `role == "reviewer"` is excluded: a native reviewer is
+    /// always spawned with an explicit `branch` (the candidate under review,
+    /// via a workflow's `branch: _input.branch`), and must never be silently
+    /// re-pointed at the integration branch if a caller ever omits one.
+    /// Unconfigured repositories (`release` unset) are byte-for-byte
+    /// unchanged: this simply defers to [`Self::delivery_target`].
+    pub fn spawn_base(&self, role: &str, current_branch: &str) -> String {
+        let integration_branch = self.release.integration_branch.trim();
+        if !integration_branch.is_empty() && role != "reviewer" {
+            integration_branch.to_string()
+        } else {
+            self.delivery_target(current_branch)
+        }
+    }
+
     /// Render the configured remote branch. `branch` and `target` are already
     /// validated git refs and intentionally retain their slash hierarchy.
     pub fn remote_branch(&self, branch: &str, target: &str, repo: &str) -> String {
@@ -1503,6 +1529,24 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
                  repo.landing.protectedTargets — an immutable release snapshot must target a \
                  genuinely protected edge",
                 policy.release.release_target
+            )));
+        }
+        // A fixed (non-`"agent-base"`) delivery target ignores whatever branch
+        // a worker actually forked from (`delivery_target`'s doc comment) — it
+        // ships every worker to that one fixed branch regardless of where it
+        // was spawned. Combined with an activated release role, that silently
+        // starves the integration branch of new work: `Supervisor::spawn`
+        // routes an unbased worker's *fork point* to `release.integrationBranch`,
+        // but this fixed target would then re-route its *delivery* somewhere
+        // else entirely, so the routed work would never actually reach the
+        // integration branch it was forked from. Reject the combination before
+        // it is ever activated rather than let it silently misroute deliveries.
+        if policy.delivery.target != "agent-base" {
+            return Err(rk_core::Error::other(format!(
+                "repo.delivery.target must be \"agent-base\" when repo.release is activated \
+                 (found {:?}) — a fixed delivery target would silently bypass \
+                 repo.release.integrationBranch routing",
+                policy.delivery.target
             )));
         }
     }
@@ -3151,6 +3195,90 @@ checks: [
             err.to_string()
                 .contains("must also appear in repo.landing.protectedTargets"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn repository_policy_rejects_fixed_delivery_target_with_activated_release_role() {
+        let err = load_repository_policy_str(
+            r#"
+            repo: {
+                delivery: {
+                    target: "main"
+                }
+                release: {
+                    integrationBranch: "integration"
+                    releaseTarget: "main"
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be \"agent-base\" when repo.release is activated"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn repository_policy_accepts_agent_base_delivery_target_with_activated_release_role() {
+        // The default `delivery.target` is already "agent-base" (asserted by
+        // `repository_policy_defaults_preserve_existing_behavior` above), so
+        // this must load cleanly with no explicit `delivery` block at all.
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                release: {
+                    integrationBranch: "integration"
+                    releaseTarget: "main"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.delivery.target, "agent-base");
+    }
+
+    #[test]
+    fn spawn_base_routes_an_unbased_worker_to_the_activated_integration_branch() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                release: {
+                    integrationBranch: "integration"
+                    releaseTarget: "main"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.spawn_base("rat", "main"), "integration");
+    }
+
+    #[test]
+    fn spawn_base_never_reroutes_a_reviewer_even_when_release_is_activated() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                release: {
+                    integrationBranch: "integration"
+                    releaseTarget: "main"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.spawn_base("reviewer", "main"), "main");
+    }
+
+    #[test]
+    fn spawn_base_matches_delivery_target_on_an_unconfigured_repository() {
+        let policy = RepositoryPolicy::default();
+        assert_eq!(policy.spawn_base("rat", "feature-branch"), "feature-branch");
+        assert_eq!(
+            policy.spawn_base("rat", "feature-branch"),
+            policy.delivery_target("feature-branch")
         );
     }
 
