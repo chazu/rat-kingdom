@@ -387,6 +387,40 @@ fn uses_harness_terminal_completion(role: &str, harness: &str) -> bool {
     })
 }
 
+/// Whether this spawn should receive the verification-handoff completion
+/// text (TKT-hisag-nubaf-kugon): the repo opted in (`LandingPolicy::
+/// verification_handoff`), the spawn is an ordinary "rat" (never reviewer,
+/// foreman, or any other role — those keep the mandatory self-verify text
+/// unconditionally), the delivery mode is merge/merge-push, and — the
+/// caller-supplied `land_route_live` — this repo is actually routed to a
+/// LIVE automatic completion route right now: the reactor is enabled AND it
+/// has a matching `action: "land"` trigger registered for this repo (see
+/// [`Supervisor::has_live_land_route`] / [`crate::reactor::Reactor::
+/// has_land_route`]). Deliberately NOT `Supervisor::landing_pipeline().
+/// is_some()` (REWORK finding #1, TKT-hisag-nubaf-kugon): that pipeline is
+/// installed unconditionally at daemon startup regardless of whether the
+/// reactor is enabled or any repo has a "land" trigger at all, so it is true
+/// in essentially every live daemon and proves nothing about whether THIS
+/// repo's completions actually reach an automatic gate. A standalone
+/// generation (no policy), a repo delivering via `push-branch`/`pr`, a
+/// disabled reactor, or a repo with no matching "land" trigger installed all
+/// fall back to the truthful standard protocol.
+fn verification_handoff_active(
+    role: &str,
+    policy: Option<&rk_workflow::RepositoryPolicy>,
+    land_route_live: bool,
+) -> bool {
+    role == "rat"
+        && land_route_live
+        && policy.is_some_and(|p| {
+            p.landing.verification_handoff
+                && matches!(
+                    p.delivery.mode,
+                    DeliveryMode::Merge | DeliveryMode::MergePush
+                )
+        })
+}
+
 /// Whether `tuple`'s top-level `attempt` field is EXACTLY `attempt` —
 /// deliberately a parsed-field comparison, not a `payload_search` substring
 /// test: a substring search over the whole serialized payload can be
@@ -790,6 +824,16 @@ pub struct Supervisor {
     /// Arc cycle (`LandingPipeline` already owns its `Supervisor`). In a live
     /// daemon, merge-mode `land` fails closed if this seam is absent.
     landing_pipeline: Mutex<Option<Weak<crate::landing::LandingPipeline>>>,
+    /// Installed by `server.rs` only inside its `if daemon.reactor_config.
+    /// enabled` gate, right after constructing the `Reactor` (`None` when the
+    /// reactor is disabled, or before that startup step runs). Weak avoids an
+    /// Arc cycle (`Reactor` already holds an `Arc<Supervisor>`). Existence of
+    /// an upgradeable handle here is itself proof the reactor is live; see
+    /// [`Self::reactor`] and [`verification_handoff_active`], which also
+    /// needs `Reactor::has_land_route` for the per-repo trigger half of that
+    /// same predicate (TKT-hisag-nubaf-kugon REWORK finding #1 —
+    /// `landing_pipeline().is_some()` alone proves neither).
+    reactor: Mutex<Option<Weak<crate::reactor::Reactor>>>,
     /// Verification owns its per-repo queues and exact-generation cancellation
     /// registrations; the supervisor forwards configuration/lifecycle events.
     verification: VerificationResources,
@@ -1220,6 +1264,7 @@ impl Supervisor {
             log,
             merge_queue: MergeQueue::default(),
             landing_pipeline: Mutex::new(None),
+            reactor: Mutex::new(None),
             verification: VerificationResources::default(),
             implementation_admission_limits: LaneLimits::default(),
             review_admission_limits: LaneLimits::default(),
@@ -2092,6 +2137,11 @@ impl Supervisor {
             params.review.as_ref(),
             Some(&params.task),
         );
+        let verification_handoff = verification_handoff_active(
+            &params.role,
+            repo_policy.as_ref(),
+            self.has_live_land_route(&repo_name),
+        );
         let prime_ctx = PrimeContext {
             agent: name.clone(),
             repo: repo_name.clone(),
@@ -2114,6 +2164,7 @@ impl Supervisor {
                 &params.role,
                 &effective.harness,
             ),
+            verification_handoff,
         };
         let prompt = params
             .prompt
@@ -2213,6 +2264,11 @@ impl Supervisor {
                 // provider id before one exists, and this must never be
                 // filled in from a previous launch's value.
                 "provider_session": null,
+                // Attributability for TKT-hisag-nubaf-kugon: whether this
+                // spawn's prompt carries the verification-handoff step 3
+                // (focused checks only, native landing owns acceptance) or
+                // the standard mandatory self-verify text.
+                "verification_handoff": verification_handoff,
             }),
         );
         self.emit_coordinator_event(
@@ -2543,6 +2599,11 @@ impl Supervisor {
             record.review.as_ref(),
             record.task.as_deref(),
         );
+        let resume_verification_handoff = verification_handoff_active(
+            &record.role,
+            resume_repo_policy.as_ref(),
+            self.has_live_land_route(&record.repo_name),
+        );
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
             repo: record.repo_name.clone(),
@@ -2571,6 +2632,7 @@ impl Supervisor {
                 &record.role,
                 &record.harness,
             ),
+            verification_handoff: resume_verification_handoff,
         };
         let resume_prompt = if uses_harness_terminal_completion(&record.role, &record.harness)
             && record.role == ONBOARDER_ROLE
@@ -2652,6 +2714,7 @@ impl Supervisor {
                 "session": launch_session,
                 "launched_at": launch_time,
                 "provider_session": null,
+                "verification_handoff": resume_verification_handoff,
             }),
         );
         self.emit_coordinator_event(
@@ -5312,6 +5375,11 @@ impl Supervisor {
             record.review.as_ref(),
             record.task.as_deref(),
         );
+        let recovery_verification_handoff = verification_handoff_active(
+            &record.role,
+            recovery_repo_policy.as_ref(),
+            self.has_live_land_route(&record.repo_name),
+        );
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
             repo: record.repo_name.clone(),
@@ -5338,6 +5406,7 @@ impl Supervisor {
                 &record.role,
                 harness_kind,
             ),
+            verification_handoff: recovery_verification_handoff,
         };
         let resume_prompt = if same_provider {
             format!(
@@ -5433,6 +5502,7 @@ impl Supervisor {
                 // it must never be borrowed from the recovery record's
                 // preserved (now-superseded) provider session.
                 "provider_session": null,
+                "verification_handoff": recovery_verification_handoff,
             }),
         );
 
@@ -6803,6 +6873,29 @@ impl Supervisor {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .and_then(Weak::upgrade)
+    }
+
+    pub(crate) fn set_reactor(&self, reactor: &Arc<crate::reactor::Reactor>) {
+        *self.reactor.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(reactor));
+    }
+
+    fn reactor(&self) -> Option<Arc<crate::reactor::Reactor>> {
+        self.reactor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    /// Whether `repo_name` has a live automatic landing route right now: a
+    /// reactor is running AND it has an `action: "land"` trigger that
+    /// resolves to this repo (see [`crate::reactor::Reactor::has_land_route`]
+    /// for the exact matching rule). Used only by [`verification_handoff_active`]
+    /// — kept as its own method so that predicate reads as intent, not
+    /// plumbing.
+    fn has_live_land_route(&self, repo_name: &str) -> bool {
+        self.reactor()
+            .is_some_and(|reactor| reactor.has_land_route(repo_name))
     }
 
     /// Resolve branch metadata only when every matching registry row names the
@@ -9490,6 +9583,68 @@ mod respawn_tests {
         let ordinary = supervisor.claim_completion("Whisker", generation, None, None, false, false);
         assert!(!ordinary.publish);
         assert!(!ordinary.declared_done);
+    }
+
+    #[test]
+    fn verification_handoff_active_requires_rat_role_opted_in_policy_and_live_pipeline() {
+        let mut policy = rk_workflow::RepositoryPolicy::default();
+        policy.landing.verification_handoff = true;
+        policy.delivery.mode = DeliveryMode::Merge;
+
+        // The bar case: opted-in policy, merge delivery, a live pipeline, role "rat".
+        assert!(verification_handoff_active("rat", Some(&policy), true));
+
+        // Any non-"rat" role keeps the standard protocol regardless of policy —
+        // reviewer/foreman must never see a weakened mandate.
+        assert!(!verification_handoff_active(
+            "reviewer",
+            Some(&policy),
+            true
+        ));
+        assert!(!verification_handoff_active("foreman", Some(&policy), true));
+        assert!(!verification_handoff_active(
+            "verifier",
+            Some(&policy),
+            true
+        ));
+
+        // No policy at all (a standalone/unregistered generation) never activates.
+        assert!(!verification_handoff_active("rat", None, true));
+
+        // Policy present but the flag itself is off (today's default) never activates.
+        let mut default_policy = rk_workflow::RepositoryPolicy::default();
+        default_policy.delivery.mode = DeliveryMode::Merge;
+        assert!(!verification_handoff_active(
+            "rat",
+            Some(&default_policy),
+            true
+        ));
+
+        // Opted in, but delivery mode has no automatic gate to hand the check
+        // to (push-branch/pr) — missing delivery route must not activate.
+        let mut push_branch_policy = policy.clone();
+        push_branch_policy.delivery.mode = DeliveryMode::PushBranch;
+        assert!(!verification_handoff_active(
+            "rat",
+            Some(&push_branch_policy),
+            true
+        ));
+        let mut pr_policy = policy.clone();
+        pr_policy.delivery.mode = DeliveryMode::Pr;
+        assert!(!verification_handoff_active("rat", Some(&pr_policy), true));
+
+        // MergePush is also a real automatic route.
+        let mut merge_push_policy = policy.clone();
+        merge_push_policy.delivery.mode = DeliveryMode::MergePush;
+        assert!(verification_handoff_active(
+            "rat",
+            Some(&merge_push_policy),
+            true
+        ));
+
+        // Opted in and a supported delivery mode, but no live LandingPipeline
+        // (e.g. daemon still starting up) — never activate.
+        assert!(!verification_handoff_active("rat", Some(&policy), false));
     }
 
     /// Probe O6/O8, RAT path: a rat whose harness returns control at a turn

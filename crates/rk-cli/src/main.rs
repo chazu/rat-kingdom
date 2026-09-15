@@ -1124,6 +1124,11 @@ fn print_prime(role: String, json_output: bool) -> Result<()> {
         conventions: Vec::new(),
         verification_checks: Vec::new(),
         harness_terminal_completion: false,
+        // `rk prime` is a standalone, policy-less inspection of the template
+        // shape — never a live spawn routed through a repo's activated
+        // LandingPolicy — so it must always show the truthful default
+        // (mandatory self-verify) protocol, never the handoff variant.
+        verification_handoff: false,
     };
     let text = rk_core::prime::render(&role, &ctx);
     if json_output {

@@ -2058,6 +2058,12 @@ impl Daemon {
                 // no change at any escalation source.
                 .with_sinks(&daemon.notify_config),
             );
+            // So `verification_handoff_active` can tell a live automatic
+            // land route from a merely-wired (but inert) LandingPipeline
+            // (TKT-hisag-nubaf-kugon REWORK finding #1): only reachable
+            // inside this `reactor_config.enabled` gate, so an upgradeable
+            // handle here is itself proof the reactor is live.
+            daemon.supervisor.set_reactor(&reactor);
             // Baseline the cursor so a fresh daemon does not react to the whole
             // pre-existing backlog on first boot.
             if let Err(e) = reactor.initialize_cursor() {
