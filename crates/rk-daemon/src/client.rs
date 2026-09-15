@@ -255,7 +255,8 @@ static VERSION_WARNED: AtomicBool = AtomicBool::new(false);
 /// a mismatch, since every build carrying this code stamps every response.
 fn warn_on_version_mismatch(server_version: Option<&str>) {
     let remote = server_version.unwrap_or("an unstamped build (predates this handshake)");
-    let Some(warning) = rk_core::version::mismatch_warning(rk_core::version::build_version(), remote)
+    let Some(warning) =
+        rk_core::version::mismatch_warning(rk_core::version::build_version(), remote)
     else {
         return;
     };

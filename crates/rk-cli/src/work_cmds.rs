@@ -20,8 +20,9 @@ pub async fn run(layout: &Layout, args: WorkArgs, as_json: bool) -> Result<()> {
         .call("work.current", json!({"repo": args.repo}))
         .await?;
     result["installed_build"] = json!(rk_core::version::build_version());
-    result["build_in_sync"] =
-        json!(result["daemon"]["build_version"].as_str() == Some(rk_core::version::build_version()));
+    result["build_in_sync"] = json!(
+        result["daemon"]["build_version"].as_str() == Some(rk_core::version::build_version())
+    );
     if as_json {
         println!("{result}");
         return Ok(());
