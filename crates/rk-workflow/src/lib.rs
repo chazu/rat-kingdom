@@ -89,6 +89,10 @@ impl Default for DeliveryPolicy {
 /// versioned and digest-activated like [`DeliveryPolicy`] instead of hardcoded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandingPolicy {
+    /// Named acceptance check required on protected final targets. This is
+    /// resolved from the repository's check registry, not shell command text.
+    #[serde(default = "default_final_check", rename = "finalCheck")]
+    pub final_check: String,
     /// POLICY GUARDRAIL: an ERE matched against changed file paths, run
     /// through the repo's `landing-protected-paths` named check.
     #[serde(default = "default_protected_paths", rename = "protectedPaths")]
@@ -99,7 +103,7 @@ pub struct LandingPolicy {
     pub max_diff_files: u64,
     #[serde(default = "default_max_diff_lines", rename = "maxDiffLines")]
     pub max_diff_lines: u64,
-    /// Wall-clock bound for the repo's real `verify` check, e.g. `"60m"`.
+    /// Wall-clock bound for the repo's selected acceptance check, e.g. `"60m"`.
     #[serde(default = "default_gate_timeout", rename = "gateTimeout")]
     pub gate_timeout: String,
     /// Wall-clock bound the landing pipeline parks on a review verdict
@@ -330,6 +334,7 @@ pub struct FocusedCheckRule {
 impl Default for LandingPolicy {
     fn default() -> Self {
         Self {
+            final_check: default_final_check(),
             protected_paths: default_protected_paths(),
             max_diff_files: default_max_diff_files(),
             max_diff_lines: default_max_diff_lines(),
@@ -357,6 +362,10 @@ impl Default for LandingPolicy {
             verification_handoff: false,
         }
     }
+}
+
+fn default_final_check() -> String {
+    "verify".into()
 }
 
 /// One automatic correction per reviewed branch. Deliberately not two: a
@@ -1454,6 +1463,20 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
     if policy.landing.protected_paths.trim().is_empty() {
         return Err(rk_core::Error::other(
             "repo.landing.protectedPaths must be a non-empty pattern",
+        ));
+    }
+    let final_check = &policy.landing.final_check;
+    if !final_check.starts_with(|c: char| c.is_ascii_lowercase())
+        || !final_check
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        || matches!(
+            rk_core::landing_names::canonical(final_check),
+            "landing-protected-paths" | "landing-diff-scope"
+        )
+    {
+        return Err(rk_core::Error::other(
+            "repo.landing.finalCheck must name an acceptance check using [a-z][a-z0-9-]*, distinct from the landing guards",
         ));
     }
     validate_duration_str("repo.landing.gateTimeout", &policy.landing.gate_timeout)?;
@@ -3093,6 +3116,7 @@ checks: [
         assert_eq!(policy.landing.protected_paths, default_protected_paths());
         assert_eq!(policy.landing.max_diff_files, 50);
         assert_eq!(policy.landing.max_diff_lines, 2000);
+        assert_eq!(policy.landing.final_check, "verify");
         assert_eq!(policy.landing.gate_timeout, "60m");
         assert_eq!(policy.landing.review_timeout, "15m");
         assert_eq!(policy.landing.review_max_wait, "45m");
@@ -3101,6 +3125,57 @@ checks: [
         assert!(!policy.landing.verification_handoff);
         assert_eq!(policy.release.integration_branch, "");
         assert_eq!(policy.release.release_target, "");
+    }
+
+    #[test]
+    fn repository_policy_final_check_roundtrips_and_preserves_legacy_defaults() {
+        let policy =
+            load_repository_policy_str(r#"repo: {landing: {finalCheck: "release-acceptance"}}"#)
+                .unwrap();
+        assert_eq!(policy.landing.final_check, "release-acceptance");
+        let mut json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["landing"]["finalCheck"], "release-acceptance");
+        assert_eq!(
+            serde_json::from_value::<RepositoryPolicy>(json.clone()).unwrap(),
+            policy
+        );
+        json["landing"]
+            .as_object_mut()
+            .unwrap()
+            .remove("finalCheck");
+        assert_eq!(
+            serde_json::from_value::<RepositoryPolicy>(json)
+                .unwrap()
+                .landing
+                .final_check,
+            "verify"
+        );
+    }
+
+    #[test]
+    fn repository_policy_final_check_rejects_invalid_names_and_guards() {
+        for name in [
+            "",
+            " ",
+            "run tests",
+            "Verify",
+            "-verify",
+            "verify;true",
+            "verify\n",
+            "landing-protected-paths",
+            "landing-diff-scope",
+            "steward-protected-paths",
+            "steward-diff-scope",
+        ] {
+            let source = format!(
+                "repo: {{landing: {{finalCheck: {}}}}}",
+                serde_json::to_string(name).unwrap()
+            );
+            assert!(
+                load_repository_policy_str(&source).is_err(),
+                "accepted {name:?}"
+            );
+        }
     }
 
     #[test]

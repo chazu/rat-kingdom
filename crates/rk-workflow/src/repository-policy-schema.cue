@@ -38,6 +38,10 @@ repo: #RepositoryPolicy
 // now versioned and digest-activated here in per-repo CUE and mechanically
 // executed by the daemon-native LandingPipeline (crates/rk-daemon/src/landing.rs).
 #LandingPolicy: {
+	// Required named acceptance check for protectedTargets. Kept separate
+	// from focusedChecks so integration and release can use different recipes.
+	// Empty/guard names cannot disable acceptance. The check registry must define it.
+	finalCheck: (string & =~"^[a-z][a-z0-9-]*$") | *"verify"
 	// POLICY GUARDRAIL (#19): an ERE matched against changed file paths, run
 	// through the repo's `landing-protected-paths` named check.
 	protectedPaths: string | *"(^|/)(\\.github|\\.rk|migrations)/"
@@ -45,7 +49,7 @@ repo: #RepositoryPolicy
 	// repo's `landing-diff-scope` named check.
 	maxDiffFiles: int | *50
 	maxDiffLines: int | *2000
-	// Wall-clock bound for the repo's real `verify` check.
+	// Wall-clock bound for the repo's selected finalCheck.
 	gateTimeout: string | *"60m"
 	// Wall-clock bound the landing pipeline waits on a review verdict before
 	// checking whether the reviewer is still alive (liveness-aware wait).

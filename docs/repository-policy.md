@@ -38,6 +38,7 @@ repo: {
 	}
 
 	landing: {
+		finalCheck:     "verify"
 		protectedPaths: "(^|/)(\\.github|\\.rk|migrations)/"
 		maxDiffFiles:   50
 		maxDiffLines:   2000
@@ -57,8 +58,12 @@ omits `landing` entirely behaves identically to these defaults; only set the
 fields you want to change. `protectedPaths` is an ERE matched against
 `git diff --name-only <target>...HEAD`; a hit holds the branch for a human.
 `maxDiffFiles`/`maxDiffLines` bound the diff a branch may auto-merge with
-(`0` disables that budget). `gateTimeout` bounds the repo's real `verify`
-check; `reviewTimeout` bounds the wait for a reviewer's verdict before
+(`0` disables that budget). `finalCheck` names the acceptance check in
+`.rk/checks.cue` required for `protectedTargets` (default `["main"]`). It defaults
+to `verify`; a repo can instead select a named release acceptance recipe without
+also running `verify`. Empty names and the policy-guard check names are rejected;
+a missing or failing selected check holds acceptance. `gateTimeout` bounds the
+selected check; `reviewTimeout` bounds the wait for a reviewer's verdict before
 treating it as a STOP-equivalent hold; `reviewMaxWait` is the hard ceiling the
 wait extends to while the reviewer is confirmed still alive past
 `reviewTimeout` (a merely slow reviewer is not abandoned at `reviewTimeout`
@@ -99,8 +104,8 @@ Every completed rat's branch may be triaged by the daemon-native landing
 pipeline when the repository's activated CUE triggers include an
 `action: "land"` match. That activated trigger is the unattended-landing
 authorization. The same activated policy supplies protected paths, diff
-budgets, timeouts, delivery mode, target, and the repository's named `verify`
-check. These checks are evaluated mechanically; they do not require an agent.
+budgets, timeouts, delivery mode, target, and the repository's named `finalCheck`.
+These checks are evaluated mechanically; they do not require an agent.
 A protected-path hit, an over-budget diff, or a failed/timed-out check holds
 the branch and surfaces attention instead of weakening the policy.
 
@@ -108,6 +113,46 @@ Workflow `land` and `open_pr` steps are a separate path. When
 `policy.require_approval_for_landing` is true they require a prior approved
 human gate, regardless of workflow name, and their target must match the
 activated repository policy. There is no workflow-name exception.
+
+## Separate integration checks from release acceptance
+
+Choose the acceptance check by repository policy, with its executable recipe in
+the named-check registry. For example, after defining both named checks:
+
+```cue
+repo: {
+	delivery: {target: "agent-base", mode: "merge"}
+	landing: {
+		verificationHandoff: true
+		protectedTargets: ["main"]
+		finalCheck: "release-acceptance"
+		focusedChecks: [{class: "integration", paths: [], checks: ["integration-check"]}]
+	}
+}
+```
+
+An implementation explicitly based on an integration branch returns to that
+branch and runs `integration-check`; promotion to `main` requires
+`release-acceptance`. The unconditional focused rule gives every inner edge a
+check. Define each recipe to cover its stage's obligations; changing its name
+does not make an incomplete check sufficient. `verificationHandoff` assigns
+final acceptance to the automatic landing path only when that path is live.
+Focused worker checks still apply.
+
+The configured final check uses the existing exact-check proof reuse and native
+gate event paths, including explicit operator landings. It does not introduce
+cross-check equivalence, skip review, or automatically activate/deploy a release.
+Generic `rk verify` still defaults to the named check `verify`; an explicit
+manual invocation of the release recipe is `rk verify --check release-acceptance`.
+
+After installing support, activate the exact policy through onboarding. Editing
+the file alone is inert. Subsequent gate plans use the activated value; an
+already resolved plan retains its selected check. To restore the original
+selection, activate `finalCheck: "verify"`. Repository policies and named checks
+must be supported by any binary selected for rollback.
+
+See [current delivery priorities](2026-09-15-progressive-delivery-priorities.md)
+for the remaining separation, proof-sharing, and promotion work.
 
 ## Activation is mandatory
 

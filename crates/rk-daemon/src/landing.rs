@@ -1765,11 +1765,10 @@ impl LandingPipeline {
     /// replacement for what the retired landing mega-workflow
     /// used to expose as workflow params (`protectedPaths`, `maxDiffFiles`,
     /// `maxDiffLines`, `gateTimeout`, `reviewTimeout`). A repo without an
-    /// activated policy fails closed. `check_name` is not
-    /// repo.cue-configurable: every repo's
-    /// PROTECTED-FINAL edge (`protected_targets`, default `["main"]`) runs
-    /// this same named `verify` check; an INNER edge instead runs whatever
-    /// `focused_checks` selects (both repo.cue-configurable, see
+    /// activated policy fails closed. A PROTECTED-FINAL edge
+    /// (`protected_targets`, default `["main"]`) runs `finalCheck` (default
+    /// `verify`); an INNER edge instead runs whatever `focused_checks` selects
+    /// (all repo.cue-configurable, see
     /// [`LandingEdgeClass`]).
     fn gate_config(&self, repo: &rk_git::Repo) -> rk_core::Result<GateConfig> {
         let repo_policy = self.supervisor.repository_policy(repo)?;
@@ -1777,7 +1776,7 @@ impl LandingPipeline {
         let policy = repo_policy.landing;
         let defaults = GateConfig::default();
         Ok(GateConfig {
-            check_name: defaults.check_name,
+            check_name: policy.final_check,
             protected_paths: policy.protected_paths,
             max_diff_files: policy.max_diff_files,
             max_diff_lines: policy.max_diff_lines,
@@ -19267,6 +19266,153 @@ checks: [
     }
 
     #[tokio::test]
+    async fn configured_final_check_executes_once_and_policy_changes_do_not_reuse_another_check() {
+        let (home, dir, space, pipeline, mut entry) = admission_fixture();
+        let marker = home.path().join("final-checks");
+        write_checks(
+            dir.path(),
+            &format!(
+                r#"checks: [
+                    {{name: "landing-protected-paths", command: "true"}},
+                    {{name: "landing-diff-scope", command: "true"}},
+                    {{name: "verify", command: "echo verify >> '{}'"}},
+                    {{name: "release-acceptance", command: "echo release >> '{}'"}},
+                ]"#,
+                marker.display(),
+                marker.display(),
+            ),
+        );
+        // An unactivated file edit must not select another acceptance check.
+        std::fs::write(
+            dir.path().join(".rk/repo.cue"),
+            r#"repo: {landing: {finalCheck: "release-acceptance"}}"#,
+        )
+        .unwrap();
+        let repo = rk_git::Repo::discover(dir.path()).unwrap();
+        let default_gates = pipeline.gate_config(&repo).unwrap();
+        assert_eq!(default_gates.check_name, "verify");
+        entry.admission = None;
+        let sha = entry.head_sha.clone();
+        assert_eq!(
+            pipeline
+                .run_gates_at(&mut entry, &repo, &default_gates, &sha)
+                .await
+                .unwrap(),
+            GateRunOutcome::Pass,
+        );
+        let policy = rk_workflow::load_repository_policy_str(
+            r#"repo: {landing: {finalCheck: "release-acceptance", gateTimeout: "10s"}}"#,
+        )
+        .unwrap();
+        activate_repository_policy(home.path(), dir.path(), policy);
+        let gates = pipeline.gate_config(&repo).unwrap();
+        assert_eq!(gates.check_name, "release-acceptance");
+        // Exercise both ordinary and explicit operator admission through the
+        // same gate path. Replaying the identical check must not execute twice.
+        for operator_fast_lane in [false, true] {
+            entry.operator_fast_lane = operator_fast_lane;
+            assert_eq!(
+                pipeline
+                    .run_gates_at(&mut entry, &repo, &gates, &sha)
+                    .await
+                    .unwrap(),
+                GateRunOutcome::Pass,
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "verify\nrelease\n"
+        );
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert!(plans.iter().any(|plan| plan.payload["selected_checks"]
+            == json!([
+                "landing-protected-paths",
+                "landing-diff-scope",
+                "release-acceptance",
+            ])));
+        assert!(plans
+            .iter()
+            .all(|plan| plan.payload["full_check_required"] == true));
+    }
+
+    #[tokio::test]
+    async fn configured_final_check_failure_cannot_fall_back_to_passing_verify() {
+        let (home, dir, space, pipeline, mut entry) = admission_fixture();
+        let verify_marker = home.path().join("unexpected-verify");
+        write_checks(
+            dir.path(),
+            &format!(
+                r#"checks: [
+                {{name: "landing-protected-paths", command: "true"}},
+                {{name: "landing-diff-scope", command: "true"}},
+                {{name: "verify", command: "touch '{}'"}},
+                {{name: "release-acceptance", command: "exit 7"}},
+            ]"#,
+                verify_marker.display(),
+            ),
+        );
+        activate_landing_policy(
+            home.path(),
+            dir.path(),
+            rk_workflow::LandingPolicy {
+                final_check: "release-acceptance".into(),
+                ..Default::default()
+            },
+        );
+        let repo = rk_git::Repo::discover(dir.path()).unwrap();
+        let gates = pipeline.gate_config(&repo).unwrap();
+        entry.admission = None;
+        let sha = entry.head_sha.clone();
+        assert_eq!(
+            pipeline
+                .run_gates_at(&mut entry, &repo, &gates, &sha)
+                .await
+                .unwrap(),
+            GateRunOutcome::Fail,
+        );
+        assert!(!verify_marker.exists());
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(GATE_PASS_IDENTITY),)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn configured_final_check_missing_from_registry_fails_before_execution() {
+        let (home, dir, _, pipeline, entry) = admission_fixture();
+        activate_landing_policy(
+            home.path(),
+            dir.path(),
+            rk_workflow::LandingPolicy {
+                final_check: "release-acceptance".into(),
+                ..Default::default()
+            },
+        );
+        let repo = rk_git::Repo::discover(dir.path()).unwrap();
+        let gates = pipeline.gate_config(&repo).unwrap();
+        let err = pipeline
+            .resolve_gate_plan_at(&entry, &repo, &gates, &entry.head_sha)
+            .await
+            .err()
+            .expect("missing finalCheck must fail closed");
+        assert!(err
+            .to_string()
+            .contains("no check named 'release-acceptance'"));
+        assert!(!home.path().join("executed").exists());
+        // Selection for an inner edge stays independent of finalCheck.
+        let mut inner = entry;
+        inner.target = "feature".into();
+        let plan = pipeline
+            .resolve_gate_plan_at(&inner, &repo, &gates, &inner.head_sha)
+            .await
+            .unwrap();
+        assert!(!plan.full_check_required);
+        assert_eq!(plan.checks.len(), 2);
+    }
+
+    #[tokio::test]
     async fn nested_child_to_parent_to_main_runs_focused_then_full_check() {
         let home = tempfile::tempdir().unwrap();
         let repo_dir = tempfile::tempdir().unwrap();
@@ -21409,7 +21555,10 @@ checks: [
             .await
             .unwrap();
         assert_eq!(
-            std::fs::read_to_string(&verify_log).unwrap().lines().count(),
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
             2,
             "a changed environment policy must re-execute, never reuse a stale landing_gate_pass proof"
         );
