@@ -127,6 +127,21 @@ async fn real_retirement_delivery_is_reflected_autonomously_across_a_restart_the
     let mut client = connect(&layout).await;
     support::register_repo(&mut client, &repo).await;
 
+    // Enable the underlying feature FIRST, exactly like
+    // `landing_need_retirement.rs`. Assessment activation below binds to the
+    // source feature's revision AT ACTIVATION TIME, and that binding is now
+    // an EXACT match (not a lower bound) — so activation must happen once
+    // the feature is already on its real, already-enabled revision, not the
+    // pre-enablement default (`revision: 0`) that would otherwise make every
+    // subsequent real event report as a revision mismatch.
+    client
+        .call(
+            "bbs.retirement.set",
+            json!({"repo": repo_name, "mode": "on"}),
+        )
+        .await
+        .unwrap();
+
     // Reject malformed config outright, with no partial activation — a
     // bounded fault case alongside the one real product journey.
     let mut bad_objective = objective_json();
@@ -168,17 +183,7 @@ async fn real_retirement_delivery_is_reflected_autonomously_across_a_restart_the
     // `unavailable` (no telemetry yet) on its own, with no tick call.
     wait_for_verdict(&mut client, repo_name, "unavailable").await;
 
-    // Enable the underlying feature and drive one real failing landing then
-    // one real accepted correction, exactly like
-    // `landing_need_retirement.rs`.
-    client
-        .call(
-            "bbs.retirement.set",
-            json!({"repo": repo_name, "mode": "on"}),
-        )
-        .await
-        .unwrap();
-
+    // Drive one real failing landing then one real accepted correction.
     let ticket = client
         .call(
             "ticket.new",
