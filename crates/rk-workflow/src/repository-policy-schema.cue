@@ -123,6 +123,15 @@ repo: #RepositoryPolicy
 	// means no additional check runs beyond protectedPaths/diffScope: an
 	// inner edge never falls back to the full suite by default.
 	focusedChecks: [...#FocusedCheckRule] | *[]
+	// Whether a native reviewer's BBS briefing is queried against the actual
+	// reviewed ticket instead of the reviewer's own synthetic spawn task
+	// (which never resolves to a ticket, so it always surfaces zero BBS
+	// entries). Only the BBS query target changes — the reviewer's own
+	// task/role/spawn/attempt identity is untouched, and the existing
+	// cross-repo scope check still refuses a review binding naming a
+	// ticket outside this repo. false (the default) is the pre-fix
+	// behavior.
+	reviewedTicketBbsContext: bool | *false
 }
 
 #FocusedCheckRule: {

@@ -2056,7 +2056,11 @@ impl Supervisor {
             parent: params.parent.clone(),
             briefing: self.bbs_briefing(
                 &repo_name,
-                Some(&params.task),
+                self.reviewed_bbs_task(
+                    repo_policy.as_ref(),
+                    params.review.as_ref(),
+                    Some(&params.task),
+                ),
                 rk_core::bbs::ExposureSurface::Spawn,
                 &crate::bbs::ConsumerBinding::agent(&name, &spawn.to_string(), Some(&params.task)),
             ),
@@ -2502,7 +2506,11 @@ impl Supervisor {
             // exposure binds to the generation that is resuming, not a new one.
             briefing: self.bbs_briefing(
                 &record.repo_name,
-                record.task.as_deref(),
+                self.reviewed_bbs_task(
+                    self.repository_policy(&repo).ok().as_ref(),
+                    record.review.as_ref(),
+                    record.task.as_deref(),
+                ),
                 rk_core::bbs::ExposureSurface::Resume,
                 &crate::bbs::ConsumerBinding::agent(
                     &record.name,
@@ -3868,6 +3876,35 @@ impl Supervisor {
     /// benefited; a spawn that later fails leaves this record standing, so a
     /// report must join native lifecycle evidence before counting an active
     /// consumer.
+    /// Selects which ticket a reviewer's BBS briefing is queried against.
+    /// Ordinarily (and always when `policy` is unavailable, disabled, or
+    /// this spawn/resume/recovery carries no `ReviewContext`) this is just
+    /// `fallback` — the agent's own task, synthetic or not, exactly as
+    /// before this setting existed. When
+    /// `LandingPolicy::reviewed_ticket_bbs_context` is on for the repo and
+    /// a daemon-owned `ReviewContext` is present (never workflow-supplied —
+    /// see `LandingPipeline::dispatch_review`/`launch_shadow_review`), the
+    /// query instead targets the actual reviewed ticket so its findings/
+    /// artifacts/dependency chain become visible. This never touches the
+    /// reviewer's own task/role/spawn/attempt identity — callers still pass
+    /// their own task/spawn to `bbs_briefing`'s `binding` argument
+    /// unchanged — and `bbs::brief`'s existing cross-repo scope check still
+    /// refuses (fails closed, logged, no entries) a review binding naming a
+    /// ticket outside this repo.
+    fn reviewed_bbs_task<'a>(
+        &self,
+        policy: Option<&rk_workflow::RepositoryPolicy>,
+        review: Option<&'a rk_core::review::ReviewContext>,
+        fallback: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if policy.is_some_and(|p| p.landing.reviewed_ticket_bbs_context) {
+            if let Some(review) = review {
+                return Some(review.task.as_str());
+            }
+        }
+        fallback
+    }
+
     fn bbs_briefing(
         &self,
         repo: &str,
@@ -5226,7 +5263,11 @@ impl Supervisor {
             parent: record.parent.clone(),
             briefing: self.bbs_briefing(
                 &record.repo_name,
-                record.task.as_deref(),
+                self.reviewed_bbs_task(
+                    self.repository_policy(&repo).ok().as_ref(),
+                    record.review.as_ref(),
+                    record.task.as_deref(),
+                ),
                 rk_core::bbs::ExposureSurface::Recovery,
                 &crate::bbs::ConsumerBinding::agent(
                     &record.name,
