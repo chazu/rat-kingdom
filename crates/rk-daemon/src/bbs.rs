@@ -345,12 +345,25 @@ impl Capture {
 /// was ever written" — the first is an empty `entries` array, the second is
 /// the absence of any exposure tuple (or, when capture itself failed, a
 /// `telemetry_gap`).
+///
+/// `briefing.task` is the ticket the BBS QUERY actually ran against; when a
+/// reviewer's briefing is redirected onto the ticket it is reviewing
+/// (`LandingPolicy::reviewed_ticket_bbs_context`), that can diverge from the
+/// consumer's own task carried on `binding.task` (its true, possibly
+/// synthetic, spawn task). Both are recorded explicitly — `task` for what was
+/// queried, `consumer_task` for who actually received it — so telemetry never
+/// collapses the two into one string once they can differ.
+/// `reviewed_ticket_bbs_context` records whether this exposure is one of
+/// those redirected queries; it is a distinct flag from
+/// `ranking_config_revision`/`ranking_config_status`, which describe the
+/// unrelated `bbs-discovery-ranking` feature.
 pub fn record_exposure(
     space: &Space,
     castle: &str,
     surface: rk_core::bbs::ExposureSurface,
     binding: &ConsumerBinding,
     briefing: &Briefing,
+    reviewed_ticket_bbs_context: bool,
 ) -> Capture {
     let entries: Vec<_> = briefing
         .entries
@@ -370,6 +383,8 @@ pub fn record_exposure(
         "surface": surface.as_str(),
         "repo": briefing.repo,
         "task": briefing.task,
+        "consumer_task": binding.task,
+        "reviewed_ticket_bbs_context": reviewed_ticket_bbs_context,
         "agent": binding.agent,
         "spawn": binding.spawn,
         "bound": binding.bound(),
@@ -401,6 +416,8 @@ pub fn record_exposure(
             "surface": surface.as_str(),
             "repo": briefing.repo,
             "task": briefing.task,
+            "consumer_task": binding.task,
+            "reviewed_ticket_bbs_context": reviewed_ticket_bbs_context,
             "binding": binding.json(),
         }),
     )
@@ -2416,7 +2433,14 @@ mod tests {
         .unwrap();
         assert!(empty.entries.is_empty());
         let binding = ConsumerBinding::agent("Scurry-15", "spawn-1", Some(&task.identity));
-        let capture = record_exposure(&space, "castle", ExposureSurface::Spawn, &binding, &empty);
+        let capture = record_exposure(
+            &space,
+            "castle",
+            ExposureSurface::Spawn,
+            &binding,
+            &empty,
+            false,
+        );
         assert_eq!(capture.status, TelemetryStatus::Recorded);
 
         let recorded = exposures(&space);
@@ -2451,7 +2475,14 @@ mod tests {
             crate::bbs_discovery::DiscoveryConfig::default(),
         )
         .unwrap();
-        record_exposure(&space, "castle", ExposureSurface::Brief, &binding, &filled);
+        record_exposure(
+            &space,
+            "castle",
+            ExposureSurface::Brief,
+            &binding,
+            &filled,
+            false,
+        );
         let brief_record = exposures(&space)
             .into_iter()
             .find(|t| t.payload["surface"] == "brief")

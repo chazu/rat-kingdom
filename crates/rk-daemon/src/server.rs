@@ -3339,6 +3339,7 @@ impl Daemon {
                             rk_core::bbs::ExposureSurface::Brief,
                             &self.consumer_binding(&req.caller),
                             &briefing,
+                            false,
                         );
                         briefing.telemetry = Some(capture.status);
                         briefing.exposure = capture.record;

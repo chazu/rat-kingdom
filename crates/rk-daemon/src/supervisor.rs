@@ -2046,6 +2046,11 @@ impl Supervisor {
             return Err(e);
         }
 
+        let (bbs_task, reviewed_ticket_bbs_context) = self.reviewed_bbs_task(
+            repo_policy.as_ref(),
+            params.review.as_ref(),
+            Some(&params.task),
+        );
         let prime_ctx = PrimeContext {
             agent: name.clone(),
             repo: repo_name.clone(),
@@ -2056,13 +2061,10 @@ impl Supervisor {
             parent: params.parent.clone(),
             briefing: self.bbs_briefing(
                 &repo_name,
-                self.reviewed_bbs_task(
-                    repo_policy.as_ref(),
-                    params.review.as_ref(),
-                    Some(&params.task),
-                ),
+                bbs_task,
                 rk_core::bbs::ExposureSurface::Spawn,
                 &crate::bbs::ConsumerBinding::agent(&name, &spawn.to_string(), Some(&params.task)),
+                reviewed_ticket_bbs_context,
             ),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
@@ -2494,6 +2496,12 @@ impl Supervisor {
             record.review.as_ref(),
         );
 
+        let resume_repo_policy = self.repository_policy(&repo).ok();
+        let (resume_bbs_task, resume_reviewed_ticket_bbs_context) = self.reviewed_bbs_task(
+            resume_repo_policy.as_ref(),
+            record.review.as_ref(),
+            record.task.as_deref(),
+        );
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
             repo: record.repo_name.clone(),
@@ -2506,17 +2514,14 @@ impl Supervisor {
             // exposure binds to the generation that is resuming, not a new one.
             briefing: self.bbs_briefing(
                 &record.repo_name,
-                self.reviewed_bbs_task(
-                    self.repository_policy(&repo).ok().as_ref(),
-                    record.review.as_ref(),
-                    record.task.as_deref(),
-                ),
+                resume_bbs_task,
                 rk_core::bbs::ExposureSurface::Resume,
                 &crate::bbs::ConsumerBinding::agent(
                     &record.name,
                     &record.spawn_id().to_string(),
                     record.task.as_deref(),
                 ),
+                resume_reviewed_ticket_bbs_context,
             ),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
@@ -3865,6 +3870,36 @@ impl Supervisor {
         }
     }
 
+    /// Selects which ticket a reviewer's BBS briefing is queried against, and
+    /// whether that selection is the reviewed-ticket redirect. Ordinarily
+    /// (and always when `policy` is unavailable, disabled, or this spawn/
+    /// resume/recovery carries no `ReviewContext`) the query is just
+    /// `fallback` — the agent's own task, synthetic or not, exactly as
+    /// before this setting existed — and the returned flag is `false`. When
+    /// `LandingPolicy::reviewed_ticket_bbs_context` is on for the repo and a
+    /// daemon-owned `ReviewContext` is present (never workflow-supplied —
+    /// see `LandingPipeline::dispatch_review`/`launch_shadow_review`), the
+    /// query instead targets the actual reviewed ticket so its findings/
+    /// artifacts/dependency chain become visible, and the flag is `true`.
+    /// This never touches the reviewer's own task/role/spawn/attempt
+    /// identity — callers still pass their own task/spawn to
+    /// `bbs_briefing`'s `binding` argument unchanged — and `bbs::brief`'s
+    /// existing cross-repo scope check still refuses (fails closed, logged,
+    /// no entries) a review binding naming a ticket outside this repo.
+    fn reviewed_bbs_task<'a>(
+        &self,
+        policy: Option<&rk_workflow::RepositoryPolicy>,
+        review: Option<&'a rk_core::review::ReviewContext>,
+        fallback: Option<&'a str>,
+    ) -> (Option<&'a str>, bool) {
+        if policy.is_some_and(|p| p.landing.reviewed_ticket_bbs_context) {
+            if let Some(review) = review {
+                return (Some(review.task.as_str()), true);
+            }
+        }
+        (fallback, false)
+    }
+
     /// The bounded selection prepared for one agent context, captured as a
     /// daemon-authored exposure record bound to that exact generation.
     ///
@@ -3876,41 +3911,17 @@ impl Supervisor {
     /// benefited; a spawn that later fails leaves this record standing, so a
     /// report must join native lifecycle evidence before counting an active
     /// consumer.
-    /// Selects which ticket a reviewer's BBS briefing is queried against.
-    /// Ordinarily (and always when `policy` is unavailable, disabled, or
-    /// this spawn/resume/recovery carries no `ReviewContext`) this is just
-    /// `fallback` — the agent's own task, synthetic or not, exactly as
-    /// before this setting existed. When
-    /// `LandingPolicy::reviewed_ticket_bbs_context` is on for the repo and
-    /// a daemon-owned `ReviewContext` is present (never workflow-supplied —
-    /// see `LandingPipeline::dispatch_review`/`launch_shadow_review`), the
-    /// query instead targets the actual reviewed ticket so its findings/
-    /// artifacts/dependency chain become visible. This never touches the
-    /// reviewer's own task/role/spawn/attempt identity — callers still pass
-    /// their own task/spawn to `bbs_briefing`'s `binding` argument
-    /// unchanged — and `bbs::brief`'s existing cross-repo scope check still
-    /// refuses (fails closed, logged, no entries) a review binding naming a
-    /// ticket outside this repo.
-    fn reviewed_bbs_task<'a>(
-        &self,
-        policy: Option<&rk_workflow::RepositoryPolicy>,
-        review: Option<&'a rk_core::review::ReviewContext>,
-        fallback: Option<&'a str>,
-    ) -> Option<&'a str> {
-        if policy.is_some_and(|p| p.landing.reviewed_ticket_bbs_context) {
-            if let Some(review) = review {
-                return Some(review.task.as_str());
-            }
-        }
-        fallback
-    }
-
+    ///
+    /// `reviewed_ticket_bbs_context` (see [`Self::reviewed_bbs_task`]) is
+    /// recorded on the exposure alongside `task` so an operator can tell a
+    /// reviewed-ticket-redirected query apart from an ordinary own-task one.
     fn bbs_briefing(
         &self,
         repo: &str,
         task: Option<&str>,
         surface: rk_core::bbs::ExposureSurface,
         binding: &crate::bbs::ConsumerBinding,
+        reviewed_ticket_bbs_context: bool,
     ) -> Option<rk_core::bbs::Briefing> {
         let task = task?;
         let discovery = crate::bbs_discovery::resolve_for_brief(&self.layout, repo);
@@ -3927,6 +3938,7 @@ impl Supervisor {
                     surface,
                     binding,
                     &briefing,
+                    reviewed_ticket_bbs_context,
                 );
                 if capture.is_failed() {
                     warn!(
@@ -5253,6 +5265,12 @@ impl Supervisor {
             record.workflow_instance.as_deref(),
             record.review.as_ref(),
         );
+        let recovery_repo_policy = self.repository_policy(&repo).ok();
+        let (recovery_bbs_task, recovery_reviewed_ticket_bbs_context) = self.reviewed_bbs_task(
+            recovery_repo_policy.as_ref(),
+            record.review.as_ref(),
+            record.task.as_deref(),
+        );
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
             repo: record.repo_name.clone(),
@@ -5263,17 +5281,14 @@ impl Supervisor {
             parent: record.parent.clone(),
             briefing: self.bbs_briefing(
                 &record.repo_name,
-                self.reviewed_bbs_task(
-                    self.repository_policy(&repo).ok().as_ref(),
-                    record.review.as_ref(),
-                    record.task.as_deref(),
-                ),
+                recovery_bbs_task,
                 rk_core::bbs::ExposureSurface::Recovery,
                 &crate::bbs::ConsumerBinding::agent(
                     &record.name,
                     &record.spawn_id().to_string(),
                     record.task.as_deref(),
                 ),
+                recovery_reviewed_ticket_bbs_context,
             ),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
