@@ -12,7 +12,7 @@
 //! `sharedCargoTarget` policy runs many worktrees' builds against that same
 //! `target/` concurrently, so the binary sitting there when a test spawns it
 //! can be a different commit's build than the one this test binary itself
-//! was linked against — this test process's own `rk_core::version::BUILD_VERSION`
+//! was linked against — this test process's own `rk_core::version::build_version()`
 //! then disagrees with what the spawned `rk` actually reports about itself.
 //! Every fixture below asks the freshly spawned `rk` what build it thinks it
 //! is (`cli_local_version`) instead of assuming that agreement.
@@ -97,7 +97,7 @@ fn home_with_token() -> tempfile::TempDir {
 /// The build version the freshly spawned `rk` binary reports about itself,
 /// discovered by asking it (via the "too old to stamp" branch, which always
 /// names the CLI's own build) rather than assumed to equal this test
-/// process's own `rk_core::version::BUILD_VERSION` — see the module doc for
+/// process's own `rk_core::version::build_version()` — see the module doc for
 /// why those two can differ.
 fn cli_local_version() -> String {
     let home = home_with_token();
