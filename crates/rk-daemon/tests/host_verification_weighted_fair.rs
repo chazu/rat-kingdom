@@ -172,6 +172,12 @@ fn class_executing(s: &Value, class: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn class_waiting(s: &Value, class: &str) -> u64 {
+    s["verification_host"]["classes"][class]["waiting"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
 /// Spins up a daemon with an aggregate limit AND a P3.2 weight/class
 /// policy — mirrors `host_verification_aggregate_cap.rs`'s
 /// `spawn_daemon_with_limits`, extended with the two calls this ticket adds.
@@ -442,6 +448,93 @@ async fn reserved_lane_saturated_falls_through_to_the_general_pool() {
 
     poll_status_until(&mut client, "capacity fully drains", |s| {
         host_executing(s) == 0 && host_waiting(s) == 0 && class_executing(s, "guard") == 0
+    })
+    .await;
+}
+
+/// REWORK regression (native review `01M2HWE7TBKTGZZGEKK19WM16J` against
+/// candidate `9e7bde7`): a classified check whose weight fits ONLY its own
+/// reserved lane, not the (deliberately smaller) general pool left over
+/// after the reserve is carved out, must still be admitted eventually via a
+/// BLOCKING fallback onto its own reserved lane — never hang forever
+/// waiting on general-pool capacity that pool can never hold. Also proves
+/// the new per-class `waiting` status field: the second concurrent request
+/// is genuinely queued specifically on the "guard" class's own lane, not
+/// merely on the general pool's `waiting` count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn classified_weight_exceeding_the_general_pool_blocks_on_its_own_reserved_lane() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let shared = tempfile::tempdir().unwrap();
+    let repo = prepare_repo(shared.path(), &[("big1", "b1"), ("big2", "b2")]);
+
+    // aggregate=3, guard reserve=2 -> general_limit=1. "big" is weight 2:
+    // it fits the guard reserve (2) but can NEVER fit the general pool (1)
+    // — the exact "impossible weight via fallback" shape the REWORK fixed.
+    spawn_daemon_with_policy(
+        &layout,
+        3,
+        HashMap::from([("big1".to_string(), 2), ("big2".to_string(), 2)]),
+        HashMap::from([
+            ("big1".to_string(), "guard".to_string()),
+            ("big2".to_string(), "guard".to_string()),
+        ]),
+        HashMap::from([("guard".to_string(), 2)]),
+    )
+    .await;
+    let mut client = connect(&layout).await;
+    register(&mut client, &repo.name, repo.dir.path()).await;
+
+    // big1 alone consumes the entire 2-permit reserved lane.
+    let call1 = spawn_verify(layout.clone(), repo.name.clone(), "big1".into());
+    wait_for_start(&pid_path(shared.path(), "b1")).await;
+    poll_status_until(
+        &mut client,
+        "big1 occupies the whole guard reserve (weight 2 of 2)",
+        |s| class_executing(s, "guard") == 2,
+    )
+    .await;
+
+    // big2 also needs weight 2, which ONLY the (now fully occupied) guard
+    // reserve can ever satisfy — general_limit is 1, too small. It must
+    // genuinely queue (not hang silently, not bypass admission) and be
+    // visible specifically as a GUARD-class wait, not a general-pool wait.
+    let call2 = spawn_verify(layout.clone(), repo.name.clone(), "big2".into());
+    poll_status_until(
+        &mut client,
+        "big2 is queued on the guard class's own reserved lane, not the general pool",
+        |s| class_waiting(s, "guard") == 1,
+    )
+    .await;
+    let mid = status(&mut client).await;
+    assert_eq!(
+        host_waiting(&mid),
+        0,
+        "big2's wait must be attributed to the guard class, never the general pool's \
+         own waiting count: {mid}"
+    );
+    assert_not_started_yet(
+        &pid_path(shared.path(), "b2"),
+        "big2 must still be genuinely queued, not silently bypassing admission",
+    );
+
+    release(shared.path(), "b1");
+    assert_eq!(call1.await.unwrap()["exit"], json!(0));
+
+    // big2 now proceeds via the blocking fallback it was queued on.
+    wait_for_start(&pid_path(shared.path(), "b2")).await;
+    poll_status_until(
+        &mut client,
+        "big2 now holds the guard reserve big1's release freed",
+        |s| class_executing(s, "guard") == 2 && class_waiting(s, "guard") == 0,
+    )
+    .await;
+    release(shared.path(), "b2");
+    assert_eq!(call2.await.unwrap()["exit"], json!(0));
+
+    poll_status_until(&mut client, "capacity fully drains", |s| {
+        class_executing(s, "guard") == 0 && class_waiting(s, "guard") == 0
     })
     .await;
 }
