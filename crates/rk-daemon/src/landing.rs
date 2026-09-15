@@ -1532,6 +1532,18 @@ pub(crate) struct LandingPipeline {
     /// [`RetrySchedule`]. Real in production; a test overrides it with
     /// [`LandingPipeline::with_retry_schedule`].
     retry_schedule: RetrySchedule,
+    /// The daemon's own shutdown signal (`Server::shutdown_tx`), wired in
+    /// once by [`LandingPipeline::with_shutdown`] — production only
+    /// (`Server::landing`); a pipeline built directly by a test leaves this
+    /// `None`, which makes [`Self::shutdown_requested`] pend forever, so
+    /// every wait below behaves exactly as it did before this field existed.
+    /// TKT-karut-jaraf-hivur: without this, [`Self::await_primary_verdict`]'s
+    /// poll loop has no way to notice a graceful `stop` — it only watches the
+    /// verdict pattern and the reviewer's liveness — so a genuinely live
+    /// marker-held reviewer holds the whole `run_cycle` (and so
+    /// `Server::run`'s shutdown `join_next`) open for up to
+    /// `GateConfig::review_max_wait`, not the accept loop's own bound.
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// One decision [`LandingPipeline::gate_worktree_sweep_once`] made about a
@@ -1571,6 +1583,7 @@ impl LandingPipeline {
             enqueue_lock: Mutex::new(()),
             key_locks: Mutex::new(HashMap::new()),
             retry_schedule: RetrySchedule::default(),
+            shutdown: None,
         }
     }
 
@@ -1582,6 +1595,33 @@ impl LandingPipeline {
     pub(crate) fn with_retry_schedule(mut self, schedule: RetrySchedule) -> Self {
         self.retry_schedule = schedule;
         self
+    }
+
+    /// Wire the daemon's own shutdown signal through so the review wait can
+    /// notice a graceful stop — see the `shutdown` field doc. Called exactly
+    /// once, by `Server::landing`, right after construction.
+    pub(crate) fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// Resolves once the daemon has genuinely requested shutdown; never
+    /// resolves at all when this pipeline has no shutdown handle (the
+    /// `shutdown` field doc) or once the sender side is gone (there is then
+    /// no shutdown left to observe, so treat it the same as "none pending" —
+    /// happens only in a test that drops the `Server` around this pipeline).
+    async fn shutdown_requested(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+        let Some(rx) = shutdown else {
+            return std::future::pending().await;
+        };
+        loop {
+            if *rx.borrow() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+        }
     }
 
     /// Resolve this entry's repo-owned gate/review policy from its activated
@@ -3420,6 +3460,11 @@ impl LandingPipeline {
         let started = tokio::time::Instant::now();
         let deadline = started + gates.review_max_wait;
         let mut logged_past_base_timeout = false;
+        // Cloned once, not read from `self` each iteration: a `watch`
+        // receiver's own "seen" cursor must persist across loop iterations
+        // for `shutdown_requested` below to `.await` on the NEXT change
+        // rather than the one it already observed.
+        let mut shutdown = self.shutdown.clone();
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -3433,7 +3478,24 @@ impl LandingPipeline {
                 });
             }
             let slice = remaining.min(REVIEW_POLL_SLICE);
-            if let Some(tuple) = self.space.rd(&pattern, slice).await? {
+            // Raced against shutdown, not merely checked before/after: a
+            // marker-held reviewer can leave `self.space.rd` parked for the
+            // FULL `slice` (up to `REVIEW_POLL_SLICE`), and `run_cycle`'s
+            // caller (`Server::run`'s shutdown `join_next`) must not wait
+            // that long once a graceful stop is already in hand. Dropping
+            // this `rd` future mid-wait when shutdown wins is safe: its
+            // registered waiter (`Space::blocking_read`) is process-local
+            // and this whole process is exiting right behind it — nothing
+            // durable is left dangling (see the `shutdown` field doc).
+            let found = tokio::select! {
+                found = self.space.rd(&pattern, slice) => found?,
+                _ = Self::shutdown_requested(&mut shutdown) => {
+                    return Err(rk_core::Error::other(
+                        "landing pipeline: daemon shutting down while awaiting review verdict",
+                    ));
+                }
+            };
+            if let Some(tuple) = found {
                 let recommendation = tuple
                     .payload
                     .get("recommendation")
