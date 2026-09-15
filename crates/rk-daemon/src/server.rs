@@ -872,6 +872,78 @@ fn ingest_state_filter(params: &IngestStateParams) -> (Option<String>, Option<St
     (None, None)
 }
 
+/// Whether an `ingest.state` fact carries the given repo, per its family's own
+/// provenance field rather than a blanket `subject`-prefix check: CI subjects
+/// are `{repo}:...` so a prefix match is correct there, but deployment
+/// subjects are `{environment}:{service}` (repo lives in `current.repo`
+/// instead — see sdlc_fact_tuple), and production_alert subjects carry no repo
+/// at all. A family with no repo provenance must never masquerade as a match.
+fn sdlc_fact_matches_repo(fact: &Tuple, repo: &str) -> bool {
+    match fact.payload.get("family").and_then(Value::as_str) {
+        Some("ci") => fact
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with(&format!("{repo}:"))),
+        Some("deployment") => fact
+            .payload
+            .get("current")
+            .and_then(|current| current.get("repo"))
+            .and_then(Value::as_str)
+            .is_some_and(|current_repo| current_repo == repo),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod sdlc_fact_matches_repo_tests {
+    use super::sdlc_fact_matches_repo;
+    use rk_core::tuple::{Category, Tuple};
+    use serde_json::json;
+
+    fn fact(payload: serde_json::Value) -> Tuple {
+        Tuple::new(Category::Fact, "scope", "identity", "source:probe", payload)
+    }
+
+    #[test]
+    fn ci_fact_matches_by_subject_prefix() {
+        let t = fact(json!({"family": "ci", "subject": "rat-kingdom:main:ci:test:abc123"}));
+        assert!(sdlc_fact_matches_repo(&t, "rat-kingdom"));
+        assert!(!sdlc_fact_matches_repo(&t, "other-repo"));
+    }
+
+    #[test]
+    fn deployment_fact_matches_by_current_repo_not_subject() {
+        let t = fact(json!({
+            "family": "deployment",
+            "subject": "local-production:rk-pair",
+            "current": {"environment": "local-production", "service": "rk-pair", "repo": "rat-kingdom"}
+        }));
+        assert!(sdlc_fact_matches_repo(&t, "rat-kingdom"));
+        assert!(!sdlc_fact_matches_repo(&t, "some-other-repo"));
+    }
+
+    #[test]
+    fn deployment_fact_with_missing_current_repo_never_matches() {
+        let t = fact(json!({
+            "family": "deployment",
+            "subject": "local-production:rk-pair",
+            "current": {"environment": "local-production", "service": "rk-pair"}
+        }));
+        assert!(!sdlc_fact_matches_repo(&t, "rat-kingdom"));
+    }
+
+    #[test]
+    fn production_alert_fact_has_no_repo_provenance_and_never_matches() {
+        let t = fact(json!({
+            "family": "production_alert",
+            "subject": "local-production:rk-pair:disk-full"
+        }));
+        assert!(!sdlc_fact_matches_repo(&t, "rat-kingdom"));
+        assert!(!sdlc_fact_matches_repo(&t, "some-other-repo"));
+    }
+}
+
 /// Who may close a ballot: its proposer, or the operator (TKT-184).
 ///
 /// Withdrawal is destructive-in-effect and unretractable in practice — it
@@ -12366,13 +12438,7 @@ impl Daemon {
         {
             Ok(mut facts) => {
                 if let Some(repo) = params.repo.as_deref() {
-                    let prefix = format!("{repo}:");
-                    facts.retain(|fact| {
-                        fact.payload
-                            .get("subject")
-                            .and_then(Value::as_str)
-                            .is_some_and(|s| s.starts_with(&prefix))
-                    });
+                    facts.retain(|fact| sdlc_fact_matches_repo(fact, repo));
                 }
                 facts.truncate(requested);
                 Response::ok(req.id, json!({"facts": facts, "truncated": false}))
