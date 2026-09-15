@@ -719,7 +719,7 @@ async fn start(layout: &Layout, args: StartArgs, as_json: bool) -> Result<()> {
             .as_secs(),
             max_wait_secs: positive_duration(&args.max_wait, "--max-wait")?.as_secs(),
         },
-        observer_build: rk_core::version::BUILD_VERSION.to_string(),
+        observer_build: rk_core::version::build_version().to_string(),
     };
     write_new_json(&run_dir.join(MANIFEST), &manifest)?;
     if let Some(path) = &args.contract {
@@ -3547,7 +3547,7 @@ mod tests {
                     _ => panic!("unexpected observation RPC {method}"),
                 };
                 let response = json!({"id": request["id"], "result": value,
-                    "server_version": rk_core::version::BUILD_VERSION});
+                    "server_version": rk_core::version::build_version()});
                 stream
                     .get_mut()
                     .write_all(format!("{response}\n").as_bytes())
@@ -3721,7 +3721,7 @@ mod tests {
                 let request: Value = serde_json::from_str(&line).unwrap();
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 let response = json!({"id": request["id"], "result": {},
-                    "server_version": rk_core::version::BUILD_VERSION});
+                    "server_version": rk_core::version::build_version()});
                 if stream
                     .get_mut()
                     .write_all(format!("{response}\n").as_bytes())
@@ -3796,7 +3796,7 @@ mod tests {
                             _ => panic!("unexpected observation RPC {method}"),
                         };
                         let response = json!({"id": request["id"], "result": value,
-                            "server_version": rk_core::version::BUILD_VERSION});
+                            "server_version": rk_core::version::build_version()});
                         if stream
                             .get_mut()
                             .write_all(format!("{response}\n").as_bytes())
@@ -3916,7 +3916,7 @@ mod tests {
                             _ => panic!("unexpected observation RPC {method}"),
                         };
                         let response = json!({"id": request["id"], "result": value,
-                            "server_version": rk_core::version::BUILD_VERSION});
+                            "server_version": rk_core::version::build_version()});
                         if stream
                             .get_mut()
                             .write_all(format!("{response}\n").as_bytes())
@@ -4082,7 +4082,7 @@ mod tests {
                     _ => panic!("unexpected observation RPC {method}"),
                 };
                 let response = json!({"id": request["id"], "result": value,
-                    "server_version": rk_core::version::BUILD_VERSION});
+                    "server_version": rk_core::version::build_version()});
                 stream
                     .get_mut()
                     .write_all(format!("{response}\n").as_bytes())
@@ -4147,7 +4147,7 @@ mod tests {
                 let response = if method == "space.scan" {
                     json!({"id": request["id"], "error": {"code": "frame_too_large",
                         "message": "response too large (21100000 bytes, limit 16777216); narrow the request (e.g. drop --all/--archived, or filter by repo)"},
-                        "server_version": rk_core::version::BUILD_VERSION})
+                        "server_version": rk_core::version::build_version()})
                 } else {
                     let value = match method {
                         "status" => json!({"pid": 1, "build_version": "test", "landing_queue": []}),
@@ -4161,7 +4161,7 @@ mod tests {
                         _ => panic!("unexpected observation RPC {method}"),
                     };
                     json!({"id": request["id"], "result": value,
-                        "server_version": rk_core::version::BUILD_VERSION})
+                        "server_version": rk_core::version::build_version()})
                 };
                 stream
                     .get_mut()

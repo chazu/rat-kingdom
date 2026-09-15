@@ -16,7 +16,7 @@ pub struct Request {
     /// authorization context, not a tuple payload and never a sync identity.
     #[serde(default = "default_caller")]
     pub caller: String,
-    /// Build the caller was compiled from (`rk_core::version::BUILD_VERSION`).
+    /// Build the caller was compiled from (`rk_core::version::build_version()`).
     ///
     /// Half of the version handshake: the daemon cannot warn the operator's
     /// terminal, but it can record in `daemon.log` that it is being driven by
@@ -44,7 +44,7 @@ pub struct Response {
     /// Carried on the response rather than exchanged in a dedicated
     /// connect-time round trip so the check costs nothing: `rk` is invoked
     /// constantly by rats and an extra RPC per invocation would be a real tax.
-    /// The client compares it against its own [`rk_core::version::BUILD_VERSION`]
+    /// The client compares it against its own [`rk_core::version::build_version()`]
     /// and warns once per process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_version: Option<String>,
@@ -67,7 +67,7 @@ impl Response {
             id: id.into(),
             result: Some(result),
             error: None,
-            server_version: Some(rk_core::version::BUILD_VERSION.into()),
+            server_version: Some(rk_core::version::build_version().into()),
         }
     }
 
@@ -79,7 +79,7 @@ impl Response {
                 code: code.into(),
                 message: message.into(),
             }),
-            server_version: Some(rk_core::version::BUILD_VERSION.into()),
+            server_version: Some(rk_core::version::build_version().into()),
         }
     }
 }
@@ -130,7 +130,7 @@ mod tests {
             let wire = serde_json::to_value(&response).unwrap();
             assert_eq!(
                 wire["server_version"],
-                json!(rk_core::version::BUILD_VERSION),
+                json!(rk_core::version::build_version()),
                 "a reply the client cannot date is a reply that cannot warn"
             );
         }
@@ -155,13 +155,13 @@ mod tests {
             method: "ping".into(),
             auth: "t".into(),
             caller: "operator".into(),
-            client_version: Some(rk_core::version::BUILD_VERSION.into()),
+            client_version: Some(rk_core::version::build_version().into()),
             params: json!({}),
         })
         .unwrap();
         assert_eq!(
             sent["client_version"],
-            json!(rk_core::version::BUILD_VERSION)
+            json!(rk_core::version::build_version())
         );
     }
 }

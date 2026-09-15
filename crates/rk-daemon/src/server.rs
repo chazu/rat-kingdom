@@ -2412,11 +2412,11 @@ impl Daemon {
             // a rat makes many calls and they all carry the same stamp.
             if let Ok(req) = &parsed {
                 if let Some(client) = req.client_version.as_deref() {
-                    if client != rk_core::version::BUILD_VERSION && !noted_client_build {
+                    if client != rk_core::version::build_version() && !noted_client_build {
                         noted_client_build = true;
                         warn!(
                             client_build = client,
-                            daemon_build = rk_core::version::BUILD_VERSION,
+                            daemon_build = rk_core::version::build_version(),
                             caller = %req.caller,
                             "caller is a different build than this daemon; `rk daemon rollover` onto it"
                         );
@@ -11620,7 +11620,7 @@ impl Daemon {
             // The version that can actually distinguish two daemons: `version`
             // above has read `0.1.0` since the first commit, so an operator
             // comparing it against a freshly installed binary learns nothing.
-            "build_version": rk_core::version::BUILD_VERSION,
+            "build_version": rk_core::version::build_version(),
             "pid": std::process::id(),
             // Operator-facing: the friendly alias if configured, else the actor
             // id. The wire id (self.castle) is never exposed here as a name.

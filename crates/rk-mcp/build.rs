@@ -1,18 +1,17 @@
-//! Stamps the commit this tree was built from into `RK_BUILD_SHA`, so a binary
-//! can say which build it *is* and not merely which semver it claims.
+//! Stamps the commit this tree was built from into `RK_BUILD_SHA`, so the
+//! standalone `rk-mcp` binary can say which build it *is* — see
+//! `crates/rk-cli/build.rs` for the full rationale (this is that same script,
+//! duplicated rather than shared, because it is exactly the kind of tiny
+//! per-executable leaf logic this ticket moved *out* of the widely-depended
+//! `rk-core` in the first place; sharing it back through a crate would
+//! reintroduce the same invalidation-fanout problem for whichever of the two
+//! executables didn't change).
 //!
-//! The workspace version has been `0.1.0` since the first commit and will stay
-//! there for a long while, so comparing `CARGO_PKG_VERSION` across a socket
-//! answers nothing: a daemon started before a merge and a CLI built after it
-//! report the identical string. The commit does distinguish them, which is what
-//! makes the CLI<->daemon handshake in `rk_core::version` able to notice that a
-//! running daemon predates the code the operator just installed.
-//!
-//! Deliberately *not* a dirty-tree flag: this script only reruns when the git
-//! files listed below change, and editing a source file touches none of them,
-//! so a `-dirty` suffix computed here would go stale the moment it mattered.
-//! Uncommitted differences between two builds are therefore invisible to the
-//! handshake — commit before deploying if you want the check to be exact.
+//! `rk-mcp` is a second, independent entry point into the same daemon
+//! protocol as `rk` (an MCP stdio bridge run directly by an MCP host, not a
+//! subcommand of `rk`), so it needs its own build-identity stamp and its own
+//! `rk_core::version::init_build_sha` call at the top of its `main` — the
+//! `rk` binary's call does not cover this separate process.
 
 use std::path::Path;
 use std::process::Command;
@@ -39,7 +38,7 @@ fn main() {
 /// Emitting *any* `rerun-if-changed` opts out of cargo's default "rerun when a
 /// package file changes", which is the point: this script's output depends on
 /// git state alone, and rerunning it on every source edit would recompile
-/// rk-core — and so relink the whole workspace — for no change in output.
+/// rk-mcp — and so relink the `rk-mcp` binary — for no change in output.
 ///
 /// `--git-path` is used rather than hand-built `.git/...` strings because in a
 /// linked worktree `.git` is a *file* and HEAD lives under
@@ -69,9 +68,13 @@ fn rerun_paths() -> Vec<String> {
 }
 
 fn git(args: &[&str]) -> Option<String> {
+    // Read at runtime, not baked in via `env!`, so a cached build-script
+    // binary keeps resolving the right checkout after the crate directory
+    // moves (a linked worktree relocated or promoted from a shared cache).
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
     let out = Command::new("git")
         .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(manifest_dir)
         .output()
         .ok()?;
     if !out.status.success() {
