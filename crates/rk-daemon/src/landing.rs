@@ -3270,6 +3270,16 @@ impl LandingPipeline {
         // flight; it is never checked WITHIN an already-executing half, so a
         // shared cohort's own in-flight check/reviewer/target-advance is
         // never interrupted, only the not-yet-started other half.
+        //
+        // A 3+-member cohort nests: `process_batch(right)` below can itself
+        // hit a combined-candidate conflict/gate failure and recurse into a
+        // FRESH call to this same function for its own two grandchild
+        // halves. That nested call re-runs this exact prologue and its own
+        // left/right boundary check at its own entry — an ancestor level
+        // completing its left half can never let a *grandchild* start after
+        // the fence engages either, since nothing upstream of a nested call
+        // skips past this function's own checks. There is no separate
+        // "nested" code path to keep in sync with this one.
         let repo_name = entries[0].repo_name.clone();
         if self.admission_fenced_at_split_boundary(&repo_name).await {
             return Ok(Vec::new());
@@ -15621,9 +15631,14 @@ checks: [
     /// already-executing check finishes uninterrupted and lands normally
     /// while fenced; `member-b` — the second, not-yet-started half — never
     /// starts its own gate while the fence is live (the shared invocation
-    /// counter never advances past `member-a`'s check); `member-b` stays
-    /// durably queued and is reclaimed and landed exactly once after an
-    /// explicit release.
+    /// counter never advances past `member-a`'s check); `member-b`'s durable
+    /// row (`seq`, `enqueued_at`, retry budget) is untouched by the
+    /// deferral, not re-created or re-budgeted; a genuine concurrent
+    /// `submit_manual` waiter for `member-b` (the `try_lock_owned` loser
+    /// path, same construct as
+    /// `submit_manual_as_a_genuine_loser_observes_a_real_background_drainers_outcome`)
+    /// neither resolves early nor hangs — it settles only once `member-b`
+    /// reaches its own real terminal outcome after an explicit release.
     #[tokio::test]
     async fn handoff_fence_blocks_the_second_half_of_an_already_claimed_bisected_batch() {
         let home = tempfile::tempdir().unwrap();
@@ -15723,6 +15738,19 @@ checks: [
             "exactly the combined check and member-a's solo check must have run so far"
         );
 
+        // member-b's durable row right now — already rewritten by
+        // `bisect_batch`'s prologue (RunningGates, candidate cleared) before
+        // the split, but never touched again while deferred. Captured here
+        // so the post-deferral snapshot below can prove `seq`/`enqueued_at`/
+        // retry budget survive untouched, not merely that a row exists.
+        let member_b_before = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b"))
+            .expect("member-b must already be durably present before the fence is requested")
+            .payload;
+
         // Request the fence while member-a is genuinely mid-check — the
         // still-executing FIRST half of the split, which must finish
         // uninterrupted.
@@ -15737,6 +15765,31 @@ checks: [
             .unwrap();
         assert_eq!(requested["state"], "draining", "requested: {requested}");
         let fence_id = requested["fence_id"].as_str().unwrap().to_string();
+
+        // A genuine concurrent operator resubmission of member-b: it must
+        // take the `try_lock_owned` loser path (drain_task still owns the
+        // key) and fall into `wait_for_terminal_outcome`, exactly like
+        // `submit_manual_as_a_genuine_loser_observes_a_real_background_drainers_outcome`.
+        let waiter_pipeline = Arc::clone(&pipeline);
+        let waiter_repo_dir = repo_dir.path().to_path_buf();
+        let waiter_handle = tokio::spawn(async move {
+            waiter_pipeline
+                .submit_manual(
+                    &waiter_repo_dir,
+                    "member-b",
+                    "main",
+                    false,
+                    Some("member-b-task".into()),
+                    None,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiter_handle.is_finished(),
+            "the waiter must not resolve before member-a (the real, still-blocked owner) \
+             even finishes its own gate"
+        );
 
         // Let member-a finish — a live, normal completion, unaffected by
         // the fence.
@@ -15779,6 +15832,37 @@ checks: [
                 .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b")),
             "member-b must not have been processed while fenced"
         );
+        assert!(
+            !waiter_handle.is_finished(),
+            "the waiter must still not resolve while member-b is genuinely deferred by the fence \
+             — no early success, and no fabricated terminal outcome"
+        );
+
+        // The deferral itself must not mutate member-b's durable identity or
+        // spend/reset any budget it did not actually use: same `seq` (the
+        // same queue row, not a re-created one), same `enqueued_at` (age
+        // keeps accruing from its original arrival, never resets), and its
+        // infra-retry budget untouched (it never actually ran a gate).
+        let member_b_deferred = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b"))
+            .expect("member-b must still be durably present while deferred")
+            .payload;
+        assert_eq!(member_b_deferred["seq"], member_b_before["seq"]);
+        assert_eq!(
+            member_b_deferred["enqueued_at"],
+            member_b_before["enqueued_at"]
+        );
+        assert_eq!(
+            member_b_deferred["gate_infra_retry_used"],
+            member_b_before["gate_infra_retry_used"]
+        );
+        assert_eq!(
+            member_b_deferred["gate_infra_retry_check"],
+            member_b_before["gate_infra_retry_check"]
+        );
 
         // Release the fence — member-b may now resume, exactly once, with a
         // fresh candidate binding of its own.
@@ -15799,6 +15883,20 @@ checks: [
             "member-b must resume exactly once: {outcomes:?}"
         );
         assert!(matches!(outcomes[0], LandingOutcome::Landed(_)));
+
+        // The waiter observes member-b's REAL terminal outcome, settled only
+        // after the fence actually lifted and the deferred half actually ran
+        // — never returned early, never hung.
+        let waiter_result = tokio::time::timeout(Duration::from_secs(10), waiter_handle)
+            .await
+            .expect("the waiter must resolve once member-b actually lands, not hang forever")
+            .unwrap()
+            .unwrap();
+        assert_eq!(waiter_result["merged"], true, "waiter_result: {waiter_result}");
+        assert_eq!(
+            waiter_result["delivered"], true,
+            "waiter_result: {waiter_result}"
+        );
 
         let listing = Command::new("git")
             .arg("-C")
