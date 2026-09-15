@@ -1874,8 +1874,7 @@ impl LandingPipeline {
                 // would break the single-consumer-per-key invariant. Just
                 // watch our own durable terminal outcome; the active
                 // drainer will reach `entry` in FIFO order and write it.
-                let outcome = self.wait_for_terminal_outcome(&entry).await?;
-                Ok(Self::already_settled_json(branch, target, &outcome))
+                self.wait_for_terminal_outcome(&entry).await
             }
         }
     }
@@ -1899,8 +1898,8 @@ impl LandingPipeline {
     ) -> rk_core::Result<Value> {
         loop {
             let Some(claimed) = self.queue.claim_next(&repo_name, &target)? else {
-                if let Some(prior) = self.processed_outcome(&entry)? {
-                    return Ok(Self::already_settled_json(&entry.branch, &target, &prior));
+                if let Some(result) = self.settled_terminal_json(&entry)? {
+                    return Ok(result);
                 }
                 return Err(rk_core::Error::other(format!(
                     "landing queue lost operator submission {}@{}",
@@ -2332,21 +2331,19 @@ impl LandingPipeline {
     /// later arrivals on the same key keep draining under that lock while
     /// this caller only ever watches its own work key.
     ///
-    /// The durable [`Self::processed_outcome`] marker is checked before AND
-    /// after registering for the wake hint, closing the race where
-    /// [`Self::mark_processed`] runs between the two — and the wait itself
-    /// is bounded by a short poll fallback rather than the bare notify, so a
-    /// missed or coalesced wakeup (map eviction, a restart) still settles
-    /// correctly instead of hanging: "a notification is a wake hint; durable
-    /// state remains authority."
-    async fn wait_for_terminal_outcome(
-        &self,
-        entry: &LandingQueueEntry,
-    ) -> rk_core::Result<String> {
+    /// [`Self::settled_terminal_json`] is checked before AND after
+    /// registering for the wake hint, closing the race where
+    /// [`Self::mark_processed`] (or [`landing::admission::archive_quarantine`],
+    /// for the one outcome that bypasses it) runs between the two — and the
+    /// wait itself is bounded by a short poll fallback rather than the bare
+    /// notify, so a missed or coalesced wakeup (map eviction, a restart)
+    /// still settles correctly instead of hanging: "a notification is a
+    /// wake hint; durable state remains authority."
+    async fn wait_for_terminal_outcome(&self, entry: &LandingQueueEntry) -> rk_core::Result<Value> {
         const POLL_FALLBACK: Duration = Duration::from_millis(200);
         loop {
-            if let Some(outcome) = self.processed_outcome(entry)? {
-                return Ok(outcome);
+            if let Some(result) = self.settled_terminal_json(entry)? {
+                return Ok(result);
             }
             let notify = {
                 let key = Self::entry_work_key(entry);
@@ -2360,11 +2357,79 @@ impl LandingPipeline {
                 )
             };
             let notified = notify.notified();
-            if let Some(outcome) = self.processed_outcome(entry)? {
-                return Ok(outcome);
+            if let Some(result) = self.settled_terminal_json(entry)? {
+                return Ok(result);
             }
             let _ = tokio::time::timeout(POLL_FALLBACK, notified).await;
         }
+    }
+
+    /// `entry`'s own durable terminal result, if it has reached one — `None`
+    /// otherwise (still in flight, or genuinely lost). Two correctness
+    /// requirements a non-owning caller (unlike `process_entry`'s
+    /// crash-window reconciliation, NOT operating under this key's held
+    /// lock) must not skip:
+    ///
+    /// 1. Reads [`Self::admission_marker`], never the raw
+    ///    [`Self::processed_marker`]/[`Self::processed_outcome`] — a
+    ///    non-`landed` marker superseded by a fresh admission after the
+    ///    target moved (the exact case [`Self::enqueue_disposition`] used to
+    ///    decide THIS caller's own entry deserved a new attempt) must never
+    ///    be read back as that new attempt's answer. `processed_outcome`'s
+    ///    "just processed under this held lock" safety argument does not
+    ///    hold here.
+    /// 2. Also checks for a durable quarantine record
+    ///    (`landing_queue_quarantine`, written by
+    ///    `landing::admission::archive_quarantine`) — the one terminal
+    ///    outcome [`Self::mark_processed`] deliberately never records a
+    ///    `landing_processed` marker for. Without this, a caller whose own
+    ///    candidate is ultimately quarantined would never see a marker at
+    ///    all and poll forever.
+    fn settled_terminal_json(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Value>> {
+        if let Some(marker) = self.admission_marker(entry)? {
+            let prior = marker
+                .payload
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return Ok(Some(Self::already_settled_json(
+                &entry.branch,
+                &entry.target,
+                prior,
+            )));
+        }
+        if let Some(evidence) = self.quarantine_record(entry)? {
+            return Ok(Some(json!({
+                "status": "quarantined",
+                "evidence": evidence.id.to_string(),
+                "merged": false,
+                "delivered": false,
+            })));
+        }
+        Ok(None)
+    }
+
+    /// The durable quarantine record for `entry`'s exact work key, if one
+    /// exists — [`Self::settled_terminal_json`]'s quarantine probe. Same
+    /// scan-then-filter-then-`.rfind()` shape as [`Self::processed_marker`];
+    /// the identity string is duplicated from
+    /// `landing::admission::QUARANTINE_IDENTITY` (private to that submodule)
+    /// rather than exposed, matching this module's existing sweep at
+    /// [`Self::sweep_orphaned_candidate_refs`].
+    fn quarantine_record(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
+        Ok(self
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .scope(&entry.repo_name)
+                    .identity("landing_queue_quarantine"),
+            )?
+            .into_iter()
+            .rfind(|t| {
+                t.payload["entry"]["branch"] == entry.branch
+                    && t.payload["entry"]["head_sha"] == entry.head_sha
+                    && t.payload["entry"]["target"] == entry.target
+            }))
     }
 
     /// Process exactly one candidate for `(repo_name, target)`, or `None` if
@@ -2741,8 +2806,17 @@ impl LandingPipeline {
         {
             let mut outcomes = Vec::with_capacity(entries.len());
             for entry in entries {
-                let outcome = self.process_entry(&entry).await?;
-                outcomes.push((entry, outcome));
+                let outcome = self.process_entry(&entry).await;
+                if outcome.is_ok() {
+                    // Retire THIS entry the instant its own outcome is
+                    // durable, not after every sibling in the claimed batch
+                    // (up to 8, each independently gated/reviewed) finishes
+                    // too — otherwise an already-landed row lingers active
+                    // behind a later member still blocked on its own gate or
+                    // review (TKT-dobas-lujom-lipog rework finding (3)).
+                    self.queue.remove(&entry)?;
+                }
+                outcomes.push((entry, outcome?));
             }
             return Ok(outcomes);
         }
@@ -2805,6 +2879,7 @@ impl LandingPipeline {
                 let mut outcomes = Vec::with_capacity(entries.len());
                 for entry in entries {
                     let outcome = self.hold_no_gate(&entry, error.clone())?;
+                    self.queue.remove(&entry)?;
                     outcomes.push((entry, outcome));
                 }
                 return Ok(outcomes);
@@ -2838,6 +2913,7 @@ impl LandingPipeline {
                 entry.admission_hold = first.admission_hold.clone();
                 self.escalate(&entry, "landing: batch verification admission expired before execution; held without spending child-death retries".into())?;
                 self.mark_processed(&entry, &LandingOutcome::GateHeld)?;
+                self.queue.remove(&entry)?;
                 outcomes.push((entry, LandingOutcome::GateHeld));
             }
             return Ok(outcomes);
@@ -2866,6 +2942,7 @@ impl LandingPipeline {
                     let outcome =
                         LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
                     self.mark_processed(&entry, &outcome)?;
+                    self.queue.remove(&entry)?;
                     outcomes.push((entry, outcome));
                 }
                 return Ok(outcomes);
@@ -2894,6 +2971,7 @@ impl LandingPipeline {
         for entry in entries {
             let outcome = self.finalize_landed(&entry, result.clone()).await?;
             self.mark_processed(&entry, &outcome)?;
+            self.queue.remove(&entry)?;
             outcomes.push((entry, outcome));
         }
         Ok(outcomes)
@@ -2965,11 +3043,13 @@ impl LandingPipeline {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                self.queue.remove(entry)?;
                 outcomes.push((entry.clone(), LandingOutcome::Reconciled(prior)));
                 continue;
             }
             let outcome = self.finalize_landed(entry, result.clone()).await?;
             self.mark_processed(entry, &outcome)?;
+            self.queue.remove(entry)?;
             outcomes.push((entry.clone(), outcome));
         }
         Ok(Some(outcomes))
@@ -3008,6 +3088,7 @@ impl LandingPipeline {
         if entries.len() == 1 {
             let entry = entries.pop().unwrap();
             let outcome = self.process_entry(&entry).await?;
+            self.queue.remove(&entry)?;
             return Ok(vec![(entry, outcome)]);
         }
         let right = entries.split_off(entries.len() / 2);
@@ -14780,6 +14861,474 @@ checks: [
                 .unwrap()
                 .is_empty(),
             "both candidates must be retired from the active queue once the drain completes"
+        );
+    }
+
+    /// TKT-dobas-lujom-lipog rework (native verdict `01M2HVGV7KC9X36MMEC7D3NZXS`,
+    /// finding (4)): the original diff's sole new test only ever drove
+    /// `submit_manual`'s WINNING path (it becomes the drainer itself via
+    /// `drive_key_as_owner`) — the actual new logic under review, the
+    /// `try_lock_owned` `Err` branch / `wait_for_terminal_outcome`, was
+    /// never exercised. Here a genuine background `drain_key` call (not
+    /// this test driving anything by hand — the real single-consumer path a
+    /// live daemon's `run_cycle` uses) holds `key_lock` throughout, and a
+    /// SEPARATE `submit_manual` call for the entry it is still mid-gate on
+    /// must take the loser branch and observe that same real outcome once
+    /// it lands — proven never to resolve early (still running when the
+    /// background drainer is still blocked) and never to itself touch
+    /// `key_lock`.
+    #[tokio::test]
+    async fn submit_manual_as_a_genuine_loser_observes_a_real_background_drainers_outcome() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("reached");
+        let release = barrier_dir.path().join("release");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done", timeout: "30s"}},
+]
+"#,
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        git(repo_dir.path(), &["checkout", "-b", "watched"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs").join("watched.md"), "note\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: watched"]);
+        let head_sha = rev_parse(repo_dir.path(), "watched");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "watched".into(),
+                target: "main".into(),
+                head_sha: head_sha.clone(),
+                diff_class: "doc-only".into(),
+                task: "watched-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // The genuine background daemon consumer: takes `key_lock` for real
+        // through `drain_key`'s own blocking acquire, and is the ONLY thing
+        // that ever claims/processes this entry.
+        let drainer = Arc::clone(&pipeline);
+        let drain_repo_name = repo_name.clone();
+        let drain_handle =
+            tokio::spawn(async move { drainer.drain_key(&drain_repo_name, "main").await });
+
+        let mut gate_started = false;
+        for _ in 0..300 {
+            if reached.exists() {
+                gate_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(gate_started, "background drainer never started the gate");
+
+        // `drain_key` still holds `key_lock` right now (its one gate run is
+        // blocked on the barrier) — this call MUST take the
+        // `try_lock_owned` `Err` branch, never becoming a drainer itself.
+        let submit_pipeline = Arc::clone(&pipeline);
+        let repo_path = repo_dir.path().to_path_buf();
+        let submit_handle = tokio::spawn(async move {
+            submit_pipeline
+                .submit_manual(
+                    &repo_path,
+                    "watched",
+                    "main",
+                    false,
+                    Some("watched-task".into()),
+                    None,
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !submit_handle.is_finished(),
+            "the loser call resolved before the real (still-blocked) owner ever finished its gate"
+        );
+
+        std::fs::write(&release, b"go").unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), submit_handle)
+            .await
+            .expect("loser must resolve once the real owner finishes, not hang")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["merged"], true, "result: {result}");
+        assert_eq!(result["delivered"], true, "result: {result}");
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(10), drain_handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(&outcomes[0], LandingOutcome::Landed(r) if r.delivered()),
+            "outcomes: {outcomes:?}"
+        );
+    }
+
+    /// TKT-dobas-lujom-lipog rework, finding (2): `wait_for_terminal_outcome`
+    /// (via [`LandingPipeline::settled_terminal_json`]) must never read a
+    /// non-`landed` marker back once the target has moved past what it
+    /// described — the exact currency filter `enqueue_disposition`/
+    /// `admission_marker` already apply at admission time; raw
+    /// `processed_outcome` is only safe in the just-processed/held-lock
+    /// context its own doc comment describes, which a non-owner waiter is
+    /// not in. Manufactures an old `gate-held` marker, moves `main`, and
+    /// proves the stale marker no longer answers for this key — only a
+    /// FRESH `mark_processed` call (against the new tip) does.
+    #[tokio::test]
+    async fn settled_terminal_json_rejects_a_stale_marker_superseded_by_a_moved_target() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["checkout", "-b", "stale-branch"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+        let head_sha = rev_parse(repo_dir.path(), "stale-branch");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "stale-branch".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "stale-task".into(),
+            ..Default::default()
+        };
+
+        // An old attempt was held against main's CURRENT tip.
+        pipeline
+            .mark_processed(&entry, &LandingOutcome::GateHeld)
+            .unwrap();
+        assert_eq!(
+            pipeline.settled_terminal_json(&entry).unwrap().unwrap()["status"],
+            "gate-held",
+            "the marker is current the instant it's written — sanity check"
+        );
+
+        // main moves for an unrelated reason; the old marker no longer
+        // describes the live ref.
+        std::fs::write(repo_dir.path().join("unrelated.md"), "x\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "unrelated"]);
+
+        assert!(
+            pipeline.settled_terminal_json(&entry).unwrap().is_none(),
+            "a stale non-landed marker superseded by target movement must not answer for a \
+             fresh attempt"
+        );
+
+        // The fresh attempt's own outcome, once recorded against the NEW
+        // tip, answers correctly.
+        pipeline
+            .mark_processed(&entry, &LandingOutcome::GateHeld)
+            .unwrap();
+        let fresh = pipeline.settled_terminal_json(&entry).unwrap().unwrap();
+        assert_eq!(fresh["status"], "gate-held");
+    }
+
+    /// TKT-dobas-lujom-lipog rework, finding (1): `mark_processed`
+    /// deliberately never writes a `landing_processed` marker for
+    /// `LandingOutcome::Quarantined` (its own doc comment) — a
+    /// `wait_for_terminal_outcome` caller relying only on that marker would
+    /// poll forever. Proves both the direct read (`settled_terminal_json`)
+    /// and the actual async wait resolve instead, bounded, not hanging.
+    #[tokio::test]
+    async fn wait_for_terminal_outcome_settles_a_quarantined_entry_instead_of_hanging() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["checkout", "-b", "quarantine-branch"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+        let head_sha = rev_parse(repo_dir.path(), "quarantine-branch");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "quarantine-branch".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "quarantine-task".into(),
+            ..Default::default()
+        };
+
+        assert!(pipeline.settled_terminal_json(&entry).unwrap().is_none());
+
+        pipeline
+            .archive_quarantine(&entry, "test: simulated invalid source".into())
+            .unwrap();
+
+        let direct = pipeline.settled_terminal_json(&entry).unwrap().unwrap();
+        assert_eq!(direct["status"], "quarantined");
+        assert_eq!(direct["merged"], false);
+        assert_eq!(direct["delivered"], false);
+
+        // The actual async wait a non-owner `submit_manual` caller drives —
+        // must resolve, bounded, not hang forever.
+        let waited = tokio::time::timeout(
+            Duration::from_secs(5),
+            pipeline.wait_for_terminal_outcome(&entry),
+        )
+        .await
+        .expect("must not hang on a quarantined outcome")
+        .unwrap();
+        assert_eq!(waited["status"], "quarantined");
+    }
+
+    /// TKT-dobas-lujom-lipog rework: a missed or coalesced wake — the
+    /// `terminal_notify` map entry evicted between `notify_terminal`'s
+    /// removal and a waiter's own lookup, or (equivalently, for this
+    /// in-process test) a daemon restart that starts with an empty
+    /// in-memory notify map entirely — must still settle from durable state
+    /// alone within the bounded poll fallback, not hang. Proven by
+    /// recording the terminal marker directly (bypassing
+    /// `mark_processed`/`notify_terminal` altogether, standing in for a
+    /// lost/never-sent wakeup) while `wait_for_terminal_outcome` is already
+    /// waiting, and confirming it still resolves.
+    #[tokio::test]
+    async fn wait_for_terminal_outcome_settles_from_durable_state_after_a_missed_notification() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["checkout", "-b", "missed-notify"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+        let head_sha = rev_parse(repo_dir.path(), "missed-notify");
+        let main_head = rev_parse(repo_dir.path(), "main");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "missed-notify".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "missed-notify-task".into(),
+            ..Default::default()
+        };
+
+        let waiter_pipeline = Arc::clone(&pipeline);
+        let waiter_entry = entry.clone();
+        let waiter = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                waiter_pipeline.wait_for_terminal_outcome(&waiter_entry),
+            )
+            .await
+        });
+
+        // Give the waiter a moment to start (best-effort only; correctness
+        // does not depend on this exact timing since it re-checks durable
+        // state after registering too), then record the terminal marker
+        // WITHOUT going through `mark_processed`'s own `notify_terminal`
+        // call — standing in for a wakeup lost to a map-eviction race or a
+        // restart.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let tuple = Tuple::new(
+            Category::Event,
+            entry.repo_name.clone(),
+            LANDING_PROCESSED_IDENTITY,
+            "daemon",
+            json!({
+                "branch": entry.branch,
+                "target": entry.target,
+                "target_head": main_head,
+                "head_sha": entry.head_sha,
+                "task": entry.task,
+                "outcome": "landed",
+                "admission_hold": null,
+                "admission_recovery": null,
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        space.out(tuple).unwrap();
+
+        let result = waiter
+            .await
+            .unwrap()
+            .expect("must settle from the bounded poll fallback, not hang forever")
+            .unwrap();
+        assert_eq!(result["status"], "landed");
+    }
+
+    /// TKT-dobas-lujom-lipog rework, finding (3): `process_batch`'s plain
+    /// per-entry loop (independent, non-batchable candidates each running
+    /// its own gate/review) used to defer EVERY entry's queue removal to
+    /// its caller, only after the WHOLE claimed batch finished — so an
+    /// entry that finished first still read as active, queued behind a
+    /// sibling still blocked on its own gate. `diff_class: "large"` (not
+    /// `doc-only`/`trivial`) forces both entries through this exact loop
+    /// instead of the shared-single-candidate batch path; a pre-seeded
+    /// verdict-cache hit for each keeps review instant (no reviewer spawn),
+    /// so the shared `verify` named check — blocking on its SECOND
+    /// invocation — is the only thing either entry waits on. Proves the
+    /// first (sequentially-first) entry is retired from the active queue
+    /// THE INSTANT its own outcome is durable, before the second (held at
+    /// the barrier) finishes at all.
+    #[tokio::test]
+    async fn process_batch_retires_a_finished_entry_before_a_blocked_sibling_completes() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("second-reached");
+        let release = barrier_dir.path().join("release");
+        let count_file = barrier_dir.path().join("count");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'; if [ \"$n\" = \"1\" ]; then exit 0; fi; touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done", timeout: "30s"}},
+]
+"#,
+            count = count_file.display(),
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut entries = Vec::new();
+        for branch in ["large-first", "large-second"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::write(repo_dir.path().join(format!("{branch}.rs")), "fn x() {}\n").unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("feat: {branch}")],
+            );
+            let head_sha = rev_parse(repo_dir.path(), branch);
+            git(repo_dir.path(), &["checkout", "main"]);
+            entries.push(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: branch.into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "large".into(),
+                task: format!("{branch}-task"),
+                ..Default::default()
+            });
+        }
+
+        let space = Space::open_in_memory().unwrap();
+        for entry in &entries {
+            space
+                .out(Tuple::new(
+                    Category::Artifact,
+                    "code-repo",
+                    REVIEW_ARTIFACT_IDENTITY,
+                    "some-reviewer",
+                    json!({
+                        "task": entry.task,
+                        "recommendation": "APPROVE",
+                        "notes": "notes",
+                        "head_sha": entry.head_sha,
+                        "branch": entry.branch,
+                        "target": "main",
+                        "review_attempt": review_instance_id(entry),
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        for entry in &entries {
+            pipeline.enqueue(entry.clone()).unwrap();
+        }
+        let claimed = pipeline.queue.claim_batch("code-repo", "main", 8).unwrap();
+        assert_eq!(
+            claimed.len(),
+            2,
+            "both independent entries must claim together"
+        );
+
+        let batch_pipeline = Arc::clone(&pipeline);
+        let batch_handle = tokio::spawn(async move { batch_pipeline.process_batch(claimed).await });
+
+        let mut second_reached = false;
+        for _ in 0..300 {
+            if reached.exists() {
+                second_reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(second_reached, "large-second's gate never started running");
+
+        let queued = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap();
+        assert!(
+            queued
+                .iter()
+                .all(|t| t.payload.get("branch").and_then(Value::as_str) != Some("large-first")),
+            "large-first must be retired promptly, not held behind its still-blocked sibling \
+             until the whole claimed batch returns: {queued:?}"
+        );
+        assert!(
+            queued
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("large-second")),
+            "large-second should still be the one active entry left: {queued:?}"
+        );
+        assert!(
+            !space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+                .unwrap()
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("large-second")),
+            "large-second must not have a terminal outcome yet — it is still inside its gate"
+        );
+
+        std::fs::write(&release, b"go").unwrap();
+        let outcomes = tokio::time::timeout(Duration::from_secs(10), batch_handle)
+            .await
+            .expect("process_batch must finish once the barrier is released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, o)| matches!(o, LandingOutcome::Landed(r) if r.delivered())),
+            "outcomes: {outcomes:?}"
+        );
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "both entries must be retired from the active queue once the batch finishes"
         );
     }
 
