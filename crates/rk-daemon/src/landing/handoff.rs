@@ -95,6 +95,20 @@ pub(crate) enum HandoffFenceState {
 pub(crate) struct HandoffFenceRecord {
     pub(crate) repo: String,
     pub(crate) holder: String,
+    /// Opaque, globally unique identity for THIS request — the thing
+    /// `release` actually matches on.
+    ///
+    /// `generation` cannot carry that job. It is a per-repo counter derived
+    /// from whatever the store managed to load, so a corrupt-store recovery
+    /// resets it to 1; combined with the default holder (`operator`) that
+    /// makes a fence after recovery indistinguishable from the one before
+    /// it, and a replayed `release(operator, 1)` would lift a NEW fence it
+    /// never owned. A freshly minted id is monotonic in no counter and
+    /// resets with nothing, so a stale release can never match a later
+    /// fence no matter what the store lost. `generation` is kept for
+    /// ordering and reporting only.
+    #[serde(default)]
+    pub(crate) fence_id: String,
     pub(crate) generation: u64,
     pub(crate) state: HandoffFenceState,
     pub(crate) requested_at: DateTime<Utc>,
@@ -151,29 +165,38 @@ pub(crate) struct HandoffFenceStore {
 impl HandoffFenceStore {
     pub(crate) fn load(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
-        let (data, load_failure) = if path.exists() {
-            match std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|raw| {
-                    serde_json::from_str::<HandoffStoreData>(&raw).map_err(|e| e.to_string())
-                }) {
+        // Read DIRECTLY rather than probing `Path::exists()` first.
+        // `exists()` maps EVERY metadata error — a permission-denied parent,
+        // an I/O fault — to plain `false`, which would make genuinely
+        // INACCESSIBLE state indistinguishable from "no fence was ever
+        // requested" and silently report `released`. Only a real `NotFound`
+        // is absence; every other error is the explicit unavailable posture.
+        let (data, load_failure) = match std::fs::read(&path) {
+            Ok(raw) => match serde_json::from_slice::<HandoffStoreData>(&raw) {
                 Ok(data) => (data, None),
-                Err(reason) => {
-                    // Loud, and NOT silently downgraded to "no fence": see
-                    // the struct doc. A fence acknowledged before this
-                    // restart may still be genuinely owed to an operator.
-                    warn!(
-                        path = %path.display(), error = %reason,
-                        "landing handoff fence store unreadable; refusing to \
-                         report readiness until it is recovered or explicitly \
-                         re-requested"
-                    );
-                    (HandoffStoreData::default(), Some(reason))
-                }
+                Err(error) => (
+                    HandoffStoreData::default(),
+                    Some(format!("unparseable store: {error}")),
+                ),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (HandoffStoreData::default(), None)
             }
-        } else {
-            (HandoffStoreData::default(), None)
+            Err(error) => (
+                HandoffStoreData::default(),
+                Some(format!("unreadable store: {error}")),
+            ),
         };
+        if let Some(reason) = &load_failure {
+            // Loud, and NOT silently downgraded to "no fence": see the
+            // struct doc. A fence acknowledged before this restart may still
+            // be genuinely owed to an operator.
+            warn!(
+                path = %path.display(), error = %reason,
+                "landing handoff fence store unreadable; refusing to report readiness \
+                 until it is recovered or explicitly re-requested"
+            );
+        }
         Self {
             path,
             data: Mutex::new(data),
@@ -187,46 +210,95 @@ impl HandoffFenceStore {
         self.load_failure.lock().unwrap().clone()
     }
 
-    /// Atomic write-then-rename. On the FIRST write after a failed load the
-    /// unreadable bytes are moved to `<path>.corrupt` instead of being
-    /// destroyed, so whatever an operator had acknowledged stays recoverable
-    /// by hand; the load-failure flag clears only once the new file is
-    /// durably in place.
+    /// Atomic write-then-rename, FAIL-CLOSED on preservation.
+    ///
+    /// On the first write after a failed load the unreadable bytes must be
+    /// moved aside before anything overwrites them. Two rules make that a
+    /// real guarantee rather than a best effort:
+    ///
+    /// 1. **A failed preservation refuses the rewrite.** Previously this
+    ///    logged the failure and carried on writing, which destroyed exactly
+    ///    the bytes the contract promised to keep. Now the error propagates,
+    ///    the original file is left untouched, and `load_failure` stays set
+    ///    — so the store remains explicitly unavailable instead of quietly
+    ///    becoming a fresh empty one.
+    /// 2. **Quarantines never collide.** `rename` silently replaces its
+    ///    destination, so a second corruption would overwrite the first
+    ///    `.json.corrupt`. A name already taken gets a unique suffix
+    ///    instead, and every distinct corruption is retained.
     fn persist(&self, data: &HandoffStoreData) -> rk_core::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let had_failure = self.load_failure.lock().unwrap().is_some();
-        if had_failure && self.path.exists() {
-            let quarantine = self.path.with_extension("json.corrupt");
-            if let Err(error) = std::fs::rename(&self.path, &quarantine) {
-                warn!(
-                    path = %self.path.display(), error = %error,
-                    "could not preserve unreadable landing handoff fence store"
-                );
-            } else {
-                warn!(
-                    quarantine = %quarantine.display(),
-                    "preserved unreadable landing handoff fence store before rewriting"
-                );
+        // Held across the whole write so the flag cannot be cleared by a
+        // concurrent successful write while this one is still preserving.
+        let mut load_failure = self.load_failure.lock().unwrap();
+        if load_failure.is_some() {
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(_) => {
+                    let quarantine = self.free_quarantine_path()?;
+                    std::fs::rename(&self.path, &quarantine).map_err(|error| {
+                        rk_core::Error::other(format!(
+                            "refusing to rewrite the landing handoff fence store: its \
+                             unreadable contents could not be preserved to {} ({error}); \
+                             the original is untouched and the store stays unavailable",
+                            quarantine.display()
+                        ))
+                    })?;
+                    warn!(
+                        quarantine = %quarantine.display(),
+                        "preserved unreadable landing handoff fence store before rewriting"
+                    );
+                }
+                // Genuinely gone already — nothing to preserve, so the
+                // rewrite may proceed.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(rk_core::Error::other(format!(
+                        "refusing to rewrite the landing handoff fence store: cannot tell \
+                         whether unreadable contents need preserving ({error})"
+                    )));
+                }
             }
         }
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(data)?)?;
         std::fs::rename(tmp, &self.path)?;
-        *self.load_failure.lock().unwrap() = None;
+        *load_failure = None;
         Ok(())
+    }
+
+    /// A `.json.corrupt` name that is not already taken. `rename` replaces
+    /// its destination unconditionally, so reusing a taken name would
+    /// destroy an earlier corruption's evidence.
+    fn free_quarantine_path(&self) -> rk_core::Result<PathBuf> {
+        let base = self.path.with_extension("json.corrupt");
+        if !base.exists() {
+            return Ok(base);
+        }
+        for _ in 0..8 {
+            let candidate = self
+                .path
+                .with_extension(format!("json.corrupt.{}", rk_core::id::RecordId::new()));
+            if !candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        Err(rk_core::Error::other(
+            "could not find a free quarantine name for the landing handoff fence store",
+        ))
     }
 
     pub(crate) fn current(&self, repo: &str) -> Option<HandoffFenceRecord> {
         self.data.lock().unwrap().fences.get(repo).cloned()
     }
 
-    /// Idempotent for the SAME live holder (renews `deadline_at`, keeps the
-    /// generation). A different holder may only take over once the existing
-    /// record is `Released` or its deadline has passed — that transition
-    /// bumps `generation`, fencing anything the previous holder does next
-    /// (mirrors [`crate::orchestrator_lease::LeaseStore::acquire`]).
+    /// Idempotent for the SAME live holder: renews `deadline_at` and keeps
+    /// BOTH the generation and the opaque `fence_id`, so an acknowledgment
+    /// the caller already holds stays valid. A different holder may only
+    /// take over once the existing record is `Released` or its deadline has
+    /// passed; that transition bumps `generation` AND mints a brand-new
+    /// `fence_id`, fencing anything the previous holder does next.
     pub(crate) fn request(
         &self,
         repo: &str,
@@ -249,9 +321,16 @@ impl HandoffFenceStore {
                     existing.holder, existing.deadline_at
                 )));
             }
+            // Every NEW fence gets a freshly minted identity. This is the
+            // one thing that survives a corrupt-store recovery resetting
+            // `generation` to 1 and the holder defaulting to `operator`:
+            // without it, a replayed release from before the recovery would
+            // match the new fence exactly and lift it. See the `fence_id`
+            // field doc.
             Some(existing) => HandoffFenceRecord {
                 repo: repo.to_string(),
                 holder: holder.to_string(),
+                fence_id: rk_core::id::RecordId::new().to_string(),
                 generation: existing.generation + 1,
                 state: HandoffFenceState::Requested,
                 requested_at: now,
@@ -260,6 +339,7 @@ impl HandoffFenceStore {
             None => HandoffFenceRecord {
                 repo: repo.to_string(),
                 holder: holder.to_string(),
+                fence_id: rk_core::id::RecordId::new().to_string(),
                 generation: 1,
                 state: HandoffFenceState::Requested,
                 requested_at: now,
@@ -291,15 +371,20 @@ impl HandoffFenceStore {
     /// Release is idempotent and safe to repeat: a missing record, an
     /// already-`Released` record, or a record already past its own deadline
     /// all report success rather than an error — none of them are still
-    /// blocking anything, so there is nothing left to release. Only a
-    /// STILL-LIVE record held by a different `(holder, generation)` is
-    /// refused, so a stale or superseded caller cannot release someone
-    /// else's active fence out from under them.
+    /// blocking anything, so there is nothing left to release.
+    ///
+    /// A still-live record is refused unless BOTH the holder and the opaque
+    /// `fence_id` match. Matching on `fence_id` rather than `generation` is
+    /// what makes this genuinely stale-owner-fenced across a corrupt-store
+    /// recovery: `generation` restarts at 1 and the default holder is always
+    /// `operator`, so a replayed `release(operator, 1)` would otherwise be
+    /// indistinguishable from a legitimate release of the NEW fence and
+    /// would lift it. A minted id resets with nothing.
     pub(crate) fn release(
         &self,
         repo: &str,
         holder: &str,
-        generation: u64,
+        fence_id: &str,
         now: DateTime<Utc>,
     ) -> rk_core::Result<()> {
         let mut data = self.data.lock().unwrap();
@@ -309,11 +394,11 @@ impl HandoffFenceStore {
         if !existing.blocks_admission(now) {
             return Ok(());
         }
-        if existing.holder != holder || existing.generation != generation {
+        if existing.holder != holder || existing.fence_id != fence_id {
             return Err(rk_core::Error::other(format!(
-                "landing handoff fence for {repo} is held by {} generation {} \
-                 (presented {holder} generation {generation})",
-                existing.holder, existing.generation
+                "landing handoff fence for {repo} is held by {} (fence {}); presented \
+                 {holder} (fence {fence_id})",
+                existing.holder, existing.fence_id
             )));
         }
         // Same discipline as `request`, in the opposite direction: if the
@@ -489,15 +574,30 @@ impl LandingPipeline {
         repo_name: &str,
         holder: &str,
         ttl_secs: i64,
-        managed: &ManagedWorkSnapshot,
+        probe: &(dyn Fn() -> ManagedWorkSnapshot + Sync),
     ) -> rk_core::Result<Value> {
         let gate = self.admission_gate(repo_name);
-        let record = {
+        let (record, managed) = {
             let _exclusive = gate.write().await;
-            self.handoff
-                .request(repo_name, holder, ttl_secs, Utc::now())?
+            let record = self
+                .handoff
+                .request(repo_name, holder, ttl_secs, Utc::now())?;
+            // ENGAGE FIRST, SNAPSHOT SECOND — and the snapshot is taken
+            // HERE, not handed in by the caller.
+            //
+            // `ManagedVerificationRuns::try_register` rests on exactly this
+            // order: it refuses any run that takes the registry mutex after
+            // the fence is engaged, so a run is either refused or visible to
+            // a snapshot taken afterwards. A snapshot computed BEFORE this
+            // call (as the server originally did) breaks that argument — a
+            // run could register in the gap, pass the not-yet-engaged
+            // predicate, and stay invisible in the readiness we return,
+            // which is precisely a pre-engagement observation being passed
+            // off as post-fence readiness.
+            let managed = probe();
+            (record, managed)
         };
-        Ok(self.fence_status_json(repo_name, Some(&record), managed))
+        Ok(self.fence_status_json(repo_name, Some(&record), &managed))
     }
 
     /// `repo.land.fence_release` — end the fence early (idempotent; see
@@ -507,16 +607,17 @@ impl LandingPipeline {
         &self,
         repo_name: &str,
         holder: &str,
-        generation: u64,
-        managed: &ManagedWorkSnapshot,
+        fence_id: &str,
+        probe: &(dyn Fn() -> ManagedWorkSnapshot + Sync),
     ) -> rk_core::Result<Value> {
         let gate = self.admission_gate(repo_name);
-        {
+        let (record, managed) = {
             let _exclusive = gate.write().await;
             self.handoff
-                .release(repo_name, holder, generation, Utc::now())?;
-        }
-        Ok(self.fence_status(repo_name, managed))
+                .release(repo_name, holder, fence_id, Utc::now())?;
+            (self.handoff.current(repo_name), probe())
+        };
+        Ok(self.fence_status_json(repo_name, record.as_ref(), &managed))
     }
 
     /// `repo.land.fence_status` — read-only report: state, blockers, and
@@ -626,6 +727,10 @@ impl LandingPipeline {
             },
             "fenced": engaged,
             "holder": record.holder,
+            // The token `fence_release` requires. Opaque and freshly minted
+            // per fence, so it survives nothing and can never be guessed
+            // from a reset counter.
+            "fence_id": record.fence_id,
             "generation": record.generation,
             "requested_at": record.requested_at,
             "deadline_at": record.deadline_at,
@@ -724,7 +829,7 @@ mod tests {
         std::fs::remove_dir_all(&store_dir).unwrap();
         std::fs::write(&store_dir, b"not a directory").unwrap();
 
-        let result = store.release("repo", "operator", record.generation, at(1));
+        let result = store.release("repo", "operator", &record.fence_id, at(1));
 
         assert!(result.is_err(), "the write must genuinely fail here");
         assert!(
@@ -778,7 +883,7 @@ mod tests {
         // The first holder's stale release cannot touch it.
         assert!(
             store
-                .release("repo", "operator-a", first.generation, at(62))
+                .release("repo", "operator-a", &first.fence_id, at(62))
                 .is_err(),
             "a superseded holder must not release the new fence"
         );
@@ -804,12 +909,246 @@ mod tests {
 
         // Release is idempotent once it has genuinely happened.
         store
-            .release("repo", "operator-a", renewed.generation, at(11))
+            .release("repo", "operator-a", &renewed.fence_id, at(11))
             .unwrap();
         store
-            .release("repo", "operator-a", renewed.generation, at(12))
+            .release("repo", "operator-a", &renewed.fence_id, at(12))
             .unwrap();
         assert!(!store.current("repo").unwrap().blocks_admission(at(13)));
+    }
+
+    /// THE ORDERING THE RETURNED READINESS RESTS ON: the managed-work
+    /// snapshot must be taken AFTER the fence is engaged, never before.
+    ///
+    /// `ManagedVerificationRuns::try_register` refuses any run that takes the
+    /// registry mutex once the fence is engaged, so a run is either refused
+    /// or visible to a snapshot taken afterwards. A snapshot computed BEFORE
+    /// engagement (as the server originally did) breaks that argument: a run
+    /// can register in the gap, pass the not-yet-engaged predicate, and stay
+    /// invisible in the readiness returned to the operator.
+    ///
+    /// Proven deterministically, with no threads or sleeps: the probe is a
+    /// closure that registers a run into a real registry the FIRST time it is
+    /// called, standing in for a registration that wins that exact gap. If
+    /// `fence_request` probed before engaging, the returned response would
+    /// report zero blockers and `ready`; probing after, it must see the run.
+    #[tokio::test]
+    async fn the_returned_readiness_is_snapshotted_after_the_fence_engages() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = crate::landing::tests::test_pipeline(
+            dir.path(),
+            rk_space::Space::open_in_memory().unwrap(),
+        );
+        let runs = crate::managed_verification::ManagedVerificationRuns::default();
+
+        let probed = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            // The registration that races the fence: it lands exactly once,
+            // at the moment the snapshot is taken.
+            if probed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                runs.register("Racer-1", None, "req-race", "repo", "verify");
+            }
+            ManagedWorkSnapshot::new("repo", runs.active_all(), false)
+        };
+
+        let response = pipeline
+            .fence_request("repo", "operator", 600, &probe)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the probe must be called exactly once, inside fence_request"
+        );
+        assert_eq!(
+            response["ready"], false,
+            "a run that registered at snapshot time must not be reported ready: {response}"
+        );
+        assert_eq!(
+            response["state"], "draining",
+            "the returned state must reflect the post-engagement snapshot: {response}"
+        );
+        assert_eq!(
+            response["managed_blockers"]
+                .as_array()
+                .map(|rows| rows.len()),
+            Some(1),
+            "the racing run must be VISIBLE in the response, not invisible behind a \
+             pre-engagement observation: {response}"
+        );
+        assert_eq!(response["managed_blockers"][0]["agent"], "Racer-1");
+        // And the fence really is engaged by then — which is what makes any
+        // LATER registration refused rather than merely observed.
+        assert!(
+            pipeline.admission_fenced("repo"),
+            "the fence must already be engaged when the snapshot is taken"
+        );
+    }
+
+    /// THE ABA THE GENERATION COUNTER COULD NOT STOP. A corrupt-store
+    /// recovery resets `generation` to 1, and the default holder is always
+    /// `operator` — so a release captured BEFORE the recovery has exactly
+    /// the holder and generation of the fence minted AFTER it. Replayed, it
+    /// would lift a fence it never owned. The opaque `fence_id` is what
+    /// makes the two distinguishable.
+    #[test]
+    fn a_release_replayed_across_a_corrupt_store_recovery_cannot_lift_the_new_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("landing-handoff.json");
+
+        let first = HandoffFenceStore::load(&path);
+        let old = first.request("repo", "operator", 600, at(0)).unwrap();
+        assert_eq!(old.generation, 1);
+        drop(first);
+
+        // The store is corrupted and the daemon restarts.
+        std::fs::write(&path, b"{ corrupted across a restart").unwrap();
+        let recovered = HandoffFenceStore::load(&path);
+        assert!(recovered.load_failure().is_some());
+
+        // The operator re-requests. Same default holder, and `generation`
+        // has genuinely restarted at 1 — the two records are identical on
+        // every field the OLD release carried.
+        let new = recovered.request("repo", "operator", 600, at(10)).unwrap();
+        assert_eq!(new.holder, old.holder);
+        assert_eq!(
+            new.generation, old.generation,
+            "this test is only meaningful while the counter really does reset"
+        );
+        assert_ne!(
+            new.fence_id, old.fence_id,
+            "the opaque identity must NOT be reproducible across recovery"
+        );
+
+        // The replayed release must be refused...
+        let replayed = recovered.release("repo", "operator", &old.fence_id, at(11));
+        assert!(
+            replayed.is_err(),
+            "a release replayed across recovery must not lift the new fence"
+        );
+        assert!(
+            recovered.current("repo").unwrap().blocks_admission(at(12)),
+            "the new fence must still be engaged after the replay"
+        );
+
+        // ...while the genuine holder of the NEW fence can still release it.
+        recovered
+            .release("repo", "operator", &new.fence_id, at(13))
+            .unwrap();
+        assert!(!recovered.current("repo").unwrap().blocks_admission(at(14)));
+    }
+
+    /// A failed preservation must REFUSE the rewrite. Previously this logged
+    /// and carried on, destroying the very bytes the contract promises to
+    /// keep.
+    #[test]
+    fn a_rewrite_is_refused_when_the_unreadable_bytes_cannot_be_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        let path = store_dir.join("landing-handoff.json");
+        std::fs::write(&path, b"{ irreplaceable corrupt bytes").unwrap();
+        let store = HandoffFenceStore::load(&path);
+        assert!(store.load_failure().is_some());
+
+        // Make the containing directory read-only, so NO rename inside it
+        // can succeed — preservation genuinely cannot happen, under any
+        // quarantine name. Deterministic and not dependent on which name the
+        // implementation picks.
+        let original = std::fs::metadata(&store_dir).unwrap().permissions();
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store.request("repo", "operator", 600, at(0));
+
+        // Restore before asserting, so a failure still leaves a cleanable
+        // temp dir.
+        std::fs::set_permissions(&store_dir, original).unwrap();
+
+        assert!(
+            result.is_err(),
+            "the rewrite must be refused when preservation fails"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{ irreplaceable corrupt bytes",
+            "the original unreadable bytes must be left exactly as they were"
+        );
+        assert!(
+            store.load_failure().is_some(),
+            "the store must stay explicitly unavailable, not silently become a fresh one"
+        );
+        assert!(
+            store.current("repo").is_none(),
+            "and no fence may be left engaged in memory by the refused request"
+        );
+    }
+
+    /// `rename` replaces its destination, so a second corruption would
+    /// destroy the first one's preserved evidence. Distinct quarantines must
+    /// be retained.
+    #[test]
+    fn a_second_corruption_does_not_overwrite_the_first_preserved_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("landing-handoff.json");
+
+        std::fs::write(&path, b"first corruption").unwrap();
+        let first = HandoffFenceStore::load(&path);
+        first.request("repo", "operator", 600, at(0)).unwrap();
+        let quarantine = path.with_extension("json.corrupt");
+        assert_eq!(std::fs::read(&quarantine).unwrap(), b"first corruption");
+        drop(first);
+
+        // Corrupt again and recover again.
+        std::fs::write(&path, b"second corruption").unwrap();
+        let second = HandoffFenceStore::load(&path);
+        second.request("repo", "operator", 600, at(10)).unwrap();
+
+        assert_eq!(
+            std::fs::read(&quarantine).unwrap(),
+            b"first corruption",
+            "the first preserved copy must survive the second corruption"
+        );
+        let retained: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert_eq!(
+            retained.len(),
+            2,
+            "both corruptions must be retained under distinct names: {retained:?}"
+        );
+    }
+
+    /// `Path::exists()` maps a metadata error to `false`, which would make
+    /// INACCESSIBLE state read as "no fence was ever requested". Only a real
+    /// NotFound is absence.
+    #[test]
+    fn an_inaccessible_store_is_unavailable_not_silently_released() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A DIRECTORY where the store file belongs: it exists, but reading
+        // it as a file fails with an error that is NOT NotFound.
+        let path = dir.path().join("landing-handoff.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let store = HandoffFenceStore::load(&path);
+
+        assert!(
+            store.load_failure().is_some(),
+            "an inaccessible store must be explicitly unavailable, never a silent 'released'"
+        );
+
+        // And a genuinely absent file remains ordinary absence.
+        let missing = HandoffFenceStore::load(dir.path().join("never-written.json"));
+        assert!(
+            missing.load_failure().is_none(),
+            "a genuinely missing store is absence, not a failure"
+        );
     }
 
     /// The fence covers ONE repository. A run on another repo must be

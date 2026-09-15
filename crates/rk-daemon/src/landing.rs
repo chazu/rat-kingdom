@@ -8464,7 +8464,7 @@ checks: [
         ))
     }
 
-    fn test_pipeline(home: &Path, space: Space) -> LandingPipeline {
+    pub(super) fn test_pipeline(home: &Path, space: Space) -> LandingPipeline {
         test_pipeline_routed(home, space, HashMap::new(), TierRouting::default())
     }
 
@@ -15184,11 +15184,11 @@ checks: [
                 &repo_name,
                 "operator-test",
                 60,
-                &ManagedWorkSnapshot::default(),
+                &ManagedWorkSnapshot::default,
             )
             .await
             .unwrap();
-        let generation = requested["generation"].as_u64().unwrap();
+        let fence_id = requested["fence_id"].as_str().unwrap().to_string();
         assert_eq!(requested["state"], "draining", "requested: {requested}");
         let status = pipeline.fence_status(&repo_name, &ManagedWorkSnapshot::default());
         assert_eq!(status["state"], "draining", "status: {status}");
@@ -15295,8 +15295,8 @@ checks: [
             .fence_release(
                 &repo_name,
                 "operator-test",
-                generation.wrapping_sub(1),
-                &ManagedWorkSnapshot::default(),
+                "01JZZZZZZZZZZZZZZZZZZZZZZZ",
+                &ManagedWorkSnapshot::default,
             )
             .await
             .is_err());
@@ -15306,8 +15306,8 @@ checks: [
             .fence_release(
                 &repo_name,
                 "operator-test",
-                generation,
-                &ManagedWorkSnapshot::default(),
+                &fence_id,
+                &ManagedWorkSnapshot::default,
             )
             .await
             .unwrap();

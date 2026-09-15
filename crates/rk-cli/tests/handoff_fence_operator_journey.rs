@@ -35,7 +35,8 @@
 //!  7. a REPLACEMENT daemon (a genuinely different pid) comes up and the
 //!     fence is STILL engaged, read back over the public CLI — the durable
 //!     store survived the rollover;
-//!  8. a stale-generation `rk fence-release` is refused;
+//!  8. a foreign-holder AND a stale-token `rk fence-release` are both
+//!     refused;
 //!  9. the real `rk fence-release` lets B advance EXACTLY once.
 //!
 //! What this file deliberately does NOT claim: it does not prove the
@@ -414,9 +415,13 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
             .output()
             .unwrap(),
     );
-    let generation = requested["generation"]
-        .as_u64()
-        .expect("a fence request must report its generation");
+    // The OPAQUE token, not the generation counter: a generation restarts at
+    // 1 if the durable store has to be recovered, so it cannot fence a
+    // replayed release. See `HandoffFenceRecord::fence_id`.
+    let fence_id = requested["fence_id"]
+        .as_str()
+        .expect("a fence request must report the token needed to release it")
+        .to_string();
     assert_eq!(requested["holder"], "rollover-operator");
     assert_eq!(
         requested["fenced"], true,
@@ -580,9 +585,9 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
     );
     assert_eq!(after_restart["holder"], "rollover-operator");
     assert_eq!(
-        after_restart["generation"].as_u64(),
-        Some(generation),
-        "the surviving fence must keep its generation, not silently re-mint one"
+        after_restart["fence_id"].as_str(),
+        Some(fence_id.as_str()),
+        "the surviving fence must keep its opaque identity, not silently re-mint one"
     );
     assert!(
         queue_entries(&home_path, &repo_name)
@@ -600,8 +605,8 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
             repo_path.to_str().unwrap(),
             "--holder",
             "someone-else",
-            "--generation",
-            &generation.to_string(),
+            "--fence-id",
+            &fence_id,
         ])
         .output()
         .unwrap();
@@ -616,6 +621,34 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
         "the refused release must leave the fence engaged"
     );
 
+    // ...and so is the RIGHT holder presenting a stale token. This is the
+    // arm a generation counter could not cover: after a corrupt-store
+    // recovery the counter restarts at 1 and the default holder is always
+    // `operator`, so a replayed release would have matched exactly.
+    let stale_token = rk(&home_path)
+        .args([
+            "--json",
+            "fence-release",
+            "--repo",
+            repo_path.to_str().unwrap(),
+            "--holder",
+            "rollover-operator",
+            "--fence-id",
+            "01JZZZZZZZZZZZZZZZZZZZZZZZ",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !stale_token.status.success(),
+        "a stale fence token must not release the live fence: {}",
+        String::from_utf8_lossy(&stale_token.stdout)
+    );
+    assert_eq!(
+        fence_status(&home_path, &repo_path)["fenced"],
+        true,
+        "the fence must survive a stale-token release attempt"
+    );
+
     // (9) The real release — and B advances EXACTLY once.
     json_stdout(
         &rk(&home_path)
@@ -626,8 +659,8 @@ fn an_operator_fences_lands_the_active_candidate_replaces_the_daemon_and_resumes
                 repo_path.to_str().unwrap(),
                 "--holder",
                 "rollover-operator",
-                "--generation",
-                &generation.to_string(),
+                "--fence-id",
+                &fence_id,
             ])
             .output()
             .unwrap(),

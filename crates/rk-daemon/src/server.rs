@@ -4122,11 +4122,14 @@ impl Daemon {
                         req.caller.clone()
                     }
                 });
-                let managed = self.managed_work_snapshot(&repo);
+                // Passed as a PROBE, not a precomputed value: the snapshot
+                // must be taken after the fence is engaged, inside
+                // `fence_request`. See its doc.
+                let probe = || self.managed_work_snapshot(&repo);
                 reply(
                     match self
                         .landing()
-                        .fence_request(&repo, &holder, params.ttl_secs, &managed)
+                        .fence_request(&repo, &holder, params.ttl_secs, &probe)
                         .await
                     {
                         Ok(value) => Response::ok(id, value),
@@ -4178,11 +4181,11 @@ impl Daemon {
                         ));
                     }
                 };
-                let managed = self.managed_work_snapshot(&repo);
+                let probe = || self.managed_work_snapshot(&repo);
                 reply(
                     match self
                         .landing()
-                        .fence_release(&repo, &params.holder, params.generation, &managed)
+                        .fence_release(&repo, &params.holder, &params.fence_id, &probe)
                         .await
                     {
                         Ok(value) => Response::ok(id, value),
@@ -13377,7 +13380,10 @@ struct RepoLandFenceStatusParams {
 struct RepoLandFenceReleaseParams {
     repo: String,
     holder: String,
-    generation: u64,
+    /// Opaque identity returned by `fence_request`. Replaces the old
+    /// `generation`, which resets to 1 on a corrupt-store recovery and so
+    /// could not fence a replayed release. See `HandoffFenceRecord::fence_id`.
+    fence_id: String,
 }
 
 #[derive(Deserialize)]

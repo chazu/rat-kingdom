@@ -286,9 +286,12 @@ pub struct FenceReleaseArgs {
     /// Holder that requested the fence (must match to release it).
     #[arg(long)]
     pub holder: String,
-    /// Generation returned by `fence request` (CAS-fences a stale caller).
+    /// Opaque `fence_id` returned by `rk fence-request` (fences a stale
+    /// caller). This replaces the old `--generation`: a generation counter
+    /// restarts at 1 if the durable store has to be recovered, so a replayed
+    /// release could match a NEWER fence it never owned.
     #[arg(long)]
-    pub generation: u64,
+    pub fence_id: String,
 }
 
 /// `rk fence-request` — P7.1: engage the operator-only handoff-window
@@ -308,10 +311,11 @@ pub async fn fence_request(layout: &Layout, args: FenceRequestArgs, as_json: boo
         println!("{result}");
     } else {
         println!(
-            "handoff fence requested for {repo}: state={} generation={} holder={}",
+            "handoff fence requested for {repo}: state={} holder={} fence_id={}",
             result["state"].as_str().unwrap_or("?"),
-            result["generation"].as_u64().unwrap_or(0),
             result["holder"].as_str().unwrap_or("?"),
+            // Printed because it is now REQUIRED to release the fence.
+            result["fence_id"].as_str().unwrap_or("?"),
         );
     }
     Ok(())
@@ -397,7 +401,7 @@ pub async fn fence_release(layout: &Layout, args: FenceReleaseArgs, as_json: boo
     let result = client
         .call(
             "repo.land.fence_release",
-            json!({"repo": repo, "holder": args.holder, "generation": args.generation}),
+            json!({"repo": repo, "holder": args.holder, "fence_id": args.fence_id}),
         )
         .await?;
     if as_json {
