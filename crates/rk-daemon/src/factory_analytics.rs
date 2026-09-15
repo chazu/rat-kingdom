@@ -1153,82 +1153,159 @@ fn delivered_task_work_keys(
     by_task
 }
 
+fn opt_micro_json(value: Option<u64>) -> Value {
+    match value {
+        Some(v) => json!(v),
+        None => Value::Null,
+    }
+}
+
 /// One cost bucket (implementation, review, or correction) contributing to a
-/// task's recorded cost. `cost_usd_micro` is `None` as soon as any
-/// contributing generation's cost is malformed (nonfinite/negative) or the
-/// running sum would overflow `u64` — never a partial or best-effort total.
+/// task's recorded cost, split by whether the contributing generation is
+/// `settled` (terminal — `Completed`/`Failed`/`Stopped`/`Dismissed`, so its
+/// `cost_usd` is a stable value that will not change again) or
+/// `provisional` (still live or orphaned — its `cost_usd` can still grow).
+/// Only `settled_cost_usd_micro` feeds a task's `recorded_cost_usd_micro`;
+/// `provisional_cost_usd_micro` never does, so a number labeled "recorded"
+/// never silently includes spend that is still in flight. `cost_usd_micro`
+/// in either half is `None` as soon as any contributing generation's cost is
+/// malformed (nonfinite/negative) or the running sum would overflow `u64` —
+/// never a partial or best-effort total.
 struct NativeCostBucket {
-    generation_count: u64,
-    generation_ids: Vec<String>,
-    cost_usd_micro: Option<u64>,
-    malformed_cost_generation_ids: Vec<String>,
+    settled_generation_count: u64,
+    settled_generation_ids: Vec<String>,
+    settled_cost_usd_micro: Option<u64>,
+    settled_malformed_cost_generation_ids: Vec<String>,
     excluded_archived_generations: u64,
+    provisional_generation_count: u64,
+    provisional_generation_ids: Vec<String>,
+    provisional_cost_usd_micro: Option<u64>,
+    provisional_malformed_cost_generation_ids: Vec<String>,
 }
 
 impl NativeCostBucket {
     fn empty() -> Self {
         NativeCostBucket {
-            generation_count: 0,
-            generation_ids: Vec::new(),
-            cost_usd_micro: Some(0),
-            malformed_cost_generation_ids: Vec::new(),
+            settled_generation_count: 0,
+            settled_generation_ids: Vec::new(),
+            settled_cost_usd_micro: Some(0),
+            settled_malformed_cost_generation_ids: Vec::new(),
             excluded_archived_generations: 0,
+            provisional_generation_count: 0,
+            provisional_generation_ids: Vec::new(),
+            provisional_cost_usd_micro: Some(0),
+            provisional_malformed_cost_generation_ids: Vec::new(),
         }
     }
 
     /// `cost` is `None` for a malformed value; `archived_excluded` is `true`
     /// when this generation is archived and the request did not opt into
     /// `include_archived` — such a generation is counted (it is not hidden
-    /// from `generation_count`/`generation_ids`) but contributes nothing to
-    /// the cost sum, and its exclusion is surfaced via
+    /// from `settled_generation_count`/`settled_generation_ids`) but
+    /// contributes nothing to the cost sum, surfaced via
     /// `excluded_archived_generations` rather than silently shrinking the
-    /// total.
-    fn add(&mut self, run_id: String, cost: Option<u64>, archived_excluded: bool) {
-        self.generation_count += 1;
-        self.generation_ids.push(run_id.clone());
+    /// total. `archived_excluded` is only meaningful when `settled` is
+    /// `true` — a live/orphaned generation is never archivable
+    /// (`Registry::archivable` requires a terminal state), so it never
+    /// applies to the provisional half.
+    fn add(&mut self, run_id: String, cost: Option<u64>, archived_excluded: bool, settled: bool) {
+        if !settled {
+            self.provisional_generation_count += 1;
+            self.provisional_generation_ids.push(run_id.clone());
+            self.provisional_cost_usd_micro = match (self.provisional_cost_usd_micro, cost) {
+                (Some(total), Some(c)) => total.checked_add(c),
+                _ => None,
+            };
+            if cost.is_none() {
+                self.provisional_malformed_cost_generation_ids.push(run_id);
+            }
+            return;
+        }
+        self.settled_generation_count += 1;
+        self.settled_generation_ids.push(run_id.clone());
         if archived_excluded {
             self.excluded_archived_generations += 1;
             return;
         }
-        self.cost_usd_micro = match (self.cost_usd_micro, cost) {
+        self.settled_cost_usd_micro = match (self.settled_cost_usd_micro, cost) {
             (Some(total), Some(c)) => total.checked_add(c),
             _ => None,
         };
         if cost.is_none() {
-            self.malformed_cost_generation_ids.push(run_id);
+            self.settled_malformed_cost_generation_ids.push(run_id);
         }
     }
 
     fn to_json(&self) -> Value {
-        // Sorted at emit time, not accumulation time: `generation_ids`/
-        // `malformed_cost_generation_ids` are built by iterating
-        // `AnalyticsInputs::agents` in whatever order the caller supplied
-        // it, and this section's whole point is that its output does not
-        // depend on that order (module doc on `native_delivery_section`
-        // applies here too).
-        let mut generation_ids = self.generation_ids.clone();
-        generation_ids.sort();
-        let mut malformed_cost_generation_ids = self.malformed_cost_generation_ids.clone();
-        malformed_cost_generation_ids.sort();
+        // Sorted at emit time, not accumulation time: `generation_ids` are
+        // built by iterating `AnalyticsInputs::agents` in whatever order the
+        // caller supplied it, and this section's whole point is that its
+        // output does not depend on that order (module doc on
+        // `native_delivery_section` applies here too).
+        let mut settled_generation_ids = self.settled_generation_ids.clone();
+        settled_generation_ids.sort();
+        let mut settled_malformed_cost_generation_ids =
+            self.settled_malformed_cost_generation_ids.clone();
+        settled_malformed_cost_generation_ids.sort();
+        let mut provisional_generation_ids = self.provisional_generation_ids.clone();
+        provisional_generation_ids.sort();
+        let mut provisional_malformed_cost_generation_ids =
+            self.provisional_malformed_cost_generation_ids.clone();
+        provisional_malformed_cost_generation_ids.sort();
         json!({
-            "generation_count": self.generation_count,
-            "generation_ids": generation_ids,
-            "cost_usd_micro": match self.cost_usd_micro {
-                Some(v) => json!(v),
-                None => Value::Null,
+            "settled": {
+                "generation_count": self.settled_generation_count,
+                "generation_ids": settled_generation_ids,
+                "cost_usd_micro": opt_micro_json(self.settled_cost_usd_micro),
+                "malformed_cost_generation_ids": settled_malformed_cost_generation_ids,
+                "excluded_archived_generations": self.excluded_archived_generations,
             },
-            "malformed_cost_generation_ids": malformed_cost_generation_ids,
-            "excluded_archived_generations": self.excluded_archived_generations,
+            "provisional": {
+                "generation_count": self.provisional_generation_count,
+                "generation_ids": provisional_generation_ids,
+                "cost_usd_micro": opt_micro_json(self.provisional_cost_usd_micro),
+                "malformed_cost_generation_ids": provisional_malformed_cost_generation_ids,
+                "note": "live/orphaned generation cost — not settled, may still increase, never summed into recorded_cost_usd_micro",
+            },
         })
     }
 }
 
-/// Reduce settled agent generations into the additive `native_recorded_cost`
+/// Records that `run_id` contributed to `task`'s cost, for the cross-task
+/// dedup pass in [`native_recorded_cost_section`]. The same generation can
+/// legitimately appear in more than one task's own bucket (e.g. a correction
+/// ticket that was itself natively delivered contributes to both its own
+/// task's implementation cost and its original's correction cost) — that is
+/// correct per-task, but summing every task's own total into one repo-wide
+/// total would double-count it. `cost` is the post-exclusion contribution
+/// (`None` for a malformed value or an archived generation excluded by
+/// `include_archived=false`) — identical for a given `run_id` regardless of
+/// which task recorded it, so a later call simply overwrites with the same
+/// value.
+fn record_global_contribution(
+    map: &mut BTreeMap<String, (Option<u64>, BTreeSet<String>)>,
+    run_id: &str,
+    cost: Option<u64>,
+    excluded: bool,
+    task: &str,
+) {
+    let entry = map
+        .entry(run_id.to_string())
+        .or_insert_with(|| (None, BTreeSet::new()));
+    entry.0 = if excluded { None } else { cost };
+    entry.1.insert(task.to_string());
+}
+
+/// Reduce agent generations into the additive `native_recorded_cost`
 /// section: per delivered task, the recorded (not settled-bill) ledger cost
 /// of its implementation, review, and any authoritatively linked correction
-/// generations, plus an `unattributed` bucket so a settled generation's cost
-/// never simply disappears because its task was not (yet, or ever) observed
-/// delivered in this bounded coverage.
+/// generations, plus an `unattributed` bucket so a generation's cost never
+/// simply disappears because its task was not (yet, or ever) observed
+/// delivered in this bounded coverage. Live/orphaned generations are NOT
+/// skipped — a still-running generation's recorded spend is real and must
+/// not vanish — but their cost is kept in each bucket's separate
+/// `provisional` half (see [`NativeCostBucket`]) and never folded into a
+/// task's `recorded_cost_usd_micro`, since it can still grow.
 ///
 /// Reports what `AgentRecord.cost_usd` says NOW for generations linked to a
 /// task the bounded `native_delivery` coverage shows delivered. This is not
@@ -1242,8 +1319,8 @@ impl NativeCostBucket {
 /// attempts or historical high-water samples.
 ///
 /// Two joins, both authoritative (never title/body prose):
-///   - implementation/review: `AgentRecord.task` (settled, non-reviewer
-///     generations) and `AgentRecord.review.task` (reviewer generations —
+///   - implementation/review: `AgentRecord.task` (non-reviewer generations)
+///     and `AgentRecord.review.task` (reviewer generations —
 ///     `ReviewContext.task` is set from the reviewed candidate's own task at
 ///     dispatch, `landing.rs`'s `run_review_owned_with_id` call sites).
 ///   - correction: `landing::REWORK_RESUBMISSION_IDENTITY` /
@@ -1252,6 +1329,15 @@ impl NativeCostBucket {
 ///     ([`parse_native_correction_link`]). A rework ticket id linked to more
 ///     than one distinct original task is ambiguous and excluded from every
 ///     task's correction bucket rather than guessed.
+///
+/// A single generation can be authoritatively linked to more than one task
+/// (a correction ticket that was itself natively delivered contributes to
+/// both its own task's implementation cost and its original's correction
+/// cost) — correct in each task's own view, but summing every task's own
+/// total blindly would double-count it in a repo-wide figure. `totals` below
+/// is computed from a cross-task dedup pass ([`record_global_contribution`])
+/// rather than a naive sum of `tasks[].recorded_cost_usd_micro`, and any
+/// shared generation is named in `shared_contributions`.
 fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalyticsRequest) -> Value {
     let available = inputs.native_delivery.available && inputs.native_correction_links.available;
 
@@ -1292,17 +1378,37 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
         .map(|(ticket, _)| ticket.clone())
         .collect();
 
+    // A requested since/until window, or a truncated bounded read, can each
+    // exclude an older contributing generation or an older correction link
+    // — `Server::factory_analytics_inputs` windows `agents` by `updated_at`
+    // and `native_correction_links` by `created_at`, so a delivery observed
+    // inside the requested window does not guarantee every generation that
+    // contributed to it is also inside that same window. This is the same
+    // condition `native_delivery_section` calls `may_hide_delivery`; here it
+    // additionally degrades `coverage_complete` per task rather than only
+    // being named in a top-level warning.
+    let may_hide_contributors = req.since.is_some()
+        || req.until.is_some()
+        || inputs.native_delivery.truncated
+        || inputs.native_correction_links.truncated;
+
     let cost_of = |agent: &AgentRecord| -> Option<u64> { usd_to_micro(agent.cost_usd) };
-    let run_id_of = |agent: &AgentRecord| -> String { format!("{}:{}", agent.name, agent.spawn_id()) };
-    let archived_excluded = |agent: &AgentRecord| -> bool {
-        agent.archived_at.is_some() && !req.include_archived
-    };
+    let run_id_of =
+        |agent: &AgentRecord| -> String { format!("{}:{}", agent.name, agent.spawn_id()) };
+    let archived_excluded =
+        |agent: &AgentRecord| -> bool { agent.archived_at.is_some() && !req.include_archived };
 
     let mut tasks_json: Vec<Value> = Vec::new();
-    let mut totals_generations: u64 = 0;
-    let mut totals_cost: Option<u64> = Some(0);
     let mut linked_tasks: BTreeSet<&String> = BTreeSet::new();
     let mut linked_correction_tickets: BTreeSet<String> = BTreeSet::new();
+    // Cross-task dedup ledgers: `run_id -> (post-exclusion cost, tasks that
+    // authoritatively claim it)`. Fed once per (agent, task) pairing below,
+    // consumed after the loop to compute `totals` without double-counting a
+    // generation linked to more than one task.
+    let mut settled_contributions: BTreeMap<String, (Option<u64>, BTreeSet<String>)> =
+        BTreeMap::new();
+    let mut provisional_contributions: BTreeMap<String, (Option<u64>, BTreeSet<String>)> =
+        BTreeMap::new();
 
     if available {
         for (task, work_keys) in &by_task {
@@ -1314,6 +1420,10 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
                 .filter(|ticket| !ambiguous_rework_tickets.contains(*ticket))
                 .cloned()
                 .collect();
+            let task_had_ambiguous_correction =
+                correction_links_by_task.get(task).is_some_and(|tickets| {
+                    tickets.iter().any(|t| ambiguous_rework_tickets.contains(t))
+                });
             linked_correction_tickets.extend(confirmed_correction_tickets.iter().cloned());
 
             let mut implementation = NativeCostBucket::empty();
@@ -1321,43 +1431,71 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
             let mut correction = NativeCostBucket::empty();
 
             for agent in &inputs.agents {
-                if !is_settled(agent.state) {
-                    continue;
-                }
                 let run_id = run_id_of(agent);
                 let cost = cost_of(agent);
                 let excluded = archived_excluded(agent);
-                match &agent.review {
-                    Some(rc) if rc.task == *task => review.add(run_id, cost, excluded),
+                let settled = is_settled(agent.state);
+                let assigned = match &agent.review {
+                    Some(rc) if rc.task == *task => Some(&mut review),
                     Some(rc) if confirmed_correction_tickets.contains(&rc.task) => {
-                        correction.add(run_id, cost, excluded)
+                        Some(&mut correction)
                     }
-                    Some(_) => {}
+                    Some(_) => None,
                     None => match &agent.task {
-                        Some(t) if t == task => implementation.add(run_id, cost, excluded),
+                        Some(t) if t == task => Some(&mut implementation),
                         Some(t) if confirmed_correction_tickets.contains(t) => {
-                            correction.add(run_id, cost, excluded)
+                            Some(&mut correction)
                         }
-                        _ => {}
+                        _ => None,
                     },
+                };
+                if let Some(bucket) = assigned {
+                    bucket.add(run_id.clone(), cost, excluded, settled);
+                    if settled {
+                        record_global_contribution(
+                            &mut settled_contributions,
+                            &run_id,
+                            cost,
+                            excluded,
+                            task,
+                        );
+                    } else {
+                        record_global_contribution(
+                            &mut provisional_contributions,
+                            &run_id,
+                            cost,
+                            false,
+                            task,
+                        );
+                    }
                 }
             }
 
-            let total_cost = [&implementation, &review, &correction].iter().try_fold(
-                0u64,
-                |acc, bucket| match bucket.cost_usd_micro {
-                    Some(c) => acc.checked_add(c),
-                    None => None,
-                },
-            );
+            let total_cost =
+                [&implementation, &review, &correction]
+                    .iter()
+                    .try_fold(0u64, |acc, bucket| match bucket.settled_cost_usd_micro {
+                        Some(c) => acc.checked_add(c),
+                        None => None,
+                    });
+            let provisional_total_cost =
+                [&implementation, &review, &correction]
+                    .iter()
+                    .try_fold(0u64, |acc, bucket| {
+                        match bucket.provisional_cost_usd_micro {
+                            Some(c) => acc.checked_add(c),
+                            None => None,
+                        }
+                    });
             let excluded_archived_total = implementation.excluded_archived_generations
                 + review.excluded_archived_generations
                 + correction.excluded_archived_generations;
-            let malformed_total = implementation.malformed_cost_generation_ids.len()
-                + review.malformed_cost_generation_ids.len()
-                + correction.malformed_cost_generation_ids.len();
-            let generation_count =
-                implementation.generation_count + review.generation_count + correction.generation_count;
+            let malformed_total = implementation.settled_malformed_cost_generation_ids.len()
+                + review.settled_malformed_cost_generation_ids.len()
+                + correction.settled_malformed_cost_generation_ids.len();
+            let provisional_generation_count = implementation.provisional_generation_count
+                + review.provisional_generation_count
+                + correction.provisional_generation_count;
 
             let mut task_warnings: Vec<String> = Vec::new();
             if excluded_archived_total > 0 {
@@ -1370,12 +1508,32 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
                     "malformed_cost_generations: {malformed_total} generation(s) had a nonfinite/negative recorded cost and were excluded from the sum"
                 ));
             }
+            if may_hide_contributors {
+                task_warnings.push(
+                    "may_hide_contributors: a requested since/until window and/or a truncated \
+                     bounded read can exclude an older contributing generation or an older \
+                     correction link for this task; this total is not proven complete"
+                        .to_string(),
+                );
+            }
+            if task_had_ambiguous_correction {
+                task_warnings.push(
+                    "ambiguous_correction_excluded: at least one correction ticket linked to this \
+                     task was also linked to a different original task and was excluded from this \
+                     task's correction cost rather than guessed"
+                        .to_string(),
+                );
+            }
+            if provisional_generation_count > 0 {
+                task_warnings.push(format!(
+                    "provisional_generations_excluded_from_total: {provisional_generation_count} live/orphaned generation(s) contribute recorded spend not yet included in recorded_cost_usd_micro; see provisional_cost_usd_micro"
+                ));
+            }
 
-            totals_generations += generation_count;
-            totals_cost = match (totals_cost, total_cost) {
-                (Some(t), Some(c)) => t.checked_add(c),
-                _ => None,
-            };
+            let coverage_complete = excluded_archived_total == 0
+                && malformed_total == 0
+                && !may_hide_contributors
+                && !task_had_ambiguous_correction;
 
             tasks_json.push(json!({
                 "task": task,
@@ -1391,28 +1549,26 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
                 "review": review.to_json(),
                 "correction": correction.to_json(),
                 "linked_correction_tickets": confirmed_correction_tickets,
-                "recorded_cost_usd_micro": match total_cost {
-                    Some(v) => json!(v),
-                    None => Value::Null,
-                },
-                "coverage_complete": excluded_archived_total == 0 && malformed_total == 0,
+                "recorded_cost_usd_micro": opt_micro_json(total_cost),
+                "provisional_cost_usd_micro": opt_micro_json(provisional_total_cost),
+                "coverage_complete": coverage_complete,
                 "warnings": task_warnings,
             }));
         }
     }
 
-    // Every settled generation not linked to a delivered task above still
-    // has a recorded cost; it must be visible here, not dropped because its
-    // task was never (or not yet, within this bounded coverage) observed
-    // delivered.
+    // Every generation not linked to a delivered task above still has a
+    // recorded (or provisional) cost; it must be visible here, not dropped
+    // because its task was never (or not yet, within this bounded coverage)
+    // observed delivered. Unlike task buckets, unattributed generations are
+    // per-agent only — no cross-task dedup applies here.
     let mut unattributed = NativeCostBucket::empty();
     if available {
         for agent in &inputs.agents {
-            if !is_settled(agent.state) {
-                continue;
-            }
             let linked = match &agent.review {
-                Some(rc) => linked_tasks.contains(&rc.task) || linked_correction_tickets.contains(&rc.task),
+                Some(rc) => {
+                    linked_tasks.contains(&rc.task) || linked_correction_tickets.contains(&rc.task)
+                }
                 None => agent.task.as_ref().is_some_and(|t| {
                     linked_tasks.contains(t) || linked_correction_tickets.contains(t)
                 }),
@@ -1420,9 +1576,32 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
             if linked {
                 continue;
             }
-            unattributed.add(run_id_of(agent), cost_of(agent), archived_excluded(agent));
+            unattributed.add(
+                run_id_of(agent),
+                cost_of(agent),
+                archived_excluded(agent),
+                is_settled(agent.state),
+            );
         }
     }
+
+    // Cross-task dedup: sum each distinct generation's cost exactly once,
+    // regardless of how many tasks it was authoritatively linked to above.
+    let shared_settled: Vec<Value> = settled_contributions
+        .iter()
+        .filter(|(_, (_, tasks))| tasks.len() > 1)
+        .map(|(run_id, (_, tasks))| {
+            json!({"generation_id": run_id, "tasks": tasks.iter().collect::<Vec<_>>()})
+        })
+        .collect();
+    let totals_generations = settled_contributions.len() as u64;
+    let totals_cost = settled_contributions
+        .values()
+        .try_fold(0u64, |acc, (cost, _)| cost.and_then(|c| acc.checked_add(c)));
+    let provisional_totals_generations = provisional_contributions.len() as u64;
+    let provisional_totals_cost = provisional_contributions
+        .values()
+        .try_fold(0u64, |acc, (cost, _)| cost.and_then(|c| acc.checked_add(c)));
 
     let mut warnings: Vec<String> = Vec::new();
     if let Some(warning) = &inputs.native_delivery.read_warning {
@@ -1446,9 +1625,10 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
     if req.since.is_some() || req.until.is_some() {
         warnings.push(
             "native_recorded_cost_window_may_exclude_delivery: a requested since/until window can \
-             exclude the landing_processed marker that attributes a task as delivered, so that \
-             task's recorded cost would not appear here even though generations for it exist and \
-             are counted in `unattributed`"
+             exclude the landing_processed marker that attributes a task as delivered, or an older \
+             contributing generation/correction link for a task still inside the window, so a \
+             task's recorded cost may be missing or incomplete even though generations for it \
+             exist and are counted in `unattributed` or reported with coverage_complete=false"
                 .to_string(),
         );
     }
@@ -1464,6 +1644,12 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
             ambiguous_rework_tickets.len()
         ));
     }
+    if !shared_settled.is_empty() {
+        warnings.push(format!(
+            "shared_contributions: {} generation(s) are authoritatively linked to more than one delivered task (e.g. a correction ticket that was itself natively delivered); totals below count each once, so summing every task's own recorded_cost_usd_micro will overcount by the shared amount",
+            shared_settled.len()
+        ));
+    }
 
     json!({
         "schema_version": NATIVE_RECORDED_COST_SCHEMA_VERSION,
@@ -1477,7 +1663,8 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
             generations authoritatively linked to a task the bounded native_delivery coverage \
             shows delivered. Not a settled provider bill, not a reconstructed price, and a \
             Completed/Stopped generation state is not proof its usage has been finally \
-            reconciled.",
+            reconciled. Live/orphaned generations are reported separately as provisional and \
+            never folded into recorded_cost_usd_micro.",
         "unit": "usd_micro (1e-6 USD, round-half-away-from-zero; null means unavailable/malformed, never a false-healthy zero)",
         "available": available,
         "requested_window": {"since": req.since, "until": req.until},
@@ -1496,21 +1683,18 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
                 "truncated": inputs.native_correction_links.truncated,
                 "malformed_source_ids": malformed_link_ids,
             },
+            "may_hide_contributors": may_hide_contributors,
         },
         "ambiguous_correction_tickets": ambiguous_rework_tickets,
         "tasks": tasks_json,
         "unattributed": if available { unattributed.to_json() } else { Value::Null },
+        "shared_contributions": shared_settled,
         "totals": {
             "tasks_with_recorded_cost": tasks_json.len(),
             "contributing_generations": if available { json!(totals_generations) } else { Value::Null },
-            "recorded_cost_usd_micro": if available {
-                match totals_cost {
-                    Some(v) => json!(v),
-                    None => Value::Null,
-                }
-            } else {
-                Value::Null
-            },
+            "recorded_cost_usd_micro": if available { opt_micro_json(totals_cost) } else { Value::Null },
+            "provisional_contributing_generations": if available { json!(provisional_totals_generations) } else { Value::Null },
+            "provisional_cost_usd_micro": if available { opt_micro_json(provisional_totals_cost) } else { Value::Null },
         },
         "warnings": warnings,
     })
@@ -2787,10 +2971,16 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         let task = &tasks[0];
         assert_eq!(task["task"], json!("TKT-1"));
-        assert_eq!(task["implementation"]["cost_usd_micro"], json!(100_000));
-        assert_eq!(task["review"]["cost_usd_micro"], json!(50_000));
+        assert_eq!(
+            task["implementation"]["settled"]["cost_usd_micro"],
+            json!(100_000)
+        );
+        assert_eq!(task["review"]["settled"]["cost_usd_micro"], json!(50_000));
         assert_eq!(task["recorded_cost_usd_micro"], json!(150_000));
         assert_eq!(task["coverage_complete"], json!(true));
+        assert_eq!(nrc["totals"]["recorded_cost_usd_micro"], json!(150_000));
+        assert_eq!(nrc["totals"]["contributing_generations"], json!(2));
+        assert!(nrc["shared_contributions"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -2815,9 +3005,74 @@ mod tests {
             Utc.timestamp_opt(2_000, 0).unwrap(),
         );
         let task = &resp["native_recorded_cost"]["tasks"][0];
-        assert_eq!(task["correction"]["cost_usd_micro"], json!(200_000));
+        assert_eq!(
+            task["correction"]["settled"]["cost_usd_micro"],
+            json!(200_000)
+        );
         assert_eq!(task["linked_correction_tickets"], json!(["TKT-2"]));
         assert_eq!(task["recorded_cost_usd_micro"], json!(300_000));
+    }
+
+    #[test]
+    fn native_recorded_cost_deduplicates_a_generation_shared_across_two_tasks() {
+        // TKT-2 is BOTH a correction of TKT-1 (via the resubmission link)
+        // AND its own natively-delivered task (its own branch also landed).
+        // Its implementer's cost must show under both tasks' own views (that
+        // is correct per-task) but must be counted exactly once in the
+        // repo-wide totals.
+        let delivery = vec![
+            landing_processed_event(
+                "feature-1",
+                "sha1",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-1"),
+                1_000,
+            ),
+            landing_processed_event(
+                "feature-2",
+                "sha2",
+                "main",
+                "TKT-2",
+                "landed",
+                Some("merge-2"),
+                1_050,
+            ),
+        ];
+        let correction_links = vec![resubmission_event("TKT-2", "TKT-1", 1_100)];
+        let agents = vec![implementer("rat-fix", "TKT-2", 0.20)];
+        let resp = scorecards_response(
+            &cost_inputs(agents, delivery, correction_links),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nrc = &resp["native_recorded_cost"];
+        let tasks = nrc["tasks"].as_array().unwrap();
+        let tkt1 = tasks.iter().find(|t| t["task"] == json!("TKT-1")).unwrap();
+        let tkt2 = tasks.iter().find(|t| t["task"] == json!("TKT-2")).unwrap();
+        assert_eq!(
+            tkt1["correction"]["settled"]["cost_usd_micro"],
+            json!(200_000)
+        );
+        assert_eq!(
+            tkt2["implementation"]["settled"]["cost_usd_micro"],
+            json!(200_000)
+        );
+        // Naive per-task sum would be 400_000; the dedup'd repo total counts
+        // the one generation once.
+        assert_eq!(nrc["totals"]["recorded_cost_usd_micro"], json!(200_000));
+        assert_eq!(nrc["totals"]["contributing_generations"], json!(1));
+        let shared = nrc["shared_contributions"].as_array().unwrap();
+        assert_eq!(shared.len(), 1);
+        assert!(shared[0]["tasks"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("TKT-1")));
+        assert!(shared[0]["tasks"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("TKT-2")));
     }
 
     #[test]
@@ -2841,9 +3096,12 @@ mod tests {
             Utc.timestamp_opt(2_000, 0).unwrap(),
         );
         let task = &resp["native_recorded_cost"]["tasks"][0];
-        assert_eq!(task["implementation"]["cost_usd_micro"], json!(100_000));
         assert_eq!(
-            task["implementation"]["excluded_archived_generations"],
+            task["implementation"]["settled"]["cost_usd_micro"],
+            json!(100_000)
+        );
+        assert_eq!(
+            task["implementation"]["settled"]["excluded_archived_generations"],
             json!(1)
         );
         assert_eq!(task["coverage_complete"], json!(false));
@@ -2858,11 +3116,15 @@ mod tests {
             Utc.timestamp_opt(2_000, 0).unwrap(),
         );
         let task2 = &resp2["native_recorded_cost"]["tasks"][0];
-        assert_eq!(task2["implementation"]["cost_usd_micro"], json!(400_000));
         assert_eq!(
-            task2["implementation"]["excluded_archived_generations"],
+            task2["implementation"]["settled"]["cost_usd_micro"],
+            json!(400_000)
+        );
+        assert_eq!(
+            task2["implementation"]["settled"]["excluded_archived_generations"],
             json!(0)
         );
+        assert_eq!(task2["coverage_complete"], json!(true));
     }
 
     #[test]
@@ -2883,16 +3145,17 @@ mod tests {
             Utc.timestamp_opt(2_000, 0).unwrap(),
         );
         let task = &resp["native_recorded_cost"]["tasks"][0];
-        assert!(task["implementation"]["cost_usd_micro"].is_null());
+        assert!(task["implementation"]["settled"]["cost_usd_micro"].is_null());
         assert!(task["recorded_cost_usd_micro"].is_null());
         assert_eq!(task["coverage_complete"], json!(false));
         assert_eq!(
-            task["implementation"]["malformed_cost_generation_ids"]
+            task["implementation"]["settled"]["malformed_cost_generation_ids"]
                 .as_array()
                 .unwrap()
                 .len(),
             1
         );
+        assert!(resp["native_recorded_cost"]["totals"]["recorded_cost_usd_micro"].is_null());
     }
 
     #[test]
@@ -2932,12 +3195,15 @@ mod tests {
         let nrc = &resp["native_recorded_cost"];
         assert_eq!(nrc["ambiguous_correction_tickets"], json!(["TKT-9"]));
         for task in nrc["tasks"].as_array().unwrap() {
-            assert_eq!(task["correction"]["generation_count"], json!(0));
+            assert_eq!(task["correction"]["settled"]["generation_count"], json!(0));
         }
         // Not silently dropped: the generation's cost still shows up,
         // just unattributed to either candidate task.
-        assert_eq!(nrc["unattributed"]["generation_count"], json!(1));
-        assert_eq!(nrc["unattributed"]["cost_usd_micro"], json!(200_000));
+        assert_eq!(nrc["unattributed"]["settled"]["generation_count"], json!(1));
+        assert_eq!(
+            nrc["unattributed"]["settled"]["cost_usd_micro"],
+            json!(200_000)
+        );
     }
 
     #[test]
@@ -2950,8 +3216,66 @@ mod tests {
         );
         let nrc = &resp["native_recorded_cost"];
         assert!(nrc["tasks"].as_array().unwrap().is_empty());
-        assert_eq!(nrc["unattributed"]["generation_count"], json!(1));
-        assert_eq!(nrc["unattributed"]["cost_usd_micro"], json!(150_000));
+        assert_eq!(nrc["unattributed"]["settled"]["generation_count"], json!(1));
+        assert_eq!(
+            nrc["unattributed"]["settled"]["cost_usd_micro"],
+            json!(150_000)
+        );
+        assert_eq!(nrc["totals"]["recorded_cost_usd_micro"], json!(0));
+    }
+
+    #[test]
+    fn native_recorded_cost_live_generation_is_provisional_not_dropped_and_not_in_recorded_total() {
+        let delivery = vec![landing_processed_event(
+            "feature",
+            "sha1",
+            "main",
+            "TKT-1",
+            "landed",
+            Some("merge-1"),
+            1_000,
+        )];
+        let mut live_impl = implementer("rat-live", "TKT-1", 0.42);
+        live_impl.state = AgentState::Running;
+        let mut live_orphan = implementer("rat-orphan-live", "TKT-999", 0.07);
+        live_orphan.state = AgentState::Running;
+        let agents = vec![live_impl, live_orphan];
+        let resp = scorecards_response(
+            &cost_inputs(agents, delivery, Vec::new()),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nrc = &resp["native_recorded_cost"];
+        let task = &nrc["tasks"][0];
+        // Live spend is visible...
+        assert_eq!(
+            task["implementation"]["provisional"]["cost_usd_micro"],
+            json!(420_000)
+        );
+        assert_eq!(
+            task["implementation"]["provisional"]["generation_count"],
+            json!(1)
+        );
+        // ...but never counted as settled/recorded, and the task total does
+        // not silently include it.
+        assert_eq!(
+            task["implementation"]["settled"]["generation_count"],
+            json!(0)
+        );
+        assert_eq!(task["recorded_cost_usd_micro"], json!(0));
+        assert_eq!(task["provisional_cost_usd_micro"], json!(420_000));
+        // A live orphaned generation (task never delivered) still shows up,
+        // under unattributed's own provisional half.
+        assert_eq!(
+            nrc["unattributed"]["provisional"]["cost_usd_micro"],
+            json!(70_000)
+        );
+        assert_eq!(nrc["totals"]["provisional_cost_usd_micro"], json!(420_000));
+        assert_eq!(
+            nrc["totals"]["provisional_contributing_generations"],
+            json!(1)
+        );
+        // Live generations never touch the settled recorded totals.
         assert_eq!(nrc["totals"]["recorded_cost_usd_micro"], json!(0));
     }
 

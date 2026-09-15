@@ -1628,7 +1628,7 @@ fn render_native_recorded_cost(out: &mut String, result: &Value) {
             .unwrap_or_else(|| "none".into()),
     ));
     out.push_str(&format!(
-        "- totals: tasks_with_recorded_cost={} contributing_generations={} recorded_cost_usd={}\n",
+        "- totals: tasks_with_recorded_cost={} contributing_generations={} recorded_cost_usd={} provisional_contributing_generations={} provisional_cost_usd={}\n",
         section["totals"]["tasks_with_recorded_cost"]
             .as_u64()
             .unwrap_or(0),
@@ -1637,28 +1637,47 @@ fn render_native_recorded_cost(out: &mut String, result: &Value) {
             .map(|n| n.to_string())
             .unwrap_or_else(|| "n/a".into()),
         micro(&section["totals"]["recorded_cost_usd_micro"]),
+        section["totals"]["provisional_contributing_generations"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        micro(&section["totals"]["provisional_cost_usd_micro"]),
     ));
     if let Some(tasks) = section["tasks"].as_array() {
         for task in tasks {
             out.push_str(&format!(
-                "  - {}: implementation={} review={} correction={} total={} coverage_complete={}\n",
+                "  - {}: implementation={} review={} correction={} total={} provisional={} coverage_complete={}\n",
                 task["task"].as_str().unwrap_or("?"),
-                micro(&task["implementation"]["cost_usd_micro"]),
-                micro(&task["review"]["cost_usd_micro"]),
-                micro(&task["correction"]["cost_usd_micro"]),
+                micro(&task["implementation"]["settled"]["cost_usd_micro"]),
+                micro(&task["review"]["settled"]["cost_usd_micro"]),
+                micro(&task["correction"]["settled"]["cost_usd_micro"]),
                 micro(&task["recorded_cost_usd_micro"]),
+                micro(&task["provisional_cost_usd_micro"]),
                 task["coverage_complete"].as_bool().unwrap_or(false),
             ));
         }
     }
     out.push_str(&format!(
-        "- unattributed: generation_count={} cost_usd={} (settled generations whose task was not observed delivered in this coverage)\n",
-        section["unattributed"]["generation_count"]
+        "- unattributed: generation_count={} cost_usd={} provisional_generation_count={} provisional_cost_usd={} (generations whose task was not observed delivered in this coverage)\n",
+        section["unattributed"]["settled"]["generation_count"]
             .as_u64()
             .map(|n| n.to_string())
             .unwrap_or_else(|| "n/a".into()),
-        micro(&section["unattributed"]["cost_usd_micro"]),
+        micro(&section["unattributed"]["settled"]["cost_usd_micro"]),
+        section["unattributed"]["provisional"]["generation_count"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        micro(&section["unattributed"]["provisional"]["cost_usd_micro"]),
     ));
+    if let Some(shared) = section["shared_contributions"].as_array() {
+        if !shared.is_empty() {
+            out.push_str(&format!(
+                "- shared_contributions: {} generation(s) linked to more than one task (deduplicated in totals above)\n",
+                shared.len()
+            ));
+        }
+    }
     if let Some(ambiguous) = section["ambiguous_correction_tickets"].as_array() {
         if !ambiguous.is_empty() {
             out.push_str(&format!(
