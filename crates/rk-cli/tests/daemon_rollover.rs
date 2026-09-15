@@ -211,30 +211,32 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"resumed a
 /// it on a later CLI invocation that merely talks to an already-running
 /// daemon has no effect, so every command in these tests carries it from the
 /// first one that can trigger `connect_or_spawn`.
-fn rk_delayed_shutdown(home: &Path) -> Command {
+fn rk_delayed_shutdown(home: &Path, delay_ms: &str) -> Command {
     let mut cmd = rk(home);
-    cmd.env("RK_TEST_SHUTDOWN_DELAY_MS", "4000");
+    cmd.env("RK_TEST_SHUTDOWN_DELAY_MS", delay_ms);
     cmd
 }
 
-/// TKT-nusod-lizuk-jomun: a real daemon process told to hold the socket open
-/// past `daemon_rollover`'s bounded 3s wait for old-instance exit must never
-/// be reported as a successful rollover. This is the exact production
-/// failure: the CLI reconnecting to the still-live retiring daemon and
-/// declaring victory.
+/// TKT-nusod-lizuk-jomun: an ordinary slow shutdown (well inside the 15s
+/// `OLD_INSTANCE_EXIT_BOUND`, comfortably past the old, too-tight 3s
+/// assumption) must still end in a genuinely replaced daemon — not a false
+/// "nothing changed" failure, and not a false-success reconnect to the
+/// still-live retiring instance either. Zero live rats: the drain phase
+/// returns immediately, exercising the branch the original production bug
+/// hit (no further RPC or identity check before reporting success).
 #[test]
-fn rollover_fails_loudly_when_old_daemon_outlives_the_wait_bound() {
+fn rollover_succeeds_once_old_daemon_exits_within_the_reasonable_bound() {
     let home = tempfile::tempdir().unwrap();
     disable_disk_floor(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    rk_delayed_shutdown(home.path())
+    rk_delayed_shutdown(home.path(), "4000")
         .args(["ping"])
         .output()
         .expect("run rk ping");
     json_stdout(
-        &rk_delayed_shutdown(home.path())
+        &rk_delayed_shutdown(home.path(), "4000")
             .args(["--json", "repo", "add", repo_dir.path().to_str().unwrap()])
             .output()
             .unwrap(),
@@ -249,29 +251,15 @@ fn rollover_fails_loudly_when_old_daemon_outlives_the_wait_bound() {
         .as_u64()
         .unwrap();
 
-    // Zero live rats: the drain phase returns immediately, so this exercises
-    // exactly the "zero parked rats" branch the production bug hit — no
-    // further RPC or identity check happened before reporting success.
-    // The delay (4s) exceeds the CLI's fixed 3s (50 * 60ms) old-exit bound.
-    let rollover_out = rk_delayed_shutdown(home.path())
+    let rollover_out = rk_delayed_shutdown(home.path(), "4000")
         .args(["--json", "daemon", "rollover", "--wait-secs", "0"])
         .output()
         .expect("run rk daemon rollover");
-    assert!(
-        !rollover_out.status.success(),
-        "rollover must fail, not report success, while the old daemon is still \
-         live: stdout={} stderr={}",
-        String::from_utf8_lossy(&rollover_out.stdout),
-        String::from_utf8_lossy(&rollover_out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&rollover_out.stderr);
-    assert!(
-        stderr.contains("timed out waiting for the outgoing daemon"),
-        "expected the explicit old-instance timeout error, got: {stderr}"
-    );
+    let rollover = json_stdout(&rollover_out);
+    assert_eq!(rollover["rolled_over"], true, "{rollover}");
 
-    // Dispatch was resumed on the (still the only) daemon — nothing was lost
-    // or left wedged by the failed attempt, and it is still the same pid.
+    // A genuinely different, live process — not a reconnect to the (by now
+    // actually exited) outgoing daemon.
     let pid2 = json_stdout(
         &rk(home.path())
             .args(["--json", "daemon", "status"])
@@ -280,14 +268,14 @@ fn rollover_fails_loudly_when_old_daemon_outlives_the_wait_bound() {
     )["pid"]
         .as_u64()
         .unwrap();
-    assert_eq!(pid1, pid2, "no daemon was actually replaced by the failed attempt");
+    assert_ne!(pid1, pid2, "rollover did not actually replace the daemon process");
 
     let spawn_out = rk(home.path())
         .args([
             "--json",
             "spawn",
             "--task",
-            "post-failed-rollover",
+            "post-rollover-delayed",
             "--repo",
             repo_dir.path().to_str().unwrap(),
             "--harness",
@@ -297,34 +285,33 @@ fn rollover_fails_loudly_when_old_daemon_outlives_the_wait_bound() {
         .expect("run rk spawn");
     assert!(
         spawn_out.status.success(),
-        "dispatch must work again after a failed rollover resumes it: {}",
+        "dispatch must work on the fresh daemon: {}",
         String::from_utf8_lossy(&spawn_out.stderr)
     );
 
     let _ = rk(home.path()).args(["daemon", "stop"]).output();
 }
 
-/// Same delayed-shutdown barrier as above, but with a live rat that would
-/// otherwise be parked and respawned — proving the false-success path is
-/// closed for the "parked generation" branch too, and that the live rat's
-/// worktree/branch/ticket state is untouched by the failed attempt (dispatch
-/// is resumed on the same still-running daemon, so the rat just keeps going).
+/// Same ordinary-but-slow shutdown as above, but with a live rat that must
+/// be correctly parked and respawned once the genuine replacement daemon
+/// comes up — proving the "exactly parked generations" contract holds
+/// across a realistic delayed exit, not just an instantaneous one.
 #[test]
-fn rollover_does_not_falsely_park_when_old_daemon_outlives_the_wait_bound() {
+fn rollover_parks_and_respawns_across_a_reasonable_delayed_exit() {
     let home = tempfile::tempdir().unwrap();
     disable_disk_floor(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
     json_stdout(
-        &rk_delayed_shutdown(home.path())
+        &rk_delayed_shutdown(home.path(), "4000")
             .env("RK_FAKE_HARNESS_CMD", "sleep 60")
             .args(["--json", "repo", "add", repo_dir.path().to_str().unwrap()])
             .output()
             .unwrap(),
     );
 
-    let spawn_out = rk_delayed_shutdown(home.path())
+    let spawn_out = rk_delayed_shutdown(home.path(), "4000")
         .env("RK_FAKE_HARNESS_CMD", "sleep 60")
         .args([
             "--json",
@@ -366,20 +353,112 @@ fn rollover_does_not_falsely_park_when_old_daemon_outlives_the_wait_bound() {
     }
     assert!(running, "rat never reached Running");
 
-    let rollover_out = rk_delayed_shutdown(home.path())
+    let rollover_out = rk_delayed_shutdown(home.path(), "4000")
+        .env(
+            "RK_FAKE_HARNESS_CMD",
+            format!(
+                r#"{} done "resumed after delayed rollover" >/dev/null 2>&1 || true
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"resumed after delayed rollover","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}'"#,
+                env!("CARGO_BIN_EXE_rk")
+            ),
+        )
         .args(["--json", "daemon", "rollover", "--wait-secs", "1"])
+        .output()
+        .expect("run rk daemon rollover");
+    let rollover = json_stdout(&rollover_out);
+    assert_eq!(rollover["rolled_over"], true, "{rollover}");
+    let respawned = rollover["respawned"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        respawned.iter().any(|v| v.as_str() == Some(name.as_str())),
+        "expected {name} in respawned list: {rollover}"
+    );
+
+    let pid2 = json_stdout(
+        &rk(home.path())
+            .args(["--json", "daemon", "status"])
+            .output()
+            .unwrap(),
+    )["pid"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(pid1, pid2, "rollover did not actually replace the daemon process");
+
+    let mut completed = false;
+    for _ in 0..100 {
+        let st = json_stdout(
+            &rk(home.path())
+                .args(["--json", "status", &name])
+                .output()
+                .unwrap(),
+        );
+        if st["state"] == "completed" {
+            completed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(completed, "respawned rat never completed on the new daemon");
+
+    let _ = rk(home.path()).args(["daemon", "stop"]).output();
+}
+
+/// TKT-nusod-lizuk-jomun, the corrected recovery contract: once a daemon
+/// truly outlives even the generous 15s `OLD_INSTANCE_EXIT_BOUND`, rollover
+/// must fail loudly (not report false success) AND must not resume dispatch
+/// on that daemon — its `stop` is already accepted and irrevocable, so
+/// admitting new work onto it would just get killed out from under whatever
+/// got dispatched. `agent.spawn` staying refused after the failure is the
+/// proof dispatch was never resumed.
+#[test]
+fn rollover_fails_without_resuming_dispatch_past_the_reasonable_bound() {
+    let home = tempfile::tempdir().unwrap();
+    disable_disk_floor(home.path());
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    // Longer than OLD_INSTANCE_EXIT_BOUND (15s) — a genuinely unreasonable
+    // shutdown, not just an ordinary slow one.
+    rk_delayed_shutdown(home.path(), "17000")
+        .args(["ping"])
+        .output()
+        .expect("run rk ping");
+    json_stdout(
+        &rk_delayed_shutdown(home.path(), "17000")
+            .args(["--json", "repo", "add", repo_dir.path().to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
+
+    let pid1 = json_stdout(
+        &rk(home.path())
+            .args(["--json", "daemon", "status"])
+            .output()
+            .unwrap(),
+    )["pid"]
+        .as_u64()
+        .unwrap();
+
+    let rollover_out = rk_delayed_shutdown(home.path(), "17000")
+        .args(["--json", "daemon", "rollover", "--wait-secs", "0"])
         .output()
         .expect("run rk daemon rollover");
     assert!(
         !rollover_out.status.success(),
-        "rollover must fail rather than falsely report the live rat parked \
-         and respawned: stdout={} stderr={}",
+        "rollover must fail once the outgoing daemon exceeds the reasonable \
+         exit bound: stdout={} stderr={}",
         String::from_utf8_lossy(&rollover_out.stdout),
         String::from_utf8_lossy(&rollover_out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&rollover_out.stderr);
+    assert!(
+        stderr.contains("did not actually exit within"),
+        "expected the explicit old-instance timeout error, got: {stderr}"
+    );
 
-    // Same daemon, same rat, still running — the failed attempt did not park
-    // or lose anything.
+    // Still the same (still-retiring) daemon — nothing was replaced.
     let pid2 = json_stdout(
         &rk(home.path())
             .args(["--json", "daemon", "status"])
@@ -390,13 +469,28 @@ fn rollover_does_not_falsely_park_when_old_daemon_outlives_the_wait_bound() {
         .unwrap();
     assert_eq!(pid1, pid2, "no daemon was actually replaced by the failed attempt");
 
-    let st = json_stdout(
-        &rk(home.path())
-            .args(["--json", "status", &name])
-            .output()
-            .unwrap(),
+    // The corrected contract: dispatch must stay paused, because this
+    // daemon's stop is already committed and irrevocable — resuming it
+    // would admit work onto a process that is going away regardless.
+    let spawn_out = rk(home.path())
+        .args([
+            "--json",
+            "spawn",
+            "--task",
+            "post-timeout-rollover",
+            "--repo",
+            repo_dir.path().to_str().unwrap(),
+            "--harness",
+            "fake",
+        ])
+        .output()
+        .expect("run rk spawn");
+    assert!(
+        !spawn_out.status.success(),
+        "dispatch must remain paused on a daemon whose stop is already \
+         committed — resuming it here would be unsafe: {}",
+        String::from_utf8_lossy(&spawn_out.stdout)
     );
-    assert_eq!(st["state"], "running", "the live rat must not have been parked");
 
     let _ = rk(home.path()).args(["daemon", "stop"]).output();
 }

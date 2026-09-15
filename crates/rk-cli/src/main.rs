@@ -764,6 +764,15 @@ enum DaemonCommand {
 /// and must not be resumed) — so it never disturbs an unrelated agent an
 /// operator left `Orphaned` from an earlier incident, and it works
 /// regardless of the `respawn_enabled` policy flag.
+/// How long a physical old-instance exit is allowed to take once `stop` has
+/// been accepted, before rollover gives up. The graceful shutdown path
+/// (draining background loops via `background_tasks.join_next()` in
+/// rk-daemon's `run()`) is not instant — a confirmed production case
+/// overran the previous 3s assumption by several seconds — so this is
+/// deliberately generous, but still bounded: this command must not spin
+/// indefinitely on a daemon that has wedged mid-shutdown.
+const OLD_INSTANCE_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Result<()> {
     let mut client = Client::connect(layout)
         .await
@@ -771,15 +780,22 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
 
     // Capture the outgoing instance's identity before we ask it to stop —
     // this is the only way to later tell a genuine replacement apart from a
-    // reconnect to the same retiring process (see the post-stop check below).
+    // reconnect to the same retiring process (see the post-stop check
+    // below). The signature (pid + start time) is captured now, while the
+    // daemon is confirmed alive, so it can be compared against later to
+    // confirm this exact process — not just some process at this pid —
+    // actually went away.
     let old_status = client.call("status", json!({})).await?;
     let old_pid = old_status["pid"].as_u64();
+    let old_signature = old_pid.and_then(|pid| process_signature(pid as u32));
 
     let mut live = match rollover_drain(&mut client, wait_secs, as_json).await {
         Ok(live) => live,
         Err(e) => {
             // Don't leave a live daemon stuck refusing dispatch over a
-            // failure that happened before we ever got to `stop`.
+            // failure that happened before we ever got to `stop` — this is
+            // still safe: the outgoing daemon has not been told to shut
+            // down yet, so nothing about its shutdown is irrevocable.
             let _ = client.call("daemon.resume_dispatch", json!({})).await;
             return Err(e);
         }
@@ -793,28 +809,25 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
     }
 
     client.call("stop", json!({})).await?;
-    let mut old_exited = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        if Client::connect(layout).await.is_err() {
-            old_exited = true;
-            break;
-        }
-    }
+    // From this point on the outgoing daemon has unconditionally committed
+    // to shutting down — there is no "cancel stop" RPC. Resuming dispatch
+    // on it now would admit new work onto a process that is going away
+    // regardless of what happens next, so any failure below must NOT touch
+    // its dispatch state; it can only wait, then report.
+    let old_exited = wait_for_old_instance_exit(layout, old_pid, old_signature.as_deref()).await;
     if !old_exited {
-        // The outgoing daemon never released the socket within the bounded
-        // wait. Proceeding here is exactly the bug this guards against:
-        // `connect_or_spawn` would just reconnect to the still-live retiring
-        // instance and we would report a restart that never happened.
-        // Resume dispatch on it — it is still the only daemon running — and
-        // fail loudly instead.
-        let _ = client.call("daemon.resume_dispatch", json!({})).await;
         anyhow::bail!(
-            "rollover timed out waiting for the outgoing daemon (pid {}) to exit — \
-             dispatch resumed on it, nothing was replaced",
+            "rollover: the outgoing daemon (pid {}) did not actually exit within {}s of \
+             accepting stop — its shutdown is already committed and cannot be undone, so \
+             dispatch was left as-is rather than resumed on a daemon that is going away; \
+             check `rk daemon status` / `ps -p {}` before retrying",
             old_pid
                 .map(|p| p.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            OLD_INSTANCE_EXIT_BOUND.as_secs(),
+            old_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
         );
     }
 
@@ -831,7 +844,7 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
     let new_status = client.call("status", json!({})).await?;
     let new_pid = new_status["pid"].as_u64();
     let new_build = new_status["build_version"].as_str();
-    let expected_build = rk_core::version::BUILD_VERSION;
+    let expected_build = rk_core::version::build_version();
     let replaced = matches!(
         (new_pid, old_pid, new_build),
         (Some(new_pid), Some(old_pid), Some(new_build))
@@ -960,6 +973,64 @@ async fn rollover_drain(
     }
 
     Ok(live)
+}
+
+/// A best-effort physical identity for OS process `pid`: its start time, as
+/// `ps` reports it right now. PID alone is not an identity — the OS can
+/// recycle it — so this is what lets [`wait_for_old_instance_exit`] tell
+/// "this exact process is gone" apart from "the socket merely stopped
+/// answering", which can happen well before the process actually finishes
+/// its background-task drain and calls `exit()`. Mirrors the pid+start-time
+/// discipline `rk_daemon`'s own `managed_verification::process_signature`
+/// uses for the same reason; that one is `pub(crate)` and unreachable
+/// across the crate boundary, so this is a from-scratch equivalent, not a
+/// shared implementation.
+fn process_signature(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Wait (bounded by [`OLD_INSTANCE_EXIT_BOUND`]) for the outgoing daemon to
+/// physically exit, rather than for its socket to merely stop answering —
+/// the accept loop can break, and new connections start refusing, well
+/// before `background_tasks.join_next()` finishes draining and the process
+/// actually calls `exit()` (see rk-daemon's `Daemon::run`). When a baseline
+/// signature was captured before `stop`, exit is confirmed once the pid's
+/// current signature no longer matches it (gone entirely, or handed by the
+/// OS to an unrelated process — either way this exact daemon is gone).
+/// Without a baseline (e.g. `ps` itself failed even though the daemon just
+/// answered `status`), fall back to the weaker socket-refusal signal so a
+/// healthy exit is not misreported as a hang on a platform quirk alone.
+async fn wait_for_old_instance_exit(
+    layout: &Layout,
+    old_pid: Option<u64>,
+    old_signature: Option<&str>,
+) -> bool {
+    let deadline = std::time::Instant::now() + OLD_INSTANCE_EXIT_BOUND;
+    loop {
+        let exited = match (old_pid, old_signature) {
+            (Some(pid), Some(sig)) => process_signature(pid as u32).as_deref() != Some(sig),
+            _ => Client::connect(layout).await.is_err(),
+        };
+        if exited {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
 }
 
 /// Emit a human approval decision for a workflow instance parked at an
