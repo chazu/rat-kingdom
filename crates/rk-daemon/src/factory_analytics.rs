@@ -1277,13 +1277,16 @@ impl NativeCostBucket {
 /// ticket that was itself natively delivered contributes to both its own
 /// task's implementation cost and its original's correction cost) — that is
 /// correct per-task, but summing every task's own total into one repo-wide
-/// total would double-count it. `cost` is the post-exclusion contribution
-/// (`None` for a malformed value or an archived generation excluded by
-/// `include_archived=false`) — identical for a given `run_id` regardless of
-/// which task recorded it, so a later call simply overwrites with the same
-/// value.
+/// total would double-count it. `cost` and `excluded` are identical for a
+/// given `run_id` regardless of which task recorded it, so a later call
+/// simply overwrites with the same values. `excluded` (an archived
+/// generation excluded by `include_archived=false`) is kept distinct from a
+/// malformed/nonfinite `cost` of `None` all the way to the totals fold —
+/// collapsing the two onto the same `None` encoding is what let a single
+/// excluded generation null out the entire repo-wide total (see
+/// `native_recorded_cost_excludes_archived_generation_unless_requested`).
 fn record_global_contribution(
-    map: &mut BTreeMap<String, (Option<u64>, BTreeSet<String>)>,
+    map: &mut BTreeMap<String, (Option<u64>, bool, BTreeSet<String>)>,
     run_id: &str,
     cost: Option<u64>,
     excluded: bool,
@@ -1291,9 +1294,10 @@ fn record_global_contribution(
 ) {
     let entry = map
         .entry(run_id.to_string())
-        .or_insert_with(|| (None, BTreeSet::new()));
-    entry.0 = if excluded { None } else { cost };
-    entry.1.insert(task.to_string());
+        .or_insert_with(|| (None, false, BTreeSet::new()));
+    entry.0 = cost;
+    entry.1 = excluded;
+    entry.2.insert(task.to_string());
 }
 
 /// Reduce agent generations into the additive `native_recorded_cost`
@@ -1405,9 +1409,9 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
     // authoritatively claim it)`. Fed once per (agent, task) pairing below,
     // consumed after the loop to compute `totals` without double-counting a
     // generation linked to more than one task.
-    let mut settled_contributions: BTreeMap<String, (Option<u64>, BTreeSet<String>)> =
+    let mut settled_contributions: BTreeMap<String, (Option<u64>, bool, BTreeSet<String>)> =
         BTreeMap::new();
-    let mut provisional_contributions: BTreeMap<String, (Option<u64>, BTreeSet<String>)> =
+    let mut provisional_contributions: BTreeMap<String, (Option<u64>, bool, BTreeSet<String>)> =
         BTreeMap::new();
 
     if available {
@@ -1589,19 +1593,40 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
     // regardless of how many tasks it was authoritatively linked to above.
     let shared_settled: Vec<Value> = settled_contributions
         .iter()
-        .filter(|(_, (_, tasks))| tasks.len() > 1)
-        .map(|(run_id, (_, tasks))| {
+        .filter(|(_, (_, _, tasks))| tasks.len() > 1)
+        .map(|(run_id, (_, _, tasks))| {
             json!({"generation_id": run_id, "tasks": tasks.iter().collect::<Vec<_>>()})
         })
         .collect();
     let totals_generations = settled_contributions.len() as u64;
+    let excluded_archived_totals_generations = settled_contributions
+        .values()
+        .filter(|(_, excluded, _)| *excluded)
+        .count() as u64;
+    // An excluded (archived) generation contributes 0 to the total, matching
+    // `NativeCostBucket::add`'s per-task semantics — only a genuinely
+    // malformed/nonfinite cost (`None` on a generation that is not excluded)
+    // makes the total unavailable.
     let totals_cost = settled_contributions
         .values()
-        .try_fold(0u64, |acc, (cost, _)| cost.and_then(|c| acc.checked_add(c)));
+        .try_fold(0u64, |acc, (cost, excluded, _)| {
+            if *excluded {
+                Some(acc)
+            } else {
+                cost.and_then(|c| acc.checked_add(c))
+            }
+        });
     let provisional_totals_generations = provisional_contributions.len() as u64;
-    let provisional_totals_cost = provisional_contributions
-        .values()
-        .try_fold(0u64, |acc, (cost, _)| cost.and_then(|c| acc.checked_add(c)));
+    let provisional_totals_cost =
+        provisional_contributions
+            .values()
+            .try_fold(0u64, |acc, (cost, excluded, _)| {
+                if *excluded {
+                    Some(acc)
+                } else {
+                    cost.and_then(|c| acc.checked_add(c))
+                }
+            });
 
     let mut warnings: Vec<String> = Vec::new();
     if let Some(warning) = &inputs.native_delivery.read_warning {
@@ -1650,6 +1675,11 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
             shared_settled.len()
         ));
     }
+    if excluded_archived_totals_generations > 0 {
+        warnings.push(format!(
+            "totals_excluded_archived_generations: {excluded_archived_totals_generations} archived generation(s) excluded from totals.recorded_cost_usd_micro because include_archived=false; this total is not a complete lifetime cost"
+        ));
+    }
 
     json!({
         "schema_version": NATIVE_RECORDED_COST_SCHEMA_VERSION,
@@ -1692,6 +1722,7 @@ fn native_recorded_cost_section(inputs: &AnalyticsInputs, req: &FactoryAnalytics
         "totals": {
             "tasks_with_recorded_cost": tasks_json.len(),
             "contributing_generations": if available { json!(totals_generations) } else { Value::Null },
+            "excluded_archived_generations": if available { json!(excluded_archived_totals_generations) } else { Value::Null },
             "recorded_cost_usd_micro": if available { opt_micro_json(totals_cost) } else { Value::Null },
             "provisional_contributing_generations": if available { json!(provisional_totals_generations) } else { Value::Null },
             "provisional_cost_usd_micro": if available { opt_micro_json(provisional_totals_cost) } else { Value::Null },
@@ -3125,6 +3156,109 @@ mod tests {
             json!(0)
         );
         assert_eq!(task2["coverage_complete"], json!(true));
+    }
+
+    #[test]
+    fn native_recorded_cost_totals_are_not_nulled_by_an_archived_exclusion_elsewhere() {
+        // Regression for the bug verified in review of da2f0277: one
+        // archived-excluded settled generation anywhere in the repo used to
+        // null out `totals.recorded_cost_usd_micro` for every task, even
+        // though every task's own `recorded_cost_usd_micro` stayed correct.
+        // TKT-1 has an archived-excluded generation alongside an included
+        // one; TKT-2 is untouched by archiving. The default (non-malformed)
+        // repo total must equal the sum of what each task's own known
+        // included contributions report — not null.
+        let delivery = vec![
+            landing_processed_event(
+                "feature-1",
+                "sha1",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-1"),
+                1_000,
+            ),
+            landing_processed_event(
+                "feature-2",
+                "sha2",
+                "main",
+                "TKT-2",
+                "landed",
+                Some("merge-2"),
+                1_050,
+            ),
+        ];
+        let mut archived_impl = implementer("rat-old", "TKT-1", 0.30);
+        archived_impl.archived_at = Some(Utc.timestamp_opt(900, 0).unwrap());
+        let agents = vec![
+            implementer("rat-impl-1", "TKT-1", 0.10),
+            archived_impl,
+            implementer("rat-impl-2", "TKT-2", 0.05),
+        ];
+        let resp = scorecards_response(
+            &cost_inputs(agents, delivery, Vec::new()),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nrc = &resp["native_recorded_cost"];
+        let tasks = nrc["tasks"].as_array().unwrap();
+        let tkt1 = tasks.iter().find(|t| t["task"] == json!("TKT-1")).unwrap();
+        let tkt2 = tasks.iter().find(|t| t["task"] == json!("TKT-2")).unwrap();
+        assert_eq!(tkt1["recorded_cost_usd_micro"], json!(100_000));
+        assert_eq!(tkt2["recorded_cost_usd_micro"], json!(50_000));
+        // The known-good per-task contributions sum to 150_000; the repo
+        // total must agree, not go null because of the archived exclusion.
+        assert_eq!(nrc["totals"]["recorded_cost_usd_micro"], json!(150_000));
+        assert_eq!(nrc["totals"]["contributing_generations"], json!(3));
+        assert_eq!(nrc["totals"]["excluded_archived_generations"], json!(1));
+        assert!(nrc["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .starts_with("totals_excluded_archived_generations")));
+    }
+
+    #[test]
+    fn native_recorded_cost_totals_remain_unavailable_for_genuinely_malformed_cost() {
+        // Companion to the archived-exclusion regression above: a genuinely
+        // malformed/nonfinite cost (not an archived exclusion) must still
+        // poison `totals.recorded_cost_usd_micro` to null, even when a
+        // separate, unrelated task has a clean archived exclusion. The two
+        // encodings must not be collapsed back together.
+        let delivery = vec![
+            landing_processed_event(
+                "feature-1",
+                "sha1",
+                "main",
+                "TKT-1",
+                "landed",
+                Some("merge-1"),
+                1_000,
+            ),
+            landing_processed_event(
+                "feature-2",
+                "sha2",
+                "main",
+                "TKT-2",
+                "landed",
+                Some("merge-2"),
+                1_050,
+            ),
+        ];
+        let mut archived_impl = implementer("rat-old", "TKT-1", 0.30);
+        archived_impl.archived_at = Some(Utc.timestamp_opt(900, 0).unwrap());
+        let agents = vec![
+            implementer("rat-impl-1", "TKT-1", 0.10),
+            archived_impl,
+            implementer("rat-bad", "TKT-2", f64::NAN),
+        ];
+        let resp = scorecards_response(
+            &cost_inputs(agents, delivery, Vec::new()),
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let nrc = &resp["native_recorded_cost"];
+        assert!(nrc["totals"]["recorded_cost_usd_micro"].is_null());
+        assert_eq!(nrc["totals"]["excluded_archived_generations"], json!(1));
     }
 
     #[test]
