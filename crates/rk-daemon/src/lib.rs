@@ -10,6 +10,7 @@ pub mod bbs;
 pub mod bbs_discovery;
 mod capabilities;
 pub mod client;
+mod continuous_assessment;
 pub mod coordinator;
 pub mod cron;
 mod current_needs;

@@ -35,6 +35,14 @@ use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 
 const GC_INTERVAL: Duration = Duration::from_secs(60);
+// Internal scheduler granularity for the continuous-assessment sweep (P9.3,
+// TKT-bahov-lakat-darif) — NOT the operator-declared per-objective
+// `evaluation_cadence_seconds` (which stays fully configurable; this is just
+// how often the daemon checks whether any activated repo's own cadence has
+// elapsed). Small and fixed, unlike the other sweep intervals above, because
+// unlike those this one gates a per-objective-declared cadence rather than
+// running its own work directly on this tick.
+const CONTINUOUS_ASSESSMENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 // Default lifetime for a pheromone trail (claim / obstacle / need) written
 // without an explicit TTL — the hard-TTL backstop for strength decay — lives in
 // rk-core so daemon-internal trail writers (supervisor, syncer) age on the same
@@ -1829,6 +1837,38 @@ impl Daemon {
             });
         }
 
+        // Continuous-assessment scheduler sweep (P9.3, TKT-bahov-lakat-darif):
+        // bounded, cadence-driven autonomous evaluation over every repo with
+        // an ACTIVE assessment. This reuses the exact same
+        // `continuous_assessment::tick` the RPC path calls — enabling an
+        // objective via `bbs.assessment.activate` is sufficient on its own to
+        // produce results; no operator `bbs.assessment.tick` call is
+        // required, and `bbs.assessment.disable` stops future evaluation
+        // immediately because `sweep_due` never selects a repo whose
+        // `activation` is `None`. Registry state is durable JSON
+        // (`continuous-assessment.json`), so a restarted daemon resumes each
+        // repo's saved cursor and reducer totals from exactly where the prior
+        // generation left off. No agents, no King wake, no paid work.
+        {
+            let space = daemon.space.clone();
+            let layout = daemon.layout.clone();
+            let mut assessment_shutdown = daemon.shutdown_tx.subscribe();
+            background_tasks.spawn(async move {
+                let mut tick = tokio::time::interval(CONTINUOUS_ASSESSMENT_POLL_INTERVAL);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let ticked = crate::continuous_assessment::sweep_due(&space, &layout, Utc::now());
+                            if ticked > 0 {
+                                debug!(ticked, "continuous-assessment sweep advanced due repos");
+                            }
+                        }
+                        _ = assessment_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
         // Install the merge-mode landing seam even when the background
         // reactor is disabled: explicit workflow/operator `land` calls still
         // enter and synchronously drive this queue.
@@ -3583,6 +3623,117 @@ impl Daemon {
                             &req.caller,
                             &params,
                         )
+                        .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.show" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::show(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.status" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::status(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.latest" => {
+                let result = parse_params::<crate::continuous_assessment::ShowParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::latest(&self.layout, &params)
+                            .map_err(|e| e.to_string())
+                    });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.configure" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::ConfigureParams>(&req.params)
+                        .and_then(|params| {
+                            let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                            crate::continuous_assessment::configure(
+                                &self.layout,
+                                &repos,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.activate" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::ActivateParams>(&req.params)
+                        .and_then(|params| {
+                            crate::continuous_assessment::activate(
+                                &self.layout,
+                                &self.space,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.disable" => {
+                let result =
+                    parse_params::<crate::continuous_assessment::DisableParams>(&req.params)
+                        .and_then(|params| {
+                            crate::continuous_assessment::disable(
+                                &self.layout,
+                                &req.caller,
+                                &params,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::BAD_PARAMS, error),
+                })
+            }
+            "bbs.assessment.tick" => {
+                let result = parse_params::<crate::continuous_assessment::TickParams>(&req.params)
+                    .and_then(|params| {
+                        crate::continuous_assessment::tick(
+                            &self.space,
+                            &self.layout,
+                            &params.repo,
+                            "daemon",
+                            chrono::Utc::now(),
+                        )
+                        .map(|outcome| {
+                            serde_json::json!({
+                                "repo": params.repo,
+                                "pages_processed": outcome.pages_processed,
+                                "events_consumed": outcome.events_consumed,
+                                "truncated": outcome.truncated,
+                                "verdict": outcome.verdict,
+                                "published": outcome.published,
+                            })
+                        })
                         .map_err(|e| e.to_string())
                     });
                 reply(match result {

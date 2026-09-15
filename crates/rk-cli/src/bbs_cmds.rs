@@ -124,6 +124,14 @@ pub enum BbsCommand {
         #[command(subcommand)]
         command: RetirementCommand,
     },
+    /// Continuous assessment (P9.3): a narrow, native, incremental
+    /// pass/fail/inconclusive/unavailable evaluator over one enabled
+    /// feature's bounded telemetry. Default is unconfigured/off per repo;
+    /// see `docs/2026-09-13-continuous-validation-promotion.md` 7.2/8.
+    Assessment {
+        #[command(subcommand)]
+        command: AssessmentCommand,
+    },
     /// Operator-only: assess a reuse receipt.
     Assess {
         /// The reuse receipt this assessment is about.
@@ -215,6 +223,54 @@ pub enum RetirementCommand {
     /// Retained Resolution trails and run telemetry from while it was on stay
     /// readable. Operator-only.
     Disable {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AssessmentCommand {
+    /// Show the effective objective configuration and activation identity.
+    Show {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Show incremental evaluator progress: cursor, cumulative counters,
+    /// truncation/lag.
+    Status {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Show the latest published assessment, if any.
+    Latest {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Validate and store an objective config from a JSON file (see
+    /// `first-production-objective-v1.json`'s `metric`/`profile` shape).
+    /// Does not activate; does not touch a live evaluation window.
+    /// Operator-only.
+    Configure {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+        /// Path to a JSON file matching `ObjectiveConfig`.
+        #[arg(long)]
+        objective: std::path::PathBuf,
+    },
+    /// Begin (or restart) the evaluation window from the current persistence
+    /// boundary. Requires a prior `configure`. Operator-only.
+    Activate {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Stop evaluating new events. Retains all prior evidence and the last
+    /// published assessment. Operator-only.
+    Disable {
+        #[arg(long, env = "RK_REPO")]
+        repo: String,
+    },
+    /// Advance the evaluator by one bounded catch-up pass. Operator-only.
+    Tick {
         #[arg(long, env = "RK_REPO")]
         repo: String,
     },
@@ -442,6 +498,80 @@ pub async fn run(layout: &Layout, command: BbsCommand, as_json: bool) -> Result<
             }
             RetirementCommand::Disable { repo } => {
                 retirement_set(&mut client, &repo, "off", as_json).await?;
+            }
+        },
+        BbsCommand::Assessment { command } => match command {
+            AssessmentCommand::Show { repo } => {
+                let result = client
+                    .call("bbs.assessment.show", json!({"repo": repo}))
+                    .await?;
+                println!("{result}");
+            }
+            AssessmentCommand::Status { repo } => {
+                let result = client
+                    .call("bbs.assessment.status", json!({"repo": repo}))
+                    .await?;
+                println!("{result}");
+            }
+            AssessmentCommand::Latest { repo } => {
+                let result = client
+                    .call("bbs.assessment.latest", json!({"repo": repo}))
+                    .await?;
+                println!("{result}");
+            }
+            AssessmentCommand::Configure { repo, objective } => {
+                let objective = read_json(&objective, "objective")?;
+                let result = client
+                    .call(
+                        "bbs.assessment.configure",
+                        json!({"repo": repo, "objective": objective}),
+                    )
+                    .await?;
+                if as_json {
+                    println!("{result}");
+                } else {
+                    println!(
+                        "continuous-assessment for {}: configured (revision {}); {}",
+                        repo,
+                        result["revision"].as_u64().unwrap_or(0),
+                        result["rollover_note"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            AssessmentCommand::Activate { repo } => {
+                let result = client
+                    .call("bbs.assessment.activate", json!({"repo": repo}))
+                    .await?;
+                if as_json {
+                    println!("{result}");
+                } else {
+                    println!(
+                        "continuous-assessment for {}: activated (revision {})",
+                        repo,
+                        result["revision"].as_u64().unwrap_or(0),
+                    );
+                }
+            }
+            AssessmentCommand::Disable { repo } => {
+                let result = client
+                    .call("bbs.assessment.disable", json!({"repo": repo}))
+                    .await?;
+                if as_json {
+                    println!("{result}");
+                } else {
+                    println!(
+                        "continuous-assessment for {}: disabled (revision {}); {}",
+                        repo,
+                        result["revision"].as_u64().unwrap_or(0),
+                        result["retained_note"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            AssessmentCommand::Tick { repo } => {
+                let result = client
+                    .call("bbs.assessment.tick", json!({"repo": repo}))
+                    .await?;
+                println!("{result}");
             }
         },
         BbsCommand::Assess {
