@@ -367,10 +367,10 @@ impl Reactor {
     /// through this reactor: a [`LandingPipeline`] is wired ([`Self::
     /// with_landing`]) AND at least one loaded `action: "land"` trigger
     /// resolves to this repo under the exact same precedence [`Self::
-    /// try_fire`] applies at dispatch time (`trigger.repo` explicit override
-    /// > the trigger file's own repo > the matched tuple's scope — for this
-    /// repo's own `harness_result` tuples that scope is always `repo_name`,
-    /// so a trigger with no `repo:` at all still counts as a match here).
+    /// try_fire`] applies at dispatch time: `trigger.repo`, then the trigger
+    /// file's own repo, then the matched tuple's scope. For this repo's own
+    /// `harness_result` tuples that scope is always `repo_name`, so a trigger
+    /// with no `repo:` still counts as a match here.
     /// This exists to disprove `Supervisor::landing_pipeline().is_some()` as
     /// a live-route signal (TKT-hisag-nubaf-kugon REWORK finding #1): that
     /// pipeline is installed unconditionally at daemon startup regardless of
