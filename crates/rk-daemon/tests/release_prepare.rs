@@ -719,6 +719,238 @@ mod host_admission {
         .await;
     }
 
+    /// P4.1 cancellation (TKT-nibuv-gokun-sibin): `release.prepare` now
+    /// routes through `dispatch_watching_disconnect`, the same explicit
+    /// RPC-disconnect signal `verify.run` already uses — registering with,
+    /// and being cancelled through, the identical
+    /// `ManagedVerificationRuns` registry, keyed on the identical
+    /// `request_key`. A caller that disconnects while its build is
+    /// genuinely QUEUED for the aggregate permit must release that wait
+    /// promptly, and never falsely settle as `prepared`.
+    #[tokio::test]
+    async fn cancelling_a_queued_release_build_releases_the_wait_without_falsely_settling() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let checker_dir = tempfile::tempdir().unwrap();
+        let checker_name = init_checker_repo(checker_dir.path(), shared.path(), "chk");
+        let release_dir = tempfile::tempdir().unwrap();
+        init_fixture_repo(release_dir.path(), "v1");
+        let release_name = repo_name_of(release_dir.path());
+
+        let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        daemon.set_verification_admission_aggregate_limit(1);
+        daemon.set_release_build_admission_enabled(true);
+        let _handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        register_repo(&mut client, checker_dir.path()).await;
+        register_repo(&mut client, release_dir.path()).await;
+
+        let checker_layout = layout.clone();
+        let checker_repo = checker_name.clone();
+        let checker_call = tokio::spawn(async move {
+            let mut c = Client::connect_as_operator(&checker_layout).await.unwrap();
+            c.call("verify.run", json!({"repo": checker_repo, "check": "go"}))
+                .await
+        });
+        wait_for_start(&pid_path(shared.path(), "chk")).await;
+        poll_status_until(
+            &mut client,
+            "checker occupies the one aggregate permit",
+            |s| host_executing(s) == 1,
+        )
+        .await;
+
+        // Fire the release build on its OWN connection so cancelling it does
+        // not touch the polling connection — `JoinHandle::abort`, not a bare
+        // `drop`, actually tears the connection down (same reasoning as
+        // `host_verification_aggregate_cap.rs`'s own cancellation tests).
+        let prepare_layout = layout.clone();
+        let repo_for_call = release_name.clone();
+        let prepare_conn = tokio::spawn(async move {
+            let mut c = Client::connect_as_operator(&prepare_layout).await.unwrap();
+            c.call(
+                "release.prepare",
+                json!({"repo": repo_for_call, "candidate": "main"}),
+            )
+            .await
+        });
+        poll_status_until(
+            &mut client,
+            "release build is genuinely queued behind the saturated aggregate cap",
+            |s| host_executing(s) == 1 && host_waiting(s) == 1,
+        )
+        .await;
+
+        prepare_conn.abort();
+        let _ = prepare_conn.await;
+
+        // Cancelling a QUEUED wait must never touch the permit the checker
+        // still holds — only the waiting count drops. Nothing else could
+        // ever free this wait: the checker's own barrier is never released
+        // until after this assertion.
+        poll_status_until(
+            &mut client,
+            "the cancelled release build's wait drops out of the queue",
+            |s| host_executing(s) == 1 && host_waiting(s) == 0,
+        )
+        .await;
+
+        // Truthful state: the release entry was durably marked `Preparing`
+        // before the build ever waited on admission, and a cancelled build
+        // never reaches its own `Prepared`/`Failed` write — `effective_status`
+        // (release.rs) is what turns a stale `Preparing` with a now-free
+        // `release_prepare_lock` into an honest `unknown`, never a false
+        // `prepared`.
+        let listed = client
+            .call("release.list", json!({"repo": release_name}))
+            .await
+            .unwrap();
+        let releases = listed["releases"].as_array().unwrap();
+        assert_eq!(releases.len(), 1, "{listed:?}");
+        assert_eq!(releases[0]["status"], json!("unknown"), "{listed:?}");
+
+        release_marker(shared.path(), "chk");
+        checker_call.await.unwrap().unwrap();
+    }
+
+    /// A `build.rs` script that, when compiled as part of the fixture's
+    /// `rk-cli` package, writes its own pid then blocks on an explicit
+    /// release file — the same barrier technique as
+    /// `barrier_check_body`, applied to a REAL `cargo build` step instead of
+    /// a named check, so a cancellation test can prove the release build's
+    /// own owned child (not a stand-in) actually dies. The paths are baked
+    /// in as string literals at fixture-generation time — no environment
+    /// variables cross the `cargo build` boundary, so this cannot leak into
+    /// or race with any other concurrently-running test in this binary.
+    fn write_build_barrier(dir: &Path, shared: &Path, marker: &str) {
+        let shared_display = shared.display();
+        let build_rs = format!(
+            r#"fn main() {{
+    std::fs::write("{shared_display}/{marker}.pid", std::process::id().to_string()).unwrap();
+    let release = std::path::Path::new("{shared_display}").join("{marker}.release");
+    for _ in 0..600 {{
+        if release.exists() {{
+            return;
+        }}
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }}
+    panic!("build barrier {marker} never released");
+}}
+"#
+        );
+        std::fs::write(dir.join("rk-cli/build.rs"), build_rs).unwrap();
+        let cargo_toml = std::fs::read_to_string(dir.join("rk-cli/Cargo.toml")).unwrap();
+        let cargo_toml = cargo_toml.replacen("[package]\n", "[package]\nbuild = \"build.rs\"\n", 1);
+        std::fs::write(dir.join("rk-cli/Cargo.toml"), cargo_toml).unwrap();
+    }
+
+    /// A committed fixture repo whose `rk-cli` package pauses at
+    /// `write_build_barrier`'s marker partway through a real `cargo build`.
+    fn init_fixture_repo_with_build_barrier(dir: &Path, shared: &Path, marker: &str) -> String {
+        write_fixture_source(dir, "barrier");
+        write_build_barrier(dir, shared, marker);
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "r@x"]);
+        git(dir, &["config", "user.name", "R"]);
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "fixture with build barrier"]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// A caller that disconnects while its build is genuinely EXECUTING (its
+    /// own real owned child paused mid-compile at a marker, holding the one
+    /// aggregate permit) must actually kill that child — via the same
+    /// `ProcessGroupGuard`-on-drop discipline `verify.run`'s own cancellation
+    /// relies on, `HostVerificationAdmission` has no way to know a permit is
+    /// abandoned other than the guard dropping — release its permit with no
+    /// leak, and never falsely settle as `prepared`.
+    #[tokio::test]
+    async fn cancelling_an_executing_release_build_kills_its_owned_child_and_releases_the_permit() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_fixture_repo_with_build_barrier(repo_dir.path(), shared.path(), "build");
+        let repo_name = repo_name_of(repo_dir.path());
+
+        let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        daemon.set_verification_admission_aggregate_limit(1);
+        daemon.set_release_build_admission_enabled(true);
+        let _handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        register_repo(&mut client, repo_dir.path()).await;
+
+        let prepare_layout = layout.clone();
+        let repo_for_call = repo_name.clone();
+        let prepare_conn = tokio::spawn(async move {
+            let mut c = Client::connect_as_operator(&prepare_layout).await.unwrap();
+            c.call(
+                "release.prepare",
+                json!({"repo": repo_for_call, "candidate": "main"}),
+            )
+            .await
+        });
+
+        // Wait for the build to genuinely reach its barrier — real
+        // compilation underway, not merely admitted — and for the aggregate
+        // permit to show as held.
+        wait_for_start(&pid_path(shared.path(), "build")).await;
+        poll_status_until(
+            &mut client,
+            "the release build occupies the one aggregate permit",
+            |s| host_executing(s) == 1,
+        )
+        .await;
+        let build_pid: i32 = std::fs::read_to_string(pid_path(shared.path(), "build"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        prepare_conn.abort();
+        let _ = prepare_conn.await;
+
+        // The real owned build child must actually die — a concrete OS pid
+        // check, never inferred from daemon bookkeeping alone, same
+        // technique as `host_verification_aggregate_cap.rs`.
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            if Command::new("kill")
+                .args(["-0", &build_pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| !s.success())
+                .unwrap_or(true)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelling release.prepare must reap its owned build child (pid {build_pid})"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        // No permit leak.
+        poll_status_until(&mut client, "capacity fully drains, no leak", |s| {
+            host_executing(s) == 0 && host_waiting(s) == 0
+        })
+        .await;
+
+        // Truthful state: never falsely reported `prepared`.
+        let listed = client
+            .call("release.list", json!({"repo": repo_name}))
+            .await
+            .unwrap();
+        let releases = listed["releases"].as_array().unwrap();
+        assert_eq!(releases.len(), 1, "{listed:?}");
+        assert_ne!(releases[0]["status"], json!("prepared"), "{listed:?}");
+    }
+
     /// Enabled with the aggregate cap itself still disabled (`0`, the
     /// default) is a documented no-op: `HostVerificationAdmission::acquire`
     /// returns immediately, so the build never actually waits, matching
