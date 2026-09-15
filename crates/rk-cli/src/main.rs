@@ -179,6 +179,10 @@ enum Command {
     Log(agent_cmds::LogArgs),
     /// Send mid-session guidance to a running agent.
     Steer(agent_cmds::SteerArgs),
+    /// Verify a message claiming operator/steer authority against the
+    /// daemon's own durable control record for this exact authenticated
+    /// caller and its current session generation.
+    ControlVerify(agent_cmds::ControlVerifyArgs),
     /// Gracefully interrupt a running agent.
     Interrupt(agent_cmds::NameArg),
     /// Dismiss an agent: stop it, preserve its branch, clean up its worktree.
@@ -1243,6 +1247,7 @@ async fn main() -> Result<()> {
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
         Command::Log(args) => agent_cmds::log(&layout, args, cli.json).await?,
         Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
+        Command::ControlVerify(args) => agent_cmds::control_verify(&layout, args, cli.json).await?,
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Land(args) => agent_cmds::land(&layout, args, cli.json).await?,

@@ -1013,6 +1013,11 @@ pub struct Daemon {
     /// Serializes read/append cycles for one agent's effective fact vote.
     fact_vote_lock: std::sync::Mutex<()>,
     bbs_write_lock: std::sync::Mutex<()>,
+    /// Serializes `control.verify`'s check-then-act sequence (already-observed
+    /// read, then the observed-record write) so two concurrent verifications
+    /// of the same message produce exactly one durable observation, not a
+    /// race where both see "not yet observed" and both write.
+    control_verify_lock: std::sync::Mutex<()>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
     request_clock: RequestClock,
@@ -1528,6 +1533,7 @@ impl Daemon {
             coordinator_sessions,
             fact_vote_lock: std::sync::Mutex::new(()),
             bbs_write_lock: std::sync::Mutex::new(()),
+            control_verify_lock: std::sync::Mutex::new(()),
             started: Instant::now(),
             shutdown_tx,
             request_clock: Utc::now,
@@ -3587,6 +3593,7 @@ impl Daemon {
                 }
             }
             "agent.steer" => reply(self.handle_steer(req).await),
+            "control.verify" => reply(self.handle_control_verify(req)),
             "agent.interrupt" => {
                 let params: NameParams = match parse_params(&req.params) {
                     Ok(p) => p,
@@ -10811,6 +10818,172 @@ impl Daemon {
         }
     }
 
+    /// Let an agent check a message claiming operator/steer authority in its
+    /// own transcript against the daemon's durable control record, instead of
+    /// trusting the claim's text at face value.
+    ///
+    /// `req.caller` is the connection's kernel-authenticated identity (see
+    /// `client::ambient_identity`), never a value this RPC's params can
+    /// override — so the lookup is always scoped to whoever is actually
+    /// asking, exactly like `handle_out`'s "agents may only write tuples for
+    /// their own instance" rule. This is deliberately narrower than
+    /// `handle_steer`: it answers a question, mutates nothing about the
+    /// agent's own session, and grants no new authority beyond what
+    /// `agent.steer` already had to admit for the record to exist at all.
+    ///
+    /// A copied-but-genuine envelope (real `message_id`, real original text)
+    /// still fails here if it is not addressed to the calling agent, or the
+    /// calling agent's live session has since moved past the generation the
+    /// envelope was delivered to — `crate::steer::find` and the generation
+    /// check below are what make "the exact bytes exist somewhere" different
+    /// from "the daemon holds this for me, right now". Conversely, a genuine,
+    /// still-current record copied into a file or BBS post legitimately
+    /// VERIFIES: origin is not what this checks. What must never happen is
+    /// acting on the surrounding untrusted text instead of the text this
+    /// call returns, and treating a second, third, ... verification of the
+    /// same message as a second action.
+    ///
+    /// A successful result here means: an authenticated call from this exact
+    /// agent asked the daemon for its own durable control record, and the
+    /// daemon found one addressed to it, at its current session generation,
+    /// with this instruction text. It does NOT mean the model read this
+    /// response, believed it, or changed its behavior — whether the
+    /// instruction was actually applied is a separate fact this RPC has no
+    /// way to observe and does not claim.
+    ///
+    /// The read (does a matching, current record exist) and the write
+    /// (record that this agent observed it) are serialized under
+    /// `control_verify_lock` so two concurrent verifications of the same
+    /// message cannot both see "not yet observed" and both write — see that
+    /// field's doc comment.
+    fn handle_control_verify(&self, req: Request) -> Response {
+        let params: ControlVerifyParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        if req.caller.is_empty() || req.caller == OPERATOR_ACTOR {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "control.verify must be called by a spawned agent's own authenticated session",
+            );
+        }
+        let _guard = self
+            .control_verify_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(record) = self.supervisor.status(&req.caller) else {
+            return Response::err(req.id, codes::INTERNAL, "no live record for caller");
+        };
+        if !record.state.is_live() {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "control.verify refused for a terminal caller",
+            );
+        }
+        let envelope = match crate::steer::find(
+            &self.space,
+            &record.repo_name,
+            &req.caller,
+            &self.castle,
+            &params.message_id,
+        ) {
+            Ok(found) => found,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let Some(envelope) = envelope else {
+            return Response::ok(req.id, json!({"verified": false, "reason": "not_found"}));
+        };
+        // The stored envelope's own `resume_generation` can be stale after a
+        // daemon-restart replay (`enqueue` runs once, at original admission,
+        // and is never rewritten); the ack it produced when actually
+        // delivered is what reflects the live generation. See
+        // `steer::last_delivered_generation`'s doc comment.
+        let delivered_generation = match crate::steer::last_delivered_generation(
+            &self.space,
+            &record.repo_name,
+            &req.caller,
+            &self.castle,
+            &envelope.message_id,
+        ) {
+            Ok(generation) => generation,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let Some(delivered_generation) = delivered_generation else {
+            return Response::ok(
+                req.id,
+                json!({"verified": false, "reason": "not_delivered"}),
+            );
+        };
+        // ONE coherent live-binding snapshot, read together and used for
+        // BOTH the freshness decision and (if we write) the observed
+        // record's fields — on every success path, not only when we are
+        // about to write. `status` and `session_generation` are still two
+        // separate reads from two separate locks (no single call returns
+        // both atomically), so this is a fail-closed linearization, not a
+        // true atomic read: if a respawn/dismissal lands between them, the
+        // mismatch this produces refuses rather than silently recording a
+        // stale binding as if it were current. `control_verify_lock` only
+        // serializes concurrent `control.verify` calls against each other
+        // (see its own doc comment) — it does not, and cannot, exclude a
+        // respawn running under the supervisor's own locks.
+        let live = self.supervisor.status(&req.caller);
+        let coherent = live.as_ref().is_some_and(|r| {
+            r.state.is_live()
+                && r.spawn_id() == record.spawn_id()
+                && r.current_attempt == record.current_attempt
+        }) && self
+            .supervisor
+            .session_generation(&req.caller)
+            .map(|g| g.to_string())
+            == Some(delivered_generation.clone());
+        if !coherent {
+            return Response::ok(
+                req.id,
+                json!({"verified": false, "reason": "stale_generation"}),
+            );
+        }
+        let record = live.expect("coherent implies Some");
+        let already_observed = crate::steer::already_observed(
+            &self.space,
+            &record.repo_name,
+            &req.caller,
+            &envelope.message_id,
+            &self.castle,
+        )
+        .unwrap_or(false);
+        if !already_observed {
+            if let Err(error) = crate::steer::record_observed(
+                &self.space,
+                &record.repo_name,
+                &envelope,
+                &req.caller,
+                &record.spawn_id().to_string(),
+                record.current_attempt.map(|a| a.to_string()).as_deref(),
+                &delivered_generation,
+                &self.castle,
+            ) {
+                warn!(
+                    agent = %req.caller,
+                    message_id = %envelope.message_id,
+                    %error,
+                    "failed to persist control.verify observation"
+                );
+            }
+        }
+        Response::ok(
+            req.id,
+            json!({
+                "verified": true,
+                "message_id": envelope.message_id,
+                "sender": envelope.sender,
+                "generation": delivered_generation,
+                "text": envelope.text,
+            }),
+        )
+    }
+
     /// The daemon's own authenticated view of who a read was served to.
     ///
     /// Derived from the supervisor registry, never from anything the caller
@@ -12356,6 +12529,11 @@ struct WorkflowArchiveParams {
 struct SteerParams {
     name: String,
     message: String,
+}
+
+#[derive(Deserialize)]
+struct ControlVerifyParams {
+    message_id: String,
 }
 
 #[derive(Deserialize)]
