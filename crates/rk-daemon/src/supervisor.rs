@@ -104,6 +104,22 @@ pub(crate) fn transport_breaker_open_refused(provider: &str) -> String {
 /// [`crate::workflow_exec::is_fleet_wip_refusal`].
 pub(crate) const DUPLICATE_TASK_REFUSED_PREFIX: &str = "duplicate dispatch refused for task";
 
+/// The durable [`crate::agents::LaneWaiter`] key for one logical spawn
+/// request — stable across THIS caller's own retries, matching
+/// [`Registry::try_reserve_lane_wip`](crate::agents::Registry::try_reserve_lane_wip)'s
+/// key contract. Shared by [`Supervisor::spawn`] (which mints the key a
+/// refused admission is queued under) and
+/// [`Supervisor::abandon_lane_wait`] (which must reconstruct the identical
+/// key to release the SAME queued reservation once that request's caller
+/// knows it is terminal) — TKT-minak-mogiz-lizun: the two must never drift,
+/// or an abandonment call would silently clear (or miss) the wrong record.
+fn lane_wait_key(role: &str, task: &str, workflow_instance: Option<&str>) -> String {
+    match workflow_instance {
+        Some(instance) => format!("workflow:{instance}:{task}"),
+        None => format!("{role}:{task}"),
+    }
+}
+
 fn duplicate_task_refused(task: &str, owner: &str) -> String {
     if owner.is_empty() {
         format!(
@@ -1927,10 +1943,11 @@ impl Supervisor {
         // reclaiming the same ticket) so the durable wait queue holds this
         // logical request's place in line instead of minting a fresh entry
         // per attempt — see `Registry::try_reserve_lane_wip`/`LaneWaiter`.
-        let lane_wait_key = match &params.workflow_instance {
-            Some(instance) => format!("workflow:{instance}:{}", params.task),
-            None => format!("{}:{}", params.role, params.task),
-        };
+        let lane_wait_key = lane_wait_key(
+            &params.role,
+            &params.task,
+            params.workflow_instance.as_deref(),
+        );
         let name = {
             let mut reg = self.lock_registry();
             if !reg.try_reserve_wip(fleet_wip_cap) {
@@ -8586,6 +8603,41 @@ impl Supervisor {
         match self.registry.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Release one specific automatic dispatch's own durable lane-wait
+    /// reservation the moment that dispatch becomes terminal — refused,
+    /// cancelled, or otherwise never going to retry under this generation
+    /// (TKT-minak-mogiz-lizun). `role`/`task`/`workflow_instance` must match
+    /// the exact [`SpawnParams`] the terminal attempt used, so the
+    /// reconstructed key ([`lane_wait_key`]) names the SAME
+    /// `(repo, lane, key)` record [`spawn`](Self::spawn) queued — this never
+    /// touches any other waiter, so an actively retrying caller elsewhere in
+    /// the same repo/lane queue keeps its FIFO place regardless. Without
+    /// this, a terminally refused automatic rework/correction dispatch (e.g.
+    /// `landing.rs`'s `dispatch-refused` withhold) stays parked at the FIFO
+    /// head for the full `LANE_WAIT_STALE_SECS` window, leaving a free slot
+    /// unusable by the next legitimate request until that crash-fallback
+    /// expiry. A no-op if this key was never queued at all (admitted on its
+    /// first attempt, or refused for a reason other than lane capacity).
+    pub(crate) fn abandon_lane_wait(
+        &self,
+        repo_name: &str,
+        role: &str,
+        task: &str,
+        workflow_instance: Option<&str>,
+    ) {
+        let lane = crate::agents::Lane::for_role(role);
+        let key = lane_wait_key(role, task, workflow_instance);
+        if let Err(e) = self
+            .lock_registry()
+            .abandon_lane_wait(repo_name, lane, &key)
+        {
+            tracing::error!(
+                repo = repo_name, lane = lane.tag(), key = %key, error = %e,
+                "failed to release an abandoned lane-wait reservation for a terminal dispatch"
+            );
         }
     }
 
