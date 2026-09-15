@@ -1596,11 +1596,114 @@ fn render_native_delivery(out: &mut String, result: &Value) {
     out.push('\n');
 }
 
+fn render_native_recorded_cost(out: &mut String, result: &Value) {
+    out.push_str("## Native Recorded Cost\n\n");
+    let section = &result["native_recorded_cost"];
+    if section.is_null() {
+        out.push_str("(not reported)\n\n");
+        return;
+    }
+    let micro = |value: &Value| -> String {
+        value
+            .as_u64()
+            .map(|n| format!("{:.6}", n as f64 / 1_000_000.0))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    out.push_str(&format!(
+        "{}\n",
+        section["semantics"].as_str().unwrap_or("")
+    ));
+    let window = &section["requested_window"];
+    out.push_str(&format!(
+        "- available={} include_archived={} requested_window: since={} until={}\n",
+        section["available"].as_bool().unwrap_or(false),
+        section["include_archived"].as_bool().unwrap_or(false),
+        window["since"]
+            .as_i64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".into()),
+        window["until"]
+            .as_i64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".into()),
+    ));
+    out.push_str(&format!(
+        "- totals: tasks_with_recorded_cost={} contributing_generations={} recorded_cost_usd={} provisional_contributing_generations={} provisional_cost_usd={}\n",
+        section["totals"]["tasks_with_recorded_cost"]
+            .as_u64()
+            .unwrap_or(0),
+        section["totals"]["contributing_generations"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        micro(&section["totals"]["recorded_cost_usd_micro"]),
+        section["totals"]["provisional_contributing_generations"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        micro(&section["totals"]["provisional_cost_usd_micro"]),
+    ));
+    if let Some(tasks) = section["tasks"].as_array() {
+        for task in tasks {
+            out.push_str(&format!(
+                "  - {}: implementation={} review={} correction={} total={} provisional={} coverage_complete={}\n",
+                task["task"].as_str().unwrap_or("?"),
+                micro(&task["implementation"]["settled"]["cost_usd_micro"]),
+                micro(&task["review"]["settled"]["cost_usd_micro"]),
+                micro(&task["correction"]["settled"]["cost_usd_micro"]),
+                micro(&task["recorded_cost_usd_micro"]),
+                micro(&task["provisional_cost_usd_micro"]),
+                task["coverage_complete"].as_bool().unwrap_or(false),
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "- unattributed: generation_count={} cost_usd={} provisional_generation_count={} provisional_cost_usd={} (generations whose task was not observed delivered in this coverage)\n",
+        section["unattributed"]["settled"]["generation_count"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        micro(&section["unattributed"]["settled"]["cost_usd_micro"]),
+        section["unattributed"]["provisional"]["generation_count"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        micro(&section["unattributed"]["provisional"]["cost_usd_micro"]),
+    ));
+    if let Some(shared) = section["shared_contributions"].as_array() {
+        if !shared.is_empty() {
+            out.push_str(&format!(
+                "- shared_contributions: {} generation(s) linked to more than one task (deduplicated in totals above)\n",
+                shared.len()
+            ));
+        }
+    }
+    if let Some(ambiguous) = section["ambiguous_correction_tickets"].as_array() {
+        if !ambiguous.is_empty() {
+            out.push_str(&format!(
+                "- ambiguous_correction_tickets: {}\n",
+                ambiguous
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if let Some(warnings) = section["warnings"].as_array() {
+        for warning in warnings {
+            out.push_str(&format!("- warning: {}\n", warning.as_str().unwrap_or("")));
+        }
+    }
+    out.push('\n');
+}
+
 fn render_scorecards_markdown(result: &Value) -> String {
     let mut out = String::from("# Factory Scorecards\n\n");
     render_source_counts(&mut out, result);
     render_scorecard_rows(&mut out, result);
     render_native_delivery(&mut out, result);
+    render_native_recorded_cost(&mut out, result);
     render_warnings(&mut out, result);
     out
 }

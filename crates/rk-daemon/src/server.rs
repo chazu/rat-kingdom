@@ -3071,6 +3071,68 @@ impl Daemon {
                 )),
             },
         };
+        // Same bounded pattern as `native_delivery` above, for the two
+        // resubmission-marker identities the additive `native_recorded_cost`
+        // section joins a filed correction ticket back to its original task
+        // through (`landing::REWORK_RESUBMISSION_IDENTITY` /
+        // `CONFLICT_RESUBMISSION_IDENTITY`). The two identities genuinely
+        // share one `MAX_SCAN_TUPLES` page budget rather than each getting
+        // its own full cap: `remaining_budget` is spent by the first
+        // identity's read before the second one runs, and either identity
+        // exhausting it marks the combined read truncated — the reported
+        // `limit`/`scanned`/`truncated` describe this one shared budget, not
+        // `2 * MAX_SCAN_TUPLES`.
+        let mut correction_link_rows: Vec<Tuple> = Vec::new();
+        let mut correction_link_scanned = 0usize;
+        let mut correction_link_truncated = false;
+        let mut correction_link_read_warning: Option<String> = None;
+        let mut correction_link_available = true;
+        let mut remaining_budget = MAX_SCAN_TUPLES;
+        for identity in [
+            crate::landing::REWORK_RESUBMISSION_IDENTITY,
+            crate::landing::CONFLICT_RESUBMISSION_IDENTITY,
+        ] {
+            if remaining_budget == 0 {
+                // The other identity already spent the whole shared budget;
+                // this identity's rows (if any) are beyond it, not observed.
+                correction_link_truncated = true;
+                continue;
+            }
+            let pattern = Pattern::category(Category::Event)
+                .identity(identity)
+                .scope(repo.clone());
+            match self
+                .space
+                .scan_newest_limited(&pattern, remaining_budget.saturating_add(1))
+            {
+                Ok(mut rows) => {
+                    let this_scanned = rows.len().min(remaining_budget);
+                    correction_link_truncated =
+                        correction_link_truncated || rows.len() > remaining_budget;
+                    rows.truncate(remaining_budget);
+                    correction_link_scanned += this_scanned;
+                    remaining_budget -= this_scanned;
+                    correction_link_rows.extend(
+                        rows.into_iter()
+                            .filter(|event| in_window(event.created_at.timestamp_millis())),
+                    );
+                }
+                Err(error) => {
+                    correction_link_available = false;
+                    correction_link_read_warning = Some(format!(
+                        "source_family_read_failed: NativeCorrectionLink unavailable: {error}"
+                    ));
+                }
+            }
+        }
+        let native_correction_links = crate::factory_analytics::NativeCorrectionLinkInputs {
+            events: correction_link_rows,
+            scanned: correction_link_scanned,
+            limit: MAX_SCAN_TUPLES,
+            truncated: correction_link_truncated,
+            available: correction_link_available,
+            read_warning: correction_link_read_warning,
+        };
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
@@ -3083,6 +3145,7 @@ impl Daemon {
             runtime_unavailable,
             read_warnings,
             native_delivery,
+            native_correction_links,
         }
     }
 
