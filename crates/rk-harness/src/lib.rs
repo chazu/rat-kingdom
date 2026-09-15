@@ -381,8 +381,18 @@ impl SessionControl {
     /// process had already exited before this was called.
     pub async fn wait_exited(&self, timeout: Duration) -> bool {
         let mut exited = self.exited.clone();
+        // `wait_for` resolves `Err(RecvError)`, not a hang, if the sender is
+        // dropped while the watched value is still `false` — e.g. the owning
+        // task panics or is aborted before it ever observes `child.wait()`
+        // resolve. That is the channel closing with NOTHING confirmed, not
+        // proof the process exited; only an inner `Ok` (which `wait_for` only
+        // ever returns once the predicate matched, i.e. the value is `true`)
+        // is a genuine confirmed exit. `result.is_ok()` on the OUTER
+        // `timeout` alone would accept that `Err` as if it were a success —
+        // this must check both layers, not just that the timeout itself
+        // didn't elapse.
         let result = tokio::time::timeout(timeout, exited.wait_for(|done| *done)).await;
-        result.is_ok()
+        matches!(result, Ok(Ok(_)))
     }
 }
 
@@ -1175,6 +1185,26 @@ mod session_control_tests {
             },
             steer_rx,
         )
+    }
+
+    /// TKT-rohib-rukaf-sizak acceptance correction (finding
+    /// `exit-watch-closed-is-not-confirmed-exit`): `control_with_capacity`
+    /// drops its `exited` sender immediately, while the watched value is
+    /// still `false` — modeling the owning runner task aborting/panicking
+    /// before it ever observes `child.wait()` resolve. The old
+    /// implementation read the OUTER `tokio::time::timeout`'s `Ok` alone,
+    /// which is also `Ok` when the INNER `wait_for` resolves `Err` on a
+    /// closed-while-false channel — a false positive that would have
+    /// reported a process as confirmed-exited on nothing but the channel
+    /// going away. Only an actually observed `true` may report confirmed
+    /// exit.
+    #[tokio::test]
+    async fn wait_exited_does_not_confirm_exit_when_the_watch_closes_before_reporting_true() {
+        let (control, _steer_rx) = control_with_capacity(1);
+        assert!(
+            !control.wait_exited(Duration::from_millis(200)).await,
+            "a closed watch that never reported true must not be read as confirmed exit"
+        );
     }
 
     /// The core contract `Supervisor::admit_steer` (rk-daemon) depends on: a

@@ -2347,6 +2347,21 @@ impl Daemon {
         // channel even if the value is unchanged, so this is a harmless no-op
         // when a `stop` RPC already sent it.
         let _ = daemon.shutdown_tx.send(true);
+        // Cancel every currently owned managed-check subprocess BEFORE
+        // waiting on anything below (TKT-rohib-rukaf-sizak): a background
+        // loop inside `background_tasks` (the landing consumer loop in
+        // particular) or a `spawn_background_drain` continuation can be
+        // genuinely blocked awaiting `execute_gate_plan_at`'s own check
+        // child for up to that check's OWN timeout — production default well
+        // past any reasonable shutdown bound. Cancelling here makes
+        // `verify_repo_check`'s `tokio::select!` observe this immediately,
+        // drop its `run_fut` (killing the check's real process group via its
+        // own `ProcessGroupGuard::drop`) and release its
+        // `ManagedRegistration`, so whatever was awaiting it below unblocks
+        // promptly instead of racing this signal against the join loops.
+        daemon
+            .supervisor
+            .cancel_all_managed_verification("daemon_shutdown");
         // Wait for every background loop to actually exit before returning —
         // see the `background_tasks` comment above for why this, rather than
         // a bare detached `tokio::spawn`, is what makes shutdown observable
@@ -2374,10 +2389,13 @@ impl Daemon {
                 .await;
         }
 
-        // Deliberate owned-process shutdown (TKT-rohib-rukaf-sizak): see
-        // `shut_down_owned_processes`'s own doc comment for the full
-        // rationale and the incidental-`kill_on_drop` gap this replaces.
-        shut_down_owned_processes(&daemon.supervisor).await;
+        // Deliberate owned-reviewer-process shutdown (TKT-rohib-rukaf-sizak):
+        // see `shut_down_owned_reviewer_processes`'s own doc comment for the
+        // full rationale, the incidental-`kill_on_drop` gap this replaces,
+        // and why an ordinary rat is deliberately excluded. Managed check
+        // subprocesses were already handled above, before the
+        // background-loop joins that could be waiting on one.
+        shut_down_owned_reviewer_processes(&daemon.supervisor).await;
 
         // Remove the socket/pid files only if they are still OURS — a newer
         // daemon may have already bound a fresh socket at the same path, and
@@ -13869,30 +13887,43 @@ const OWNED_PROCESS_HARD_KILL_GRACE: Duration = Duration::from_secs(5);
 const LANDING_BACKGROUND_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// TKT-rohib-rukaf-sizak: on a graceful stop, deliberately signal and
-/// bounded-join every currently owned live agent/check process instead of
-/// leaving `rk-harness`'s pre-existing `Child::kill_on_drop(true)` to reap
-/// it as an incidental side effect of this task tree tearing down once
-/// `Server::run` can actually return promptly (see
+/// bounded-join every currently owned live REVIEWER harness process
+/// (`Supervisor::live_reviewer_session_controls`) instead of leaving
+/// `rk-harness`'s pre-existing `Child::kill_on_drop(true)` to reap it as an
+/// incidental side effect of this task tree tearing down once `Server::run`
+/// can actually return promptly (see
 /// `crates/rk-cli/tests/bounded_daemon_stop_with_active_review.rs`, BBS
-/// finding 01M2HWNZA7V4WCSRTJ04XYN7ES). `kill()` (SIGTERM) is tried first —
-/// harnesses treat it as a request to shut down cleanly
-/// (`SessionControl::kill`'s own doc) — with `hard_kill()` (SIGKILL)
-/// reserved for whatever is still alive past the graceful grace window,
-/// mirroring `SessionControl::hard_kill`'s documented escalation order. A
-/// generation that survives even that bound is left for `kill_on_drop` as
-/// the final backstop, exactly as before this change — nothing here weakens
-/// that guarantee, it only makes the ordinary case deliberate instead of
-/// incidental.
+/// finding 01M2HWNZA7V4WCSRTJ04XYN7ES). This is the reviewer half only —
+/// managed CHECK subprocesses (`ManagedVerificationRuns`) are a completely
+/// separate registry with their own owner-signalled cancellation, handled by
+/// `cancel_all_managed_verification` above, before this runs; and an
+/// ordinary `"rat"` generation is deliberately NOT touched here at all — see
+/// `live_reviewer_session_controls`'s own doc for why signalling one would
+/// silently break `rk daemon rollover`'s pre-existing, tested
+/// park-then-`agent.respawn` contract (acceptance correction: this used to
+/// signal every live session and broke
+/// `daemon_rollover.rs::rollover_parks_a_live_rat_and_it_respawns` and
+/// `agent_archive.rs::live_and_orphaned_records_are_never_archived`).
+/// `kill()` (SIGTERM) is tried first — harnesses treat it as a request to
+/// shut down cleanly (`SessionControl::kill`'s own doc) — with `hard_kill()`
+/// (SIGKILL) reserved for whatever is still alive past the graceful grace
+/// window, mirroring `SessionControl::hard_kill`'s documented escalation
+/// order. A generation that survives even that bound is left for
+/// `kill_on_drop` as the final backstop, exactly as before this change —
+/// nothing here weakens that guarantee, it only makes the ordinary case
+/// deliberate instead of incidental.
 ///
-/// No separate recovery path is built here: an owned process signalled this
-/// way exits without ever publishing a `Completed` event, which
+/// No separate recovery path is built here: a reviewer signalled this way
+/// exits without ever publishing a `Completed` event, which
 /// `Supervisor::handle_event`'s existing `Exited` arm already treats as an
 /// ordinary crash/kill (state -> `Failed`, `pid` cleared, managed
-/// verification for it cancelled). The next daemon generation's existing
-/// respawn/recovery sweep resumes it exactly as it would any other crash —
-/// same-generation recovery, no extra replacement budget or reset.
-async fn shut_down_owned_processes(supervisor: &crate::supervisor::Supervisor) {
-    let owned = supervisor.live_session_controls();
+/// verification for it cancelled). The landing pipeline's own review-death
+/// detection and bounded replacement dispatch — proven end to end by
+/// `bounded_daemon_stop_with_active_review.rs` — does not key off
+/// `state == "orphaned"`, so this reuses that existing recovery path exactly
+/// as it would for any other reviewer crash.
+async fn shut_down_owned_reviewer_processes(supervisor: &crate::supervisor::Supervisor) {
+    let owned = supervisor.live_reviewer_session_controls();
     if owned.is_empty() {
         return;
     }
