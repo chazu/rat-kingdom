@@ -81,8 +81,14 @@ strip_rk_spawn_env=(
 	-u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT
 )
 
+# clippy runs right after fmt, before the build/nextest/doctest phases: it is
+# deterministic static rejection that needs no prior `cargo build` artifacts
+# (clippy-driver does its own check pass), so a lint violation now fails fast
+# before the far more expensive test phases run instead of after them
+# (TKT-totaz-hohid-gafum). crates/rk-core/tests/verify_full_recipe_regression.rs
+# proves this ordering.
 cargo fmt --all --check
+cargo clippy --workspace --all-targets --jobs "$verify_jobs" -- -D warnings
 cargo build --workspace --jobs "$verify_jobs"
 env "${strip_rk_spawn_env[@]}" cargo nextest run --workspace --no-fail-fast --build-jobs "$verify_jobs" --test-threads "$verify_jobs"
 env "${strip_rk_spawn_env[@]}" cargo test --workspace --doc --jobs "$verify_jobs" -- --test-threads "$verify_jobs"
-cargo clippy --workspace --all-targets --jobs "$verify_jobs" -- -D warnings
