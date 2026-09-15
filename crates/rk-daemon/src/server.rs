@@ -2411,13 +2411,20 @@ impl Daemon {
     /// `request_review`).
     fn landing(&self) -> Arc<crate::landing::LandingPipeline> {
         Arc::clone(self.landing.get_or_init(|| {
-            let pipeline = Arc::new(crate::landing::LandingPipeline::new(
-                self.space.clone(),
-                Arc::clone(&self.supervisor),
-                self.engine(),
-                Arc::clone(&self.tickets),
-                self.layout.clone(),
-            ));
+            let pipeline = Arc::new(
+                crate::landing::LandingPipeline::new(
+                    self.space.clone(),
+                    Arc::clone(&self.supervisor),
+                    self.engine(),
+                    Arc::clone(&self.tickets),
+                    self.layout.clone(),
+                )
+                // TKT-karut-jaraf-hivur: lets the review-wait loop notice a
+                // graceful `stop`/rollover instead of blocking `Self::run`'s
+                // shutdown `join_next` behind a live reviewer for up to
+                // `GateConfig::review_max_wait`.
+                .with_shutdown(self.shutdown_tx.subscribe()),
+            );
             self.supervisor.set_landing_pipeline(&pipeline);
             pipeline
         }))
