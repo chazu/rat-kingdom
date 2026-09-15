@@ -3258,6 +3258,22 @@ impl LandingPipeline {
             self.queue
                 .persist(entry, LandingEntryStatus::RunningGates)?;
         }
+        // P7.1 handoff fence, extended to a split-batch boundary
+        // (TKT-vaful-sabuh-rajon): every member above is already durably
+        // RunningGates with its candidate cleared — the same on-disk shape
+        // restart-safety already recovers from — so returning here without
+        // starting any of them leaves nothing but ordinary pending work for
+        // the next `claim_batch`/`claim_next` to pick back up once the fence
+        // lifts. This is checked again below, between the two halves, since
+        // the LEFT half's own `process_batch` call can run an arbitrarily
+        // long gate/review and a fence may be requested while it is in
+        // flight; it is never checked WITHIN an already-executing half, so a
+        // shared cohort's own in-flight check/reviewer/target-advance is
+        // never interrupted, only the not-yet-started other half.
+        let repo_name = entries[0].repo_name.clone();
+        if self.admission_fenced_at_split_boundary(&repo_name).await {
+            return Ok(Vec::new());
+        }
         if entries.len() == 1 {
             let entry = entries.pop().unwrap();
             let outcome = self.process_entry(&entry).await?;
@@ -3266,6 +3282,15 @@ impl LandingPipeline {
         }
         let right = entries.split_off(entries.len() / 2);
         let mut outcomes = Box::pin(self.process_batch(entries)).await?;
+        if self.admission_fenced_at_split_boundary(&repo_name).await {
+            // `right` was already persisted (RunningGates, candidate
+            // cleared) above and is durably queued; leaving it out of the
+            // returned outcomes here is what keeps it unclaimed — the
+            // caller (`drain_key`/`process_batch`) only removes/retires
+            // entries it actually gets back. Nothing terminal is fabricated
+            // for it, and its retry/spending budgets are untouched.
+            return Ok(outcomes);
+        }
         outcomes.extend(Box::pin(self.process_batch(right)).await?);
         Ok(outcomes)
     }
@@ -15578,6 +15603,213 @@ checks: [
             1,
             "second must advance exactly once: {processed:?}"
         );
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// TKT-vaful-sabuh-rajon: a live operator fence must be honored at the
+    /// boundary BETWEEN a bisected batch's two members, not just between
+    /// separate `claim_batch` calls (the coarse boundary
+    /// `handoff_fence_blocks_new_admission_without_draining_the_queue`
+    /// already proves). `member-a` and `member-b` are claimed TOGETHER in
+    /// one `claim_batch` call; their combined gate check always fails on
+    /// its first invocation, forcing `bisect_batch` to split them without
+    /// ever returning through a claim site; `member-a`'s own solo gate sits
+    /// at a barrier when the fence is requested. Proves: `member-a`'s
+    /// already-executing check finishes uninterrupted and lands normally
+    /// while fenced; `member-b` — the second, not-yet-started half — never
+    /// starts its own gate while the fence is live (the shared invocation
+    /// counter never advances past `member-a`'s check); `member-b` stays
+    /// durably queued and is reclaimed and landed exactly once after an
+    /// explicit release.
+    #[tokio::test]
+    async fn handoff_fence_blocks_the_second_half_of_an_already_claimed_bisected_batch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let reached = barrier_dir.path().join("reached");
+        let release = barrier_dir.path().join("release");
+        let count_file = barrier_dir.path().join("count");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "landing-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "landing-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'; if [ \"$n\" = \"1\" ]; then exit 1; fi; if [ -f docs/member-a.md ] && [ ! -f docs/member-b.md ]; then touch '{reached}'; while [ ! -f '{release}' ]; do sleep 0.02; done; fi; exit 0", timeout: "30s"}},
+]
+"#,
+            count = count_file.display(),
+            reached = reached.display(),
+            release = release.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        let mut heads = Vec::new();
+        for branch in ["member-a", "member-b"] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("{branch}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+            heads.push(rev_parse(repo_dir.path(), branch));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+        let (a_head, b_head) = (heads[0].clone(), heads[1].clone());
+
+        let space = Space::open_in_memory().unwrap();
+        let repo_name = rk_git::Repo::discover(repo_dir.path()).unwrap().name();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "member-a".into(),
+                target: "main".into(),
+                head_sha: a_head,
+                diff_class: "doc-only".into(),
+                task: "member-a-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: repo_name.clone(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "member-b".into(),
+                target: "main".into(),
+                head_sha: b_head,
+                diff_class: "doc-only".into(),
+                task: "member-b-task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Both entries claim together (same key, one `claim_batch`), so the
+        // combined gate check runs once and, on failure, `bisect_batch`
+        // splits them in-process — the boundary this test is about never
+        // goes back through a claim site.
+        let drain_pipeline = Arc::clone(&pipeline);
+        let drain_repo = repo_name.clone();
+        let drain_task =
+            tokio::spawn(async move { drain_pipeline.drain_key(&drain_repo, "main").await });
+
+        let mut member_a_reached = false;
+        for _ in 0..300 {
+            if reached.exists() {
+                member_a_reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            member_a_reached,
+            "member-a's solo gate never started running"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&count_file).unwrap().trim(),
+            "2",
+            "exactly the combined check and member-a's solo check must have run so far"
+        );
+
+        // Request the fence while member-a is genuinely mid-check — the
+        // still-executing FIRST half of the split, which must finish
+        // uninterrupted.
+        let requested = pipeline
+            .fence_request(
+                &repo_name,
+                "operator-test",
+                60,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(requested["state"], "draining", "requested: {requested}");
+        let fence_id = requested["fence_id"].as_str().unwrap().to_string();
+
+        // Let member-a finish — a live, normal completion, unaffected by
+        // the fence.
+        std::fs::write(&release, b"go").unwrap();
+
+        let drain_outcomes = tokio::time::timeout(Duration::from_secs(10), drain_task)
+            .await
+            .expect("the drain must return once member-a settles, not wait on member-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            drain_outcomes.len(),
+            1,
+            "only member-a's outcome must come back from this drain: {drain_outcomes:?}"
+        );
+        assert!(matches!(drain_outcomes[0], LandingOutcome::Landed(_)));
+
+        // member-b never started its own gate: the shared invocation
+        // counter still reads exactly what member-a alone produced.
+        assert_eq!(
+            std::fs::read_to_string(&count_file).unwrap().trim(),
+            "2",
+            "member-b's gate must not have started while the fence is engaged"
+        );
+
+        let queued = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap();
+        assert!(
+            queued
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b")),
+            "member-b must remain durably queued while fenced: {queued:?}"
+        );
+        assert!(
+            !space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+                .unwrap()
+                .iter()
+                .any(|t| t.payload.get("branch").and_then(Value::as_str) == Some("member-b")),
+            "member-b must not have been processed while fenced"
+        );
+
+        // Release the fence — member-b may now resume, exactly once, with a
+        // fresh candidate binding of its own.
+        pipeline
+            .fence_release(
+                &repo_name,
+                "operator-test",
+                &fence_id,
+                &ManagedWorkSnapshot::default,
+            )
+            .await
+            .unwrap();
+
+        let outcomes = pipeline.drain_key(&repo_name, "main").await.unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "member-b must resume exactly once: {outcomes:?}"
+        );
+        assert!(matches!(outcomes[0], LandingOutcome::Landed(_)));
+
+        let listing = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["ls-tree", "-r", "--name-only", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("docs/member-a.md"));
+        assert!(listing.contains("docs/member-b.md"));
+
         assert!(space
             .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
             .unwrap()
