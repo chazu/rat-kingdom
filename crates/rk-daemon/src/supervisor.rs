@@ -1921,9 +1921,14 @@ impl Supervisor {
         // Shared with the `repo.resolve_landing_target` RPC (the CLI's
         // pre-ticket-transition check) so the two boundaries can never
         // silently diverge on what "the effective target" means or on how
-        // a bad one is reported.
-        let target_branch =
-            self.resolve_landing_target(&repo, params.base.as_deref(), repo_policy.as_ref())?;
+        // a bad one is reported — including on the role-dependent routing an
+        // activated release role applies to an unbased spawn.
+        let target_branch = self.resolve_landing_target(
+            &repo,
+            &params.role,
+            params.base.as_deref(),
+            repo_policy.as_ref(),
+        )?;
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
         // A review spawn must fork from the exact candidate head the landing
         // pipeline already gated, not from whatever `target_branch` (the
@@ -6872,7 +6877,7 @@ impl Supervisor {
     }
 
     /// Resolve the landing target a spawn would use — an explicit `--base`
-    /// or, absent one, the policy-derived delivery default — and confirm it
+    /// or, absent one, the policy-derived spawn default — and confirm it
     /// names a real local branch before returning it. `repo_policy` is
     /// `None` exactly when the caller's role has no activated policy to
     /// fall back on (onboarding); threading it in rather than re-resolving
@@ -6881,6 +6886,14 @@ impl Supervisor {
     /// way — so the CLI's pre-ticket-transition check and this native
     /// boundary can never silently diverge on what "the effective target"
     /// means or on how a bad one is reported.
+    ///
+    /// `role` is threaded in for the same reason: the unbased default is
+    /// [`rk_workflow::RepositoryPolicy::spawn_base`], which routes an
+    /// ordinary worker to an activated integration branch but deliberately
+    /// leaves a `reviewer` on the delivery default. That routing is part of
+    /// "the effective target", so the preflight must see the same role the
+    /// real spawn will. It is unused when `base` is `Some` — an explicit
+    /// base is never overridden by policy, for any role.
     ///
     /// `Ok(false)` from `branch_exists_checked` is a definitive verdict —
     /// refused outright. `Err` is not proof of absence, but it is also not
@@ -6891,6 +6904,7 @@ impl Supervisor {
     pub(crate) fn resolve_landing_target(
         &self,
         repo: &Repo,
+        role: &str,
         base: Option<&str>,
         repo_policy: Option<&rk_workflow::RepositoryPolicy>,
     ) -> rk_core::Result<String> {
@@ -6900,7 +6914,7 @@ impl Supervisor {
                 .ok_or_else(|| {
                     rk_core::Error::other("onboarder spawn requires an explicit base branch")
                 })?
-                .delivery_target(&repo.current_branch()?),
+                .spawn_base(role, &repo.current_branch()?),
         };
         match repo.branch_exists_checked(&target_branch) {
             Ok(true) => Ok(target_branch),
@@ -13097,6 +13111,158 @@ mod respawn_tests {
             profile: None,
             resolved_profile: None,
         }
+    }
+
+    /// Register one repo under `home/repos.json` with `policy` activated —
+    /// the `respawn_tests`-local equivalent of
+    /// `verification_admission_tests::register_repo_with_policy`, needed here
+    /// because `spawn_params`/`supervisor` are private to this module.
+    fn register_repo_with_policy(
+        home: &Path,
+        name: &str,
+        path: &Path,
+        policy: rk_workflow::RepositoryPolicy,
+    ) {
+        // Resolved through `Repo::discover(..).root()`, matching what
+        // `Supervisor::spawn`'s own `Repo::discover` call later looks up by —
+        // a bare `path.to_path_buf()` can disagree with it (e.g. a tempdir
+        // under a symlinked `/tmp`), silently missing the registry lookup
+        // and falling back to `RepositoryPolicy::default()`.
+        let root = Repo::discover(path).unwrap().root().to_path_buf();
+        let mut registry = crate::repos::RepoRegistry::load(&home.join("repos.json")).unwrap();
+        registry
+            .add(crate::repos::RepoRecord {
+                name: name.into(),
+                path: root,
+                created_at: Utc::now(),
+                host: None,
+                activated_policy: Some(crate::repos::ActivatedRepositoryPolicy {
+                    digest: "test-digest".into(),
+                    policy,
+                }),
+            })
+            .unwrap();
+    }
+
+    /// The P5.1 release role (`integration` -> `main`) activated alone, with
+    /// everything else at its shipped default — the shared fixture for
+    /// TKT-dijid-noruj-pirab's spawn-routing tests below.
+    fn release_role_policy() -> rk_workflow::RepositoryPolicy {
+        rk_workflow::RepositoryPolicy {
+            landing: rk_workflow::LandingPolicy {
+                protected_targets: vec!["main".into()],
+                ..Default::default()
+            },
+            release: rk_workflow::ReleasePolicy {
+                integration_branch: "integration".into(),
+                release_target: "main".into(),
+            },
+            ..Default::default()
+        }
+    }
+
+    // --- TKT-dijid-noruj-pirab: route an unbased spawn to the activated
+    // integration branch ---
+
+    #[tokio::test]
+    async fn spawn_with_no_explicit_base_routes_to_the_activated_integration_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git(repo.path(), &["checkout", "-b", "integration"]);
+        git(repo.path(), &["checkout", "main"]);
+        register_repo_with_policy(
+            home.path(),
+            "release-repo",
+            repo.path(),
+            release_role_policy(),
+        );
+        let sup = supervisor(home.path());
+
+        let record = sup
+            .spawn_async(spawn_params(repo.path(), "TKT-route-to-integration"), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(record.target_branch, "integration");
+    }
+
+    #[tokio::test]
+    async fn spawn_with_explicit_base_ignores_the_activated_integration_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git(repo.path(), &["checkout", "-b", "integration"]);
+        git(repo.path(), &["checkout", "main"]);
+        register_repo_with_policy(
+            home.path(),
+            "release-repo",
+            repo.path(),
+            release_role_policy(),
+        );
+        let sup = supervisor(home.path());
+
+        let mut params = spawn_params(repo.path(), "TKT-explicit-base-wins");
+        params.base = Some("main".into());
+        let record = sup.spawn_async(params, 0).await.unwrap();
+
+        assert_eq!(
+            record.target_branch, "main",
+            "an explicit --base must never be silently overridden by the activated integration \
+             branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_reviewer_with_no_explicit_base_never_routes_to_the_integration_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git(repo.path(), &["checkout", "-b", "integration"]);
+        git(repo.path(), &["checkout", "main"]);
+        register_repo_with_policy(
+            home.path(),
+            "release-repo",
+            repo.path(),
+            release_role_policy(),
+        );
+        let sup = supervisor(home.path());
+
+        let mut params = spawn_params(repo.path(), "TKT-reviewer-no-base");
+        params.role = "reviewer".into();
+        let record = sup.spawn_async(params, 0).await.unwrap();
+
+        assert_eq!(
+            record.target_branch, "main",
+            "a native reviewer candidate must remain exact even with the release role \
+             activated — only an explicit `branch:` picks a reviewer's base in practice, but a \
+             caller that omits one must still fall back to the pre-existing behavior, never the \
+             integration branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_on_an_unconfigured_repository_is_unaffected_by_integration_routing() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git(repo.path(), &["checkout", "-b", "integration"]);
+        git(repo.path(), &["checkout", "main"]);
+        // No `register_repo*` call at all: `resolve_repository_policy` falls
+        // back to `RepositoryPolicy::default()` for an unregistered repo,
+        // which never activates the release role.
+        let sup = supervisor(home.path());
+
+        let record = sup
+            .spawn_async(spawn_params(repo.path(), "TKT-unconfigured"), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            record.target_branch, "main",
+            "an unconfigured repository must retain existing behavior: fork from whatever is \
+             currently checked out, never the unrelated `integration` branch"
+        );
     }
 
     /// The launch producer wires into the task-to-main span substrate
