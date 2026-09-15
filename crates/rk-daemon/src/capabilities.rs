@@ -84,9 +84,11 @@ pub(crate) fn method_policy(method: &str) -> Option<MethodPolicy> {
         "space.out" => ORDINARY_SELF_DONE,
         "repo.onboard.inspect" => ORDINARY_ONBOARDER,
         "repo.onboard.propose" => ONBOARDER_ONLY,
-        "agent.spawn" | "agent.respawn" | "agent.dismiss" | "agent.interrupt" | "agent.steer" => {
-            FOREMAN_CHILD
-        }
+        "agent.spawn" | "agent.respawn" | "agent.dismiss" | "agent.interrupt" | "agent.steer"
+        // A foreman's own `rk spawn` for a delegated child calls this as a
+        // preflight ahead of `agent.spawn`; the handler answers only for
+        // that foreman's own repo/branch (see `handle_resolve_landing_target`).
+        | "repo.resolve_landing_target" => FOREMAN_CHILD,
         "ticket.update" => GROOMER_CLOSE,
         "bbs.ask"
         | "bbs.answer"

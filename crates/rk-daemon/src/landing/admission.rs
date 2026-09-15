@@ -507,24 +507,47 @@ impl LandingPipeline {
         Ok(None)
     }
 
-    pub(super) fn quarantine_invalid_source(
-        &self,
-        entry: &LandingQueueEntry,
-    ) -> rk_core::Result<Option<LandingOutcome>> {
+    /// A prior `landing_queue_quarantine` evidence tuple bound to this exact
+    /// source/task/target/generation, if one already exists — the shared
+    /// idempotency probe behind every quarantine route: a restart that
+    /// re-discovers the same durably-invalid entry must return the same
+    /// terminal verdict instead of writing a second piece of evidence.
+    ///
+    /// Matched on repo identity (the scan's own `scope`, structural — a
+    /// cross-repo collision cannot reach this branch at all), queue `seq`,
+    /// `source_spawn` generation, `branch`, `head_sha`, `target`, AND
+    /// `task`: `seq` alone is a per-repo counter, not a global one, and a
+    /// stale/superseded queue revision must never retire a DIFFERENT
+    /// ticket's newer work that happens to reuse it — the `task` comparison
+    /// is what stops that.
+    fn find_quarantine(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
         let archived = self.space.scan(
             &Pattern::category(Category::Event)
                 .scope(&entry.repo_name)
                 .identity(QUARANTINE_IDENTITY),
         )?;
-        if let Some(prior) = archived.iter().find(|t| {
+        Ok(archived.into_iter().find(|t| {
             t.payload["entry"]["seq"] == entry.seq
                 && t.payload["entry"]["source_spawn"] == json!(entry.source_spawn)
                 && t.payload["entry"]["branch"] == entry.branch
                 && t.payload["entry"]["head_sha"] == entry.head_sha
                 && t.payload["entry"]["target"] == entry.target
-        }) {
-            return Ok(Some(LandingOutcome::Quarantined(prior.clone())));
+                && t.payload["entry"]["task"] == entry.task
+        }))
+    }
+
+    pub(super) fn quarantine_invalid_source(
+        &self,
+        entry: &LandingQueueEntry,
+    ) -> rk_core::Result<Option<LandingOutcome>> {
+        if let Some(prior) = self.find_quarantine(entry)? {
+            return Ok(Some(LandingOutcome::Quarantined(prior)));
         }
+        let archived = self.space.scan(
+            &Pattern::category(Category::Event)
+                .scope(&entry.repo_name)
+                .identity(QUARANTINE_IDENTITY),
+        )?;
         if let Some(candidate) = &entry.candidate_sha {
             if let Some(prior) = archived.iter().find(|t| {
                 t.payload["entry"]["candidate_sha"] == *candidate
@@ -540,6 +563,43 @@ impl LandingPipeline {
         let Some(reason) = self.invalid_source_identity(entry)? else {
             return Ok(None);
         };
+        self.archive_quarantine(entry, reason).map(Some)
+    }
+
+    /// A landing target that is not a real local branch — persisted from a
+    /// detached commit an operator or workflow mistakenly passed as `--base`,
+    /// or a branch since deleted out from under a queued entry — can never
+    /// receive `rk_git::Repo::prepare_merge`'s merge, which hard-errors
+    /// "merge target does not exist" instead of returning an ordinary
+    /// `PrepareOutcome`. Left unchecked that error propagates out of
+    /// `process_entry` on every drain pass, so `run_cycle` logs "will retry
+    /// next cycle" and hot-loops the same permanently-invalid entry forever
+    /// without ever running a gate. Caught here — before `prepare_merge` is
+    /// reached — and routed through the same durable quarantine record as an
+    /// invalid source, so the entry leaves the active queue exactly once,
+    /// keeps its original clocks/attempts/source/ticket in the evidence, and
+    /// a restart replays the same verdict instead of re-quarantining.
+    ///
+    /// A transient git read failure is not proof the branch is absent
+    /// (`branch_exists_checked`'s own contract), so it falls through to
+    /// `Ok(None)` and lets the ordinary retry-next-cycle path run instead of
+    /// misreporting an inconclusive check as a permanent hold.
+    pub(super) fn quarantine_invalid_target(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+    ) -> rk_core::Result<Option<LandingOutcome>> {
+        if let Some(prior) = self.find_quarantine(entry)? {
+            return Ok(Some(LandingOutcome::Quarantined(prior)));
+        }
+        if !matches!(git_repo.branch_exists_checked(&entry.target), Ok(false)) {
+            return Ok(None);
+        }
+        let reason = format!(
+            "landing target is not an existing branch: {} — a merge target must be a real \
+             branch, not a bare commit or a branch that no longer exists",
+            entry.target
+        );
         self.archive_quarantine(entry, reason).map(Some)
     }
 

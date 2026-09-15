@@ -515,6 +515,26 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
 
     let repo = crate::repo_cmds::resolve_path(&mut client, &repo_arg).await?;
 
+    // Refuse an unmergeable landing target BEFORE any side effect. `--base`
+    // names a landing target branch, not a starting commit: a detached SHA
+    // resolves fine as a starting revision but can never receive a merge,
+    // and the landing queue has no way to recover once it is persisted as a
+    // spawn's target. This must run even when `--base` is omitted: the
+    // ticket-status write below happens either way, so a policy-derived
+    // default that is somehow invalid would otherwise still mark the
+    // ticket `in_progress` before `agent.spawn`'s own check catches it —
+    // caught here instead, ahead of that write, not discovered later at
+    // `agent.spawn` or (worse) at landing time.
+    if let Err(error) = client
+        .call(
+            "repo.resolve_landing_target",
+            json!({ "repo": repo, "base": args.base, "role": args.role }),
+        )
+        .await
+    {
+        anyhow::bail!("{error} (repo {repo_arg:?})");
+    }
+
     // Mark the ticket in_progress BEFORE launching the rat. A fast rat can
     // finish (and auto-set `done`) before this returns, so it must not run
     // after the spawn or it would clobber that `done`.

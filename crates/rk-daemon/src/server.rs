@@ -4267,6 +4267,7 @@ impl Daemon {
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
             }),
             "repo.get" => reply(self.handle_repo_get(req)),
+            "repo.resolve_landing_target" => reply(self.handle_resolve_landing_target(req).await),
             "repo.onboard.start" => reply(self.handle_onboarding_start(req).await),
             "repo.onboard.propose" => reply(self.handle_onboarding_propose(req).await),
             "repo.onboard.approve" => reply(self.handle_onboarding_approve(req)),
@@ -8713,6 +8714,61 @@ impl Daemon {
         }
     }
 
+    /// Front-gate for `rk spawn`: lets the CLI resolve the SAME effective
+    /// landing target `agent.spawn` would use — a caller-supplied `--base`,
+    /// or (when omitted) the policy-derived delivery default — and confirm
+    /// it names a real local branch, not a bare commit that would later be
+    /// persisted as an unmergeable landing target. This must cover the
+    /// no-`--base` case too: the CLI flips a dispatched ticket to
+    /// `in_progress` before calling `agent.spawn` regardless of whether
+    /// `--base` was given, so checking only an explicit base would still
+    /// leave a policy-derived-but-invalid default free to mark the ticket
+    /// `in_progress` before `Supervisor::spawn_async`'s own (authoritative,
+    /// role-agnostic) re-check refuses the spawn.
+    ///
+    /// `method_policy` grants this `FOREMAN_CHILD`, same as `agent.spawn`
+    /// itself: a foreman's own `rk spawn` for a delegated child must pass
+    /// through this preflight too, and an ordinary rat has no legitimate
+    /// call to make here at all (it could never call `agent.spawn` either).
+    /// For a foreman caller, this answers ONLY for that foreman's own
+    /// repository and integration branch — never a foreign, unregistered,
+    /// or role-spoofed one a caller-supplied `repo`/`base` might otherwise
+    /// probe — via the exact same boundary [`crate::supervisor::Supervisor::prepare_foreman_spawn`]
+    /// enforces for the real dispatch.
+    async fn handle_resolve_landing_target(&self, req: Request) -> Response {
+        let params: ResolveLandingTargetParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let caller = req.caller.clone();
+        let is_foreman_caller = caller != "operator" && !caller.is_empty();
+        let repo_path = std::path::PathBuf::from(&params.repo);
+        let supervisor = Arc::clone(&self.supervisor);
+        let result = tokio::task::spawn_blocking(move || {
+            let repo = rk_git::Repo::discover(&repo_path)?;
+            if is_foreman_caller {
+                let branch = supervisor.foreman_child_target_branch(
+                    &caller,
+                    &repo,
+                    params.base.as_deref(),
+                )?;
+                return supervisor.resolve_landing_target(&repo, Some(&branch), None);
+            }
+            let repo_policy = if params.role == crate::onboarding_sessions::ONBOARDER_ROLE {
+                None
+            } else {
+                Some(supervisor.repository_policy(&repo)?)
+            };
+            supervisor.resolve_landing_target(&repo, params.base.as_deref(), repo_policy.as_ref())
+        })
+        .await;
+        match result {
+            Ok(Ok(target)) => Response::ok(req.id, json!({"target": target})),
+            Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
     async fn handle_onboarding_start(&self, req: Request) -> Response {
         let params: RepoOnboardingStartParams = match parse_params(&req.params) {
             Ok(params) => params,
@@ -13098,6 +13154,15 @@ struct WorkflowApproveParams {
 #[derive(Deserialize)]
 struct NameParams {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct ResolveLandingTargetParams {
+    repo: String,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default = "crate::supervisor::default_role")]
+    role: String,
 }
 
 #[derive(Deserialize)]
