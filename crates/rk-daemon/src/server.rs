@@ -13373,9 +13373,11 @@ struct RepoLandFenceStatusParams {
     repo: String,
 }
 
-/// `repo.land.fence_release` — end a fence early; idempotent, CAS-fenced on
-/// `(holder, generation)` so a stale/foreign caller cannot release someone
-/// else's active fence.
+/// `repo.land.fence_release` — end a fence early; idempotent, fenced on
+/// `(holder, fence_id)` so a stale/foreign caller cannot release someone
+/// else's active fence. NOT `generation`: that counter restarts at 1 when the
+/// durable store has to be recovered, which made a replayed release
+/// indistinguishable from a legitimate one.
 #[derive(Deserialize)]
 struct RepoLandFenceReleaseParams {
     repo: String,
