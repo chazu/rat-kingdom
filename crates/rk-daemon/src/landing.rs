@@ -2773,8 +2773,9 @@ impl LandingPipeline {
         } else {
             let repo = git_repo.clone();
             let branch = entry.branch.clone();
+            let head_sha = entry.head_sha.clone();
             let target = entry.target.clone();
-            match blocking(move || repo.prepare_merge(&branch, &target)).await? {
+            match blocking(move || repo.prepare_merge_at(&branch, &head_sha, &target)).await? {
                 rk_git::PrepareOutcome::Prepared(candidate) => {
                     entry.candidate_sha = Some(candidate.commit.clone());
                     entry.candidate_base = Some(candidate.base.clone());
@@ -3084,9 +3085,12 @@ impl LandingPipeline {
             candidate
         } else {
             let batch_repo = repo.clone();
-            let branches = branch_names.clone();
+            let sources: Vec<(String, String)> = entries
+                .iter()
+                .map(|e| (e.branch.clone(), e.head_sha.clone()))
+                .collect();
             let target = entries[0].target.clone();
-            match blocking(move || batch_repo.prepare_merge_batch(&branches, &target)).await? {
+            match blocking(move || batch_repo.prepare_merge_batch_at(&sources, &target)).await? {
                 rk_git::PrepareOutcome::Prepared(candidate) => candidate,
                 rk_git::PrepareOutcome::Conflict { .. } => {
                     return self.bisect_batch(entries, None).await;
@@ -10408,6 +10412,235 @@ workflow: {
             .scan_current("docs-repo", Some("main"))
             .unwrap()
             .is_empty());
+    }
+
+    /// Native fixture (TKT-zajob-japos-dalot, single-entry, before-claim): a
+    /// source branch that gains commits AFTER an entry freezes `head_sha` at
+    /// enqueue but BEFORE `process_entry` claims and prepares it must still
+    /// land only the frozen content. `process_entry` now calls
+    /// `prepare_merge_at` (pinned to `entry.head_sha`), not `prepare_merge`
+    /// (which would live-resolve `entry.branch`'s now-newer tip).
+    #[tokio::test]
+    async fn source_moved_before_claim_lands_only_the_frozen_head() {
+        let (repo_dir, gated_head, _main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha: gated_head.clone(),
+                diff_class: "doc-only".into(),
+                task: "add src before claim".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // The branch moves AFTER enqueue (freezing head_sha) but BEFORE this
+        // entry is claimed/processed — e.g. a rework respawn pushed a
+        // follow-up commit onto the same branch name while the entry sat
+        // Queued behind lane/WIP admission.
+        git(repo_dir.path(), &["checkout", "feature"]);
+        std::fs::write(
+            repo_dir.path().join("src.rs"),
+            "fn x() { /* unreviewed */ }\n",
+        )
+        .unwrap();
+        git(repo_dir.path(), &["add", "src.rs"]);
+        git(repo_dir.path(), &["commit", "-m", "unreviewed follow-up"]);
+        let moved_tip = rev_parse(repo_dir.path(), "feature");
+        assert_ne!(gated_head, moved_tip);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let entry = pipeline
+            .queue
+            .claim_next("code-repo", "main")
+            .unwrap()
+            .expect("the freshly enqueued entry must be claimable");
+        let outcome = pipeline.process_entry(&entry).await.unwrap();
+        assert!(
+            matches!(outcome, LandingOutcome::Landed(_)),
+            "expected a clean land, got {outcome:?}"
+        );
+
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let main_tip = repo.rev_parse("main").unwrap();
+        assert!(
+            repo.is_ancestor(&gated_head, &main_tip),
+            "main must contain the frozen head"
+        );
+        assert!(
+            !repo.is_ancestor(&moved_tip, &main_tip),
+            "main must NOT contain the branch's later, unreviewed commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.path().join("src.rs")).unwrap(),
+            "fn x() {}\n",
+            "landed content must match the frozen candidate, not the moved tip"
+        );
+    }
+
+    /// Native fixture (TKT-zajob-japos-dalot, batch, before-claim): the same
+    /// protection extended to `process_batch`/`prepare_merge_batch_at` — a
+    /// two-member batch where ONE member's branch moves after enqueue but
+    /// before the batch is claimed must still build that member's merge from
+    /// its frozen head, not its moved tip.
+    #[tokio::test]
+    async fn batch_source_moved_before_claim_lands_only_the_frozen_heads() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        for (branch, file) in [("feature-a", "a.md"), ("feature-b", "b.md")] {
+            git(repo_dir.path(), &["checkout", "main"]);
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::write(repo_dir.path().join(file), format!("{branch}: gated\n")).unwrap();
+            git(repo_dir.path(), &["add", file]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: {branch}")],
+            );
+        }
+        let gated_a = rev_parse(repo_dir.path(), "feature-a");
+        let gated_b = rev_parse(repo_dir.path(), "feature-b");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        for (branch, head_sha) in [("feature-a", &gated_a), ("feature-b", &gated_b)] {
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: "docs-repo".into(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: (*branch).into(),
+                    target: "main".into(),
+                    head_sha: head_sha.clone(),
+                    diff_class: "doc-only".into(),
+                    task: format!("deliver-{branch}"),
+                    keep_branch: true,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        // feature-b moves AFTER both entries are enqueued (freezing their
+        // heads) but BEFORE the batch is claimed.
+        git(repo_dir.path(), &["checkout", "feature-b"]);
+        std::fs::write(repo_dir.path().join("b.md"), "feature-b: unreviewed\n").unwrap();
+        git(repo_dir.path(), &["add", "b.md"]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "docs: unreviewed follow-up"],
+        );
+        let moved_b = rev_parse(repo_dir.path(), "feature-b");
+        assert_ne!(gated_b, moved_b);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let entries = pipeline.queue.claim_batch("docs-repo", "main", 8).unwrap();
+        assert_eq!(entries.len(), 2);
+        let outcomes = pipeline.process_batch(entries).await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes
+            .iter()
+            .all(|(_, outcome)| matches!(outcome, LandingOutcome::Landed(_))));
+
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let main_tip = repo.rev_parse("main").unwrap();
+        assert!(repo.is_ancestor(&gated_a, &main_tip));
+        assert!(repo.is_ancestor(&gated_b, &main_tip));
+        assert!(
+            !repo.is_ancestor(&moved_b, &main_tip),
+            "main must NOT contain feature-b's later, unreviewed commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.path().join("b.md")).unwrap(),
+            "feature-b: gated\n",
+            "landed content must match feature-b's frozen head, not its moved tip"
+        );
+    }
+
+    /// Native fixture (TKT-zajob-japos-dalot, replay + after-prepare
+    /// movement): an entry that already carries a persisted candidate (as if
+    /// resumed after a daemon restart between gate-pass and land) must land
+    /// EXACTLY that candidate even if the source branch has since moved
+    /// further still — the persisted-candidate reuse branch in
+    /// `process_entry` never calls `prepare_merge_at`/`prepare_merge` again,
+    /// so nothing re-derives from the newer tip.
+    #[tokio::test]
+    async fn replay_with_a_persisted_candidate_ignores_further_source_movement() {
+        let (repo_dir, gated_head, _main_before) = review_candidate_repo();
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let rk_git::PrepareOutcome::Prepared(candidate) =
+            repo.prepare_merge("feature", "main").unwrap()
+        else {
+            panic!("prepare must build cleanly");
+        };
+
+        // The branch moves AGAIN after the candidate was already prepared
+        // and persisted (as if a restart happened between gate-pass and
+        // land) — a genuine replay must never re-derive anything from this
+        // newer tip.
+        git(repo_dir.path(), &["checkout", "feature"]);
+        std::fs::write(
+            repo_dir.path().join("src.rs"),
+            "fn x() { /* unreviewed */ }\n",
+        )
+        .unwrap();
+        git(repo_dir.path(), &["add", "src.rs"]);
+        git(repo_dir.path(), &["commit", "-m", "unreviewed follow-up"]);
+        let moved_tip = rev_parse(repo_dir.path(), "feature");
+        assert_ne!(gated_head, moved_tip);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha: gated_head.clone(),
+                diff_class: "doc-only".into(),
+                task: "add src replay".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut entry = pipeline
+            .queue
+            .claim_next("code-repo", "main")
+            .unwrap()
+            .expect("the freshly enqueued entry must be claimable");
+        entry.candidate_sha = Some(candidate.commit.clone());
+        entry.candidate_base = Some(candidate.base.clone());
+        entry.candidate_ref = Some(candidate.candidate_ref.clone());
+        pipeline
+            .queue
+            .persist(&mut entry, LandingEntryStatus::RunningGates)
+            .unwrap();
+
+        let outcome = pipeline.process_entry(&entry).await.unwrap();
+        assert!(
+            matches!(outcome, LandingOutcome::Landed(_)),
+            "expected a clean land, got {outcome:?}"
+        );
+
+        let main_tip = repo.rev_parse("main").unwrap();
+        assert!(repo.is_ancestor(&candidate.commit, &main_tip));
+        assert!(
+            !repo.is_ancestor(&moved_tip, &main_tip),
+            "main must NOT contain the branch's post-prepare, unreviewed commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.path().join("src.rs")).unwrap(),
+            "fn x() {}\n",
+            "replay must land the persisted candidate's content, not further branch movement"
+        );
     }
 
     /// TKT-01M0EHFDGZQDZM0CF4E04G6JKA: an approved candidate landing onto a
