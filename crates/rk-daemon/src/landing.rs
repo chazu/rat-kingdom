@@ -3054,14 +3054,39 @@ impl LandingPipeline {
         {
             // A fresh arrival must never be absorbed into a legacy prepared
             // cohort. Preserve its exact membership across a mixed restart.
+            let repo_name = entries[0].repo_name.clone();
             let (singletons, legacy): (Vec<_>, Vec<_>) = entries
                 .into_iter()
                 .partition(|e| e.batch_branches.is_empty());
             let mut outcomes = Vec::new();
             for entry in singletons {
+                // P7.1 handoff fence, extended past `bisect_batch`'s own
+                // split boundary (TKT-sisoj-difar-mazul): this loop starts a
+                // fresh, independent candidate on every iteration exactly
+                // like `bisect_batch`'s two halves do, so a fence
+                // acknowledged while an earlier sibling is genuinely
+                // mid-gate/review must still refuse the NEXT, not-yet-started
+                // one — only whatever is already mid-`process_entry` (never
+                // interrupted, since the check runs strictly BEFORE the call)
+                // finishes uninterrupted. Every entry not yet handed to
+                // `process_entry`, including every remaining singleton and
+                // all of `legacy`, is left exactly as `claim_batch` already
+                // persisted it: durably queued, `seq`/`enqueued_at`/retry
+                // budget untouched.
+                if self.admission_fenced_at_split_boundary(&repo_name).await {
+                    return Ok(outcomes);
+                }
                 let outcome = self.process_entry(&entry).await?;
                 self.queue.remove(&entry)?;
                 outcomes.push((entry, outcome));
+            }
+            // Same checkpoint as `bisect_batch`'s between-halves check: the
+            // singleton loop above can itself run an arbitrarily long
+            // gate/review, so re-check immediately before recursing into the
+            // untouched `legacy` remainder rather than assuming nothing
+            // changed while it ran.
+            if self.admission_fenced_at_split_boundary(&repo_name).await {
+                return Ok(outcomes);
             }
             outcomes.extend(Box::pin(self.process_batch(legacy)).await?);
             return Ok(outcomes);
@@ -3078,8 +3103,23 @@ impl LandingPipeline {
                     || !matches!(entry.diff_class.as_str(), "doc-only" | "trivial")
             })
         {
+            // Every entry here is processed independently — no shared
+            // prepared candidate binds them — so the same handoff-fence
+            // checkpoint as the mixed-cohort loop above applies at each
+            // iteration boundary (TKT-sisoj-difar-mazul): honor a fence
+            // acknowledged while an earlier sibling is genuinely mid-gate/
+            // review by refusing to start the next not-yet-claimed-by-
+            // `process_entry` member. Whatever already started finishes
+            // uninterrupted; every entry not yet reached stays exactly as
+            // `claim_batch` left it.
+            let repo_name = entries.first().map(|e| e.repo_name.clone());
             let mut outcomes = Vec::with_capacity(entries.len());
             for entry in entries {
+                if let Some(repo_name) = &repo_name {
+                    if self.admission_fenced_at_split_boundary(repo_name).await {
+                        return Ok(outcomes);
+                    }
+                }
                 let outcome = self.process_entry(&entry).await;
                 if outcome.is_ok() {
                     // Retire THIS entry the instant its own outcome is
