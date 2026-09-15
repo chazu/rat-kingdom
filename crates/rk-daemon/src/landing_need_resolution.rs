@@ -366,7 +366,7 @@ pub fn telemetry_event(
         serde_json::json!({
             "bbs_kind": "landing_need_retirement_run",
             "feature": FEATURE_ID,
-            "build": rk_core::version::BUILD_VERSION,
+            "build": rk_core::version::build_version(),
             "config_revision": config.revision,
             "config_status": config.status.as_str(),
             "attempted": outcome.attempted,
