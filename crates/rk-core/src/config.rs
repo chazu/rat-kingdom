@@ -1253,6 +1253,23 @@ pub struct PolicyConfig {
     /// keyed by repo name, same fallback role as the other admission limits
     /// above.
     pub review_admission_limit_by_repo: BTreeMap<String, u32>,
+    /// P4.1 (TKT-nibuv-gokun-sibin): whether `rk release prepare`'s
+    /// `paired-rk-mcp` recipe build subprocess acquires one permit from the
+    /// SAME [`verification_admission_aggregate_limit`](Self::verification_admission_aggregate_limit)
+    /// (P3.1) host-wide semaphore every managed named check already shares,
+    /// before it spawns. `false` (the default) preserves existing behavior
+    /// exactly — the release build's process-wide single-flight lock
+    /// (`Daemon::release_prepare_lock`) is unaffected either way, but with
+    /// this off the build spawns unconditionally, outside any aggregate
+    /// admission bound, exactly as before this field existed. Enabling it
+    /// with `verification_admission_aggregate_limit` still `0` (disabled)
+    /// has no effect — [`HostVerificationAdmission::acquire`] itself is a
+    /// no-op whenever the aggregate cap is disabled, same as for every named
+    /// check. Read once at daemon startup like every other admission field
+    /// in this file — changing it requires a daemon restart, it is not
+    /// live-reloaded. Disable by reverting to `false` and restarting; this
+    /// never removes or rewrites an already-`Prepared` release.
+    pub release_build_admission_enabled: bool,
 }
 
 impl Default for PolicyConfig {
@@ -1275,6 +1292,7 @@ impl Default for PolicyConfig {
             )]),
             review_admission_limit: 0,
             review_admission_limit_by_repo: BTreeMap::new(),
+            release_build_admission_enabled: false,
         }
     }
 }
